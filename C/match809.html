@@ -1,0 +1,1894 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML><HEAD><TITLE>Matches for imklog.c & omprog.c</TITLE>
+<META http-equiv="Content-Type" content="text/html; charset=UTF-8">
+</HEAD>
+<body>
+  <div style="align-items: center; display: flex; justify-content: space-around;">
+    <div>
+      <h3 align="center">
+Matches for imklog.c & omprog.c
+      </h3>
+      <h1 align="center">
+        10.6%
+      </h1>
+      <center>
+        <a href="index.html" target="_top">
+          INDEX
+        </a>
+        <span>-</span>
+        <a href="help-en.html" target="_top">
+          HELP
+        </a>
+      </center>
+    </div>
+    <div>
+<TABLE BORDER="1" CELLSPACING="0" BGCOLOR="#d0d0d0">
+<TR><TH><TH>imklog.c (19.642857%)<TH>omprog.c (7.3008847%)<TH>Tokens
+<TR><TD BGCOLOR="#0000ff"><FONT COLOR="#0000ff">-</FONT><TD><A HREF="javascript:ZweiFrames('match809-0.html#0',2,'match809-1.html#0',3)" NAME="0">(99-115)<TD><A HREF="javascript:ZweiFrames('match809-0.html#0',2,'match809-1.html#0',3)" NAME="0">(134-153)</A><TD ALIGN=center><FONT COLOR="#ff0000">28</FONT>
+<TR><TD BGCOLOR="#f63526"><FONT COLOR="#f63526">-</FONT><TD><A HREF="javascript:ZweiFrames('match809-0.html#1',2,'match809-1.html#1',3)" NAME="1">(374-381)<TD><A HREF="javascript:ZweiFrames('match809-0.html#1',2,'match809-1.html#1',3)" NAME="1">(1123-1130)</A><TD ALIGN=center><FONT COLOR="#bf0000">21</FONT>
+<TR><TD BGCOLOR="#980517"><FONT COLOR="#980517">-</FONT><TD><A HREF="javascript:ZweiFrames('match809-0.html#2',2,'match809-1.html#2',3)" NAME="2">(382-387)<TD><A HREF="javascript:ZweiFrames('match809-0.html#2',2,'match809-1.html#2',3)" NAME="2">(1117-1122)</A><TD ALIGN=center><FONT COLOR="#9a0000">17</FONT>
+</TABLE>
+    </div>
+  </div>
+  <hr>
+  <div style="display: flex;">
+<div style="flex-grow: 1;">
+<h3>
+<center>
+<span>imklog.c</span>
+<span> - </span>
+<span></span>
+</center>
+</h3>
+<HR>
+<PRE>
+/* The kernel log module.
+ *
+ * This is an abstracted module. As Linux and BSD kernel log is conceptually the
+ * same, we do not do different input plugins for them but use
+ * imklog in both cases, just with different &quot;backend drivers&quot; for
+ * the different platforms. This also enables a rsyslog.conf to
+ * be used on multiple platforms without the need to take care of
+ * what the kernel log is coming from.
+ *
+ * See platform-specific files (e.g. linux.c, bsd.c) in the plugin's
+ * working directory. For other systems with similar kernel logging
+ * functionality, no new input plugin shall be written but rather a
+ * driver be developed for imklog. Please note that imklog itself is
+ * mostly concerned with handling the interface. Any real action happens
+ * in the drivers, as things may be pretty different on different
+ * platforms.
+ *
+ * Please note that this file replaces the klogd daemon that was
+ * also present in pre-v3 versions of rsyslog.
+ *
+ * To test under Linux:
+ * echo test1 &gt; /dev/kmsg
+ *
+ * Copyright (C) 2008-2020 Adiscon GmbH
+ *
+ * This file is part of rsyslog.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *       -or-
+ *       see COPYING.ASL20 in the source distribution
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include &quot;config.h&quot;
+#include &quot;rsyslog.h&quot;
+#include &lt;stdio.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdarg.h&gt;
+#include &lt;ctype.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;sys/socket.h&gt;
+
+#include &quot;dirty.h&quot;
+#include &quot;cfsysline.h&quot;
+#include &quot;parserif.h&quot;
+#include &quot;obj.h&quot;
+#include &quot;msg.h&quot;
+#include &quot;module-template.h&quot;
+#include &quot;datetime.h&quot;
+#include &quot;imklog.h&quot;
+#include &quot;net.h&quot;
+#include &quot;glbl.h&quot;
+#include &quot;prop.h&quot;
+#include &quot;errmsg.h&quot;
+#include &quot;unicode-helper.h&quot;
+#include &quot;ruleset.h&quot;
+
+
+MODULE_TYPE_INPUT
+MODULE_TYPE_NOKEEP
+MODULE_CNFNAME(&quot;imklog&quot;)
+
+/* Module static data */
+DEF_IMOD_STATIC_DATA
+DEFobjCurrIf(datetime)
+DEFobjCurrIf(ruleset)
+DEFobjCurrIf(glbl)
+DEFobjCurrIf(prop)
+DEFobjCurrIf(net)
+
+/* config settings */
+typedef struct configSettings_s {
+	int bPermitNonKernel; /* permit logging of messages not having LOG_KERN facility */
+	int bParseKernelStamp; /* if try to parse kernel timestamps for message time */
+	int bKeepKernelStamp; /* keep the kernel timestamp in the message */
+	int iFacilIntMsg; /* the facility to use for internal messages (set by driver) */
+	uchar *pszPath;
+	int console_log_level; /* still used for BSD */
+	unsigned int ratelimitInterval;
+	unsigned int ratelimitBurst;
+} configSettings_t;
+static configSettings_t cs;
+
+static modConfData_t *loadModConf = NULL;/* modConf ptr to use for the current load process */
+static modConfData_t *runModConf = NULL;/* modConf ptr to use for the current load process */
+static int bLegacyCnfModGlobalsPermitted;/* are legacy module-global config parameters permitted? */
+<A NAME="0"></A>
+/* module-global parameters */
+static struct cnfparamdescr modpdescr[] = {
+<FONT color="#0000ff"><A HREF="javascript:ZweiFrames('match809-1.html#0',3,'match809-top.html#0',1)"><IMG SRC="forward.gif" ALT="other" BORDER="0" ALIGN="right"></A><B>	{ &quot;ruleset&quot;, eCmdHdlrString, 0 },
+	{ &quot;logpath&quot;, eCmdHdlrGetWord, 0 },
+	{ &quot;permitnonkernelfacility&quot;, eCmdHdlrBinary, 0 },
+	{ &quot;consoleloglevel&quot;, eCmdHdlrInt, 0 },
+	{ &quot;parsekerneltimestamp&quot;, eCmdHdlrBinary, 0 },
+	{ &quot;keepkerneltimestamp&quot;, eCmdHdlrBinary, 0 },
+	{ &quot;internalmsgfacility&quot;, eCmdHdlrFacility, 0 },
+	{ &quot;ratelimitinterval&quot;, eCmdHdlrInt, 0 },
+	{ &quot;ratelimitburst&quot;, eCmdHdlrInt, 0 }
+};
+static struct cnfparamblk modpblk =
+	{ CNFPARAMBLK_VERSION,
+	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+	  modpdescr
+	};
+
+static prop_t *pInputName = NULL;</B></FONT>
+/* there is only one global inputName for all messages generated by this module */
+static prop_t *pLocalHostIP = NULL;
+
+/** POTENTIAL COMMON CODE FOR RULESET CHECK **/
+static inline void std_mod_checkRuleset_genErrMsg(const modConfData_t *const modConf);
+static inline rsRetVal
+std_mod_checkRuleset(modConfData_t *const modConf)
+{
+	ruleset_t *pRuleset;
+	rsRetVal localRet;
+	DEFiRet;
+
+	modConf-&gt;pBindRuleset = NULL;	/* assume default ruleset */
+
+	if(modConf-&gt;pszBindRuleset == NULL)
+		FINALIZE;
+
+	localRet = ruleset.GetRuleset(modConf-&gt;pConf, &amp;pRuleset, modConf-&gt;pszBindRuleset);
+	if(localRet == RS_RET_NOT_FOUND) {
+		std_mod_checkRuleset_genErrMsg(modConf);
+	}
+	CHKiRet(localRet);
+	modConf-&gt;pBindRuleset = pRuleset;
+
+finalize_it:
+	RETiRet;
+}
+/** END POTENTIAL COMMON CODE FOR RULESET CHECK **/
+static inline void
+std_mod_checkRuleset_genErrMsg(const modConfData_t *const modConf)
+{
+	LogError(0, NO_ERRCODE, &quot;imklog: ruleset '%s' not found - &quot;
+			&quot;using default ruleset instead&quot;, modConf-&gt;pszBindRuleset);
+}
+
+static void
+initConfigSettings(void)
+{
+	cs.bPermitNonKernel = 0;
+	cs.bParseKernelStamp = 0;
+	cs.bKeepKernelStamp = 0;
+	cs.console_log_level = -1;
+	cs.pszPath = NULL;
+	cs.iFacilIntMsg = klogFacilIntMsg();
+}
+
+
+/* enqueue the the kernel message into the message queue.
+ * The provided msg string is not freed - thus must be done
+ * by the caller.
+ * rgerhards, 2008-04-12
+ */
+static rsRetVal
+enqMsg(uchar *const __restrict__ msg,
+	uchar* pszTag,
+	const syslog_pri_t pri,
+	struct timeval *tp,
+	ratelimit_t *ratelimiter)
+{
+	struct syslogTime st;
+	smsg_t *pMsg;
+	DEFiRet;
+
+	assert(msg != NULL);
+	assert(pszTag != NULL);
+
+	if(tp == NULL) {
+		CHKiRet(msgConstruct(&amp;pMsg));
+	} else {
+		datetime.timeval2syslogTime(tp, &amp;st, TIME_IN_LOCALTIME);
+		CHKiRet(msgConstructWithTime(&amp;pMsg, &amp;st, tp-&gt;tv_sec));
+	}
+	MsgSetFlowControlType(pMsg, eFLOWCTL_LIGHT_DELAY);
+	MsgSetInputName(pMsg, pInputName);
+	MsgSetRawMsgWOSize(pMsg, (char*)msg);
+	MsgSetRuleset(pMsg, runModConf-&gt;pBindRuleset);
+	MsgSetMSGoffs(pMsg, 0);	/* we do not have a header... */
+	MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
+	MsgSetRcvFromIP(pMsg, pLocalHostIP);
+	MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
+	MsgSetTAG(pMsg, pszTag, ustrlen(pszTag));
+	msgSetPRI(pMsg, pri);
+	ratelimitAddMsg(ratelimiter, NULL, pMsg);
+finalize_it:
+	RETiRet;
+}
+
+/* parse the PRI from a kernel message. At least BSD seems to have
+ * non-kernel messages inside the kernel log...
+ * Expected format: &quot;&lt;pri&gt;&quot;. piPri is only valid if the function
+ * successfully returns. If there was a proper pri ppSz is advanced to the
+ * position right after &quot;&gt;&quot;.
+ * rgerhards, 2008-04-14
+ */
+static rsRetVal
+parsePRI(uchar **ppSz, syslog_pri_t *piPri)
+{
+	DEFiRet;
+	syslog_pri_t i;
+	uchar *pSz;
+
+	assert(ppSz != NULL);
+	pSz = *ppSz;
+	assert(pSz != NULL);
+	assert(piPri != NULL);
+
+	if(*pSz != '&lt;' || !isdigit(*(pSz+1)))
+		ABORT_FINALIZE(RS_RET_INVALID_PRI);
+
+	++pSz;
+	i = 0;
+	while(isdigit(*pSz) &amp;&amp; i &lt;= LOG_MAXPRI) {
+		i = i * 10 + *pSz++ - '0';
+	}
+
+	if(*pSz != '&gt;' || i &gt; LOG_MAXPRI)
+		ABORT_FINALIZE(RS_RET_INVALID_PRI);
+
+	/* OK, we have a valid PRI */
+	*piPri = i;
+	*ppSz = pSz + 1; /* update msg ptr to position after PRI */
+
+finalize_it:
+	RETiRet;
+}
+
+
+/* log an imklog-internal message
+ * rgerhards, 2008-04-14
+ */
+rsRetVal imklogLogIntMsg(syslog_pri_t priority, const char *fmt, ...)
+{
+	DEFiRet;
+	va_list ap;
+	uchar msgBuf[2048]; /* we use the same size as sysklogd to remain compatible */
+
+	va_start(ap, fmt);
+	vsnprintf((char*)msgBuf, sizeof(msgBuf), fmt, ap);
+	va_end(ap);
+
+	logmsgInternal(NO_ERRCODE, priority, msgBuf, 0);
+
+	RETiRet;
+}
+
+
+/* log a kernel message. If tp is non-NULL, it contains the message creation
+ * time to use.
+ * rgerhards, 2008-04-14
+ */
+rsRetVal Syslog(modConfData_t *pModConf, syslog_pri_t priority, uchar *pMsg, struct timeval *tp)
+{
+	syslog_pri_t pri;
+	int bPRISet = 0;
+	rsRetVal localRet;
+	DEFiRet;
+
+	/* then check if we have two PRIs. This can happen in case of systemd,
+	 * in which case the second PRI is the right one.
+	 */
+	if(pMsg[3] == '&lt;' || (pMsg[3] == ' ' &amp;&amp; pMsg[4] == '&lt;')) { /* could be a pri... */
+		uchar *pMsgTmp = pMsg + ((pMsg[3] == '&lt;') ? 3 : 4);
+		localRet = parsePRI(&amp;pMsgTmp, &amp;pri);
+		if(localRet == RS_RET_OK &amp;&amp; pri &gt;= 8 &amp;&amp; pri &lt;= LOG_MAXPRI) {
+			/* *this* is our PRI */
+			DBGPRINTF(&quot;imklog detected secondary PRI(%d) in klog msg\n&quot;, pri);
+			pMsg = pMsgTmp;
+			priority = pri;
+			bPRISet = 1;
+		}
+	}
+	if(!bPRISet) {
+		localRet = parsePRI(&amp;pMsg, &amp;priority);
+		if(localRet != RS_RET_INVALID_PRI &amp;&amp; localRet != RS_RET_OK)
+			FINALIZE;
+	}
+	/* if we don't get the pri, we use whatever we were supplied */
+
+	/* ignore non-kernel messages if not permitted */
+	if(pModConf-&gt;bPermitNonKernel == 0 &amp;&amp; pri2fac(priority) != LOG_KERN)
+		FINALIZE; /* silently ignore */
+
+	iRet = enqMsg((uchar*)pMsg, (uchar*) &quot;kernel:&quot;, priority, tp, pModConf-&gt;ratelimiter);
+
+finalize_it:
+	RETiRet;
+}
+
+
+/* helper for some klog drivers which need to know the MaxLine global setting. They can
+ * not obtain it themselfs, because they are no modules and can not query the object hander.
+ * It would probably be a good idea to extend the interface to support it, but so far
+ * we create a (sufficiently valid) work-around. -- rgerhards, 2008-11-24
+ */
+int klog_getMaxLine(void)
+{
+	return glbl.GetMaxLine(runConf);
+}
+
+
+BEGINrunInput
+CODESTARTrunInput
+	/* this is an endless loop - it is terminated when the thread is
+	 * signalled to do so. This, however, is handled by the framework,
+	 * right into the sleep below.
+	 */
+	while(!pThrd-&gt;bShallStop) {
+		/* klogLogKMsg() waits for the next kernel message, obtains it
+		 * and then submits it to the rsyslog main queue.
+	   	 * rgerhards, 2008-04-09
+	   	 */
+		CHKiRet(klogLogKMsg(runModConf));
+	}
+finalize_it:
+ENDrunInput
+
+
+BEGINbeginCnfLoad
+CODESTARTbeginCnfLoad
+	loadModConf = pModConf;
+	pModConf-&gt;pConf = pConf;
+	/* init our settings */
+	pModConf-&gt;pszPath = NULL;
+	pModConf-&gt;bPermitNonKernel = 0;
+	pModConf-&gt;bParseKernelStamp = 0;
+	pModConf-&gt;bKeepKernelStamp = 0;
+	pModConf-&gt;console_log_level = -1;
+	pModConf-&gt;bKeepKernelStamp = 0;
+	pModConf-&gt;iFacilIntMsg = klogFacilIntMsg();
+	loadModConf-&gt;configSetViaV2Method = 0;
+	pModConf-&gt;ratelimiter = NULL;
+	pModConf-&gt;ratelimitBurst = 10000; /* arbitrary high limit */
+	pModConf-&gt;ratelimitInterval = 0; /* off */
+	bLegacyCnfModGlobalsPermitted = 1;
+	/* init legacy config vars */
+	initConfigSettings();
+ENDbeginCnfLoad
+
+
+BEGINsetModCnf
+	struct cnfparamvals *pvals = NULL;
+	int i;
+CODESTARTsetModCnf
+	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
+	if(pvals == NULL) {
+		LogError(0, RS_RET_MISSING_CNFPARAMS, &quot;error processing module &quot;
+				&quot;config parameters [module(...)]&quot;);
+		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+	}
+
+	if(Debug) {
+		dbgprintf(&quot;module (global) param blk for imklog:\n&quot;);
+		cnfparamsPrint(&amp;modpblk, pvals);
+	}
+
+<A NAME="1"></A>	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
+		if(!pvals[i].bUsed)
+			continue;
+<FONT color="#f63526"><A HREF="javascript:ZweiFrames('match809-1.html#1',3,'match809-top.html#1',1)"><IMG SRC="forward.gif" ALT="other" BORDER="0" ALIGN="right"></A><B>		if(!strcmp(modpblk.descr[i].name, &quot;logpath&quot;)) {
+			loadModConf-&gt;pszPath = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(modpblk.descr[i].name, &quot;permitnonkernelfacility&quot;)) {
+			loadModConf-&gt;bPermitNonKernel = (int) pvals[i].val.d.n;
+		} else if(!strcmp(modpblk.descr[i].name, &quot;parsekerneltimestamp&quot;)) {
+<A NAME="2"></A>			loadModConf-&gt;bParseKernelStamp = (int) pvals[i].val.d.n;
+		} else if(!strcmp(modpblk.descr[i].name, &quot;keepkerneltimestamp&quot;)) {
+			loadModConf-&gt;bKeepKernelStamp = (int) pvals[i].val.d.n;</B></FONT>
+<FONT color="#980517"><A HREF="javascript:ZweiFrames('match809-1.html#2',3,'match809-top.html#2',1)"><IMG SRC="forward.gif" ALT="other" BORDER="0" ALIGN="right"></A><B>		} else if(!strcmp(modpblk.descr[i].name, &quot;consoleloglevel&quot;)) {
+			loadModConf-&gt;console_log_level= (int) pvals[i].val.d.n;
+		} else if(!strcmp(modpblk.descr[i].name, &quot;internalmsgfacility&quot;)) {
+			loadModConf-&gt;iFacilIntMsg = (int) pvals[i].val.d.n;
+		} else if(!strcmp(modpblk.descr[i].name, &quot;ratelimitburst&quot;)) {
+			loadModConf-&gt;ratelimitBurst = (unsigned int) pvals[i].val.d.n;</B></FONT>
+		} else if(!strcmp(modpblk.descr[i].name, &quot;ratelimitinterval&quot;)) {
+			loadModConf-&gt;ratelimitInterval = (unsigned int) pvals[i].val.d.n;
+		} else if(!strcmp(modpblk.descr[i].name, &quot;ruleset&quot;)) {
+			loadModConf-&gt;pszBindRuleset = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else {
+			LogMsg(0, RS_RET_INTERNAL_ERROR, LOG_WARNING,
+				&quot;imklog: RSYSLOG BUG, non-handled param '%s' in &quot;
+				&quot;beginCnfLoad\n&quot;, modpblk.descr[i].name);
+		}
+	}
+
+	/* disable legacy module-global config directives */
+	bLegacyCnfModGlobalsPermitted = 0;
+	loadModConf-&gt;configSetViaV2Method = 1;
+
+finalize_it:
+	if(pvals != NULL)
+		cnfparamvalsDestruct(pvals, &amp;modpblk);
+ENDsetModCnf
+
+
+BEGINendCnfLoad
+CODESTARTendCnfLoad
+	if(!loadModConf-&gt;configSetViaV2Method) {
+		/* persist module-specific settings from legacy config system */
+		loadModConf-&gt;bPermitNonKernel = cs.bPermitNonKernel;
+		loadModConf-&gt;bParseKernelStamp = cs.bParseKernelStamp;
+		loadModConf-&gt;bKeepKernelStamp = cs.bKeepKernelStamp;
+		loadModConf-&gt;iFacilIntMsg = cs.iFacilIntMsg;
+		loadModConf-&gt;console_log_level = cs.console_log_level;
+		if((cs.pszPath == NULL) || (cs.pszPath[0] == '\0')) {
+			loadModConf-&gt;pszPath = NULL;
+			if(cs.pszPath != NULL)
+				free(cs.pszPath);
+		} else {
+			loadModConf-&gt;pszPath = cs.pszPath;
+		}
+		cs.pszPath = NULL;
+	}
+
+	loadModConf = NULL; /* done loading */
+ENDendCnfLoad
+
+
+BEGINcheckCnf
+CODESTARTcheckCnf
+	std_mod_checkRuleset(pModConf);
+ENDcheckCnf
+
+
+BEGINactivateCnfPrePrivDrop
+CODESTARTactivateCnfPrePrivDrop
+	runModConf = pModConf;
+	iRet = klogWillRunPrePrivDrop(runModConf);
+ENDactivateCnfPrePrivDrop
+
+
+BEGINactivateCnf
+CODESTARTactivateCnf
+	CHKiRet(ratelimitNew(&amp;runModConf-&gt;ratelimiter, &quot;imklog&quot;, NULL));
+	ratelimitSetLinuxLike(runModConf-&gt;ratelimiter,
+			      runModConf-&gt;ratelimitInterval,
+			      runModConf-&gt;ratelimitBurst);
+finalize_it:
+ENDactivateCnf
+
+
+BEGINfreeCnf
+CODESTARTfreeCnf
+	free(pModConf-&gt;pszBindRuleset);
+ENDfreeCnf
+
+
+BEGINwillRun
+CODESTARTwillRun
+	pLocalHostIP = glbl.GetLocalHostIP();
+	iRet = klogWillRunPostPrivDrop(runModConf);
+ENDwillRun
+
+
+BEGINafterRun
+CODESTARTafterRun
+	ratelimitDestruct(runModConf-&gt;ratelimiter);
+	iRet = klogAfterRun(runModConf);
+ENDafterRun
+
+
+BEGINmodExit
+CODESTARTmodExit
+	if(pInputName != NULL)
+		prop.Destruct(&amp;pInputName);
+
+	/* release objects we used */
+	objRelease(glbl, CORE_COMPONENT);
+	objRelease(net, CORE_COMPONENT);
+	objRelease(datetime, CORE_COMPONENT);
+	objRelease(ruleset, CORE_COMPONENT);
+	objRelease(prop, CORE_COMPONENT);
+ENDmodExit
+
+
+BEGINqueryEtryPt
+CODESTARTqueryEtryPt
+CODEqueryEtryPt_STD_IMOD_QUERIES
+CODEqueryEtryPt_STD_CONF2_QUERIES
+CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+CODEqueryEtryPt_STD_CONF2_PREPRIVDROP_QUERIES
+ENDqueryEtryPt
+
+static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
+{
+	cs.bPermitNonKernel = 0;
+	cs.bParseKernelStamp = 0;
+	cs.bKeepKernelStamp = 0;
+	if(cs.pszPath != NULL) {
+		free(cs.pszPath);
+		cs.pszPath = NULL;
+	}
+	cs.iFacilIntMsg = klogFacilIntMsg();
+	return RS_RET_OK;
+}
+
+BEGINmodInit()
+CODESTARTmodInit
+	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
+CODEmodInit_QueryRegCFSLineHdlr
+	CHKiRet(objUse(datetime, CORE_COMPONENT));
+	CHKiRet(objUse(glbl, CORE_COMPONENT));
+	CHKiRet(objUse(prop, CORE_COMPONENT));
+	CHKiRet(objUse(ruleset, CORE_COMPONENT));
+	CHKiRet(objUse(net, CORE_COMPONENT));
+
+	/* we need to create the inputName property (only once during our lifetime) */
+	CHKiRet(prop.CreateStringProp(&amp;pInputName, UCHAR_CONSTANT(&quot;imklog&quot;), sizeof(&quot;imklog&quot;) - 1));
+
+	/* init legacy config settings */
+	initConfigSettings();
+
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)&quot;klogLocalipif&quot;, 0, eCmdHdlrGoneAway,
+			NULL, NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)&quot;debugprintkernelsymbols&quot;, 0, eCmdHdlrGoneAway,
+			NULL, NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(regCfSysLineHdlr2((uchar *)&quot;klogpath&quot;, 0, eCmdHdlrGetWord,
+			NULL, &amp;cs.pszPath, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)&quot;klogsymbollookup&quot;, 0, eCmdHdlrGoneAway,
+			NULL, NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)&quot;klogsymbolstwice&quot;, 0, eCmdHdlrGoneAway,
+			NULL, NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)&quot;klogusesyscallinterface&quot;, 0, eCmdHdlrGoneAway,
+			NULL, NULL, STD_LOADABLE_MODULE_ID));
+	CHKiRet(regCfSysLineHdlr2((uchar *)&quot;klogpermitnonkernelfacility&quot;, 0, eCmdHdlrBinary,
+			NULL, &amp;cs.bPermitNonKernel, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+	CHKiRet(regCfSysLineHdlr2((uchar *)&quot;klogconsoleloglevel&quot;, 0, eCmdHdlrInt,
+			NULL, &amp;cs.console_log_level, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+	CHKiRet(regCfSysLineHdlr2((uchar *)&quot;kloginternalmsgfacility&quot;, 0, eCmdHdlrFacility,
+			NULL, &amp;cs.iFacilIntMsg, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+	CHKiRet(regCfSysLineHdlr2((uchar *)&quot;klogparsekerneltimestamp&quot;, 0, eCmdHdlrBinary,
+			NULL, &amp;cs.bParseKernelStamp, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+	CHKiRet(regCfSysLineHdlr2((uchar *)&quot;klogkeepkerneltimestamp&quot;, 0, eCmdHdlrBinary,
+			NULL, &amp;cs.bKeepKernelStamp, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)&quot;resetconfigvariables&quot;, 1, eCmdHdlrCustomHandler,
+			resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+ENDmodInit
+</PRE>
+</div>
+<div style="flex-grow: 1;">
+<h3>
+<center>
+<span>omprog.c</span>
+<span> - </span>
+<span></span>
+</center>
+</h3>
+<HR>
+<PRE>
+/* omprog.c
+ * This output plugin enables rsyslog to execute a program and
+ * feed it the message stream as standard input.
+ *
+ * NOTE: read comments in module-template.h for more specifics!
+ *
+ * File begun on 2009-04-01 by RGerhards
+ *
+ * Copyright 2009-2020 Adiscon GmbH.
+ *
+ * This file is part of rsyslog.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *       -or-
+ *       see COPYING.ASL20 in the source distribution
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include &quot;config.h&quot;
+#include &lt;stdio.h&gt;
+#include &lt;syslog.h&gt;
+#include &lt;stdarg.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;poll.h&gt;
+
+#include &quot;rsyslog.h&quot;
+#include &quot;conf.h&quot;
+#include &quot;syslogd-types.h&quot;
+#include &quot;srUtils.h&quot;
+#include &quot;template.h&quot;
+#include &quot;module-template.h&quot;
+#include &quot;errmsg.h&quot;
+#include &quot;cfsysline.h&quot;
+#include &quot;glbl.h&quot;
+#include &quot;rsconf.h&quot;
+
+MODULE_TYPE_OUTPUT
+MODULE_TYPE_NOKEEP
+MODULE_CNFNAME(&quot;omprog&quot;)
+
+extern char **environ; /* POSIX environment ptr, by std not in a header... (see man 7 environ) */
+
+/* internal structures
+ */
+DEF_OMOD_STATIC_DATA
+
+#define NO_HUP_FORWARD -1	/* indicates that HUP should NOT be forwarded */
+#define DEFAULT_CONFIRM_TIMEOUT_MS 10000
+#define DEFAULT_CLOSE_TIMEOUT_MS 5000
+#define RESPONSE_LINE_BUFFER_SIZE 4096
+#define OUTPUT_CAPTURE_BUFFER_SIZE 4096
+#define MAX_FD_TO_CLOSE 65535
+
+typedef struct childProcessCtx {
+	int bIsRunning;		/* is the program running? (if 0, next fields are uninitialized) */
+	pid_t pid;			/* pid of currently running child process */
+	int fdPipeOut;		/* fd for sending messages to the program */
+	int fdPipeIn;		/* fd for receiving status messages from the program, or -1 */
+} childProcessCtx_t;
+
+typedef struct outputCaptureCtx {
+	uchar *szFileName;		/* name of file to write the program output to, or NULL */
+	mode_t fCreateMode;		/* output file creation permissions */
+	pthread_mutex_t mutStart;	/* mutex for starting the output-capture thread */
+	pthread_mutex_t mutWrite;	/* mutex for reopening the output file on HUP while being written */
+	pthread_mutex_t mutTerm;	/* mutex for signaling the termination of the thread */
+	pthread_cond_t condTerm;	/* condition for signaling the termination of the thread */
+	int bIsRunning;			/* is the thread running? (if 0, next fields are uninitialized) */
+	pthread_t thrdID;		/* ID of the output-capture thread */
+	int fdPipe[2];			/* pipe for capturing the output of the child processes */
+	int fdFile;				/* fd of the output file (-1 if it could not be opened) */
+	int bFileErr;			/* file open error occurred? (to avoid reporting too many errors) */
+	int bReadErr;			/* read error occurred? (to avoid reporting too many errors) */
+	int bWriteErr;			/* write error occurred? (to avoid reporting too many errors) */
+} outputCaptureCtx_t;
+
+typedef struct _instanceData {
+	uchar *szBinary;		/* name of external program to call */
+	char **aParams;			/* optional parameters to pass to external program */
+	int iParams;			/* holds the count of parameters if set */
+	uchar *szTemplateName;	/* assigned output template */
+	int bConfirmMessages;	/* does the program provide feedback via stdout? */
+	long lConfirmTimeout;	/* how long to wait for feedback from the program (ms) */
+	int bReportFailures;	/* report failures returned by the program as warning logs? */
+	int bUseTransactions;	/* send begin/end transaction marks to program? */
+	uchar *szBeginTransactionMark;	/* mark message for begin transaction */
+	uchar *szCommitTransactionMark;	/* mark message for commit transaction */
+	int iHUPForward;		/* signal to forward on HUP (or NO_HUP_FORWARD) */
+	int bSignalOnClose;		/* should send SIGTERM to program before closing pipe? */
+	long lCloseTimeout;		/* how long to wait for program to terminate after closing pipe (ms) */
+	int bKillUnresponsive;	/* should send SIGKILL if closeTimeout is reached? */
+	int bForceSingleInst;	/* start only one instance of program, even with multiple workers? */
+	childProcessCtx_t *pSingleChildCtx;		/* child process context when bForceSingleInst=true */
+	pthread_mutex_t *pSingleChildMut;		/* mutex for interacting with single child process */
+	outputCaptureCtx_t *pOutputCaptureCtx;	/* settings and state for the output capture thread */
+	time_t block_if_err;			/* time until which interface error is not to be shown */
+} instanceData;
+
+typedef struct wrkrInstanceData {
+	instanceData *pData;
+	childProcessCtx_t *pChildCtx;	/* child process context (can be equal to pSingleChildCtx) */
+} wrkrInstanceData_t;
+
+typedef struct configSettings_s {
+	uchar *szBinary;	/* name of external program to call */
+} configSettings_t;
+static configSettings_t cs;
+
+/* tables for interfacing with the v6 config system */
+/* action (instance) parameters */
+static struct cnfparamdescr actpdescr[] = {
+	{ &quot;binary&quot;, eCmdHdlrString, CNFPARAM_REQUIRED },
+	{ &quot;confirmMessages&quot;, eCmdHdlrBinary, 0 },
+	{ &quot;confirmTimeout&quot;, eCmdHdlrInt, 0 },
+<A NAME="0"></A>	{ &quot;reportFailures&quot;, eCmdHdlrBinary, 0 },
+	{ &quot;useTransactions&quot;, eCmdHdlrBinary, 0 },
+	{ &quot;beginTransactionMark&quot;, eCmdHdlrString, 0 },
+<FONT color="#0000ff"><div style="position:absolute;left:0"><A HREF="javascript:ZweiFrames('match809-0.html#0',2,'match809-top.html#0',1)"><IMG SRC="back.gif" ALT="other" BORDER="0" ALIGN="left"></A></div><B>	{ &quot;commitTransactionMark&quot;, eCmdHdlrString, 0 },
+	{ &quot;forceSingleInstance&quot;, eCmdHdlrBinary, 0 },
+	{ &quot;hup.signal&quot;, eCmdHdlrGetWord, 0 },
+	{ &quot;template&quot;, eCmdHdlrGetWord, 0 },
+	{ &quot;signalOnClose&quot;, eCmdHdlrBinary, 0 },
+	{ &quot;closeTimeout&quot;, eCmdHdlrInt, 0 },
+	{ &quot;killUnresponsive&quot;, eCmdHdlrBinary, 0 },
+	{ &quot;output&quot;, eCmdHdlrString, 0 },
+	{ &quot;fileCreateMode&quot;, eCmdHdlrFileCreateMode, 0 }
+};
+
+static struct cnfparamblk actpblk =
+	{ CNFPARAMBLK_VERSION,
+	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+	  actpdescr
+	};
+
+/* execute the external program (must be called in child context after fork).
+ */
+static __attribute__((noreturn)) void</B></FONT>
+execBinary(const instanceData *pData, int fdStdin, int fdStdout)
+{
+	int fdOutput, maxFd, fd, sigNum;
+	struct sigaction sigAct;
+	sigset_t sigSet;
+	char errStr[1024];
+
+	if(dup2(fdStdin, STDIN_FILENO) == -1) {
+		goto failed;
+	}
+
+	if(pData-&gt;pOutputCaptureCtx != NULL) {
+		fdOutput = pData-&gt;pOutputCaptureCtx-&gt;fdPipe[1];
+	} else {
+		fdOutput = open(&quot;/dev/null&quot;, O_WRONLY);
+		if(fdOutput == -1) {
+			goto failed;
+		}
+	}
+
+	if(fdStdout != -1) {
+		/* confirmMessages enabled: redirect stdout to parent via pipe. After
+		 * this point, anything written to the child's stdout will be treated
+		 * by omprog as initialization feedback (see startChild). This
+		 * includes debug messages (DBGPRINTF) when in debug mode. So we
+		 * cannot use DBGPRINTF from this point on, except for error cases.
+		 */
+		if(dup2(fdStdout, STDOUT_FILENO) == -1) {
+			goto failed;
+		}
+	} else {
+		/* confirmMessages disabled: redirect stdout to file or /dev/null */
+		if(dup2(fdOutput, STDOUT_FILENO) == -1) {
+			goto failed;
+		}
+	}
+
+	/* redirect stderr to file or /dev/null */
+	if(dup2(fdOutput, STDERR_FILENO) == -1) {
+		goto failed;
+	}
+
+	/* close the file handles the child process doesn't need (all above STDERR).
+	 * The following way is simple and portable, though not perfect.
+	 * See https://stackoverflow.com/a/918469 for alternatives.
+	 */
+	maxFd = sysconf(_SC_OPEN_MAX);
+	if(maxFd &lt; 0 || maxFd &gt; MAX_FD_TO_CLOSE) {
+		maxFd = MAX_FD_TO_CLOSE;
+	}
+#	ifdef VALGRIND
+	else {  /* don't close valgrind reserved fds, to avoid warnings */
+		maxFd -= 10;
+	}
+#	endif
+	for(fd = STDERR_FILENO + 1 ; fd &lt;= maxFd ; ++fd) {
+		close(fd);
+	}
+
+	/* reset signal handlers to default */
+	memset(&amp;sigAct, 0, sizeof(sigAct));
+	sigemptyset(&amp;sigAct.sa_mask);
+	sigAct.sa_handler = SIG_DFL;
+	for(sigNum = 1 ; sigNum &lt; NSIG ; ++sigNum) {
+		sigaction(sigNum, &amp;sigAct, NULL);
+	}
+
+	/* we need to block SIGINT, otherwise our program is cancelled when we are
+	 * stopped in debug mode.
+	 */
+	sigAct.sa_handler = SIG_IGN;
+	sigaction(SIGINT, &amp;sigAct, NULL);
+	sigemptyset(&amp;sigSet);
+	sigprocmask(SIG_SETMASK, &amp;sigSet, NULL);
+
+	alarm(0);
+
+	/* finally exec program */
+	execve((char*)pData-&gt;szBinary, pData-&gt;aParams, environ);
+
+failed:
+	/* an error occurred: log it and exit the child process. We use the
+	 * 'syslog' system call to log the error (we cannot use LogMsg/LogError,
+	 * since these functions add directly to the rsyslog input queue).
+	 */
+	rs_strerror_r(errno, errStr, sizeof(errStr));
+	DBGPRINTF(&quot;omprog: failed to execute program '%s': %s\n&quot;,
+			pData-&gt;szBinary, errStr);
+	openlog(&quot;rsyslogd&quot;, 0, LOG_SYSLOG);
+	syslog(LOG_ERR, &quot;omprog: failed to execute program '%s': %s\n&quot;,
+			pData-&gt;szBinary, errStr);
+	exit(1);
+}
+
+/* creates a pipe and starts program, uses pipe as stdin for program.
+ * rgerhards, 2009-04-01
+ */
+static rsRetVal
+openPipe(instanceData *pData, childProcessCtx_t *pChildCtx)
+{
+	int pipeStdin[2] = { -1, -1 };
+	int pipeStdout[2] = { -1, -1 };
+	pid_t cpid;
+	DEFiRet;
+
+	/* open a pipe to send messages to the program */
+	if(pipe(pipeStdin) == -1) {
+		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
+	}
+
+	/* if the 'confirmMessages' setting is enabled, open a pipe to receive
+	   message confirmations from the program */
+	if(pData-&gt;bConfirmMessages &amp;&amp; pipe(pipeStdout) == -1) {
+		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
+	}
+
+	DBGPRINTF(&quot;omprog: executing program '%s' with '%d' parameters\n&quot;, pData-&gt;szBinary,
+			pData-&gt;iParams);
+
+	cpid = fork();
+	if(cpid == -1) {
+		ABORT_FINALIZE(RS_RET_ERR_FORK);
+	}
+
+	if(cpid == 0) {  /* we are now the child process: execute the program */
+		/* close the pipe ends that the child doesn't need */
+		close(pipeStdin[1]);
+		if(pipeStdout[0] != -1) {
+			close(pipeStdout[0]);
+		}
+
+		execBinary(pData, pipeStdin[0], pipeStdout[1]);
+		/* NO CODE HERE - WILL NEVER BE REACHED! */
+	}
+
+	DBGPRINTF(&quot;omprog: child has pid %d\n&quot;, (int) cpid);
+
+	/* close the pipe ends that the parent doesn't need */
+	close(pipeStdin[0]);
+	if(pipeStdout[1] != -1) {
+		close(pipeStdout[1]);
+	}
+
+	pChildCtx-&gt;fdPipeOut = pipeStdin[1];  /* we'll send messages to the program via this fd */
+	pChildCtx-&gt;fdPipeIn = pipeStdout[0];  /* we'll receive message confirmations via this fd */
+	pChildCtx-&gt;pid = cpid;
+	pChildCtx-&gt;bIsRunning = 1;
+
+finalize_it:
+	if(iRet != RS_RET_OK) {
+		if(pipeStdin[0] != -1) {
+			close(pipeStdin[0]);
+			close(pipeStdin[1]);
+		}
+		if(pipeStdout[0] != -1) {
+			close(pipeStdout[0]);
+			close(pipeStdout[1]);
+		}
+	}
+	RETiRet;
+}
+
+static void
+waitForChild(instanceData *pData, childProcessCtx_t *pChildCtx)
+{
+	int status;
+	int ret;
+	long counter;
+
+	counter = pData-&gt;lCloseTimeout / 10;
+	while ((ret = waitpid(pChildCtx-&gt;pid, &amp;status, WNOHANG)) == 0 &amp;&amp; counter &gt; 0) {
+		srSleep(0, 10000);  /* 0 seconds, 10 milliseconds */
+		--counter;
+	}
+
+	if (ret == 0) {  /* timeout reached */
+		if (!pData-&gt;bKillUnresponsive) {
+			LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: program '%s' (pid %ld) did not terminate &quot;
+					&quot;within timeout (%ld ms); ignoring it&quot;, pData-&gt;szBinary,
+					(long) pChildCtx-&gt;pid, pData-&gt;lCloseTimeout);
+			return;
+		}
+
+		LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: program '%s' (pid %ld) did not terminate &quot;
+				&quot;within timeout (%ld ms); killing it&quot;, pData-&gt;szBinary, (long) pChildCtx-&gt;pid,
+				pData-&gt;lCloseTimeout);
+		if (kill(pChildCtx-&gt;pid, SIGKILL) == -1) {
+			LogError(errno, RS_RET_SYS_ERR, &quot;omprog: could not send SIGKILL to child process&quot;);
+			return;
+		}
+
+		ret = waitpid(pChildCtx-&gt;pid, &amp;status, 0);
+	}
+
+	/* waitpid will fail with errno == ECHILD if the child process has already
+	   been reaped by the rsyslogd main loop (see rsyslogd.c) */
+	if(ret == pChildCtx-&gt;pid) {
+		glblReportChildProcessExit(runConf, pData-&gt;szBinary, pChildCtx-&gt;pid, status);
+	}
+}
+
+/* close pipe and wait for child to terminate
+ */
+static void
+cleanupChild(instanceData *pData, childProcessCtx_t *pChildCtx)
+{
+	assert(pChildCtx-&gt;bIsRunning);
+
+	if(pChildCtx-&gt;fdPipeIn != -1) {
+		close(pChildCtx-&gt;fdPipeIn);
+		pChildCtx-&gt;fdPipeIn = -1;
+	}
+	if(pChildCtx-&gt;fdPipeOut != -1) {
+		close(pChildCtx-&gt;fdPipeOut);
+		pChildCtx-&gt;fdPipeOut = -1;
+	}
+
+	/* wait for the child AFTER closing the pipe, so it receives EOF */
+	waitForChild(pData, pChildCtx);
+
+	pChildCtx-&gt;bIsRunning = 0;
+}
+
+/* Send SIGTERM to child process if configured to do so, close pipe
+ * and wait for child to terminate.
+ */
+static void
+terminateChild(instanceData *pData, childProcessCtx_t *pChildCtx)
+{
+	assert(pChildCtx-&gt;bIsRunning);
+
+	if (pData-&gt;bSignalOnClose) {
+		kill(pChildCtx-&gt;pid, SIGTERM);
+	}
+
+	cleanupChild(pData, pChildCtx);
+}
+
+/* write message to pipe
+ * note that we do not try to run block-free. If the user fears something
+ * may block (and this is not acceptable), the action should be run on its
+ * own action queue.
+ */
+static rsRetVal
+sendMessage(instanceData *pData, childProcessCtx_t *pChildCtx, const uchar *szMsg)
+{
+	ssize_t written;
+	size_t offset = 0;
+	DEFiRet;
+
+	const size_t len = strlen((char*)szMsg);
+
+	do {
+		written = write(pChildCtx-&gt;fdPipeOut, ((char*)szMsg) + offset, len - offset);
+		if(written == -1) {
+			if(errno == EINTR) {
+				continue;  /* call interrupted: retry write */
+			}
+			if(errno == EPIPE) {
+				LogMsg(0, RS_RET_ERR_WRITE_PIPE, LOG_WARNING,
+						&quot;omprog: program '%s' (pid %ld) terminated; will be restarted&quot;,
+						pData-&gt;szBinary, (long) pChildCtx-&gt;pid);
+				cleanupChild(pData, pChildCtx);  /* force restart in tryResume() */
+				ABORT_FINALIZE(RS_RET_SUSPENDED);
+			}
+			LogError(errno, RS_RET_ERR_WRITE_PIPE, &quot;omprog: error sending message to program&quot;);
+			ABORT_FINALIZE(RS_RET_SUSPENDED);
+		}
+		offset += written;
+	} while(offset &lt; len);
+
+finalize_it:
+	RETiRet;
+}
+
+static rsRetVal
+lineToStatusCode(instanceData *pData, const char* line)
+{
+	DEFiRet;
+
+	/* strip leading dots (.) from the line, so the program can use them as a keep-alive mechanism */
+	while(line[0] == '.') {
+		++line;
+	}
+
+	if(strcmp(line, &quot;OK&quot;) == 0) {
+		iRet = RS_RET_OK;
+	} else if(strcmp(line, &quot;DEFER_COMMIT&quot;) == 0) {
+		iRet = RS_RET_DEFER_COMMIT;
+	} else if(strcmp(line, &quot;PREVIOUS_COMMITTED&quot;) == 0) {
+		iRet = RS_RET_PREVIOUS_COMMITTED;
+	} else {
+		/* anything else is considered a recoverable error */
+		DBGPRINTF(&quot;omprog: program '%s' returned: %s\n&quot;, pData-&gt;szBinary, line);
+		if(pData-&gt;bReportFailures) {
+			LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: program '%s' returned: %s&quot;,
+					pData-&gt;szBinary, line);
+		}
+		iRet = RS_RET_SUSPENDED;
+	}
+	RETiRet;
+}
+
+static rsRetVal
+readStatus(instanceData *pData, childProcessCtx_t *pChildCtx)
+{
+	struct pollfd fdToPoll[1];
+	int numReady;
+	char lineBuf[RESPONSE_LINE_BUFFER_SIZE];
+	ssize_t lenRead;
+	size_t offset = 0;
+	int lineEnded = 0;
+	DEFiRet;
+
+	fdToPoll[0].fd = pChildCtx-&gt;fdPipeIn;
+	fdToPoll[0].events = POLLIN;
+
+	do {
+		numReady = poll(fdToPoll, 1, pData-&gt;lConfirmTimeout);
+		if(numReady == -1) {
+			if(errno == EINTR) {
+				continue;  /* call interrupted: retry poll */
+			}
+			LogError(errno, RS_RET_SYS_ERR, &quot;omprog: error polling for response from program&quot;);
+			ABORT_FINALIZE(RS_RET_SUSPENDED);
+		}
+
+		if(numReady == 0) {  /* timeout reached */
+			LogMsg(0, RS_RET_TIMED_OUT, LOG_WARNING, &quot;omprog: program '%s' (pid %ld) did not respond &quot;
+					&quot;within timeout (%ld ms); will be restarted&quot;, pData-&gt;szBinary,
+					(long) pChildCtx-&gt;pid, pData-&gt;lConfirmTimeout);
+			terminateChild(pData, pChildCtx);
+			ABORT_FINALIZE(RS_RET_SUSPENDED);
+		}
+
+		lenRead = read(pChildCtx-&gt;fdPipeIn, lineBuf + offset, sizeof(lineBuf) - offset - 1);
+		if(lenRead == -1) {
+			if(errno == EINTR) {
+				continue;  /* call interrupted: retry poll + read */
+			}
+			LogError(errno, RS_RET_READ_ERR, &quot;omprog: error reading response from program&quot;);
+			ABORT_FINALIZE(RS_RET_SUSPENDED);
+		}
+
+		if(lenRead == 0) {
+			LogMsg(0, RS_RET_READ_ERR, LOG_WARNING, &quot;omprog: program '%s' (pid %ld) terminated; &quot;
+					&quot;will be restarted&quot;, pData-&gt;szBinary, (long) pChildCtx-&gt;pid);
+			cleanupChild(pData, pChildCtx);
+			ABORT_FINALIZE(RS_RET_SUSPENDED);
+		}
+
+		offset += lenRead;
+		lineBuf[offset] = '\0';
+		lineEnded = (lineBuf[offset-1] == '\n');
+
+		/* check that the program has not returned multiple lines. This should not occur if
+		 * the program honors the specified interface. Otherwise, we force a restart of the
+		 * program, since we have probably lost synchronism with it.
+		 */
+		if(!lineEnded &amp;&amp; strchr(lineBuf + offset - lenRead, '\n') != NULL) {
+			DBGPRINTF(&quot;omprog: program '%s' returned: %s\n&quot;, pData-&gt;szBinary, lineBuf);
+			LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: program '%s' returned a multiline response; &quot;
+					&quot;will be restarted&quot;, pData-&gt;szBinary);
+			if(pData-&gt;bReportFailures) {
+				LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: program '%s' returned: %s&quot;,
+						pData-&gt;szBinary, lineBuf);
+			}
+			terminateChild(pData, pChildCtx);
+			ABORT_FINALIZE(RS_RET_SUSPENDED);
+		}
+	} while(!lineEnded &amp;&amp; offset &lt; sizeof(lineBuf) - 1);
+
+	if(!lineEnded) {
+		DBGPRINTF(&quot;omprog: program '%s' returned: %s\n&quot;, pData-&gt;szBinary, lineBuf);
+		LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: program '%s' returned a too long response; &quot;
+				&quot;will be restarted&quot;, pData-&gt;szBinary);
+		if(pData-&gt;bReportFailures) {
+			LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: program '%s' returned: %s&quot;,
+					pData-&gt;szBinary, lineBuf);
+		}
+		terminateChild(pData, pChildCtx);
+		ABORT_FINALIZE(RS_RET_SUSPENDED);
+	}
+
+	lineBuf[offset-1] = '\0';  /* strip newline char */
+
+	/* NOTE: coverity does not like CHKiRet() if it is the last thing before finalize_it.
+	 * Reason is that the if() inside that macro than does not lead to different code paths.
+	 */
+	iRet = lineToStatusCode(pData, lineBuf);
+
+finalize_it:
+	RETiRet;
+}
+
+static rsRetVal
+allocChildCtx(childProcessCtx_t **ppChildCtx)
+{
+	childProcessCtx_t *pChildCtx;
+	DEFiRet;
+
+	CHKmalloc(pChildCtx = calloc(1, sizeof(childProcessCtx_t)));
+	*ppChildCtx = pChildCtx;
+
+	pChildCtx-&gt;bIsRunning = 0;
+	pChildCtx-&gt;pid = -1;
+	pChildCtx-&gt;fdPipeOut = -1;
+	pChildCtx-&gt;fdPipeIn = -1;
+
+finalize_it:
+	RETiRet;
+}
+
+static rsRetVal
+startChild(instanceData *pData, childProcessCtx_t *pChildCtx)
+{
+	DEFiRet;
+
+	assert(!pChildCtx-&gt;bIsRunning);
+
+	CHKiRet(openPipe(pData, pChildCtx));
+
+	if(pData-&gt;bConfirmMessages) {
+		/* wait for program to confirm successful initialization */
+		CHKiRet(readStatus(pData, pChildCtx));
+	}
+
+finalize_it:
+	if(iRet != RS_RET_OK &amp;&amp; pChildCtx-&gt;bIsRunning) {
+		/* if initialization has failed, terminate program */
+		terminateChild(pData, pChildCtx);
+	}
+	RETiRet;
+}
+
+static rsRetVal
+startSingleChildOnce(instanceData *pData)
+{
+	DEFiRet;
+
+	assert(pData-&gt;bForceSingleInst);
+	CHKiConcCtrl(pthread_mutex_lock(pData-&gt;pSingleChildMut));
+
+	if(pData-&gt;pSingleChildCtx-&gt;bIsRunning)
+		goto finalize_it;  /* child process already started: nothing to do */
+
+	iRet = startChild(pData, pData-&gt;pSingleChildCtx);
+
+finalize_it:
+	pthread_mutex_unlock(pData-&gt;pSingleChildMut);
+	RETiRet;
+}
+
+static void
+writeOutputToFile(outputCaptureCtx_t *pCtx, char *buf, ssize_t len)
+{
+	ssize_t written;
+	ssize_t offset = 0;
+
+	assert(pCtx-&gt;bIsRunning);
+	pthread_mutex_lock(&amp;pCtx-&gt;mutWrite);
+
+	if(pCtx-&gt;fdFile == -1) {
+		if(pCtx-&gt;bFileErr) {  /* discarding output because file couldn't be opened */
+			goto done;
+		}
+
+		pCtx-&gt;fdFile = open((char*)pCtx-&gt;szFileName, O_WRONLY | O_APPEND | O_CREAT,
+				pCtx-&gt;fCreateMode);
+		if(pCtx-&gt;fdFile == -1) {
+			LogError(errno, RS_RET_NO_FILE_ACCESS, &quot;omprog: error opening output file %s; &quot;
+					&quot;output from program will be discarded&quot;, pCtx-&gt;szFileName);
+			pCtx-&gt;bFileErr = 1;  /* avoid reporting too many errors */
+			goto done;
+		}
+	}
+
+	do {
+		written = write(pCtx-&gt;fdFile, buf + offset, len - offset);
+		if(written == -1) {
+			if(errno == EINTR) {
+				continue;  /* call interrupted: retry write */
+			}
+
+			if(!pCtx-&gt;bWriteErr) {
+				LogError(errno, RS_RET_SYS_ERR, &quot;omprog: error writing to output file &quot;
+						&quot;(subsequent errors will not be reported)&quot;);
+				pCtx-&gt;bWriteErr = 1;  /* avoid reporting too many errors */
+			}
+			break;
+		}
+
+		if(pCtx-&gt;bWriteErr) {
+			LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: resumed writing to output file&quot;);
+			pCtx-&gt;bWriteErr = 0;
+		}
+
+		offset += written;
+	} while(offset &lt; len);
+
+done:
+	pthread_mutex_unlock(&amp;pCtx-&gt;mutWrite);
+}
+
+static void
+closeOutputFile(outputCaptureCtx_t *pCtx)
+{
+	DBGPRINTF(&quot;omprog: reopening output file upon reception of HUP signal\n&quot;);
+	pthread_mutex_lock(&amp;pCtx-&gt;mutWrite);
+
+	if(pCtx-&gt;fdFile != -1) {
+		close(pCtx-&gt;fdFile);
+		pCtx-&gt;fdFile = -1;
+	}
+	pCtx-&gt;bFileErr = 0;  /* if there was an error opening the file, we'll retry */
+
+	pthread_mutex_unlock(&amp;pCtx-&gt;mutWrite);
+}
+
+/* This code runs in a dedicated thread. Captures the output of the child processes
+ * through a shared pipe (one reader and multiple writers), and writes the output
+ * to a file. The lines concurrently emmitted to stdout/stderr by the child processes
+ * will not appear intermingled in the output file if 1) the lines are short enough
+ * (less than PIPE_BUF bytes long: 4KB on Linux, and 512 bytes or more on other
+ * POSIX systems), and 2) the program outputs each line using a single 'write'
+ * syscall (line buffering mode). When a HUP signal is received, the output file is
+ * reopened (this provides support for external rotation of the file).
+ */
+static void *
+captureOutput(void *_pCtx) {
+	outputCaptureCtx_t *pCtx = (outputCaptureCtx_t *)_pCtx;
+	sigset_t sigSet;
+	char readBuf[OUTPUT_CAPTURE_BUFFER_SIZE];
+	ssize_t lenRead;
+
+	DBGPRINTF(&quot;omprog: starting output capture thread\n&quot;);
+
+	/* block signals for this thread (otherwise shutdown hangs on FreeBSD) */
+	sigfillset(&amp;sigSet);
+	pthread_sigmask(SIG_SETMASK, &amp;sigSet, NULL);
+
+	for(;;) {
+		lenRead = read(pCtx-&gt;fdPipe[0], readBuf, sizeof(readBuf));
+		if(lenRead == -1) {
+			if(errno == EINTR) {
+				continue;  /* call interrupted: retry read */
+			}
+
+			if(!pCtx-&gt;bReadErr) {
+				LogError(errno, RS_RET_SYS_ERR, &quot;omprog: error capturing output from program &quot;
+						&quot;(subsequent errors will not be reported)&quot;);
+				pCtx-&gt;bReadErr = 1;  /* avoid reporting too many errors */
+			}
+			continue;  /* continue with next line */
+		}
+
+		if(lenRead == 0) {
+			break;  /* all write ends of pipe closed: exit loop and terminate thread */
+		}
+
+		if(pCtx-&gt;bReadErr) {
+			LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: resumed capturing output from program&quot;);
+			pCtx-&gt;bReadErr = 0;
+		}
+
+		writeOutputToFile(pCtx, readBuf, lenRead);
+	}
+
+	DBGPRINTF(&quot;omprog: all output-capture pipe ends closed, terminating output capture thread\n&quot;);
+	pthread_mutex_lock(&amp;pCtx-&gt;mutTerm);
+	pCtx-&gt;bIsRunning = 0;
+	pthread_cond_signal(&amp;pCtx-&gt;condTerm);
+	pthread_mutex_unlock(&amp;pCtx-&gt;mutTerm);
+	return NULL;
+}
+
+static rsRetVal
+allocOutputCaptureCtx(outputCaptureCtx_t **ppCtx)
+{
+	outputCaptureCtx_t *pCtx;
+	DEFiRet;
+
+	CHKmalloc(pCtx = calloc(1, sizeof(outputCaptureCtx_t)));
+	*ppCtx = pCtx;
+
+	pCtx-&gt;szFileName = NULL;
+	pCtx-&gt;fCreateMode = 0600;
+	pCtx-&gt;bIsRunning = 0;
+
+	CHKiConcCtrl(pthread_mutex_init(&amp;pCtx-&gt;mutStart, NULL));
+	CHKiConcCtrl(pthread_mutex_init(&amp;pCtx-&gt;mutWrite, NULL));
+	CHKiConcCtrl(pthread_mutex_init(&amp;pCtx-&gt;mutTerm, NULL));
+	CHKiConcCtrl(pthread_cond_init(&amp;pCtx-&gt;condTerm, NULL));
+
+finalize_it:
+	RETiRet;
+}
+
+static void
+freeOutputCaptureCtx(outputCaptureCtx_t *pCtx) {
+	if(pCtx-&gt;szFileName != NULL) {
+		free(pCtx-&gt;szFileName);
+	}
+
+	pthread_cond_destroy(&amp;pCtx-&gt;condTerm);
+	pthread_mutex_destroy(&amp;pCtx-&gt;mutTerm);
+	pthread_mutex_destroy(&amp;pCtx-&gt;mutWrite);
+	pthread_mutex_destroy(&amp;pCtx-&gt;mutStart);
+
+	free(pCtx);
+}
+
+static rsRetVal
+startOutputCaptureOnce(outputCaptureCtx_t *pCtx)
+{
+	int pip[2] = { -1, -1 };
+	DEFiRet;
+
+	CHKiConcCtrl(pthread_mutex_lock(&amp;pCtx-&gt;mutStart));
+
+	if(pCtx-&gt;bIsRunning)
+		goto finalize_it;  /* output capture thread already started: nothing to do */
+
+	/* open a (single) pipe to capture output from (all) child processes */
+	if(pipe(pip) == -1) {
+		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
+	}
+
+	pCtx-&gt;fdPipe[0] = pip[0];
+	pCtx-&gt;fdPipe[1] = pip[1];
+	pCtx-&gt;fdFile = -1;
+	pCtx-&gt;bFileErr = 0;
+	pCtx-&gt;bReadErr = 0;
+	pCtx-&gt;bWriteErr = 0;
+
+	/* start a thread to read lines from the pipe and write them to the output file */
+	CHKiConcCtrl(pthread_create(&amp;pCtx-&gt;thrdID, NULL, captureOutput, (void *)pCtx));
+
+	pCtx-&gt;bIsRunning = 1;
+
+finalize_it:
+	if(iRet != RS_RET_OK &amp;&amp; pip[0] != -1) {
+		close(pip[0]);
+		close(pip[1]);
+	}
+	pthread_mutex_unlock(&amp;pCtx-&gt;mutStart);
+	RETiRet;
+}
+
+static void
+endOutputCapture(outputCaptureCtx_t *pCtx, long timeoutMs)
+{
+	struct timespec ts;
+	int bTimedOut;
+
+	assert(pCtx-&gt;bIsRunning);
+
+	/* close our write end of the output-capture pipe */
+	close(pCtx-&gt;fdPipe[1]);
+
+	/* the output capture thread will now terminate because there are no more
+	 * writers attached to the output-capture pipe. However, if a child becomes
+	 * unresponsive without closing its pipe end (assuming killUnresponsive=off),
+	 * we would wait forever. To avoid this, we wait for the thread to terminate
+	 * during a maximum timeout (we reuse the 'closeTimeout' setting for this).
+	 */
+	timeoutComp(&amp;ts, timeoutMs);
+	pthread_mutex_lock(&amp;pCtx-&gt;mutTerm);
+	bTimedOut = 0;
+	while(pCtx-&gt;bIsRunning &amp;&amp; !bTimedOut) {
+		if(pthread_cond_timedwait(&amp;pCtx-&gt;condTerm, &amp;pCtx-&gt;mutTerm, &amp;ts) == ETIMEDOUT) {
+			bTimedOut = 1;
+		}
+	}
+	pthread_mutex_unlock(&amp;pCtx-&gt;mutTerm);
+
+	if(bTimedOut) {
+		LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: forcing termination of output capture &quot;
+				&quot;thread because of unresponsive child process&quot;);
+		pthread_cancel(pCtx-&gt;thrdID);
+		pCtx-&gt;bIsRunning = 0;
+	}
+
+	pthread_join(pCtx-&gt;thrdID, NULL);
+
+	/* close the read end of the output-capture pipe */
+	close(pCtx-&gt;fdPipe[0]);
+
+	/* close the output file (if it could be opened) */
+	if(pCtx-&gt;fdFile != -1) {
+		close(pCtx-&gt;fdFile);
+	}
+}
+
+
+BEGINinitConfVars		/* (re)set config variables to default values */
+CODESTARTinitConfVars
+	cs.szBinary = NULL;	/* name of binary to call */
+ENDinitConfVars
+
+
+BEGINcreateInstance
+CODESTARTcreateInstance
+	pData-&gt;szBinary = NULL;
+	pData-&gt;szTemplateName = NULL;
+	pData-&gt;aParams = NULL;
+	pData-&gt;iParams = 0;
+	pData-&gt;bConfirmMessages = 0;
+	pData-&gt;block_if_err = 0;
+	pData-&gt;lConfirmTimeout = DEFAULT_CONFIRM_TIMEOUT_MS;
+	pData-&gt;bReportFailures = 0;
+	pData-&gt;bUseTransactions = 0;
+	pData-&gt;szBeginTransactionMark = NULL;
+	pData-&gt;szCommitTransactionMark = NULL;
+	pData-&gt;iHUPForward = NO_HUP_FORWARD;
+	pData-&gt;bSignalOnClose = 0;
+	pData-&gt;lCloseTimeout = DEFAULT_CLOSE_TIMEOUT_MS;
+	pData-&gt;bKillUnresponsive = -1;
+	pData-&gt;bForceSingleInst = 0;
+	pData-&gt;pSingleChildCtx = NULL;
+	pData-&gt;pSingleChildMut = NULL;
+	pData-&gt;pOutputCaptureCtx = NULL;
+ENDcreateInstance
+
+
+static rsRetVal
+postInitInstance(instanceData *pData)
+{
+	DEFiRet;
+
+	if(pData-&gt;bUseTransactions &amp;&amp; pData-&gt;szBeginTransactionMark == NULL) {
+		pData-&gt;szBeginTransactionMark = (uchar*)strdup(&quot;BEGIN TRANSACTION&quot;);
+	}
+	if(pData-&gt;bUseTransactions &amp;&amp; pData-&gt;szCommitTransactionMark == NULL) {
+		pData-&gt;szCommitTransactionMark = (uchar*)strdup(&quot;COMMIT TRANSACTION&quot;);
+	}
+	if(pData-&gt;bKillUnresponsive == -1) {  /* default value: bSignalOnClose */
+		pData-&gt;bKillUnresponsive = pData-&gt;bSignalOnClose;
+	}
+
+	if(pData-&gt;pOutputCaptureCtx != NULL &amp;&amp; pData-&gt;pOutputCaptureCtx-&gt;szFileName == NULL) {
+		LogError(0, RS_RET_CONF_PARAM_INVLD, &quot;omprog: the 'fileCreateMode' parameter requires &quot;
+				&quot;specifying the 'output' parameter also&quot;);
+		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+	}
+
+	if(pData-&gt;bForceSingleInst) {
+		CHKmalloc(pData-&gt;pSingleChildMut = calloc(1, sizeof(pthread_mutex_t)));
+		CHKiConcCtrl(pthread_mutex_init(pData-&gt;pSingleChildMut, NULL));
+		CHKiRet(allocChildCtx(&amp;pData-&gt;pSingleChildCtx));
+		/* do not start the child here. The config is still being parsed, and the daemon
+		   has not been forked yet. When the daemon is forked, all fds will be closed! */
+	}
+
+finalize_it:
+	/* no cleanup needed on error: newActInst() will call freeInstance() */
+	RETiRet;
+}
+
+
+BEGINcreateWrkrInstance
+CODESTARTcreateWrkrInstance
+	pWrkrData-&gt;pChildCtx = NULL;
+
+	if(pWrkrData-&gt;pData-&gt;pOutputCaptureCtx != NULL) {
+		CHKiRet(startOutputCaptureOnce(pWrkrData-&gt;pData-&gt;pOutputCaptureCtx));
+	}
+
+	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		CHKiRet(startSingleChildOnce(pWrkrData-&gt;pData));
+		pWrkrData-&gt;pChildCtx = pData-&gt;pSingleChildCtx;
+	} else {
+		CHKiRet(allocChildCtx(&amp;pWrkrData-&gt;pChildCtx));
+		CHKiRet(startChild(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
+	}
+
+finalize_it:
+	if(iRet != RS_RET_OK &amp;&amp; !pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		free(pWrkrData-&gt;pChildCtx);
+	}
+ENDcreateWrkrInstance
+
+
+BEGINisCompatibleWithFeature
+CODESTARTisCompatibleWithFeature
+	if(eFeat == sFEATURERepeatedMsgReduction) {
+		iRet = RS_RET_OK;
+	}
+ENDisCompatibleWithFeature
+
+
+BEGINdbgPrintInstInfo
+CODESTARTdbgPrintInstInfo
+ENDdbgPrintInstInfo
+
+
+BEGINtryResume
+CODESTARTtryResume
+	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
+	}
+	if(!pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {
+		CHKiRet(startChild(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
+	}
+
+finalize_it:
+	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
+	}
+ENDtryResume
+
+
+BEGINbeginTransaction
+CODESTARTbeginTransaction
+	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
+	}
+	if(!pWrkrData-&gt;pData-&gt;bUseTransactions) {
+		FINALIZE;
+	}
+
+	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx,
+			pWrkrData-&gt;pData-&gt;szBeginTransactionMark));
+	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, (uchar*) &quot;\n&quot;));
+
+	if(pWrkrData-&gt;pData-&gt;bConfirmMessages) {
+		CHKiRet(readStatus(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
+	}
+
+finalize_it:
+	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
+	}
+ENDbeginTransaction
+
+
+BEGINdoAction
+CODESTARTdoAction
+	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
+	}
+	if(!pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {  /* should not occur */
+		ABORT_FINALIZE(RS_RET_SUSPENDED);
+	}
+
+	const uchar *const szMsg = ppString[0];
+	const size_t len = strlen((char*)szMsg);
+	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, szMsg));
+	if(szMsg[len-1] != '\n') {
+		const time_t tt = time(NULL);
+		if(tt &gt; pWrkrData-&gt;pData-&gt;block_if_err) {
+			LogMsg(0, NO_ERRCODE, LOG_WARNING, &quot;omprog: messages must be terminated with \\n &quot;
+				&quot;at end of message, but this message is not: '%s'\n&quot;, ppString[0]);
+			pWrkrData-&gt;pData-&gt;block_if_err = tt + 30;
+		}
+		CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, (uchar*) &quot;\n&quot;));
+	}
+
+	if(pWrkrData-&gt;pData-&gt;bConfirmMessages) {
+		CHKiRet(readStatus(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
+	} else if(pWrkrData-&gt;pData-&gt;bUseTransactions) {
+		/* ensure endTransaction will be called */
+		iRet = RS_RET_DEFER_COMMIT;
+	}
+
+finalize_it:
+	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
+	}
+ENDdoAction
+
+
+BEGINendTransaction
+CODESTARTendTransaction
+	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
+	}
+	if(!pWrkrData-&gt;pData-&gt;bUseTransactions) {
+		FINALIZE;
+	}
+
+	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx,
+			pWrkrData-&gt;pData-&gt;szCommitTransactionMark));
+	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, (uchar*) &quot;\n&quot;));
+
+	if(pWrkrData-&gt;pData-&gt;bConfirmMessages) {
+		CHKiRet(readStatus(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
+	}
+
+finalize_it:
+	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
+	}
+ENDendTransaction
+
+
+BEGINfreeWrkrInstance
+CODESTARTfreeWrkrInstance
+	if(!pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+		if(pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {
+			terminateChild(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx);
+		}
+		free(pWrkrData-&gt;pChildCtx);
+	}
+ENDfreeWrkrInstance
+
+
+BEGINfreeInstance
+	int i;
+CODESTARTfreeInstance
+	if(pData-&gt;pSingleChildCtx != NULL) {
+		if(pData-&gt;pSingleChildCtx-&gt;bIsRunning) {
+			terminateChild(pData, pData-&gt;pSingleChildCtx);
+		}
+		free(pData-&gt;pSingleChildCtx);
+	}
+
+	if(pData-&gt;pSingleChildMut != NULL) {
+		pthread_mutex_destroy(pData-&gt;pSingleChildMut);
+		free(pData-&gt;pSingleChildMut);
+	}
+
+	if(pData-&gt;pOutputCaptureCtx != NULL) {
+		if(pData-&gt;pOutputCaptureCtx-&gt;bIsRunning) {
+			endOutputCapture(pData-&gt;pOutputCaptureCtx, pData-&gt;lCloseTimeout);
+		}
+		freeOutputCaptureCtx(pData-&gt;pOutputCaptureCtx);
+	}
+
+	free(pData-&gt;szBinary);
+	free(pData-&gt;szTemplateName);
+	free(pData-&gt;szBeginTransactionMark);
+	free(pData-&gt;szCommitTransactionMark);
+
+	if(pData-&gt;aParams != NULL) {
+		for (i = 0; i &lt; pData-&gt;iParams; i++) {
+			free(pData-&gt;aParams[i]);
+		}
+		free(pData-&gt;aParams);
+	}
+ENDfreeInstance
+
+
+BEGINnewActInst
+	struct cnfparamvals *pvals;
+	int i;
+CODESTARTnewActInst
+	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
+		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+	}
+
+	CHKiRet(createInstance(&amp;pData));
+
+	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+		if(!pvals[i].bUsed)
+			continue;
+		if(!strcmp(actpblk.descr[i].name, &quot;binary&quot;)) {
+			CHKiRet(split_binary_parameters(&amp;pData-&gt;szBinary, &amp;pData-&gt;aParams, &amp;pData-&gt;iParams,
+				pvals[i].val.d.estr));
+		} else if(!strcmp(actpblk.descr[i].name, &quot;confirmMessages&quot;)) {
+<A NAME="2"></A>			pData-&gt;bConfirmMessages = (int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, &quot;confirmTimeout&quot;)) {
+			pData-&gt;lConfirmTimeout = (long) pvals[i].val.d.n;
+<FONT color="#980517"><div style="position:absolute;left:0"><A HREF="javascript:ZweiFrames('match809-0.html#2',2,'match809-top.html#2',1)"><IMG SRC="back.gif" ALT="other" BORDER="0" ALIGN="left"></A></div><B>		} else if(!strcmp(actpblk.descr[i].name, &quot;reportFailures&quot;)) {
+			pData-&gt;bReportFailures = (int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, &quot;useTransactions&quot;)) {
+<A NAME="1"></A>			pData-&gt;bUseTransactions = (int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, &quot;beginTransactionMark&quot;)) {
+			pData-&gt;szBeginTransactionMark = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</B></FONT>
+<FONT color="#f63526"><div style="position:absolute;left:0"><A HREF="javascript:ZweiFrames('match809-0.html#1',2,'match809-top.html#1',1)"><IMG SRC="back.gif" ALT="other" BORDER="0" ALIGN="left"></A></div><B>		} else if(!strcmp(actpblk.descr[i].name, &quot;commitTransactionMark&quot;)) {
+			pData-&gt;szCommitTransactionMark = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(actpblk.descr[i].name, &quot;forceSingleInstance&quot;)) {
+			pData-&gt;bForceSingleInst = (int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, &quot;signalOnClose&quot;)) {
+			pData-&gt;bSignalOnClose = (int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, &quot;closeTimeout&quot;)) {
+			pData-&gt;lCloseTimeout = (long) pvals[i].val.d.n;</B></FONT>
+		} else if(!strcmp(actpblk.descr[i].name, &quot;killUnresponsive&quot;)) {
+			pData-&gt;bKillUnresponsive = (int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, &quot;hup.signal&quot;)) {
+			const char *const sig = es_str2cstr(pvals[i].val.d.estr, NULL);
+			if(!strcmp(sig, &quot;HUP&quot;))
+				pData-&gt;iHUPForward = SIGHUP;
+			else if(!strcmp(sig, &quot;USR1&quot;))
+				pData-&gt;iHUPForward = SIGUSR1;
+			else if(!strcmp(sig, &quot;USR2&quot;))
+				pData-&gt;iHUPForward = SIGUSR2;
+			else if(!strcmp(sig, &quot;INT&quot;))
+				pData-&gt;iHUPForward = SIGINT;
+			else if(!strcmp(sig, &quot;TERM&quot;))
+				pData-&gt;iHUPForward = SIGTERM;
+			else {
+				LogError(0, RS_RET_CONF_PARAM_INVLD,
+					&quot;omprog: hup.signal '%s' in hup.signal parameter&quot;, sig);
+				ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+			}
+			free((void*)sig);
+		} else if(!strcmp(actpblk.descr[i].name, &quot;template&quot;)) {
+			pData-&gt;szTemplateName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(actpblk.descr[i].name, &quot;output&quot;)) {
+			if(pData-&gt;pOutputCaptureCtx == NULL) {
+				CHKiRet(allocOutputCaptureCtx(&amp;pData-&gt;pOutputCaptureCtx));
+			}
+			pData-&gt;pOutputCaptureCtx-&gt;szFileName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(actpblk.descr[i].name, &quot;fileCreateMode&quot;)) {
+			if(pData-&gt;pOutputCaptureCtx == NULL) {
+				CHKiRet(allocOutputCaptureCtx(&amp;pData-&gt;pOutputCaptureCtx));
+			}
+			pData-&gt;pOutputCaptureCtx-&gt;fCreateMode = (mode_t) pvals[i].val.d.n;
+		} else {
+			DBGPRINTF(&quot;omprog: program error, non-handled param '%s'\n&quot;, actpblk.descr[i].name);
+		}
+	}
+
+	CODE_STD_STRING_REQUESTnewActInst(1)
+	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup(pData-&gt;szTemplateName == NULL ?
+			&quot;RSYSLOG_FileFormat&quot; : (char*)pData-&gt;szTemplateName), OMSR_NO_RQD_TPL_OPTS));
+
+	iRet = postInitInstance(pData);
+
+CODE_STD_FINALIZERnewActInst
+	cnfparamvalsDestruct(pvals, &amp;actpblk);
+ENDnewActInst
+
+
+BEGINparseSelectorAct
+CODESTARTparseSelectorAct
+CODE_STD_STRING_REQUESTparseSelectorAct(1)
+	/* first check if this config line is actually for us */
+	if(strncmp((char*) p, &quot;:omprog:&quot;, sizeof(&quot;:omprog:&quot;) - 1)) {
+		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
+	}
+
+	/* ok, if we reach this point, we have something for us */
+	p += sizeof(&quot;:omprog:&quot;) - 1; /* eat indicator sequence  (-1 because of '\0'!) */
+	if(cs.szBinary == NULL) {
+		LogError(0, RS_RET_CONF_RQRD_PARAM_MISSING, &quot;no binary to execute specified&quot;);
+		ABORT_FINALIZE(RS_RET_CONF_RQRD_PARAM_MISSING);
+	}
+
+	CHKiRet(createInstance(&amp;pData));
+	CHKmalloc(pData-&gt;szBinary = (uchar*) strdup((char*)cs.szBinary));
+
+	/* check if a non-standard template is to be applied */
+	if(*(p-1) == ';')
+		--p;
+	CHKiRet(cflineParseTemplateName(&amp;p, *ppOMSR, 0, 0, (uchar*) &quot;RSYSLOG_FileFormat&quot;));
+
+	iRet = postInitInstance(pData);
+
+CODE_STD_FINALIZERparseSelectorAct
+ENDparseSelectorAct
+
+
+BEGINdoHUP
+CODESTARTdoHUP
+	if(pData-&gt;bForceSingleInst &amp;&amp; pData-&gt;iHUPForward != NO_HUP_FORWARD &amp;&amp;
+			pData-&gt;pSingleChildCtx-&gt;bIsRunning) {
+		DBGPRINTF(&quot;omprog: forwarding HUP to program '%s' (pid %ld) as signal %d\n&quot;,
+				pData-&gt;szBinary, (long) pData-&gt;pSingleChildCtx-&gt;pid, pData-&gt;iHUPForward);
+		kill(pData-&gt;pSingleChildCtx-&gt;pid, pData-&gt;iHUPForward);
+	}
+
+	if(pData-&gt;pOutputCaptureCtx != NULL &amp;&amp; pData-&gt;pOutputCaptureCtx-&gt;bIsRunning) {
+		closeOutputFile(pData-&gt;pOutputCaptureCtx);
+	}
+ENDdoHUP
+
+
+BEGINdoHUPWrkr
+CODESTARTdoHUPWrkr
+	if(!pWrkrData-&gt;pData-&gt;bForceSingleInst &amp;&amp; pWrkrData-&gt;pData-&gt;iHUPForward != NO_HUP_FORWARD &amp;&amp;
+	 		pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {
+		DBGPRINTF(&quot;omprog: forwarding HUP to program '%s' (pid %ld) as signal %d\n&quot;,
+				pWrkrData-&gt;pData-&gt;szBinary, (long) pWrkrData-&gt;pChildCtx-&gt;pid,
+				pWrkrData-&gt;pData-&gt;iHUPForward);
+		kill(pWrkrData-&gt;pChildCtx-&gt;pid, pWrkrData-&gt;pData-&gt;iHUPForward);
+	}
+ENDdoHUPWrkr
+
+
+BEGINmodExit
+CODESTARTmodExit
+	free(cs.szBinary);
+	cs.szBinary = NULL;
+ENDmodExit
+
+
+BEGINqueryEtryPt
+CODESTARTqueryEtryPt
+CODEqueryEtryPt_STD_OMOD_QUERIES
+CODEqueryEtryPt_STD_OMOD8_QUERIES
+CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+CODEqueryEtryPt_TXIF_OMOD_QUERIES /* we support the transactional interface */
+CODEqueryEtryPt_doHUP
+CODEqueryEtryPt_doHUPWrkr
+ENDqueryEtryPt
+
+
+/* Reset legacy config variables for this module to default values.
+ */
+static rsRetVal
+resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
+{
+	DEFiRet;
+	free(cs.szBinary);
+	cs.szBinary = NULL;
+	RETiRet;
+}
+
+BEGINmodInit()
+CODESTARTmodInit
+INITLegCnfVars
+	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
+CODEmodInit_QueryRegCFSLineHdlr
+	/* tell engine which objects we need */
+
+	/* check that rsyslog core supports transactional plugins */
+	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
+	if (!bCoreSupportsBatching) {
+		LogError(0, NO_ERRCODE, &quot;omprog: rsyslog core too old (does not support batching)&quot;);
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)&quot;actionomprogbinary&quot;, 0, eCmdHdlrGetWord, NULL, &amp;cs.szBinary,
+		STD_LOADABLE_MODULE_ID));
+	CHKiRet(omsdRegCFSLineHdlr((uchar *)&quot;resetconfigvariables&quot;, 1, eCmdHdlrCustomHandler, resetConfigVariables,
+		NULL, STD_LOADABLE_MODULE_ID));
+CODEmodInit_QueryRegCFSLineHdlr
+ENDmodInit
+</PRE>
+</div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,1830 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML><HEAD><TITLE>Matches for ipc.py & hgfs.py</TITLE>
+<META http-equiv="Content-Type" content="text/html; charset=UTF-8">
+</HEAD>
+<body>
+  <div style="align-items: center; display: flex; justify-content: space-around;">
+    <div>
+      <h3 align="center">
+Matches for ipc.py & hgfs.py
+      </h3>
+      <h1 align="center">
+        4.2%
+      </h1>
+      <center>
+        <a href="index.html" target="_top">
+          INDEX
+        </a>
+        <span>-</span>
+        <a href="help-en.html" target="_top">
+          HELP
+        </a>
+      </center>
+    </div>
+    <div>
+<TABLE BORDER="1" CELLSPACING="0" BGCOLOR="#d0d0d0">
+<TR><TH><TH>ipc.py (5.1087985%)<TH>hgfs.py (3.6784742%)<TH>Tokens
+<TR><TD BGCOLOR="#0000ff"><FONT COLOR="#0000ff">-</FONT><TD><A HREF="javascript:ZweiFrames('match75822-0.html#0',2,'match75822-1.html#0',3)" NAME="0">(6-24)<TD><A HREF="javascript:ZweiFrames('match75822-0.html#0',2,'match75822-1.html#0',3)" NAME="0">(42-60)</A><TD ALIGN=center><FONT COLOR="#ff0000">18</FONT>
+<TR><TD BGCOLOR="#f63526"><FONT COLOR="#f63526">-</FONT><TD><A HREF="javascript:ZweiFrames('match75822-0.html#1',2,'match75822-1.html#1',3)" NAME="1">(541-544)<TD><A HREF="javascript:ZweiFrames('match75822-0.html#1',2,'match75822-1.html#1',3)" NAME="1">(139-140)</A><TD ALIGN=center><FONT COLOR="#aa0000">12</FONT>
+<TR><TD BGCOLOR="#980517"><FONT COLOR="#980517">-</FONT><TD><A HREF="javascript:ZweiFrames('match75822-0.html#2',2,'match75822-1.html#2',3)" NAME="2">(137-140)<TD><A HREF="javascript:ZweiFrames('match75822-0.html#2',2,'match75822-1.html#2',3)" NAME="2">(114-115)</A><TD ALIGN=center><FONT COLOR="#aa0000">12</FONT>
+<TR><TD BGCOLOR="#53858b"><FONT COLOR="#53858b">-</FONT><TD><A HREF="javascript:ZweiFrames('match75822-0.html#3',2,'match75822-1.html#3',3)" NAME="3">(128-131)<TD><A HREF="javascript:ZweiFrames('match75822-0.html#3',2,'match75822-1.html#3',3)" NAME="3">(214-216)</A><TD ALIGN=center><FONT COLOR="#aa0000">12</FONT>
+</TABLE>
+    </div>
+  </div>
+  <hr>
+  <div style="display: flex;">
+<div style="flex-grow: 1;">
+<h3>
+<center>
+<span>ipc.py</span>
+<span> - </span>
+<span></span>
+</center>
+</h3>
+<HR>
+<PRE>
+&quot;&quot;&quot;
+IPC transport classes
+<A NAME="0"></A>&quot;&quot;&quot;
+
+
+<FONT color="#0000ff"><A HREF="javascript:ZweiFrames('match75822-1.html#0',3,'match75822-top.html#0',1)"><IMG SRC="forward.gif" ALT="other" BORDER="0" ALIGN="right"></A><B>import errno
+import logging
+import socket
+import time
+
+import salt.ext.tornado
+import salt.ext.tornado.concurrent
+import salt.ext.tornado.gen
+import salt.ext.tornado.ioloop
+import salt.ext.tornado.netutil
+import salt.transport.client
+import salt.transport.frame
+import salt.utils.msgpack
+from salt.ext.tornado.ioloop import IOLoop
+from salt.ext.tornado.ioloop import TimeoutError as TornadoTimeoutError
+from salt.ext.tornado.iostream import IOStream, StreamClosedError
+from salt.ext.tornado.locks import Lock
+
+log = logging.</B></FONT>getLogger(__name__)
+
+
+# 'tornado.concurrent.Future' doesn't support
+# remove_done_callback() which we would have called
+# in the timeout case. Due to this, we have this
+# callback function outside of FutureWithTimeout.
+def future_with_timeout_callback(future):
+    if future._future_with_timeout is not None:
+        future._future_with_timeout._done_callback(future)
+
+
+class FutureWithTimeout(salt.ext.tornado.concurrent.Future):
+    def __init__(self, io_loop, future, timeout):
+        super().__init__()
+        self.io_loop = io_loop
+        self._future = future
+        if timeout is not None:
+            if timeout &lt; 0.1:
+                timeout = 0.1
+            self._timeout_handle = self.io_loop.add_timeout(
+                self.io_loop.time() + timeout, self._timeout_callback
+            )
+        else:
+            self._timeout_handle = None
+
+        if hasattr(self._future, &quot;_future_with_timeout&quot;):
+            # Reusing a future that has previously been used.
+            # Due to this, no need to call add_done_callback()
+            # because we did that before.
+            self._future._future_with_timeout = self
+            if self._future.done():
+                future_with_timeout_callback(self._future)
+        else:
+            self._future._future_with_timeout = self
+            self._future.add_done_callback(future_with_timeout_callback)
+
+    def _timeout_callback(self):
+        self._timeout_handle = None
+        # 'tornado.concurrent.Future' doesn't support
+        # remove_done_callback(). So we set an attribute
+        # inside the future itself to track what happens
+        # when it completes.
+        self._future._future_with_timeout = None
+        self.set_exception(TornadoTimeoutError())
+
+    def _done_callback(self, future):
+        try:
+            if self._timeout_handle is not None:
+                self.io_loop.remove_timeout(self._timeout_handle)
+                self._timeout_handle = None
+
+            self.set_result(future.result())
+        except Exception as exc:  # pylint: disable=broad-except
+            self.set_exception(exc)
+
+
+class IPCServer:
+    &quot;&quot;&quot;
+    A Tornado IPC server very similar to Tornado's TCPServer class
+    but using either UNIX domain sockets or TCP sockets
+    &quot;&quot;&quot;
+
+    async_methods = [
+        &quot;handle_stream&quot;,
+    ]
+    close_methods = [
+        &quot;close&quot;,
+    ]
+
+    def __init__(self, socket_path, io_loop=None, payload_handler=None):
+        &quot;&quot;&quot;
+        Create a new Tornado IPC server
+
+        :param str/int socket_path: Path on the filesystem for the
+                                    socket to bind to. This socket does
+                                    not need to exist prior to calling
+                                    this method, but parent directories
+                                    should.
+                                    It may also be of type 'int', in
+                                    which case it is used as the port
+                                    for a tcp localhost connection.
+        :param IOLoop io_loop: A Tornado ioloop to handle scheduling
+        :param func payload_handler: A function to customize handling of
+                                     incoming data.
+        &quot;&quot;&quot;
+        self.socket_path = socket_path
+        self._started = False
+        self.payload_handler = payload_handler
+
+        # Placeholders for attributes to be populated by method calls
+        self.sock = None
+        self.io_loop = io_loop or salt.ext.tornado.ioloop.IOLoop.current()
+        self._closing = False
+
+    def start(self):
+        &quot;&quot;&quot;
+        Perform the work necessary to start up a Tornado IPC server
+
+        Blocks until socket is established
+        &quot;&quot;&quot;
+<A NAME="3"></A>        # Start up the ioloop
+        log.trace(&quot;IPCServer: binding to socket: %s&quot;, self.socket_path)
+        if isinstance(self.socket_path, int):
+            self.sock = socket.socket(socket<FONT color="#53858b"><A HREF="javascript:ZweiFrames('match75822-1.html#3',3,'match75822-top.html#3',1)"><IMG SRC="forward.gif" ALT="other" BORDER="0" ALIGN="right"></A><B>.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.setblocking(0)
+            self.sock.</B></FONT>bind((&quot;127.0.0.1&quot;, self.socket_path))
+            # Based on default used in tornado.netutil.bind_sockets()
+            self.sock.listen(128)
+<A NAME="2"></A>        else:
+            self.sock = salt.ext.tornado.netutil.bind_unix_socket(self.socket_path)
+
+        with salt<FONT color="#980517"><A HREF="javascript:ZweiFrames('match75822-1.html#2',3,'match75822-top.html#2',1)"><IMG SRC="forward.gif" ALT="other" BORDER="0" ALIGN="right"></A><B>.utils.asynchronous.current_ioloop(self.io_loop):
+            salt.ext.tornado.netutil.add_accept_handler(
+                self.sock,
+                self.</B></FONT>handle_connection,
+            )
+        self._started = True
+
+    @salt.ext.tornado.gen.coroutine
+    def handle_stream(self, stream):
+        &quot;&quot;&quot;
+        Override this to handle the streams as they arrive
+
+        :param IOStream stream: An IOStream for processing
+
+        See https://tornado.readthedocs.io/en/latest/iostream.html#tornado.iostream.IOStream
+        for additional details.
+        &quot;&quot;&quot;
+
+        @salt.ext.tornado.gen.coroutine
+        def _null(msg):
+            raise salt.ext.tornado.gen.Return(None)
+
+        def write_callback(stream, header):
+            if header.get(&quot;mid&quot;):
+
+                @salt.ext.tornado.gen.coroutine
+                def return_message(msg):
+                    pack = salt.transport.frame.frame_msg_ipc(
+                        msg,
+                        header={&quot;mid&quot;: header[&quot;mid&quot;]},
+                        raw_body=True,
+                    )
+                    yield stream.write(pack)
+
+                return return_message
+            else:
+                return _null
+
+        # msgpack deprecated `encoding` starting with version 0.5.2
+        if salt.utils.msgpack.version &gt;= (0, 5, 2):
+            # Under Py2 we still want raw to be set to True
+            msgpack_kwargs = {&quot;raw&quot;: False}
+        else:
+            msgpack_kwargs = {&quot;encoding&quot;: &quot;utf-8&quot;}
+        unpacker = salt.utils.msgpack.Unpacker(**msgpack_kwargs)
+        while not stream.closed():
+            try:
+                wire_bytes = yield stream.read_bytes(4096, partial=True)
+                unpacker.feed(wire_bytes)
+                for framed_msg in unpacker:
+                    body = framed_msg[&quot;body&quot;]
+                    self.io_loop.spawn_callback(
+                        self.payload_handler,
+                        body,
+                        write_callback(stream, framed_msg[&quot;head&quot;]),
+                    )
+            except StreamClosedError:
+                log.trace(&quot;Client disconnected from IPC %s&quot;, self.socket_path)
+                break
+            except OSError as exc:
+                # On occasion an exception will occur with
+                # an error code of 0, it's a spurious exception.
+                if exc.errno == 0:
+                    log.trace(
+                        &quot;Exception occurred with error number 0, &quot;
+                        &quot;spurious exception: %s&quot;,
+                        exc,
+                    )
+                else:
+                    log.error(&quot;Exception occurred while handling stream: %s&quot;, exc)
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(&quot;Exception occurred while handling stream: %s&quot;, exc)
+
+    def handle_connection(self, connection, address):
+        log.trace(
+            &quot;IPCServer: Handling connection to address: %s&quot;,
+            address if address else connection,
+        )
+        try:
+            with salt.utils.asynchronous.current_ioloop(self.io_loop):
+                stream = IOStream(
+                    connection,
+                )
+            self.io_loop.spawn_callback(self.handle_stream, stream)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.error(&quot;IPC streaming error: %s&quot;, exc)
+
+    def close(self):
+        &quot;&quot;&quot;
+        Routines to handle any cleanup before the instance shuts down.
+        Sockets and filehandles should be closed explicitly, to prevent
+        leaks.
+        &quot;&quot;&quot;
+        if self._closing:
+            return
+        self._closing = True
+        if hasattr(self.sock, &quot;close&quot;):
+            self.sock.close()
+
+    # pylint: disable=W1701
+    def __del__(self):
+        try:
+            self.close()
+        except TypeError:
+            # This is raised when Python's GC has collected objects which
+            # would be needed when calling self.close()
+            pass
+
+    # pylint: enable=W1701
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class IPCClient:
+    &quot;&quot;&quot;
+    A Tornado IPC client very similar to Tornado's TCPClient class
+    but using either UNIX domain sockets or TCP sockets
+
+    This was written because Tornado does not have its own IPC
+    server/client implementation.
+
+    :param IOLoop io_loop: A Tornado ioloop to handle scheduling
+    :param str/int socket_path: A path on the filesystem where a socket
+                                belonging to a running IPCServer can be
+                                found.
+                                It may also be of type 'int', in which
+                                case it is used as the port for a tcp
+                                localhost connection.
+    &quot;&quot;&quot;
+
+    def __init__(self, socket_path, io_loop=None):
+        &quot;&quot;&quot;
+        Create a new IPC client
+
+        IPC clients cannot bind to ports, but must connect to
+        existing IPC servers. Clients can then send messages
+        to the server.
+
+        &quot;&quot;&quot;
+        self.io_loop = io_loop or salt.ext.tornado.ioloop.IOLoop.current()
+        self.socket_path = socket_path
+        self._closing = False
+        self.stream = None
+        # msgpack deprecated `encoding` starting with version 0.5.2
+        if salt.utils.msgpack.version &gt;= (0, 5, 2):
+            # Under Py2 we still want raw to be set to True
+            msgpack_kwargs = {&quot;raw&quot;: False}
+        else:
+            msgpack_kwargs = {&quot;encoding&quot;: &quot;utf-8&quot;}
+        self.unpacker = salt.utils.msgpack.Unpacker(**msgpack_kwargs)
+        self._connecting_future = None
+
+    def connected(self):
+        return self.stream is not None and not self.stream.closed()
+
+    def connect(self, callback=None, timeout=None):
+        &quot;&quot;&quot;
+        Connect to the IPC socket
+        &quot;&quot;&quot;
+        if self._connecting_future is not None and not self._connecting_future.done():
+            future = self._connecting_future
+        else:
+            if self._connecting_future is not None:
+                # read previous future result to prevent the &quot;unhandled future exception&quot; error
+                self._connecting_future.exception()  # pylint: disable=E0203
+            future = salt.ext.tornado.concurrent.Future()
+            self._connecting_future = future
+            self._connect(timeout)
+
+        if callback is not None:
+
+            def handle_future(future):
+                response = future.result()
+                self.io_loop.add_callback(callback, response)
+
+            future.add_done_callback(handle_future)
+
+        return future
+
+    @salt.ext.tornado.gen.coroutine
+    def _connect(self, timeout=None):
+        &quot;&quot;&quot;
+        Connect to a running IPCServer
+        &quot;&quot;&quot;
+        if isinstance(self.socket_path, int):
+            sock_type = socket.AF_INET
+            sock_addr = (&quot;127.0.0.1&quot;, self.socket_path)
+        else:
+            sock_type = socket.AF_UNIX
+            sock_addr = self.socket_path
+
+        self.stream = None
+        if timeout is not None:
+            timeout_at = time.time() + timeout
+
+        while True:
+            if self._closing:
+                break
+
+            if self.stream is None:
+                with salt.utils.asynchronous.current_ioloop(self.io_loop):
+                    self.stream = IOStream(socket.socket(sock_type, socket.SOCK_STREAM))
+            try:
+                log.trace(&quot;IPCClient: Connecting to socket: %s&quot;, self.socket_path)
+                yield self.stream.connect(sock_addr)
+                self._connecting_future.set_result(True)
+                break
+            except Exception as e:  # pylint: disable=broad-except
+                if self.stream.closed():
+                    self.stream = None
+
+                if timeout is None or time.time() &gt; timeout_at:
+                    if self.stream is not None:
+                        self.stream.close()
+                        self.stream = None
+                    self._connecting_future.set_exception(e)
+                    break
+
+                yield salt.ext.tornado.gen.sleep(1)
+
+    def close(self):
+        &quot;&quot;&quot;
+        Routines to handle any cleanup before the instance shuts down.
+        Sockets and filehandles should be closed explicitly, to prevent
+        leaks.
+        &quot;&quot;&quot;
+        if self._closing:
+            return
+
+        self._closing = True
+        self._connecting_future = None
+
+        log.debug(&quot;Closing %s instance&quot;, self.__class__.__name__)
+
+        if self.stream is not None and not self.stream.closed():
+            try:
+                self.stream.close()
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    # If its not a bad file descriptor error, raise
+                    raise
+
+    # pylint: disable=W1701
+    def __del__(self):
+        try:
+            self.close()
+        except TypeError:
+            # This is raised when Python's GC has collected objects which
+            # would be needed when calling self.close()
+            pass
+
+    # pylint: enable=W1701
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class IPCMessageClient(IPCClient):
+    &quot;&quot;&quot;
+    Salt IPC message client
+
+    Create an IPC client to send messages to an IPC server
+
+    An example of a very simple IPCMessageClient connecting to an IPCServer. This
+    example assumes an already running IPCMessage server.
+
+    IMPORTANT: The below example also assumes a running IOLoop process.
+
+    # Import Tornado libs
+    import salt.ext.tornado.ioloop
+
+    # Import Salt libs
+    import salt.config
+    import salt.transport.ipc
+
+    io_loop = salt.ext.tornado.ioloop.IOLoop.current()
+
+    ipc_server_socket_path = '/var/run/ipc_server.ipc'
+
+    ipc_client = salt.transport.ipc.IPCMessageClient(ipc_server_socket_path, io_loop=io_loop)
+
+    # Connect to the server
+    ipc_client.connect()
+
+    # Send some data
+    ipc_client.send('Hello world')
+    &quot;&quot;&quot;
+
+    async_methods = [
+        &quot;send&quot;,
+        &quot;connect&quot;,
+        &quot;_connect&quot;,
+    ]
+    close_methods = [
+        &quot;close&quot;,
+    ]
+
+    # FIXME timeout unimplemented
+    # FIXME tries unimplemented
+    @salt.ext.tornado.gen.coroutine
+    def send(self, msg, timeout=None, tries=None):
+        &quot;&quot;&quot;
+        Send a message to an IPC socket
+
+        If the socket is not currently connected, a connection will be established.
+
+        :param dict msg: The message to be sent
+        :param int timeout: Timeout when sending message (Currently unimplemented)
+        &quot;&quot;&quot;
+        if not self.connected():
+            yield self.connect()
+        pack = salt.transport.frame.frame_msg_ipc(msg, raw_body=True)
+        yield self.stream.write(pack)
+
+
+class IPCMessageServer(IPCServer):
+    &quot;&quot;&quot;
+    Salt IPC message server
+
+    Creates a message server which can create and bind to a socket on a given
+    path and then respond to messages asynchronously.
+
+    An example of a very simple IPCServer which prints received messages to
+    a console:
+
+        # Import Tornado libs
+        import salt.ext.tornado.ioloop
+
+        # Import Salt libs
+        import salt.transport.ipc
+
+        io_loop = salt.ext.tornado.ioloop.IOLoop.current()
+        ipc_server_socket_path = '/var/run/ipc_server.ipc'
+        ipc_server = salt.transport.ipc.IPCMessageServer(ipc_server_socket_path, io_loop=io_loop,
+                                                         payload_handler=print_to_console)
+        # Bind to the socket and prepare to run
+        ipc_server.start()
+
+        # Start the server
+        io_loop.start()
+
+        # This callback is run whenever a message is received
+        def print_to_console(payload):
+            print(payload)
+
+    See IPCMessageClient() for an example of sending messages to an IPCMessageServer instance
+    &quot;&quot;&quot;
+
+
+class IPCMessagePublisher:
+    &quot;&quot;&quot;
+    A Tornado IPC Publisher similar to Tornado's TCPServer class
+    but using either UNIX domain sockets or TCP sockets
+    &quot;&quot;&quot;
+
+    def __init__(self, opts, socket_path, io_loop=None):
+        &quot;&quot;&quot;
+        Create a new Tornado IPC server
+        :param dict opts: Salt options
+        :param str/int socket_path: Path on the filesystem for the
+                                    socket to bind to. This socket does
+                                    not need to exist prior to calling
+                                    this method, but parent directories
+                                    should.
+                                    It may also be of type 'int', in
+                                    which case it is used as the port
+                                    for a tcp localhost connection.
+        :param IOLoop io_loop: A Tornado ioloop to handle scheduling
+        &quot;&quot;&quot;
+        self.opts = opts
+        self.socket_path = socket_path
+        self._started = False
+
+        # Placeholders for attributes to be populated by method calls
+        self.sock = None
+        self.io_loop = io_loop or IOLoop.current()
+        self._closing = False
+        self.streams = set()
+
+    def start(self):
+        &quot;&quot;&quot;
+        Perform the work necessary to start up a Tornado IPC server
+
+        Blocks until socket is established
+        &quot;&quot;&quot;
+        # Start up the ioloop
+        log.trace(&quot;IPCMessagePublisher: binding to socket: %s&quot;, self.socket_path)
+        if isinstance(self.socket_path, int):
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.setblocking(0)
+            self.sock.bind((&quot;127.0.0.1&quot;, self.socket_path))
+            # Based on default used in salt.ext.tornado.netutil.bind_sockets()
+            self.sock.listen(128)
+<A NAME="1"></A>        else:
+            self.sock = salt.ext.tornado.netutil.bind_unix_socket(self.socket_path)
+
+        with salt<FONT color="#f63526"><A HREF="javascript:ZweiFrames('match75822-1.html#1',3,'match75822-top.html#1',1)"><IMG SRC="forward.gif" ALT="other" BORDER="0" ALIGN="right"></A><B>.utils.asynchronous.current_ioloop(self.io_loop):
+            salt.ext.tornado.netutil.add_accept_handler(
+                self.sock,
+                self.</B></FONT>handle_connection,
+            )
+        self._started = True
+
+    @salt.ext.tornado.gen.coroutine
+    def _write(self, stream, pack):
+        try:
+            yield stream.write(pack)
+        except StreamClosedError:
+            log.trace(&quot;Client disconnected from IPC %s&quot;, self.socket_path)
+            self.streams.discard(stream)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.error(&quot;Exception occurred while handling stream: %s&quot;, exc)
+            if not stream.closed():
+                stream.close()
+            self.streams.discard(stream)
+
+    def publish(self, msg):
+        &quot;&quot;&quot;
+        Send message to all connected sockets
+        &quot;&quot;&quot;
+        if not self.streams:
+            return
+
+        pack = salt.transport.frame.frame_msg_ipc(msg, raw_body=True)
+        for stream in self.streams:
+            self.io_loop.spawn_callback(self._write, stream, pack)
+
+    def handle_connection(self, connection, address):
+        log.trace(&quot;IPCServer: Handling connection to address: %s&quot;, address)
+        try:
+            kwargs = {}
+            if self.opts[&quot;ipc_write_buffer&quot;] &gt; 0:
+                kwargs[&quot;max_write_buffer_size&quot;] = self.opts[&quot;ipc_write_buffer&quot;]
+                log.trace(
+                    &quot;Setting IPC connection write buffer: %s&quot;,
+                    (self.opts[&quot;ipc_write_buffer&quot;]),
+                )
+            with salt.utils.asynchronous.current_ioloop(self.io_loop):
+                stream = IOStream(connection, **kwargs)
+            self.streams.add(stream)
+
+            def discard_after_closed():
+                self.streams.discard(stream)
+
+            stream.set_close_callback(discard_after_closed)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.error(&quot;IPC streaming error: %s&quot;, exc)
+
+    def close(self):
+        &quot;&quot;&quot;
+        Routines to handle any cleanup before the instance shuts down.
+        Sockets and filehandles should be closed explicitly, to prevent
+        leaks.
+        &quot;&quot;&quot;
+        if self._closing:
+            return
+        self._closing = True
+        for stream in self.streams:
+            stream.close()
+        self.streams.clear()
+        if hasattr(self.sock, &quot;close&quot;):
+            self.sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class IPCMessageSubscriber(IPCClient):
+    &quot;&quot;&quot;
+    Salt IPC message subscriber
+
+    Create an IPC client to receive messages from IPC publisher
+
+    An example of a very simple IPCMessageSubscriber connecting to an IPCMessagePublisher.
+    This example assumes an already running IPCMessagePublisher.
+
+    IMPORTANT: The below example also assumes the IOLoop is NOT running.
+
+    # Import Tornado libs
+    import salt.ext.tornado.ioloop
+
+    # Import Salt libs
+    import salt.config
+    import salt.transport.ipc
+
+    # Create a new IO Loop.
+    # We know that this new IO Loop is not currently running.
+    io_loop = salt.ext.tornado.ioloop.IOLoop()
+
+    ipc_publisher_socket_path = '/var/run/ipc_publisher.ipc'
+
+    ipc_subscriber = salt.transport.ipc.IPCMessageSubscriber(ipc_server_socket_path, io_loop=io_loop)
+
+    # Connect to the server
+    # Use the associated IO Loop that isn't running.
+    io_loop.run_sync(ipc_subscriber.connect)
+
+    # Wait for some data
+    package = ipc_subscriber.read_sync()
+    &quot;&quot;&quot;
+
+    async_methods = [
+        &quot;read&quot;,
+        &quot;connect&quot;,
+    ]
+    close_methods = [
+        &quot;close&quot;,
+    ]
+
+    def __init__(self, socket_path, io_loop=None):
+        super().__init__(socket_path, io_loop=io_loop)
+        self._read_stream_future = None
+        self._saved_data = []
+        self._read_in_progress = Lock()
+
+    @salt.ext.tornado.gen.coroutine
+    def _read(self, timeout, callback=None):
+        try:
+            try:
+                yield self._read_in_progress.acquire(timeout=0.00000001)
+            except salt.ext.tornado.gen.TimeoutError:
+                raise salt.ext.tornado.gen.Return(None)
+
+            exc_to_raise = None
+            ret = None
+            try:
+                while True:
+                    if self._read_stream_future is None:
+                        self._read_stream_future = self.stream.read_bytes(
+                            4096, partial=True
+                        )
+
+                    if timeout is None:
+                        wire_bytes = yield self._read_stream_future
+                    else:
+                        wire_bytes = yield FutureWithTimeout(
+                            self.io_loop, self._read_stream_future, timeout
+                        )
+                    self._read_stream_future = None
+
+                    # Remove the timeout once we get some data or an exception
+                    # occurs. We will assume that the rest of the data is already
+                    # there or is coming soon if an exception doesn't occur.
+                    timeout = None
+
+                    self.unpacker.feed(wire_bytes)
+                    first_sync_msg = True
+                    for framed_msg in self.unpacker:
+                        if callback:
+                            self.io_loop.spawn_callback(callback, framed_msg[&quot;body&quot;])
+                        elif first_sync_msg:
+                            ret = framed_msg[&quot;body&quot;]
+                            first_sync_msg = False
+                        else:
+                            self._saved_data.append(framed_msg[&quot;body&quot;])
+                    if not first_sync_msg:
+                        # We read at least one piece of data and we're on sync run
+                        break
+            except TornadoTimeoutError:
+                # In the timeout case, just return None.
+                # Keep 'self._read_stream_future' alive.
+                ret = None
+            except StreamClosedError as exc:
+                log.trace(&quot;Subscriber disconnected from IPC %s&quot;, self.socket_path)
+                self._read_stream_future = None
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(
+                    &quot;Exception occurred in Subscriber while handling stream: %s&quot;, exc
+                )
+                self._read_stream_future = None
+                exc_to_raise = exc
+
+            self._read_in_progress.release()
+
+            if exc_to_raise is not None:
+                raise exc_to_raise  # pylint: disable=E0702
+            raise salt.ext.tornado.gen.Return(ret)
+        # Handle ctrl+c gracefully
+        except TypeError:
+            pass
+
+    @salt.ext.tornado.gen.coroutine
+    def read(self, timeout):
+        &quot;&quot;&quot;
+        Asynchronously read messages and invoke a callback when they are ready.
+        :param callback: A callback with the received data
+        &quot;&quot;&quot;
+        if self._saved_data:
+            res = self._saved_data.pop(0)
+            raise salt.ext.tornado.gen.Return(res)
+        while not self.connected():
+            try:
+                yield self.connect(timeout=5)
+            except StreamClosedError:
+                log.trace(
+                    &quot;Subscriber closed stream on IPC %s before connect&quot;,
+                    self.socket_path,
+                )
+                yield salt.ext.tornado.gen.sleep(1)
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(&quot;Exception occurred while Subscriber connecting: %s&quot;, exc)
+                yield salt.ext.tornado.gen.sleep(1)
+        res = yield self._read(timeout)
+        raise salt.ext.tornado.gen.Return(res)
+
+    def read_sync(self, timeout=None):
+        &quot;&quot;&quot;
+        Read a message from an IPC socket
+
+        The socket must already be connected.
+        The associated IO Loop must NOT be running.
+        :param int timeout: Timeout when receiving message
+        :return: message data if successful. None if timed out. Will raise an
+                 exception for all other error conditions.
+        &quot;&quot;&quot;
+        if self._saved_data:
+            return self._saved_data.pop(0)
+        return self.io_loop.run_sync(lambda: self._read(timeout))
+
+    @salt.ext.tornado.gen.coroutine
+    def read_async(self, callback):
+        &quot;&quot;&quot;
+        Asynchronously read messages and invoke a callback when they are ready.
+
+        :param callback: A callback with the received data
+        &quot;&quot;&quot;
+        while not self.connected():
+            try:
+                yield self.connect(timeout=5)
+            except StreamClosedError:
+                log.trace(
+                    &quot;Subscriber closed stream on IPC %s before connect&quot;,
+                    self.socket_path,
+                )
+                yield salt.ext.tornado.gen.sleep(1)
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(&quot;Exception occurred while Subscriber connecting: %s&quot;, exc)
+                yield salt.ext.tornado.gen.sleep(1)
+        yield self._read(None, callback)
+
+    def close(self):
+        &quot;&quot;&quot;
+        Routines to handle any cleanup before the instance shuts down.
+        Sockets and filehandles should be closed explicitly, to prevent
+        leaks.
+        &quot;&quot;&quot;
+        if self._closing:
+            return
+        super().close()
+        # This will prevent this message from showing up:
+        # '[ERROR   ] Future exception was never retrieved:
+        # StreamClosedError'
+        if self._read_stream_future is not None and self._read_stream_future.done():
+            exc = self._read_stream_future.exception()
+            if exc and not isinstance(exc, StreamClosedError):
+                log.error(&quot;Read future returned exception %r&quot;, exc)
+</PRE>
+</div>
+<div style="flex-grow: 1;">
+<h3>
+<center>
+<span>hgfs.py</span>
+<span> - </span>
+<span></span>
+</center>
+</h3>
+<HR>
+<PRE>
+&quot;&quot;&quot;
+Mercurial Fileserver Backend
+
+To enable, add ``hgfs`` to the :conf_master:`fileserver_backend` option in the
+Master config file.
+
+.. code-block:: yaml
+
+    fileserver_backend:
+      - hgfs
+
+.. note::
+    ``hg`` also works here. Prior to the 2018.3.0 release, *only* ``hg`` would
+    work.
+
+After enabling this backend, branches, bookmarks, and tags in a remote
+mercurial repository are exposed to salt as different environments. This
+feature is managed by the :conf_master:`fileserver_backend` option in the salt
+master config file.
+
+This fileserver has an additional option :conf_master:`hgfs_branch_method` that
+will set the desired branch method. Possible values are: ``branches``,
+``bookmarks``, or ``mixed``. If using ``branches`` or ``mixed``, the
+``default`` branch will be mapped to ``base``.
+
+
+.. versionchanged:: 2014.1.0
+    The :conf_master:`hgfs_base` master config parameter was added, allowing
+    for a branch other than ``default`` to be used for the ``base``
+    environment, and allowing for a ``base`` environment to be specified when
+    using an :conf_master:`hgfs_branch_method` of ``bookmarks``.
+
+
+:depends:   - mercurial
+            - python bindings for mercurial (``python-hglib``)
+&quot;&quot;&quot;
+
+
+<A NAME="0"></A>import copy
+import errno
+import fnmatch
+<FONT color="#0000ff"><div style="position:absolute;left:0"><A HREF="javascript:ZweiFrames('match75822-0.html#0',2,'match75822-top.html#0',1)"><IMG SRC="back.gif" ALT="other" BORDER="0" ALIGN="left"></A></div><B>import glob
+import hashlib
+import logging
+import os
+import shutil
+from datetime import datetime
+
+import salt.fileserver
+import salt.utils.data
+import salt.utils.files
+import salt.utils.gzip_util
+import salt.utils.hashutils
+import salt.utils.stringutils
+import salt.utils.url
+import salt.utils.versions
+from salt.exceptions import FileserverConfigError
+from salt.utils.event import tagify
+
+VALID_BRANCH_METHODS = (&quot;branches&quot;</B></FONT>, &quot;bookmarks&quot;, &quot;mixed&quot;)
+PER_REMOTE_OVERRIDES = (&quot;base&quot;, &quot;branch_method&quot;, &quot;mountpoint&quot;, &quot;root&quot;)
+
+
+# pylint: disable=import-error
+try:
+    import hglib
+
+    HAS_HG = True
+except ImportError:
+    HAS_HG = False
+# pylint: enable=import-error
+
+
+log = logging.getLogger(__name__)
+
+# Define the module's virtual name
+__virtualname__ = &quot;hgfs&quot;
+__virtual_aliases__ = (&quot;hg&quot;,)
+
+
+def __virtual__():
+    &quot;&quot;&quot;
+    Only load if mercurial is available
+    &quot;&quot;&quot;
+    if __virtualname__ not in __opts__[&quot;fileserver_backend&quot;]:
+        return False
+    if not HAS_HG:
+        log.error(
+            &quot;Mercurial fileserver backend is enabled in configuration &quot;
+            &quot;but could not be loaded, is hglib installed?&quot;
+        )
+        return False
+    if __opts__[&quot;hgfs_branch_method&quot;] not in VALID_BRANCH_METHODS:
+        log.error(
+            &quot;Invalid hgfs_branch_method '%s'. Valid methods are: %s&quot;,
+            __opts__[&quot;hgfs_branch_method&quot;],
+            VALID_BRANCH_METHODS,
+        )
+        return False
+    if salt.utils.path.which(&quot;hg&quot;) is None:
+        log.error(&quot;hgfs requested but hg executable is not available.&quot;)
+        return False
+    return __virtualname__
+
+
+def _all_branches(repo):
+    &quot;&quot;&quot;
+    Returns all branches for the specified repo
+    &quot;&quot;&quot;
+    # repo.branches() returns a list of 3-tuples consisting of
+<A NAME="2"></A>    # (branch name, rev #, nodeid)
+    # Example: [('default', 4, '7c96229269fa')]
+    branches = [
+        (salt<FONT color="#980517"><div style="position:absolute;left:0"><A HREF="javascript:ZweiFrames('match75822-0.html#2',2,'match75822-top.html#2',1)"><IMG SRC="back.gif" ALT="other" BORDER="0" ALIGN="left"></A></div><B>.utils.stringutils.to_str(x[0]), x[1], salt.utils.stringutils.to_str(x[2]))
+        for x in repo.</B></FONT>branches()
+    ]
+    return branches
+
+
+def _get_branch(repo, name):
+    &quot;&quot;&quot;
+    Find the requested branch in the specified repo
+    &quot;&quot;&quot;
+    try:
+        return [x for x in _all_branches(repo) if x[0] == name][0]
+    except IndexError:
+        return False
+
+
+def _all_bookmarks(repo):
+    &quot;&quot;&quot;
+    Returns all bookmarks for the specified repo
+    &quot;&quot;&quot;
+    # repo.bookmarks() returns a tuple containing the following:
+    #   1. A list of 3-tuples consisting of (bookmark name, rev #, nodeid)
+<A NAME="1"></A>    #   2. The index of the current bookmark (-1 if no current one)
+    # Example: ([('mymark', 4, '7c96229269fa')], -1)
+    bookmarks = [
+        (salt<FONT color="#f63526"><div style="position:absolute;left:0"><A HREF="javascript:ZweiFrames('match75822-0.html#1',2,'match75822-top.html#1',1)"><IMG SRC="back.gif" ALT="other" BORDER="0" ALIGN="left"></A></div><B>.utils.stringutils.to_str(x[0]), x[1], salt.utils.stringutils.to_str(x[2]))
+        for x in repo.</B></FONT>bookmarks()[0]
+    ]
+    return bookmarks
+
+
+def _get_bookmark(repo, name):
+    &quot;&quot;&quot;
+    Find the requested bookmark in the specified repo
+    &quot;&quot;&quot;
+    try:
+        return [x for x in _all_bookmarks(repo) if x[0] == name][0]
+    except IndexError:
+        return False
+
+
+def _all_tags(repo):
+    &quot;&quot;&quot;
+    Returns all tags for the specified repo
+    &quot;&quot;&quot;
+    # repo.tags() returns a list of 4-tuples consisting of
+    # (tag name, rev #, nodeid, islocal)
+    # Example: [('1.0', 3, '3be15e71b31a', False),
+    #           ('tip', 4, '7c96229269fa', False)]
+    # Avoid returning the special 'tip' tag.
+    return [
+        (
+            salt.utils.stringutils.to_str(x[0]),
+            x[1],
+            salt.utils.stringutils.to_str(x[2]),
+            x[3],
+        )
+        for x in repo.tags()
+        if salt.utils.stringutils.to_str(x[0]) != &quot;tip&quot;
+    ]
+
+
+def _get_tag(repo, name):
+    &quot;&quot;&quot;
+    Find the requested tag in the specified repo
+    &quot;&quot;&quot;
+    try:
+        return [x for x in _all_tags(repo) if x[0] == name][0]
+    except IndexError:
+        return False
+
+
+def _get_ref(repo, name):
+    &quot;&quot;&quot;
+    Return ref tuple if ref is in the repo.
+    &quot;&quot;&quot;
+    if name == &quot;base&quot;:
+        name = repo[&quot;base&quot;]
+    if name == repo[&quot;base&quot;] or name in envs():
+        if repo[&quot;branch_method&quot;] == &quot;branches&quot;:
+            return _get_branch(repo[&quot;repo&quot;], name) or _get_tag(repo[&quot;repo&quot;], name)
+        elif repo[&quot;branch_method&quot;] == &quot;bookmarks&quot;:
+            return _get_bookmark(repo[&quot;repo&quot;], name) or _get_tag(repo[&quot;repo&quot;], name)
+        elif repo[&quot;branch_method&quot;] == &quot;mixed&quot;:
+            return (
+                _get_branch(repo[&quot;repo&quot;], name)
+                or _get_bookmark(repo[&quot;repo&quot;], name)
+                or _get_tag(repo[&quot;repo&quot;], name)
+            )
+    return False
+
+
+def _get_manifest(repo, ref):
+    &quot;&quot;&quot;
+    Get manifest for ref
+    &quot;&quot;&quot;
+    # repo.manifest() returns a list of 5-tuples consisting of
+<A NAME="3"></A>    # ('b80de5d138758541c5f05265ad144ab9fa86d1db', '644', False, False, 'thing.sls')
+    manifest = [
+        (
+            <FONT color="#53858b"><div style="position:absolute;left:0"><A HREF="javascript:ZweiFrames('match75822-0.html#3',2,'match75822-top.html#3',1)"><IMG SRC="back.gif" ALT="other" BORDER="0" ALIGN="left"></A></div><B>salt.utils.stringutils.to_str(x[0]),
+            salt.utils.stringutils.to_str(x[1]),
+            x[</B></FONT>2],
+            x[3],
+            salt.utils.stringutils.to_str(x[4]),
+        )
+        for x in repo.manifest(rev=ref[1])
+    ]
+    return manifest
+
+
+def _failhard():
+    &quot;&quot;&quot;
+    Fatal fileserver configuration issue, raise an exception
+    &quot;&quot;&quot;
+    raise FileserverConfigError(&quot;Failed to load hg fileserver backend&quot;)
+
+
+def init():
+    &quot;&quot;&quot;
+    Return a list of hglib objects for the various hgfs remotes
+    &quot;&quot;&quot;
+    bp_ = os.path.join(__opts__[&quot;cachedir&quot;], &quot;hgfs&quot;)
+    new_remote = False
+    repos = []
+
+    per_remote_defaults = {}
+    for param in PER_REMOTE_OVERRIDES:
+        per_remote_defaults[param] = str(__opts__[&quot;hgfs_{}&quot;.format(param)])
+
+    for remote in __opts__[&quot;hgfs_remotes&quot;]:
+        repo_conf = copy.deepcopy(per_remote_defaults)
+        if isinstance(remote, dict):
+            repo_url = next(iter(remote))
+            per_remote_conf = {
+                key: str(val)
+                for key, val in salt.utils.data.repack_dictlist(
+                    remote[repo_url]
+                ).items()
+            }
+            if not per_remote_conf:
+                log.error(
+                    &quot;Invalid per-remote configuration for hgfs remote %s. If &quot;
+                    &quot;no per-remote parameters are being specified, there may &quot;
+                    &quot;be a trailing colon after the URL, which should be &quot;
+                    &quot;removed. Check the master configuration file.&quot;,
+                    repo_url,
+                )
+                _failhard()
+
+            branch_method = per_remote_conf.get(
+                &quot;branch_method&quot;, per_remote_defaults[&quot;branch_method&quot;]
+            )
+            if branch_method not in VALID_BRANCH_METHODS:
+                log.error(
+                    &quot;Invalid branch_method '%s' for remote %s. Valid &quot;
+                    &quot;branch methods are: %s. This remote will be ignored.&quot;,
+                    branch_method,
+                    repo_url,
+                    &quot;, &quot;.join(VALID_BRANCH_METHODS),
+                )
+                _failhard()
+
+            per_remote_errors = False
+            for param in (x for x in per_remote_conf if x not in PER_REMOTE_OVERRIDES):
+                log.error(
+                    &quot;Invalid configuration parameter '%s' for remote %s. &quot;
+                    &quot;Valid parameters are: %s. See the documentation for &quot;
+                    &quot;further information.&quot;,
+                    param,
+                    repo_url,
+                    &quot;, &quot;.join(PER_REMOTE_OVERRIDES),
+                )
+                per_remote_errors = True
+            if per_remote_errors:
+                _failhard()
+
+            repo_conf.update(per_remote_conf)
+        else:
+            repo_url = remote
+
+        if not isinstance(repo_url, str):
+            log.error(
+                &quot;Invalid hgfs remote %s. Remotes must be strings, you may &quot;
+                &quot;need to enclose the URL in quotes&quot;,
+                repo_url,
+            )
+            _failhard()
+
+        try:
+            repo_conf[&quot;mountpoint&quot;] = salt.utils.url.strip_proto(
+                repo_conf[&quot;mountpoint&quot;]
+            )
+        except TypeError:
+            # mountpoint not specified
+            pass
+
+        hash_type = getattr(hashlib, __opts__.get(&quot;hash_type&quot;, &quot;md5&quot;))
+        repo_hash = hash_type(repo_url.encode(&quot;utf-8&quot;)).hexdigest()
+        rp_ = os.path.join(bp_, repo_hash)
+        if not os.path.isdir(rp_):
+            os.makedirs(rp_)
+
+        if not os.listdir(rp_):
+            # Only init if the directory is empty.
+            client = hglib.init(rp_)
+            client.close()
+            new_remote = True
+        repo = None
+        try:
+            try:
+                repo = hglib.open(rp_)
+            except hglib.error.ServerError:
+                log.error(
+                    &quot;Cache path %s (corresponding remote: %s) exists but is not &quot;
+                    &quot;a valid mercurial repository. You will need to manually &quot;
+                    &quot;delete this directory on the master to continue to use this &quot;
+                    &quot;hgfs remote.&quot;,
+                    rp_,
+                    repo_url,
+                )
+                _failhard()
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(
+                    &quot;Exception '%s' encountered while initializing hgfs remote %s&quot;,
+                    exc,
+                    repo_url,
+                )
+                _failhard()
+
+            try:
+                refs = repo.config(names=b&quot;paths&quot;)
+            except hglib.error.CommandError:
+                refs = None
+
+            # Do NOT put this if statement inside the except block above. Earlier
+            # versions of hglib did not raise an exception, so we need to do it
+            # this way to support both older and newer hglib.
+            if not refs:
+                # Write an hgrc defining the remote URL
+                hgconfpath = os.path.join(rp_, &quot;.hg&quot;, &quot;hgrc&quot;)
+                with salt.utils.files.fopen(hgconfpath, &quot;w+&quot;) as hgconfig:
+                    hgconfig.write(&quot;[paths]\n&quot;)
+                    hgconfig.write(
+                        salt.utils.stringutils.to_str(&quot;default = {}\n&quot;.format(repo_url))
+                    )
+
+            repo_conf.update(
+                {
+                    &quot;repo&quot;: repo,
+                    &quot;url&quot;: repo_url,
+                    &quot;hash&quot;: repo_hash,
+                    &quot;cachedir&quot;: rp_,
+                    &quot;lockfile&quot;: os.path.join(
+                        __opts__[&quot;cachedir&quot;], &quot;hgfs&quot;, &quot;{}.update.lk&quot;.format(repo_hash)
+                    ),
+                }
+            )
+            repos.append(repo_conf)
+        finally:
+            if repo:
+                repo.close()
+
+    if new_remote:
+        remote_map = os.path.join(__opts__[&quot;cachedir&quot;], &quot;hgfs/remote_map.txt&quot;)
+        try:
+            with salt.utils.files.fopen(remote_map, &quot;w+&quot;) as fp_:
+                timestamp = datetime.now().strftime(&quot;%d %b %Y %H:%M:%S.%f&quot;)
+                fp_.write(&quot;# hgfs_remote map as of {}\n&quot;.format(timestamp))
+                for repo in repos:
+                    fp_.write(
+                        salt.utils.stringutils.to_str(
+                            &quot;{} = {}\n&quot;.format(repo[&quot;hash&quot;], repo[&quot;url&quot;])
+                        )
+                    )
+        except OSError:
+            pass
+        else:
+            log.info(&quot;Wrote new hgfs_remote map to %s&quot;, remote_map)
+
+    return repos
+
+
+def _clear_old_remotes():
+    &quot;&quot;&quot;
+    Remove cache directories for remotes no longer configured
+    &quot;&quot;&quot;
+    bp_ = os.path.join(__opts__[&quot;cachedir&quot;], &quot;hgfs&quot;)
+    try:
+        cachedir_ls = os.listdir(bp_)
+    except OSError:
+        cachedir_ls = []
+    repos = init()
+    # Remove actively-used remotes from list
+    for repo in repos:
+        try:
+            cachedir_ls.remove(repo[&quot;hash&quot;])
+        except ValueError:
+            pass
+    to_remove = []
+    for item in cachedir_ls:
+        if item in (&quot;hash&quot;, &quot;refs&quot;):
+            continue
+        path = os.path.join(bp_, item)
+        if os.path.isdir(path):
+            to_remove.append(path)
+    failed = []
+    if to_remove:
+        for rdir in to_remove:
+            try:
+                shutil.rmtree(rdir)
+            except OSError as exc:
+                log.error(&quot;Unable to remove old hgfs remote cachedir %s: %s&quot;, rdir, exc)
+                failed.append(rdir)
+            else:
+                log.debug(&quot;hgfs removed old cachedir %s&quot;, rdir)
+    for fdir in failed:
+        to_remove.remove(fdir)
+    return bool(to_remove), repos
+
+
+def clear_cache():
+    &quot;&quot;&quot;
+    Completely clear hgfs cache
+    &quot;&quot;&quot;
+    fsb_cachedir = os.path.join(__opts__[&quot;cachedir&quot;], &quot;hgfs&quot;)
+    list_cachedir = os.path.join(__opts__[&quot;cachedir&quot;], &quot;file_lists/hgfs&quot;)
+    errors = []
+    for rdir in (fsb_cachedir, list_cachedir):
+        if os.path.exists(rdir):
+            try:
+                shutil.rmtree(rdir)
+            except OSError as exc:
+                errors.append(&quot;Unable to delete {}: {}&quot;.format(rdir, exc))
+    return errors
+
+
+def clear_lock(remote=None):
+    &quot;&quot;&quot;
+    Clear update.lk
+
+    ``remote`` can either be a dictionary containing repo configuration
+    information, or a pattern. If the latter, then remotes for which the URL
+    matches the pattern will be locked.
+    &quot;&quot;&quot;
+
+    def _do_clear_lock(repo):
+        def _add_error(errlist, repo, exc):
+            msg = &quot;Unable to remove update lock for {} ({}): {} &quot;.format(
+                repo[&quot;url&quot;], repo[&quot;lockfile&quot;], exc
+            )
+            log.debug(msg)
+            errlist.append(msg)
+
+        success = []
+        failed = []
+        if os.path.exists(repo[&quot;lockfile&quot;]):
+            try:
+                os.remove(repo[&quot;lockfile&quot;])
+            except OSError as exc:
+                if exc.errno == errno.EISDIR:
+                    # Somehow this path is a directory. Should never happen
+                    # unless some wiseguy manually creates a directory at this
+                    # path, but just in case, handle it.
+                    try:
+                        shutil.rmtree(repo[&quot;lockfile&quot;])
+                    except OSError as exc:
+                        _add_error(failed, repo, exc)
+                else:
+                    _add_error(failed, repo, exc)
+            else:
+                msg = &quot;Removed lock for {}&quot;.format(repo[&quot;url&quot;])
+                log.debug(msg)
+                success.append(msg)
+        return success, failed
+
+    if isinstance(remote, dict):
+        return _do_clear_lock(remote)
+
+    cleared = []
+    errors = []
+    for repo in init():
+        try:
+            if remote:
+                try:
+                    if not fnmatch.fnmatch(repo[&quot;url&quot;], remote):
+                        continue
+                except TypeError:
+                    # remote was non-string, try again
+                    if not fnmatch.fnmatch(repo[&quot;url&quot;], str(remote)):
+                        continue
+            success, failed = _do_clear_lock(repo)
+            cleared.extend(success)
+            errors.extend(failed)
+        finally:
+            repo[&quot;repo&quot;].close()
+    return cleared, errors
+
+
+def lock(remote=None):
+    &quot;&quot;&quot;
+    Place an update.lk
+
+    ``remote`` can either be a dictionary containing repo configuration
+    information, or a pattern. If the latter, then remotes for which the URL
+    matches the pattern will be locked.
+    &quot;&quot;&quot;
+
+    def _do_lock(repo):
+        success = []
+        failed = []
+        if not os.path.exists(repo[&quot;lockfile&quot;]):
+            try:
+                with salt.utils.files.fopen(repo[&quot;lockfile&quot;], &quot;w&quot;):
+                    pass
+            except OSError as exc:
+                msg = &quot;Unable to set update lock for {} ({}): {} &quot;.format(
+                    repo[&quot;url&quot;], repo[&quot;lockfile&quot;], exc
+                )
+                log.debug(msg)
+                failed.append(msg)
+            else:
+                msg = &quot;Set lock for {}&quot;.format(repo[&quot;url&quot;])
+                log.debug(msg)
+                success.append(msg)
+        return success, failed
+
+    if isinstance(remote, dict):
+        return _do_lock(remote)
+
+    locked = []
+    errors = []
+    for repo in init():
+        try:
+            if remote:
+                try:
+                    if not fnmatch.fnmatch(repo[&quot;url&quot;], remote):
+                        continue
+                except TypeError:
+                    # remote was non-string, try again
+                    if not fnmatch.fnmatch(repo[&quot;url&quot;], str(remote)):
+                        continue
+            success, failed = _do_lock(repo)
+            locked.extend(success)
+            errors.extend(failed)
+        finally:
+            repo[&quot;repo&quot;].close()
+
+    return locked, errors
+
+
+def update():
+    &quot;&quot;&quot;
+    Execute an hg pull on all of the repos
+    &quot;&quot;&quot;
+    # data for the fileserver event
+    data = {&quot;changed&quot;: False, &quot;backend&quot;: &quot;hgfs&quot;}
+    # _clear_old_remotes runs init(), so use the value from there to avoid a
+    # second init()
+    data[&quot;changed&quot;], repos = _clear_old_remotes()
+    for repo in repos:
+        try:
+            if os.path.exists(repo[&quot;lockfile&quot;]):
+                log.warning(
+                    &quot;Update lockfile is present for hgfs remote %s, skipping. &quot;
+                    &quot;If this warning persists, it is possible that the update &quot;
+                    &quot;process was interrupted. Removing %s or running &quot;
+                    &quot;'salt-run fileserver.clear_lock hgfs' will allow updates &quot;
+                    &quot;to continue for this remote.&quot;,
+                    repo[&quot;url&quot;],
+                    repo[&quot;lockfile&quot;],
+                )
+                continue
+            _, errors = lock(repo)
+            if errors:
+                log.error(
+                    &quot;Unable to set update lock for hgfs remote %s, skipping.&quot;,
+                    repo[&quot;url&quot;],
+                )
+                continue
+            log.debug(&quot;hgfs is fetching from %s&quot;, repo[&quot;url&quot;])
+            repo[&quot;repo&quot;].open()
+            curtip = repo[&quot;repo&quot;].tip()
+            try:
+                repo[&quot;repo&quot;].pull()
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(
+                    &quot;Exception %s caught while updating hgfs remote %s&quot;,
+                    exc,
+                    repo[&quot;url&quot;],
+                    exc_info_on_loglevel=logging.DEBUG,
+                )
+            else:
+                newtip = repo[&quot;repo&quot;].tip()
+                if curtip[1] != newtip[1]:
+                    data[&quot;changed&quot;] = True
+        finally:
+            repo[&quot;repo&quot;].close()
+        clear_lock(repo)
+
+    env_cache = os.path.join(__opts__[&quot;cachedir&quot;], &quot;hgfs/envs.p&quot;)
+    if data.get(&quot;changed&quot;, False) is True or not os.path.isfile(env_cache):
+        env_cachedir = os.path.dirname(env_cache)
+        if not os.path.exists(env_cachedir):
+            os.makedirs(env_cachedir)
+        new_envs = envs(ignore_cache=True)
+        with salt.utils.files.fopen(env_cache, &quot;wb+&quot;) as fp_:
+            fp_.write(salt.payload.dumps(new_envs))
+            log.trace(&quot;Wrote env cache data to %s&quot;, env_cache)
+
+    # if there is a change, fire an event
+    if __opts__.get(&quot;fileserver_events&quot;, False):
+        with salt.utils.event.get_event(
+            &quot;master&quot;,
+            __opts__[&quot;sock_dir&quot;],
+            opts=__opts__,
+            listen=False,
+        ) as event:
+            event.fire_event(data, tagify([&quot;hgfs&quot;, &quot;update&quot;], prefix=&quot;fileserver&quot;))
+    try:
+        salt.fileserver.reap_fileserver_cache_dir(
+            os.path.join(__opts__[&quot;cachedir&quot;], &quot;hgfs/hash&quot;), find_file
+        )
+    except OSError:
+        # Hash file won't exist if no files have yet been served up
+        pass
+
+
+def _env_is_exposed(env):
+    &quot;&quot;&quot;
+    Check if an environment is exposed by comparing it against a whitelist and
+    blacklist.
+    &quot;&quot;&quot;
+    return salt.utils.stringutils.check_whitelist_blacklist(
+        env,
+        whitelist=__opts__[&quot;hgfs_saltenv_whitelist&quot;],
+        blacklist=__opts__[&quot;hgfs_saltenv_blacklist&quot;],
+    )
+
+
+def envs(ignore_cache=False):
+    &quot;&quot;&quot;
+    Return a list of refs that can be used as environments
+    &quot;&quot;&quot;
+    if not ignore_cache:
+        env_cache = os.path.join(__opts__[&quot;cachedir&quot;], &quot;hgfs/envs.p&quot;)
+        cache_match = salt.fileserver.check_env_cache(__opts__, env_cache)
+        if cache_match is not None:
+            return cache_match
+    ret = set()
+
+    for repo in init():
+        try:
+            repo[&quot;repo&quot;].open()
+            if repo[&quot;branch_method&quot;] in (&quot;branches&quot;, &quot;mixed&quot;):
+                for branch in _all_branches(repo[&quot;repo&quot;]):
+                    branch_name = branch[0]
+                    if branch_name == repo[&quot;base&quot;]:
+                        branch_name = &quot;base&quot;
+                    ret.add(branch_name)
+            if repo[&quot;branch_method&quot;] in (&quot;bookmarks&quot;, &quot;mixed&quot;):
+                for bookmark in _all_bookmarks(repo[&quot;repo&quot;]):
+                    bookmark_name = bookmark[0]
+                    if bookmark_name == repo[&quot;base&quot;]:
+                        bookmark_name = &quot;base&quot;
+                    ret.add(bookmark_name)
+            ret.update([x[0] for x in _all_tags(repo[&quot;repo&quot;])])
+        finally:
+            repo[&quot;repo&quot;].close()
+    return [x for x in sorted(ret) if _env_is_exposed(x)]
+
+
+def find_file(path, tgt_env=&quot;base&quot;, **kwargs):  # pylint: disable=W0613
+    &quot;&quot;&quot;
+    Find the first file to match the path and ref, read the file out of hg
+    and send the path to the newly cached file
+    &quot;&quot;&quot;
+    fnd = {&quot;path&quot;: &quot;&quot;, &quot;rel&quot;: &quot;&quot;}
+    if os.path.isabs(path) or tgt_env not in envs():
+        return fnd
+
+    dest = os.path.join(__opts__[&quot;cachedir&quot;], &quot;hgfs/refs&quot;, tgt_env, path)
+    hashes_glob = os.path.join(
+        __opts__[&quot;cachedir&quot;], &quot;hgfs/hash&quot;, tgt_env, &quot;{}.hash.*&quot;.format(path)
+    )
+    blobshadest = os.path.join(
+        __opts__[&quot;cachedir&quot;], &quot;hgfs/hash&quot;, tgt_env, &quot;{}.hash.blob_sha1&quot;.format(path)
+    )
+    lk_fn = os.path.join(
+        __opts__[&quot;cachedir&quot;], &quot;hgfs/hash&quot;, tgt_env, &quot;{}.lk&quot;.format(path)
+    )
+    destdir = os.path.dirname(dest)
+    hashdir = os.path.dirname(blobshadest)
+    if not os.path.isdir(destdir):
+        try:
+            os.makedirs(destdir)
+        except OSError:
+            # Path exists and is a file, remove it and retry
+            os.remove(destdir)
+            os.makedirs(destdir)
+    if not os.path.isdir(hashdir):
+        try:
+            os.makedirs(hashdir)
+        except OSError:
+            # Path exists and is a file, remove it and retry
+            os.remove(hashdir)
+            os.makedirs(hashdir)
+
+    for repo in init():
+        try:
+            if repo[&quot;mountpoint&quot;] and not path.startswith(
+                repo[&quot;mountpoint&quot;] + os.path.sep
+            ):
+                continue
+            repo_path = path[len(repo[&quot;mountpoint&quot;]) :].lstrip(os.path.sep)
+            if repo[&quot;root&quot;]:
+                repo_path = os.path.join(repo[&quot;root&quot;], repo_path)
+
+            repo[&quot;repo&quot;].open()
+            ref = _get_ref(repo, tgt_env)
+            if not ref:
+                # Branch or tag not found in repo, try the next
+                repo[&quot;repo&quot;].close()
+                continue
+            salt.fileserver.wait_lock(lk_fn, dest)
+            if os.path.isfile(blobshadest) and os.path.isfile(dest):
+                with salt.utils.files.fopen(blobshadest, &quot;r&quot;) as fp_:
+                    sha = fp_.read()
+                    if sha == ref[2]:
+                        fnd[&quot;rel&quot;] = path
+                        fnd[&quot;path&quot;] = dest
+                        repo[&quot;repo&quot;].close()
+                        return fnd
+            try:
+                repo[&quot;repo&quot;].cat(
+                    [salt.utils.stringutils.to_bytes(&quot;path:{}&quot;.format(repo_path))],
+                    rev=ref[2],
+                    output=dest,
+                )
+            except hglib.error.CommandError:
+                repo[&quot;repo&quot;].close()
+                continue
+            with salt.utils.files.fopen(lk_fn, &quot;w&quot;):
+                pass
+            for filename in glob.glob(hashes_glob):
+                try:
+                    os.remove(filename)
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            with salt.utils.files.fopen(blobshadest, &quot;w+&quot;) as fp_:
+                fp_.write(salt.utils.stringutils.to_str(ref[2]))
+            try:
+                os.remove(lk_fn)
+            except OSError:
+                pass
+            fnd[&quot;rel&quot;] = path
+            fnd[&quot;path&quot;] = dest
+            try:
+                # Converting the stat result to a list, the elements of the
+                # list correspond to the following stat_result params:
+                # 0 =&gt; st_mode=33188
+                # 1 =&gt; st_ino=10227377
+                # 2 =&gt; st_dev=65026
+                # 3 =&gt; st_nlink=1
+                # 4 =&gt; st_uid=1000
+                # 5 =&gt; st_gid=1000
+                # 6 =&gt; st_size=1056233
+                # 7 =&gt; st_atime=1468284229
+                # 8 =&gt; st_mtime=1456338235
+                # 9 =&gt; st_ctime=1456338235
+                fnd[&quot;stat&quot;] = list(os.stat(dest))
+            except Exception:  # pylint: disable=broad-except
+                pass
+        finally:
+            repo[&quot;repo&quot;].close()
+        return fnd
+    return fnd
+
+
+def serve_file(load, fnd):
+    &quot;&quot;&quot;
+    Return a chunk from a file based on the data received
+    &quot;&quot;&quot;
+    if &quot;env&quot; in load:
+        # &quot;env&quot; is not supported; Use &quot;saltenv&quot;.
+        load.pop(&quot;env&quot;)
+
+    ret = {&quot;data&quot;: &quot;&quot;, &quot;dest&quot;: &quot;&quot;}
+    if not all(x in load for x in (&quot;path&quot;, &quot;loc&quot;, &quot;saltenv&quot;)):
+        return ret
+    if not fnd[&quot;path&quot;]:
+        return ret
+    ret[&quot;dest&quot;] = fnd[&quot;rel&quot;]
+    gzip = load.get(&quot;gzip&quot;, None)
+    fpath = os.path.normpath(fnd[&quot;path&quot;])
+    with salt.utils.files.fopen(fpath, &quot;rb&quot;) as fp_:
+        fp_.seek(load[&quot;loc&quot;])
+        data = fp_.read(__opts__[&quot;file_buffer_size&quot;])
+        if data and not salt.utils.files.is_binary(fpath):
+            data = data.decode(__salt_system_encoding__)
+        if gzip and data:
+            data = salt.utils.gzip_util.compress(data, gzip)
+            ret[&quot;gzip&quot;] = gzip
+        ret[&quot;data&quot;] = data
+    return ret
+
+
+def file_hash(load, fnd):
+    &quot;&quot;&quot;
+    Return a file hash, the hash type is set in the master config file
+    &quot;&quot;&quot;
+    if &quot;env&quot; in load:
+        # &quot;env&quot; is not supported; Use &quot;saltenv&quot;.
+        load.pop(&quot;env&quot;)
+
+    if not all(x in load for x in (&quot;path&quot;, &quot;saltenv&quot;)):
+        return &quot;&quot;
+    ret = {&quot;hash_type&quot;: __opts__[&quot;hash_type&quot;]}
+    relpath = fnd[&quot;rel&quot;]
+    path = fnd[&quot;path&quot;]
+    hashdest = os.path.join(
+        __opts__[&quot;cachedir&quot;],
+        &quot;hgfs/hash&quot;,
+        load[&quot;saltenv&quot;],
+        &quot;{}.hash.{}&quot;.format(relpath, __opts__[&quot;hash_type&quot;]),
+    )
+    if not os.path.isfile(hashdest):
+        ret[&quot;hsum&quot;] = salt.utils.hashutils.get_hash(path, __opts__[&quot;hash_type&quot;])
+        with salt.utils.files.fopen(hashdest, &quot;w+&quot;) as fp_:
+            fp_.write(ret[&quot;hsum&quot;])
+        return ret
+    else:
+        with salt.utils.files.fopen(hashdest, &quot;rb&quot;) as fp_:
+            ret[&quot;hsum&quot;] = salt.utils.stringutils.to_unicode(fp_.read())
+        return ret
+
+
+def _file_lists(load, form):
+    &quot;&quot;&quot;
+    Return a dict containing the file lists for files and dirs
+    &quot;&quot;&quot;
+    if &quot;env&quot; in load:
+        # &quot;env&quot; is not supported; Use &quot;saltenv&quot;.
+        load.pop(&quot;env&quot;)
+
+    list_cachedir = os.path.join(__opts__[&quot;cachedir&quot;], &quot;file_lists/hgfs&quot;)
+    if not os.path.isdir(list_cachedir):
+        try:
+            os.makedirs(list_cachedir)
+        except os.error:
+            log.critical(&quot;Unable to make cachedir %s&quot;, list_cachedir)
+            return []
+    list_cache = os.path.join(list_cachedir, &quot;{}.p&quot;.format(load[&quot;saltenv&quot;]))
+    w_lock = os.path.join(list_cachedir, &quot;.{}.w&quot;.format(load[&quot;saltenv&quot;]))
+    cache_match, refresh_cache, save_cache = salt.fileserver.check_file_list_cache(
+        __opts__, form, list_cache, w_lock
+    )
+    if cache_match is not None:
+        return cache_match
+    if refresh_cache:
+        ret = {}
+        ret[&quot;files&quot;] = _get_file_list(load)
+        ret[&quot;dirs&quot;] = _get_dir_list(load)
+        if save_cache:
+            salt.fileserver.write_file_list_cache(__opts__, ret, list_cache, w_lock)
+        return ret.get(form, [])
+    # Shouldn't get here, but if we do, this prevents a TypeError
+    return []
+
+
+def file_list(load):
+    &quot;&quot;&quot;
+    Return a list of all files on the file server in a specified environment
+    &quot;&quot;&quot;
+    return _file_lists(load, &quot;files&quot;)
+
+
+def _get_file_list(load):
+    &quot;&quot;&quot;
+    Get a list of all files on the file server in a specified environment
+    &quot;&quot;&quot;
+    if &quot;env&quot; in load:
+        # &quot;env&quot; is not supported; Use &quot;saltenv&quot;.
+        load.pop(&quot;env&quot;)
+
+    if &quot;saltenv&quot; not in load or load[&quot;saltenv&quot;] not in envs():
+        return []
+    ret = set()
+    for repo in init():
+        try:
+            repo[&quot;repo&quot;].open()
+            ref = _get_ref(repo, load[&quot;saltenv&quot;])
+            if ref:
+                manifest = _get_manifest(repo[&quot;repo&quot;], ref=ref)
+                for tup in manifest:
+                    relpath = os.path.relpath(tup[4], repo[&quot;root&quot;])
+                    # Don't add files outside the hgfs_root
+                    if not relpath.startswith(&quot;../&quot;):
+                        ret.add(os.path.join(repo[&quot;mountpoint&quot;], relpath))
+        finally:
+            repo[&quot;repo&quot;].close()
+    return sorted(ret)
+
+
+def file_list_emptydirs(load):  # pylint: disable=W0613
+    &quot;&quot;&quot;
+    Return a list of all empty directories on the master
+    &quot;&quot;&quot;
+    # Cannot have empty dirs in hg
+    return []
+
+
+def dir_list(load):
+    &quot;&quot;&quot;
+    Return a list of all directories on the master
+    &quot;&quot;&quot;
+    return _file_lists(load, &quot;dirs&quot;)
+
+
+def _get_dir_list(load):
+    &quot;&quot;&quot;
+    Get a list of all directories on the master
+    &quot;&quot;&quot;
+    if &quot;env&quot; in load:
+        # &quot;env&quot; is not supported; Use &quot;saltenv&quot;.
+        load.pop(&quot;env&quot;)
+
+    if &quot;saltenv&quot; not in load or load[&quot;saltenv&quot;] not in envs():
+        return []
+    ret = set()
+    for repo in init():
+        try:
+            repo[&quot;repo&quot;].open()
+            ref = _get_ref(repo, load[&quot;saltenv&quot;])
+            if ref:
+                manifest = _get_manifest(repo[&quot;repo&quot;], ref=ref)
+                for tup in manifest:
+                    filepath = tup[4]
+                    split = filepath.rsplit(&quot;/&quot;, 1)
+                    while len(split) &gt; 1:
+                        relpath = os.path.relpath(split[0], repo[&quot;root&quot;])
+                        # Don't add '.'
+                        if relpath != &quot;.&quot;:
+                            # Don't add files outside the hgfs_root
+                            if not relpath.startswith(&quot;../&quot;):
+                                ret.add(os.path.join(repo[&quot;mountpoint&quot;], relpath))
+                        split = split[0].rsplit(&quot;/&quot;, 1)
+        finally:
+            repo[&quot;repo&quot;].close()
+    if repo[&quot;mountpoint&quot;]:
+        ret.add(repo[&quot;mountpoint&quot;])
+    return sorted(ret)
+</PRE>
+</div>
+  </div>
+</body>
+</html>

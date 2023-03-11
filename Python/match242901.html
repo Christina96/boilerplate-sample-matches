@@ -1,0 +1,1941 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML><HEAD><TITLE>Matches for kubernetesmod.py & hashutil.py</TITLE>
+<META http-equiv="Content-Type" content="text/html; charset=UTF-8">
+</HEAD>
+<body>
+  <div style="align-items: center; display: flex; justify-content: space-around;">
+    <div>
+      <h3 align="center">
+Matches for kubernetesmod.py & hashutil.py
+      </h3>
+      <h1 align="center">
+        1.1%
+      </h1>
+      <center>
+        <a href="index.html" target="_top">
+          INDEX
+        </a>
+        <span>-</span>
+        <a href="help-en.html" target="_top">
+          HELP
+        </a>
+      </center>
+    </div>
+    <div>
+<TABLE BORDER="1" CELLSPACING="0" BGCOLOR="#d0d0d0">
+<TR><TH><TH>kubernetesmod.py (0.64794815%)<TH>hashutil.py (6.557377%)<TH>Tokens
+<TR><TD BGCOLOR="#0000ff"><FONT COLOR="#0000ff">-</FONT><TD><A HREF="javascript:ZweiFrames('match242901-0.html#0',2,'match242901-1.html#0',3)" NAME="0">(1466-1469)<TD><A HREF="javascript:ZweiFrames('match242901-0.html#0',2,'match242901-1.html#0',3)" NAME="0">(66-71)</A><TD ALIGN=center><FONT COLOR="#ff0000">12</FONT>
+</TABLE>
+    </div>
+  </div>
+  <hr>
+  <div style="display: flex;">
+<div style="flex-grow: 1;">
+<h3>
+<center>
+<span>kubernetesmod.py</span>
+<span> - </span>
+<span></span>
+</center>
+</h3>
+<HR>
+<PRE>
+&quot;&quot;&quot;
+Module for handling kubernetes calls.
+
+:optdepends:    - kubernetes Python client
+:configuration: The k8s API settings are provided either in a pillar, in
+    the minion's config file, or in master's config file::
+
+        kubernetes.kubeconfig: '/path/to/kubeconfig'
+        kubernetes.kubeconfig-data: '&lt;base64 encoded kubeconfig content'
+        kubernetes.context: 'context'
+
+These settings can be overridden by adding `context and `kubeconfig` or
+`kubeconfig_data` parameters when calling a function.
+
+The data format for `kubernetes.kubeconfig-data` value is the content of
+`kubeconfig` base64 encoded in one line.
+
+Only `kubeconfig` or `kubeconfig-data` should be provided. In case both are
+provided `kubeconfig` entry is preferred.
+
+.. code-block:: bash
+
+    salt '*' kubernetes.nodes kubeconfig=/etc/salt/k8s/kubeconfig context=minikube
+
+.. versionadded:: 2017.7.0
+.. versionchanged:: 2019.2.0
+
+.. warning::
+
+    Configuration options changed in 2019.2.0. The following configuration options have been removed:
+
+    - kubernetes.user
+    - kubernetes.password
+    - kubernetes.api_url
+    - kubernetes.certificate-authority-data/file
+    - kubernetes.client-certificate-data/file
+    - kubernetes.client-key-data/file
+
+    Please use now:
+
+    - kubernetes.kubeconfig or kubernetes.kubeconfig-data
+    - kubernetes.context
+
+&quot;&quot;&quot;
+
+import base64
+import errno
+import logging
+import os.path
+import signal
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+
+import salt.utils.files
+import salt.utils.platform
+import salt.utils.templates
+import salt.utils.yaml
+from salt.exceptions import CommandExecutionError, TimeoutError
+
+try:
+    import kubernetes  # pylint: disable=import-self
+    import kubernetes.client
+    from kubernetes.client.rest import ApiException
+    from urllib3.exceptions import HTTPError
+
+    # pylint: disable=no-name-in-module
+    try:
+        # There is an API change in Kubernetes &gt;= 2.0.0.
+        from kubernetes.client import V1beta1Deployment as AppsV1beta1Deployment
+        from kubernetes.client import V1beta1DeploymentSpec as AppsV1beta1DeploymentSpec
+    except ImportError:
+        from kubernetes.client import AppsV1beta1Deployment
+        from kubernetes.client import AppsV1beta1DeploymentSpec
+    # pylint: enable=no-name-in-module
+
+    HAS_LIBS = True
+except ImportError:
+    HAS_LIBS = False
+
+log = logging.getLogger(__name__)
+
+__virtualname__ = &quot;kubernetes&quot;
+
+
+def __virtual__():
+    &quot;&quot;&quot;
+    Check dependencies
+    &quot;&quot;&quot;
+    if HAS_LIBS:
+        return __virtualname__
+
+    return False, &quot;python kubernetes library not found&quot;
+
+
+if not salt.utils.platform.is_windows():
+
+    @contextmanager
+    def _time_limit(seconds):
+        def signal_handler(signum, frame):
+            raise TimeoutError
+
+        signal.signal(signal.SIGALRM, signal_handler)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+
+    POLLING_TIME_LIMIT = 30
+
+
+def _setup_conn_old(**kwargs):
+    &quot;&quot;&quot;
+    Setup kubernetes API connection singleton the old way
+    &quot;&quot;&quot;
+    host = __salt__[&quot;config.option&quot;](&quot;kubernetes.api_url&quot;, &quot;http://localhost:8080&quot;)
+    username = __salt__[&quot;config.option&quot;](&quot;kubernetes.user&quot;)
+    password = __salt__[&quot;config.option&quot;](&quot;kubernetes.password&quot;)
+    ca_cert = __salt__[&quot;config.option&quot;](&quot;kubernetes.certificate-authority-data&quot;)
+    client_cert = __salt__[&quot;config.option&quot;](&quot;kubernetes.client-certificate-data&quot;)
+    client_key = __salt__[&quot;config.option&quot;](&quot;kubernetes.client-key-data&quot;)
+    ca_cert_file = __salt__[&quot;config.option&quot;](&quot;kubernetes.certificate-authority-file&quot;)
+    client_cert_file = __salt__[&quot;config.option&quot;](&quot;kubernetes.client-certificate-file&quot;)
+    client_key_file = __salt__[&quot;config.option&quot;](&quot;kubernetes.client-key-file&quot;)
+
+    # Override default API settings when settings are provided
+    if &quot;api_url&quot; in kwargs:
+        host = kwargs.get(&quot;api_url&quot;)
+
+    if &quot;api_user&quot; in kwargs:
+        username = kwargs.get(&quot;api_user&quot;)
+
+    if &quot;api_password&quot; in kwargs:
+        password = kwargs.get(&quot;api_password&quot;)
+
+    if &quot;api_certificate_authority_file&quot; in kwargs:
+        ca_cert_file = kwargs.get(&quot;api_certificate_authority_file&quot;)
+
+    if &quot;api_client_certificate_file&quot; in kwargs:
+        client_cert_file = kwargs.get(&quot;api_client_certificate_file&quot;)
+
+    if &quot;api_client_key_file&quot; in kwargs:
+        client_key_file = kwargs.get(&quot;api_client_key_file&quot;)
+
+    if (
+        kubernetes.client.configuration.host != host
+        or kubernetes.client.configuration.user != username
+        or kubernetes.client.configuration.password != password
+    ):
+        # Recreates API connection if settings are changed
+        kubernetes.client.configuration.__init__()
+
+    kubernetes.client.configuration.host = host
+    kubernetes.client.configuration.user = username
+    kubernetes.client.configuration.passwd = password
+
+    if ca_cert_file:
+        kubernetes.client.configuration.ssl_ca_cert = ca_cert_file
+    elif ca_cert:
+        with tempfile.NamedTemporaryFile(prefix=&quot;salt-kube-&quot;, delete=False) as ca:
+            ca.write(base64.b64decode(ca_cert))
+            kubernetes.client.configuration.ssl_ca_cert = ca.name
+    else:
+        kubernetes.client.configuration.ssl_ca_cert = None
+
+    if client_cert_file:
+        kubernetes.client.configuration.cert_file = client_cert_file
+    elif client_cert:
+        with tempfile.NamedTemporaryFile(prefix=&quot;salt-kube-&quot;, delete=False) as c:
+            c.write(base64.b64decode(client_cert))
+            kubernetes.client.configuration.cert_file = c.name
+    else:
+        kubernetes.client.configuration.cert_file = None
+
+    if client_key_file:
+        kubernetes.client.configuration.key_file = client_key_file
+    elif client_key:
+        with tempfile.NamedTemporaryFile(prefix=&quot;salt-kube-&quot;, delete=False) as k:
+            k.write(base64.b64decode(client_key))
+            kubernetes.client.configuration.key_file = k.name
+    else:
+        kubernetes.client.configuration.key_file = None
+    return {}
+
+
+# pylint: disable=no-member
+def _setup_conn(**kwargs):
+    &quot;&quot;&quot;
+    Setup kubernetes API connection singleton
+    &quot;&quot;&quot;
+    kubeconfig = kwargs.get(&quot;kubeconfig&quot;) or __salt__[&quot;config.option&quot;](
+        &quot;kubernetes.kubeconfig&quot;
+    )
+    kubeconfig_data = kwargs.get(&quot;kubeconfig_data&quot;) or __salt__[&quot;config.option&quot;](
+        &quot;kubernetes.kubeconfig-data&quot;
+    )
+    context = kwargs.get(&quot;context&quot;) or __salt__[&quot;config.option&quot;](&quot;kubernetes.context&quot;)
+
+    if (kubeconfig_data and not kubeconfig) or (
+        kubeconfig_data and kwargs.get(&quot;kubeconfig_data&quot;)
+    ):
+        with tempfile.NamedTemporaryFile(
+            prefix=&quot;salt-kubeconfig-&quot;, delete=False
+        ) as kcfg:
+            kcfg.write(base64.b64decode(kubeconfig_data))
+            kubeconfig = kcfg.name
+
+    if not (kubeconfig and context):
+        if kwargs.get(&quot;api_url&quot;) or __salt__[&quot;config.option&quot;](&quot;kubernetes.api_url&quot;):
+            try:
+                return _setup_conn_old(**kwargs)
+            except Exception:  # pylint: disable=broad-except
+                raise CommandExecutionError(
+                    &quot;Old style kubernetes configuration is only supported up to&quot;
+                    &quot; python-kubernetes 2.0.0&quot;
+                )
+        else:
+            raise CommandExecutionError(
+                &quot;Invalid kubernetes configuration. Parameter 'kubeconfig' and 'context'&quot;
+                &quot; are required.&quot;
+            )
+    kubernetes.config.load_kube_config(config_file=kubeconfig, context=context)
+
+    # The return makes unit testing easier
+    return {&quot;kubeconfig&quot;: kubeconfig, &quot;context&quot;: context}
+
+
+def _cleanup_old(**kwargs):
+    try:
+        ca = kubernetes.client.configuration.ssl_ca_cert
+        cert = kubernetes.client.configuration.cert_file
+        key = kubernetes.client.configuration.key_file
+        if (
+            cert
+            and os.path.exists(cert)
+            and os.path.basename(cert).startswith(&quot;salt-kube-&quot;)
+        ):
+            salt.utils.files.safe_rm(cert)
+        if (
+            key
+            and os.path.exists(key)
+            and os.path.basename(key).startswith(&quot;salt-kube-&quot;)
+        ):
+            salt.utils.files.safe_rm(key)
+        if ca and os.path.exists(ca) and os.path.basename(ca).startswith(&quot;salt-kube-&quot;):
+            salt.utils.files.safe_rm(ca)
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+
+def _cleanup(**kwargs):
+    if not kwargs:
+        return _cleanup_old(**kwargs)
+
+    if &quot;kubeconfig&quot; in kwargs:
+        kubeconfig = kwargs.get(&quot;kubeconfig&quot;)
+        if kubeconfig and os.path.basename(kubeconfig).startswith(&quot;salt-kubeconfig-&quot;):
+            try:
+                os.unlink(kubeconfig)
+            except OSError as err:
+                if err.errno != errno.ENOENT:
+                    log.exception(err)
+
+
+def ping(**kwargs):
+    &quot;&quot;&quot;
+    Checks connections with the kubernetes API server.
+    Returns True if the connection can be established, False otherwise.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.ping
+    &quot;&quot;&quot;
+    status = True
+    try:
+        nodes(**kwargs)
+    except CommandExecutionError:
+        status = False
+
+    return status
+
+
+def nodes(**kwargs):
+    &quot;&quot;&quot;
+    Return the names of the nodes composing the kubernetes cluster
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.nodes
+        salt '*' kubernetes.nodes kubeconfig=/etc/salt/k8s/kubeconfig context=minikube
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.list_node()
+
+        return [
+            k8s_node[&quot;metadata&quot;][&quot;name&quot;]
+            for k8s_node in api_response.to_dict().get(&quot;items&quot;)
+        ]
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;list_node&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def node(name, **kwargs):
+    &quot;&quot;&quot;
+    Return the details of the node identified by the specified name
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.node name='minikube'
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.list_node()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;list_node&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+    for k8s_node in api_response.items:
+        if k8s_node.metadata.name == name:
+            return k8s_node.to_dict()
+
+    return None
+
+
+def node_labels(name, **kwargs):
+    &quot;&quot;&quot;
+    Return the labels of the node identified by the specified name
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.node_labels name=&quot;minikube&quot;
+    &quot;&quot;&quot;
+    match = node(name, **kwargs)
+
+    if match is not None:
+        return match[&quot;metadata&quot;][&quot;labels&quot;]
+
+    return {}
+
+
+def node_add_label(node_name, label_name, label_value, **kwargs):
+    &quot;&quot;&quot;
+    Set the value of the label identified by `label_name` to `label_value` on
+    the node identified by the name `node_name`.
+    Creates the label if not present.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.node_add_label node_name=&quot;minikube&quot; \
+            label_name=&quot;foo&quot; label_value=&quot;bar&quot;
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        body = {&quot;metadata&quot;: {&quot;labels&quot;: {label_name: label_value}}}
+        api_response = api_instance.patch_node(node_name, body)
+        return api_response
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;patch_node&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+    return None
+
+
+def node_remove_label(node_name, label_name, **kwargs):
+    &quot;&quot;&quot;
+    Removes the label identified by `label_name` from
+    the node identified by the name `node_name`.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.node_remove_label node_name=&quot;minikube&quot; \
+            label_name=&quot;foo&quot;
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        body = {&quot;metadata&quot;: {&quot;labels&quot;: {label_name: None}}}
+        api_response = api_instance.patch_node(node_name, body)
+        return api_response
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;patch_node&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+    return None
+
+
+def namespaces(**kwargs):
+    &quot;&quot;&quot;
+    Return the names of the available namespaces
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.namespaces
+        salt '*' kubernetes.namespaces kubeconfig=/etc/salt/k8s/kubeconfig context=minikube
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.list_namespace()
+
+        return [nms[&quot;metadata&quot;][&quot;name&quot;] for nms in api_response.to_dict().get(&quot;items&quot;)]
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;list_namespace&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def deployments(namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Return a list of kubernetes deployments defined in the namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.deployments
+        salt '*' kubernetes.deployments namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.ExtensionsV1beta1Api()
+        api_response = api_instance.list_namespaced_deployment(namespace)
+
+        return [dep[&quot;metadata&quot;][&quot;name&quot;] for dep in api_response.to_dict().get(&quot;items&quot;)]
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling &quot;
+                &quot;ExtensionsV1beta1Api-&gt;list_namespaced_deployment&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def services(namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Return a list of kubernetes services defined in the namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.services
+        salt '*' kubernetes.services namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.list_namespaced_service(namespace)
+
+        return [srv[&quot;metadata&quot;][&quot;name&quot;] for srv in api_response.to_dict().get(&quot;items&quot;)]
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;list_namespaced_service&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def pods(namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Return a list of kubernetes pods defined in the namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.pods
+        salt '*' kubernetes.pods namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.list_namespaced_pod(namespace)
+
+        return [pod[&quot;metadata&quot;][&quot;name&quot;] for pod in api_response.to_dict().get(&quot;items&quot;)]
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;list_namespaced_pod&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def secrets(namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Return a list of kubernetes secrets defined in the namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.secrets
+        salt '*' kubernetes.secrets namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.list_namespaced_secret(namespace)
+
+        return [
+            secret[&quot;metadata&quot;][&quot;name&quot;] for secret in api_response.to_dict().get(&quot;items&quot;)
+        ]
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;list_namespaced_secret&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def configmaps(namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Return a list of kubernetes configmaps defined in the namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.configmaps
+        salt '*' kubernetes.configmaps namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.list_namespaced_config_map(namespace)
+
+        return [
+            secret[&quot;metadata&quot;][&quot;name&quot;] for secret in api_response.to_dict().get(&quot;items&quot;)
+        ]
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling CoreV1Api-&gt;list_namespaced_config_map&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def show_deployment(name, namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Return the kubernetes deployment defined by name and namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.show_deployment my-nginx default
+        salt '*' kubernetes.show_deployment name=my-nginx namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.ExtensionsV1beta1Api()
+        api_response = api_instance.read_namespaced_deployment(name, namespace)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling &quot;
+                &quot;ExtensionsV1beta1Api-&gt;read_namespaced_deployment&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def show_service(name, namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Return the kubernetes service defined by name and namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.show_service my-nginx default
+        salt '*' kubernetes.show_service name=my-nginx namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.read_namespaced_service(name, namespace)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;read_namespaced_service&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def show_pod(name, namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Return POD information for a given pod name defined in the namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.show_pod guestbook-708336848-fqr2x
+        salt '*' kubernetes.show_pod guestbook-708336848-fqr2x namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.read_namespaced_pod(name, namespace)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;read_namespaced_pod&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def show_namespace(name, **kwargs):
+    &quot;&quot;&quot;
+    Return information for a given namespace defined by the specified name
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.show_namespace kube-system
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.read_namespace(name)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;read_namespace&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def show_secret(name, namespace=&quot;default&quot;, decode=False, **kwargs):
+    &quot;&quot;&quot;
+    Return the kubernetes secret defined by name and namespace.
+    The secrets can be decoded if specified by the user. Warning: this has
+    security implications.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.show_secret confidential default
+        salt '*' kubernetes.show_secret name=confidential namespace=default
+        salt '*' kubernetes.show_secret name=confidential decode=True
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.read_namespaced_secret(name, namespace)
+
+        if api_response.data and (decode or decode == &quot;True&quot;):
+            for key in api_response.data:
+                value = api_response.data[key]
+                api_response.data[key] = base64.b64decode(value)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;read_namespaced_secret&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def show_configmap(name, namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Return the kubernetes configmap defined by name and namespace.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.show_configmap game-config default
+        salt '*' kubernetes.show_configmap name=game-config namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.read_namespaced_config_map(name, namespace)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling CoreV1Api-&gt;read_namespaced_config_map&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def delete_deployment(name, namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Deletes the kubernetes deployment defined by name and namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.delete_deployment my-nginx
+        salt '*' kubernetes.delete_deployment name=my-nginx namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    body = kubernetes.client.V1DeleteOptions(orphan_dependents=True)
+
+    try:
+        api_instance = kubernetes.client.ExtensionsV1beta1Api()
+        api_response = api_instance.delete_namespaced_deployment(
+            name=name, namespace=namespace, body=body
+        )
+        mutable_api_response = api_response.to_dict()
+        if not salt.utils.platform.is_windows():
+            try:
+                with _time_limit(POLLING_TIME_LIMIT):
+                    while show_deployment(name, namespace) is not None:
+                        time.sleep(1)
+                    else:  # pylint: disable=useless-else-on-loop
+                        mutable_api_response[&quot;code&quot;] = 200
+            except TimeoutError:
+                pass
+        else:
+            # Windows has not signal.alarm implementation, so we are just falling
+            # back to loop-counting.
+            for i in range(60):
+                if show_deployment(name, namespace) is None:
+                    mutable_api_response[&quot;code&quot;] = 200
+                    break
+                else:
+                    time.sleep(1)
+        if mutable_api_response[&quot;code&quot;] != 200:
+            log.warning(
+                &quot;Reached polling time limit. Deployment is not yet &quot;
+                &quot;deleted, but we are backing off. Sorry, but you'll &quot;
+                &quot;have to check manually.&quot;
+            )
+        return mutable_api_response
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling &quot;
+                &quot;ExtensionsV1beta1Api-&gt;delete_namespaced_deployment&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def delete_service(name, namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Deletes the kubernetes service defined by name and namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.delete_service my-nginx default
+        salt '*' kubernetes.delete_service name=my-nginx namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.delete_namespaced_service(
+            name=name, namespace=namespace
+        )
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;delete_namespaced_service&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def delete_pod(name, namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Deletes the kubernetes pod defined by name and namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.delete_pod guestbook-708336848-5nl8c default
+        salt '*' kubernetes.delete_pod name=guestbook-708336848-5nl8c namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    body = kubernetes.client.V1DeleteOptions(orphan_dependents=True)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.delete_namespaced_pod(
+            name=name, namespace=namespace, body=body
+        )
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;delete_namespaced_pod&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def delete_namespace(name, **kwargs):
+    &quot;&quot;&quot;
+    Deletes the kubernetes namespace defined by name
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.delete_namespace salt
+        salt '*' kubernetes.delete_namespace name=salt
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    body = kubernetes.client.V1DeleteOptions(orphan_dependents=True)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.delete_namespace(name=name, body=body)
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;delete_namespace&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def delete_secret(name, namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Deletes the kubernetes secret defined by name and namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.delete_secret confidential default
+        salt '*' kubernetes.delete_secret name=confidential namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    body = kubernetes.client.V1DeleteOptions(orphan_dependents=True)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.delete_namespaced_secret(
+            name=name, namespace=namespace, body=body
+        )
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;delete_namespaced_secret&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def delete_configmap(name, namespace=&quot;default&quot;, **kwargs):
+    &quot;&quot;&quot;
+    Deletes the kubernetes configmap defined by name and namespace
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.delete_configmap settings default
+        salt '*' kubernetes.delete_configmap name=settings namespace=default
+    &quot;&quot;&quot;
+    cfg = _setup_conn(**kwargs)
+    body = kubernetes.client.V1DeleteOptions(orphan_dependents=True)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.delete_namespaced_config_map(
+            name=name, namespace=namespace, body=body
+        )
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling CoreV1Api-&gt;delete_namespaced_config_map&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def create_deployment(
+    name, namespace, metadata, spec, source, template, saltenv, **kwargs
+):
+    &quot;&quot;&quot;
+    Creates the kubernetes deployment as defined by the user.
+    &quot;&quot;&quot;
+    body = __create_object_body(
+        kind=&quot;Deployment&quot;,
+        obj_class=AppsV1beta1Deployment,
+        spec_creator=__dict_to_deployment_spec,
+        name=name,
+        namespace=namespace,
+        metadata=metadata,
+        spec=spec,
+        source=source,
+        template=template,
+        saltenv=saltenv,
+    )
+
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.ExtensionsV1beta1Api()
+        api_response = api_instance.create_namespaced_deployment(namespace, body)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling &quot;
+                &quot;ExtensionsV1beta1Api-&gt;create_namespaced_deployment&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def create_pod(name, namespace, metadata, spec, source, template, saltenv, **kwargs):
+    &quot;&quot;&quot;
+    Creates the kubernetes deployment as defined by the user.
+    &quot;&quot;&quot;
+    body = __create_object_body(
+        kind=&quot;Pod&quot;,
+        obj_class=kubernetes.client.V1Pod,
+        spec_creator=__dict_to_pod_spec,
+        name=name,
+        namespace=namespace,
+        metadata=metadata,
+        spec=spec,
+        source=source,
+        template=template,
+        saltenv=saltenv,
+    )
+
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.create_namespaced_pod(namespace, body)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;create_namespaced_pod&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def create_service(
+    name, namespace, metadata, spec, source, template, saltenv, **kwargs
+):
+    &quot;&quot;&quot;
+    Creates the kubernetes service as defined by the user.
+    &quot;&quot;&quot;
+    body = __create_object_body(
+        kind=&quot;Service&quot;,
+        obj_class=kubernetes.client.V1Service,
+        spec_creator=__dict_to_service_spec,
+        name=name,
+        namespace=namespace,
+        metadata=metadata,
+        spec=spec,
+        source=source,
+        template=template,
+        saltenv=saltenv,
+    )
+
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.create_namespaced_service(namespace, body)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;create_namespaced_service&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def create_secret(
+    name,
+    namespace=&quot;default&quot;,
+    data=None,
+    source=None,
+    template=None,
+    saltenv=&quot;base&quot;,
+    **kwargs
+):
+    &quot;&quot;&quot;
+    Creates the kubernetes secret as defined by the user.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion1' kubernetes.create_secret \
+            passwords default '{&quot;db&quot;: &quot;letmein&quot;}'
+
+        salt 'minion2' kubernetes.create_secret \
+            name=passwords namespace=default data='{&quot;db&quot;: &quot;letmein&quot;}'
+    &quot;&quot;&quot;
+    if source:
+        data = __read_and_render_yaml_file(source, template, saltenv)
+    elif data is None:
+        data = {}
+
+    data = __enforce_only_strings_dict(data)
+
+    # encode the secrets using base64 as required by kubernetes
+    for key in data:
+        data[key] = base64.b64encode(data[key])
+
+    body = kubernetes.client.V1Secret(
+        metadata=__dict_to_object_meta(name, namespace, {}), data=data
+    )
+
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.create_namespaced_secret(namespace, body)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;create_namespaced_secret&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def create_configmap(
+    name, namespace, data, source=None, template=None, saltenv=&quot;base&quot;, **kwargs
+):
+    &quot;&quot;&quot;
+    Creates the kubernetes configmap as defined by the user.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion1' kubernetes.create_configmap \
+            settings default '{&quot;example.conf&quot;: &quot;# example file&quot;}'
+
+        salt 'minion2' kubernetes.create_configmap \
+            name=settings namespace=default data='{&quot;example.conf&quot;: &quot;# example file&quot;}'
+    &quot;&quot;&quot;
+    if source:
+        data = __read_and_render_yaml_file(source, template, saltenv)
+    elif data is None:
+        data = {}
+
+    data = __enforce_only_strings_dict(data)
+
+    body = kubernetes.client.V1ConfigMap(
+        metadata=__dict_to_object_meta(name, namespace, {}), data=data
+    )
+
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.create_namespaced_config_map(namespace, body)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling CoreV1Api-&gt;create_namespaced_config_map&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def create_namespace(name, **kwargs):
+    &quot;&quot;&quot;
+    Creates a namespace with the specified name.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' kubernetes.create_namespace salt
+        salt '*' kubernetes.create_namespace name=salt
+    &quot;&quot;&quot;
+
+    meta_obj = kubernetes.client.V1ObjectMeta(name=name)
+    body = kubernetes.client.V1Namespace(metadata=meta_obj)
+    body.metadata.name = name
+
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.create_namespace(body)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;create_namespace&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def replace_deployment(
+    name, metadata, spec, source, template, saltenv, namespace=&quot;default&quot;, **kwargs
+):
+    &quot;&quot;&quot;
+    Replaces an existing deployment with a new one defined by name and
+    namespace, having the specificed metadata and spec.
+    &quot;&quot;&quot;
+    body = __create_object_body(
+        kind=&quot;Deployment&quot;,
+        obj_class=AppsV1beta1Deployment,
+        spec_creator=__dict_to_deployment_spec,
+        name=name,
+        namespace=namespace,
+        metadata=metadata,
+        spec=spec,
+        source=source,
+        template=template,
+        saltenv=saltenv,
+    )
+
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.ExtensionsV1beta1Api()
+        api_response = api_instance.replace_namespaced_deployment(name, namespace, body)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling &quot;
+                &quot;ExtensionsV1beta1Api-&gt;replace_namespaced_deployment&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def replace_service(
+    name,
+    metadata,
+    spec,
+    source,
+    template,
+    old_service,
+    saltenv,
+    namespace=&quot;default&quot;,
+    **kwargs
+):
+    &quot;&quot;&quot;
+    Replaces an existing service with a new one defined by name and namespace,
+    having the specificed metadata and spec.
+    &quot;&quot;&quot;
+    body = __create_object_body(
+        kind=&quot;Service&quot;,
+        obj_class=kubernetes.client.V1Service,
+        spec_creator=__dict_to_service_spec,
+        name=name,
+        namespace=namespace,
+        metadata=metadata,
+        spec=spec,
+        source=source,
+        template=template,
+        saltenv=saltenv,
+    )
+
+    # Some attributes have to be preserved
+    # otherwise exceptions will be thrown
+    body.spec.cluster_ip = old_service[&quot;spec&quot;][&quot;cluster_ip&quot;]
+    body.metadata.resource_version = old_service[&quot;metadata&quot;][&quot;resource_version&quot;]
+
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.replace_namespaced_service(name, namespace, body)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling CoreV1Api-&gt;replace_namespaced_service&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def replace_secret(
+    name,
+    data,
+    source=None,
+    template=None,
+    saltenv=&quot;base&quot;,
+    namespace=&quot;default&quot;,
+    **kwargs
+):
+    &quot;&quot;&quot;
+    Replaces an existing secret with a new one defined by name and namespace,
+    having the specificed data.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion1' kubernetes.replace_secret \
+            name=passwords data='{&quot;db&quot;: &quot;letmein&quot;}'
+
+        salt 'minion2' kubernetes.replace_secret \
+            name=passwords namespace=saltstack data='{&quot;db&quot;: &quot;passw0rd&quot;}'
+    &quot;&quot;&quot;
+    if source:
+        data = __read_and_render_yaml_file(source, template, saltenv)
+    elif data is None:
+        data = {}
+
+    data = __enforce_only_strings_dict(data)
+
+    # encode the secrets using base64 as required by kubernetes
+    for key in data:
+        data[key] = base64.b64encode(data[key])
+
+    body = kubernetes.client.V1Secret(
+        metadata=__dict_to_object_meta(name, namespace, {}), data=data
+    )
+
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.replace_namespaced_secret(name, namespace, body)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(&quot;Exception when calling CoreV1Api-&gt;replace_namespaced_secret&quot;)
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def replace_configmap(
+    name,
+    data,
+    source=None,
+    template=None,
+    saltenv=&quot;base&quot;,
+    namespace=&quot;default&quot;,
+    **kwargs
+):
+    &quot;&quot;&quot;
+    Replaces an existing configmap with a new one defined by name and
+    namespace with the specified data.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion1' kubernetes.replace_configmap \
+            settings default '{&quot;example.conf&quot;: &quot;# example file&quot;}'
+
+        salt 'minion2' kubernetes.replace_configmap \
+            name=settings namespace=default data='{&quot;example.conf&quot;: &quot;# example file&quot;}'
+    &quot;&quot;&quot;
+    if source:
+        data = __read_and_render_yaml_file(source, template, saltenv)
+
+    data = __enforce_only_strings_dict(data)
+
+    body = kubernetes.client.V1ConfigMap(
+        metadata=__dict_to_object_meta(name, namespace, {}), data=data
+    )
+
+    cfg = _setup_conn(**kwargs)
+
+    try:
+        api_instance = kubernetes.client.CoreV1Api()
+        api_response = api_instance.replace_namespaced_config_map(name, namespace, body)
+
+        return api_response.to_dict()
+    except (ApiException, HTTPError) as exc:
+        if isinstance(exc, ApiException) and exc.status == 404:
+            return None
+        else:
+            log.exception(
+                &quot;Exception when calling CoreV1Api-&gt;replace_namespaced_configmap&quot;
+            )
+            raise CommandExecutionError(exc)
+    finally:
+        _cleanup(**cfg)
+
+
+def __create_object_body(
+    kind,
+    obj_class,
+    spec_creator,
+    name,
+    namespace,
+    metadata,
+    spec,
+    source,
+    template,
+    saltenv,
+):
+    &quot;&quot;&quot;
+    Create a Kubernetes Object body instance.
+    &quot;&quot;&quot;
+    if source:
+        src_obj = __read_and_render_yaml_file(source, template, saltenv)
+        if (
+            not isinstance(src_obj, dict)
+            or &quot;kind&quot; not in src_obj
+            or src_obj[&quot;kind&quot;] != kind
+        ):
+            raise CommandExecutionError(
+                &quot;The source file should define only a {} object&quot;.format(kind)
+            )
+
+        if &quot;metadata&quot; in src_obj:
+            metadata = src_obj[&quot;metadata&quot;]
+        if &quot;spec&quot; in src_obj:
+            spec = src_obj[&quot;spec&quot;]
+
+    return obj_class(
+        metadata=__dict_to_object_meta(name, namespace, metadata),
+        spec=spec_creator(spec),
+    )
+
+
+def __read_and_render_yaml_file(source, template, saltenv):
+    &quot;&quot;&quot;
+    Read a yaml file and, if needed, renders that using the specifieds
+    templating. Returns the python objects defined inside of the file.
+<A NAME="0"></A>    &quot;&quot;&quot;
+    sfn = __salt__[&quot;cp.cache_file&quot;](source, saltenv)
+    if not sfn:
+        raise CommandExecutionError<FONT color="#0000ff"><A HREF="javascript:ZweiFrames('match242901-1.html#0',3,'match242901-top.html#0',1)"><IMG SRC="forward.gif" ALT="other" BORDER="0" ALIGN="right"></A><B>(&quot;Source file '{}' not found&quot;.format(source))
+
+    with salt.utils.files.fopen(sfn, &quot;r&quot;) as src:
+        contents = src.read(</B></FONT>)
+
+        if template:
+            if template in salt.utils.templates.TEMPLATE_REGISTRY:
+                # TODO: should we allow user to set also `context` like  # pylint: disable=fixme
+                # `file.managed` does?
+                # Apply templating
+                data = salt.utils.templates.TEMPLATE_REGISTRY[template](
+                    contents,
+                    from_str=True,
+                    to_str=True,
+                    saltenv=saltenv,
+                    grains=__grains__,
+                    pillar=__pillar__,
+                    salt=__salt__,
+                    opts=__opts__,
+                )
+
+                if not data[&quot;result&quot;]:
+                    # Failed to render the template
+                    raise CommandExecutionError(
+                        &quot;Failed to render file path with error: {}&quot;.format(data[&quot;data&quot;])
+                    )
+
+                contents = data[&quot;data&quot;].encode(&quot;utf-8&quot;)
+            else:
+                raise CommandExecutionError(
+                    &quot;Unknown template specified: {}&quot;.format(template)
+                )
+
+        return salt.utils.yaml.safe_load(contents)
+
+
+def __dict_to_object_meta(name, namespace, metadata):
+    &quot;&quot;&quot;
+    Converts a dictionary into kubernetes ObjectMetaV1 instance.
+    &quot;&quot;&quot;
+    meta_obj = kubernetes.client.V1ObjectMeta()
+    meta_obj.namespace = namespace
+
+    # Replicate `kubectl [create|replace|apply] --record`
+    if &quot;annotations&quot; not in metadata:
+        metadata[&quot;annotations&quot;] = {}
+    if &quot;kubernetes.io/change-cause&quot; not in metadata[&quot;annotations&quot;]:
+        metadata[&quot;annotations&quot;][&quot;kubernetes.io/change-cause&quot;] = &quot; &quot;.join(sys.argv)
+
+    for key, value in metadata.items():
+        if hasattr(meta_obj, key):
+            setattr(meta_obj, key, value)
+
+    if meta_obj.name != name:
+        log.warning(
+            &quot;The object already has a name attribute, overwriting it with &quot;
+            &quot;the one defined inside of salt&quot;
+        )
+        meta_obj.name = name
+
+    return meta_obj
+
+
+def __dict_to_deployment_spec(spec):
+    &quot;&quot;&quot;
+    Converts a dictionary into kubernetes AppsV1beta1DeploymentSpec instance.
+    &quot;&quot;&quot;
+    spec_obj = AppsV1beta1DeploymentSpec(template=spec.get(&quot;template&quot;, &quot;&quot;))
+    for key, value in spec.items():
+        if hasattr(spec_obj, key):
+            setattr(spec_obj, key, value)
+
+    return spec_obj
+
+
+def __dict_to_pod_spec(spec):
+    &quot;&quot;&quot;
+    Converts a dictionary into kubernetes V1PodSpec instance.
+    &quot;&quot;&quot;
+    spec_obj = kubernetes.client.V1PodSpec()
+    for key, value in spec.items():
+        if hasattr(spec_obj, key):
+            setattr(spec_obj, key, value)
+
+    return spec_obj
+
+
+def __dict_to_service_spec(spec):
+    &quot;&quot;&quot;
+    Converts a dictionary into kubernetes V1ServiceSpec instance.
+    &quot;&quot;&quot;
+    spec_obj = kubernetes.client.V1ServiceSpec()
+    for key, value in spec.items():  # pylint: disable=too-many-nested-blocks
+        if key == &quot;ports&quot;:
+            spec_obj.ports = []
+            for port in value:
+                kube_port = kubernetes.client.V1ServicePort()
+                if isinstance(port, dict):
+                    for port_key, port_value in port.items():
+                        if hasattr(kube_port, port_key):
+                            setattr(kube_port, port_key, port_value)
+                else:
+                    kube_port.port = port
+                spec_obj.ports.append(kube_port)
+        elif hasattr(spec_obj, key):
+            setattr(spec_obj, key, value)
+
+    return spec_obj
+
+
+def __enforce_only_strings_dict(dictionary):
+    &quot;&quot;&quot;
+    Returns a dictionary that has string keys and values.
+    &quot;&quot;&quot;
+    ret = {}
+
+    for key, value in dictionary.items():
+        ret[str(key)] = str(value)
+
+    return ret
+</PRE>
+</div>
+<div style="flex-grow: 1;">
+<h3>
+<center>
+<span>hashutil.py</span>
+<span> - </span>
+<span></span>
+</center>
+</h3>
+<HR>
+<PRE>
+&quot;&quot;&quot;
+A collection of hashing and encoding functions
+&quot;&quot;&quot;
+
+
+import base64
+import hashlib
+import hmac
+import io
+
+import salt.exceptions
+import salt.utils.files
+import salt.utils.hashutils
+import salt.utils.stringutils
+
+
+def digest(instr, checksum=&quot;md5&quot;):
+    &quot;&quot;&quot;
+    Return a checksum digest for a string
+
+    instr
+        A string
+    checksum : ``md5``
+        The hashing algorithm to use to generate checksums. Valid options: md5,
+        sha256, sha512.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.digest 'get salted'
+    &quot;&quot;&quot;
+    hashing_funcs = {
+        &quot;md5&quot;: __salt__[&quot;hashutil.md5_digest&quot;],
+        &quot;sha256&quot;: __salt__[&quot;hashutil.sha256_digest&quot;],
+        &quot;sha512&quot;: __salt__[&quot;hashutil.sha512_digest&quot;],
+    }
+    hash_func = hashing_funcs.get(checksum)
+
+    if hash_func is None:
+        raise salt.exceptions.CommandExecutionError(
+            &quot;Hash func '{}' is not supported.&quot;.format(checksum)
+        )
+
+    return hash_func(instr)
+
+
+def digest_file(infile, checksum=&quot;md5&quot;):
+    &quot;&quot;&quot;
+    Return a checksum digest for a file
+
+    infile
+        A file path
+    checksum : ``md5``
+        The hashing algorithm to use to generate checksums. Wraps the
+        :py:func:`hashutil.digest &lt;salt.modules.hashutil.digest&gt;` execution
+        function.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+<A NAME="0"></A>        salt '*' hashutil.digest_file /path/to/file
+    &quot;&quot;&quot;
+    if not __salt__[&quot;file.file_exists&quot;](infile):
+        raise salt.exceptions.CommandExecutionError<FONT color="#0000ff"><div style="position:absolute;left:0"><A HREF="javascript:ZweiFrames('match242901-0.html#0',2,'match242901-top.html#0',1)"><IMG SRC="back.gif" ALT="other" BORDER="0" ALIGN="left"></A></div><B>(
+            &quot;File path '{}' not found.&quot;.format(infile)
+        )
+
+    with salt.utils.files.fopen(infile, &quot;rb&quot;) as f:
+        file_hash = __salt__[&quot;hashutil.digest&quot;](</B></FONT>f.read(), checksum)
+
+    return file_hash
+
+
+def base64_b64encode(instr):
+    &quot;&quot;&quot;
+    Encode a string as base64 using the &quot;modern&quot; Python interface.
+
+    Among other possible differences, the &quot;modern&quot; encoder does not include
+    newline ('\\n') characters in the encoded output.
+
+    .. versionadded:: 2016.3.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.base64_b64encode 'get salted'
+    &quot;&quot;&quot;
+    return salt.utils.hashutils.base64_b64encode(instr)
+
+
+def base64_b64decode(instr):
+    &quot;&quot;&quot;
+    Decode a base64-encoded string using the &quot;modern&quot; Python interface
+
+    .. versionadded:: 2016.3.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.base64_b64decode 'Z2V0IHNhbHRlZA=='
+    &quot;&quot;&quot;
+    return salt.utils.hashutils.base64_b64decode(instr)
+
+
+def base64_encodestring(instr):
+    &quot;&quot;&quot;
+    Encode a byte-like object as base64 using the &quot;modern&quot; Python interface.
+
+    Among other possible differences, the &quot;modern&quot; encoder includes
+    a newline ('\\n') character after every 76 characters and always
+    at the end of the encoded byte-like object.
+
+    .. versionadded:: 3000
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.base64_encodestring 'get salted'
+    &quot;&quot;&quot;
+    return salt.utils.hashutils.base64_encodestring(instr)
+
+
+def base64_encodefile(fname):
+    &quot;&quot;&quot;
+    Read a file from the file system and return as a base64 encoded string
+
+    .. versionadded:: 2016.3.0
+
+    Pillar example:
+
+    .. code-block:: yaml
+
+        path:
+          to:
+            data: |
+              {{ salt.hashutil.base64_encodefile('/path/to/binary_file') | indent(6) }}
+
+    The :py:func:`file.decode &lt;salt.states.file.decode&gt;` state function can be
+    used to decode this data and write it to disk.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.base64_encodefile /path/to/binary_file
+    &quot;&quot;&quot;
+    encoded_f = io.BytesIO()
+
+    with salt.utils.files.fopen(fname, &quot;rb&quot;) as f:
+        base64.encode(f, encoded_f)
+
+    encoded_f.seek(0)
+    return salt.utils.stringutils.to_str(encoded_f.read())
+
+
+def base64_decodestring(instr):
+    &quot;&quot;&quot;
+    Decode a base64-encoded byte-like object using the &quot;modern&quot; Python interface
+
+    .. versionadded:: 3000
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.base64_decodestring instr='Z2V0IHNhbHRlZAo='
+
+    &quot;&quot;&quot;
+    return salt.utils.hashutils.base64_decodestring(instr)
+
+
+def base64_decodefile(instr, outfile):
+    r&quot;&quot;&quot;
+    Decode a base64-encoded string and write the result to a file
+
+    .. versionadded:: 2016.3.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.base64_decodefile instr='Z2V0IHNhbHRlZAo=' outfile='/path/to/binary_file'
+    &quot;&quot;&quot;
+    encoded_f = io.StringIO(instr)
+
+    with salt.utils.files.fopen(outfile, &quot;wb&quot;) as f:
+        base64.decode(encoded_f, f)
+
+    return True
+
+
+def md5_digest(instr):
+    &quot;&quot;&quot;
+    Generate an md5 hash of a given string
+
+    .. versionadded:: 2014.7.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.md5_digest 'get salted'
+    &quot;&quot;&quot;
+    return salt.utils.hashutils.md5_digest(instr)
+
+
+def sha256_digest(instr):
+    &quot;&quot;&quot;
+    Generate an sha256 hash of a given string
+
+    .. versionadded:: 2014.7.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.sha256_digest 'get salted'
+    &quot;&quot;&quot;
+    return salt.utils.hashutils.sha256_digest(instr)
+
+
+def sha512_digest(instr):
+    &quot;&quot;&quot;
+    Generate an sha512 hash of a given string
+
+    .. versionadded:: 2014.7.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.sha512_digest 'get salted'
+    &quot;&quot;&quot;
+    return salt.utils.hashutils.sha512_digest(instr)
+
+
+def hmac_signature(string, shared_secret, challenge_hmac):
+    &quot;&quot;&quot;
+    Verify a challenging hmac signature against a string / shared-secret
+
+    .. versionadded:: 2014.7.0
+
+    Returns a boolean if the verification succeeded or failed.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.hmac_signature 'get salted' 'shared secret' 'eBWf9bstXg+NiP5AOwppB5HMvZiYMPzEM9W5YMm/AmQ='
+    &quot;&quot;&quot;
+    return salt.utils.hashutils.hmac_signature(string, shared_secret, challenge_hmac)
+
+
+def hmac_compute(string, shared_secret):
+    &quot;&quot;&quot;
+    .. versionadded:: 3000
+
+    Compute a HMAC SHA256 digest using a string and secret.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.hmac_compute 'get salted' 'shared secret'
+    &quot;&quot;&quot;
+    return salt.utils.hashutils.hmac_compute(string, shared_secret)
+
+
+def github_signature(string, shared_secret, challenge_hmac):
+    &quot;&quot;&quot;
+    Verify a challenging hmac signature against a string / shared-secret for
+    github webhooks.
+
+    .. versionadded:: 2017.7.0
+
+    Returns a boolean if the verification succeeded or failed.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' hashutil.github_signature '{&quot;ref&quot;:....} ' 'shared secret' 'sha1=bc6550fc290acf5b42283fa8deaf55cea0f8c206'
+    &quot;&quot;&quot;
+    msg = string
+    key = shared_secret
+    hashtype, challenge = challenge_hmac.split(&quot;=&quot;)
+    if isinstance(msg, str):
+        msg = salt.utils.stringutils.to_bytes(msg)
+    if isinstance(key, str):
+        key = salt.utils.stringutils.to_bytes(key)
+    hmac_hash = hmac.new(key, msg, getattr(hashlib, hashtype))
+    return hmac_hash.hexdigest() == challenge
+</PRE>
+</div>
+  </div>
+</body>
+</html>

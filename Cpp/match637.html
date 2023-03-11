@@ -1,0 +1,499 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML><HEAD><TITLE>Matches for ethernet-transport.cpp & tcp-transport.cpp</TITLE>
+<META http-equiv="Content-Type" content="text/html; charset=UTF-8">
+</HEAD>
+<body>
+  <div style="align-items: center; display: flex; justify-content: space-around;">
+    <div>
+      <h3 align="center">
+Matches for ethernet-transport.cpp & tcp-transport.cpp
+      </h3>
+      <h1 align="center">
+        6.3%
+      </h1>
+      <center>
+        <a href="index.html" target="_top">
+          INDEX
+        </a>
+        <span>-</span>
+        <a href="help-en.html" target="_top">
+          HELP
+        </a>
+      </center>
+    </div>
+    <div>
+<TABLE BORDER="1" CELLSPACING="0" BGCOLOR="#d0d0d0">
+<TR><TH><TH>ethernet-transport.cpp (5.8252425%)<TH>tcp-transport.cpp (7.017544%)<TH>Tokens
+<TR><TD BGCOLOR="#0000ff"><FONT COLOR="#0000ff">-</FONT><TD><A HREF="javascript:ZweiFrames('match637-0.html#0',2,'match637-1.html#0',3)" NAME="0">(153-159)<TD><A HREF="javascript:ZweiFrames('match637-0.html#0',2,'match637-1.html#0',3)" NAME="0">(148-154)</A><TD ALIGN=center><FONT COLOR="#ff0000">12</FONT>
+</TABLE>
+    </div>
+  </div>
+  <hr>
+  <div style="display: flex;">
+<div style="flex-grow: 1;">
+<h3>
+<center>
+<span>ethernet-transport.cpp</span>
+<span> - </span>
+<span></span>
+</center>
+</h3>
+<HR>
+<PRE>
+/* -*- Mode:C++; c-file-style:&quot;gnu&quot;; indent-tabs-mode:nil; -*- */
+/*
+ * Copyright (c) 2014-2022,  Regents of the University of California,
+ *                           Arizona Board of Regents,
+ *                           Colorado State University,
+ *                           University Pierre &amp; Marie Curie, Sorbonne University,
+ *                           Washington University in St. Louis,
+ *                           Beijing Institute of Technology,
+ *                           The University of Memphis.
+ *
+ * This file is part of NFD (Named Data Networking Forwarding Daemon).
+ * See AUTHORS.md for complete list of NFD authors and contributors.
+ *
+ * NFD is free software: you can redistribute it and/or modify it under the terms
+ * of the GNU General Public License as published by the Free Software Foundation,
+ * either version 3 of the License, or (at your option) any later version.
+ *
+ * NFD is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ * PURPOSE.  See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * NFD, e.g., in COPYING.md file.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+
+#include &quot;ethernet-transport.hpp&quot;
+#include &quot;ethernet-protocol.hpp&quot;
+#include &quot;common/global.hpp&quot;
+
+#include &lt;pcap/pcap.h&gt;
+
+#include &lt;cstring&gt; // for memcpy()
+
+#include &lt;boost/endian/conversion.hpp&gt;
+
+namespace nfd {
+namespace face {
+
+NFD_LOG_INIT(EthernetTransport);
+
+EthernetTransport::EthernetTransport(const ndn::net::NetworkInterface&amp; localEndpoint,
+                                     const ethernet::Address&amp; remoteEndpoint)
+  : m_socket(getGlobalIoService())
+  , m_pcap(localEndpoint.getName())
+  , m_srcAddress(localEndpoint.getEthernetAddress())
+  , m_destAddress(remoteEndpoint)
+  , m_interfaceName(localEndpoint.getName())
+  , m_hasRecentlyReceived(false)
+#ifdef _DEBUG
+  , m_nDropped(0)
+#endif
+{
+  try {
+    m_pcap.activate(DLT_EN10MB);
+    m_socket.assign(m_pcap.getFd());
+  }
+  catch (const PcapHelper::Error&amp; e) {
+    NDN_THROW_NESTED(Error(e.what()));
+  }
+
+  // Set initial transport state based upon the state of the underlying NetworkInterface
+  handleNetifStateChange(localEndpoint.getState());
+
+  m_netifStateChangedConn = localEndpoint.onStateChanged.connect(
+    [this] (ndn::net::InterfaceState, ndn::net::InterfaceState newState) {
+      handleNetifStateChange(newState);
+    });
+
+  m_netifMtuChangedConn = localEndpoint.onMtuChanged.connect(
+    [this] (uint32_t, uint32_t mtu) {
+      setMtu(mtu);
+    });
+
+  asyncRead();
+}
+
+void
+EthernetTransport::doClose()
+{
+  NFD_LOG_FACE_TRACE(__func__);
+
+  if (m_socket.is_open()) {
+    // Cancel all outstanding operations and close the socket.
+    // Use the non-throwing variants and ignore errors, if any.
+    boost::system::error_code error;
+    m_socket.cancel(error);
+    m_socket.close(error);
+  }
+  m_pcap.close();
+
+  // Ensure that the Transport stays alive at least
+  // until all pending handlers are dispatched
+  getGlobalIoService().post([this] {
+    this-&gt;setState(TransportState::CLOSED);
+  });
+}
+
+void
+EthernetTransport::handleNetifStateChange(ndn::net::InterfaceState netifState)
+{
+  NFD_LOG_FACE_TRACE(&quot;netif is &quot; &lt;&lt; netifState);
+  if (netifState == ndn::net::InterfaceState::RUNNING) {
+    if (getState() == TransportState::DOWN) {
+      this-&gt;setState(TransportState::UP);
+    }
+  }
+  else if (getState() == TransportState::UP) {
+    this-&gt;setState(TransportState::DOWN);
+  }
+}
+
+void
+EthernetTransport::doSend(const Block&amp; packet)
+{
+  NFD_LOG_FACE_TRACE(__func__);
+
+  sendPacket(packet);
+}
+
+void
+EthernetTransport::sendPacket(const ndn::Block&amp; block)
+{
+  ndn::EncodingBuffer buffer(block);
+
+  // pad with zeroes if the payload is too short
+  if (block.size() &lt; ethernet::MIN_DATA_LEN) {
+    static const uint8_t padding[ethernet::MIN_DATA_LEN] = {};
+    buffer.appendBytes(ndn::make_span(padding).subspan(block.size()));
+  }
+
+  // construct and prepend the ethernet header
+  uint16_t ethertype = boost::endian::native_to_big(ethernet::ETHERTYPE_NDN);
+  buffer.prependBytes({reinterpret_cast&lt;const uint8_t*&gt;(&amp;ethertype), ethernet::TYPE_LEN});
+  buffer.prependBytes(m_srcAddress);
+  buffer.prependBytes(m_destAddress);
+
+  // send the frame
+  int sent = pcap_inject(m_pcap, buffer.data(), buffer.size());
+  if (sent &lt; 0)
+    handleError(&quot;Send operation failed: &quot; + m_pcap.getLastError());
+  else if (static_cast&lt;size_t&gt;(sent) &lt; buffer.size())
+    handleError(&quot;Failed to send the full frame: size=&quot; + to_string(buffer.size()) +
+                &quot; sent=&quot; + to_string(sent));
+  else
+    // print block size because we don't want to count the padding in buffer
+    NFD_LOG_FACE_TRACE(&quot;Successfully sent: &quot; &lt;&lt; block.size() &lt;&lt; &quot; bytes&quot;);
+}
+
+void
+<A NAME="0"></A>EthernetTransport::asyncRead()
+{
+  m_socket.async_read_some(boost::asio::null_buffers(),
+<FONT color="#0000ff"><A HREF="javascript:ZweiFrames('match637-1.html#0',3,'match637-top.html#0',1)"><IMG SRC="forward.gif" ALT="other" BORDER="0" ALIGN="right"></A><B>                           [this] (const auto&amp; e, auto) { this-&gt;handleRead(e); });
+}
+
+void
+EthernetTransport::handleRead(const boost::system::error_code&amp; error)
+{
+  if (error) {</B></FONT>
+    // boost::asio::error::operation_aborted must be checked first: in that case, the Transport
+    // may already have been destructed, therefore it's unsafe to call getState() or do logging.
+    if (error != boost::asio::error::operation_aborted &amp;&amp;
+        getState() != TransportState::CLOSING &amp;&amp;
+        getState() != TransportState::FAILED &amp;&amp;
+        getState() != TransportState::CLOSED) {
+      handleError(&quot;Receive operation failed: &quot; + error.message());
+    }
+    return;
+  }
+
+  span&lt;const uint8_t&gt; pkt;
+  std::string err;
+  std::tie(pkt, err) = m_pcap.readNextPacket();
+
+  if (pkt.empty()) {
+    NFD_LOG_FACE_WARN(&quot;Read error: &quot; &lt;&lt; err);
+  }
+  else {
+    const ether_header* eh;
+    std::tie(eh, err) = ethernet::checkFrameHeader(pkt, m_srcAddress,
+                                                   m_destAddress.isMulticast() ? m_destAddress : m_srcAddress);
+    if (eh == nullptr) {
+      NFD_LOG_FACE_WARN(err);
+    }
+    else {
+      ethernet::Address sender(eh-&gt;ether_shost);
+      pkt = pkt.subspan(ethernet::HDR_LEN);
+      receivePayload(pkt, sender);
+    }
+  }
+
+#ifdef _DEBUG
+  size_t nDropped = m_pcap.getNDropped();
+  if (nDropped - m_nDropped &gt; 0)
+    NFD_LOG_FACE_DEBUG(&quot;Detected &quot; &lt;&lt; nDropped - m_nDropped &lt;&lt; &quot; dropped frame(s)&quot;);
+  m_nDropped = nDropped;
+#endif
+
+  asyncRead();
+}
+
+void
+EthernetTransport::receivePayload(span&lt;const uint8_t&gt; payload, const ethernet::Address&amp; sender)
+{
+  NFD_LOG_FACE_TRACE(&quot;Received: &quot; &lt;&lt; payload.size() &lt;&lt; &quot; bytes from &quot; &lt;&lt; sender);
+
+  bool isOk = false;
+  Block element;
+  std::tie(isOk, element) = Block::fromBuffer(payload);
+  if (!isOk) {
+    NFD_LOG_FACE_WARN(&quot;Failed to parse incoming packet from &quot; &lt;&lt; sender);
+    // This packet won't extend the face lifetime
+    return;
+  }
+  m_hasRecentlyReceived = true;
+
+  static_assert(sizeof(EndpointId) &gt;= ethernet::ADDR_LEN, &quot;EndpointId is too small&quot;);
+  EndpointId endpoint = 0;
+  if (m_destAddress.isMulticast()) {
+    std::memcpy(&amp;endpoint, sender.data(), sender.size());
+  }
+
+  this-&gt;receive(element, endpoint);
+}
+
+void
+EthernetTransport::handleError(const std::string&amp; errorMessage)
+{
+  if (getPersistency() == ndn::nfd::FACE_PERSISTENCY_PERMANENT) {
+    NFD_LOG_FACE_DEBUG(&quot;Permanent face ignores error: &quot; &lt;&lt; errorMessage);
+    return;
+  }
+
+  NFD_LOG_FACE_ERROR(errorMessage);
+  this-&gt;setState(TransportState::FAILED);
+  doClose();
+}
+
+} // namespace face
+} // namespace nfd
+</PRE>
+</div>
+<div style="flex-grow: 1;">
+<h3>
+<center>
+<span>tcp-transport.cpp</span>
+<span> - </span>
+<span></span>
+</center>
+</h3>
+<HR>
+<PRE>
+/* -*- Mode:C++; c-file-style:&quot;gnu&quot;; indent-tabs-mode:nil; -*- */
+/*
+ * Copyright (c) 2014-2019,  Regents of the University of California,
+ *                           Arizona Board of Regents,
+ *                           Colorado State University,
+ *                           University Pierre &amp; Marie Curie, Sorbonne University,
+ *                           Washington University in St. Louis,
+ *                           Beijing Institute of Technology,
+ *                           The University of Memphis.
+ *
+ * This file is part of NFD (Named Data Networking Forwarding Daemon).
+ * See AUTHORS.md for complete list of NFD authors and contributors.
+ *
+ * NFD is free software: you can redistribute it and/or modify it under the terms
+ * of the GNU General Public License as published by the Free Software Foundation,
+ * either version 3 of the License, or (at your option) any later version.
+ *
+ * NFD is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ * PURPOSE.  See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * NFD, e.g., in COPYING.md file.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+
+#include &quot;tcp-transport.hpp&quot;
+#include &quot;common/global.hpp&quot;
+
+#if defined(__linux__)
+#include &lt;linux/sockios.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#endif
+
+namespace nfd {
+namespace face {
+
+NFD_LOG_MEMBER_INIT_SPECIALIZED(StreamTransport&lt;boost::asio::ip::tcp&gt;, TcpTransport);
+
+time::milliseconds TcpTransport::s_initialReconnectWait = 1_s;
+time::milliseconds TcpTransport::s_maxReconnectWait = 5_min;
+float TcpTransport::s_reconnectWaitMultiplier = 2.0f;
+
+TcpTransport::TcpTransport(protocol::socket&amp;&amp; socket,
+                           ndn::nfd::FacePersistency persistency,
+                           ndn::nfd::FaceScope faceScope)
+  : StreamTransport(std::move(socket))
+  , m_remoteEndpoint(m_socket.remote_endpoint())
+  , m_nextReconnectWait(s_initialReconnectWait)
+{
+  this-&gt;setLocalUri(FaceUri(m_socket.local_endpoint()));
+  this-&gt;setRemoteUri(FaceUri(m_socket.remote_endpoint()));
+  this-&gt;setScope(faceScope);
+  this-&gt;setPersistency(persistency);
+  this-&gt;setLinkType(ndn::nfd::LINK_TYPE_POINT_TO_POINT);
+  this-&gt;setMtu(MTU_UNLIMITED);
+
+  NFD_LOG_FACE_DEBUG(&quot;Creating transport&quot;);
+}
+
+ssize_t
+TcpTransport::getSendQueueLength()
+{
+  int queueLength = getSendQueueBytes();
+
+  // We want to obtain the amount of &quot;not sent&quot; bytes instead of the amount of &quot;not sent&quot; + &quot;not
+  // acked&quot; bytes. On Linux, we use SIOCOUTQNSD for this reason. However, macOS does not provide an
+  // efficient mechanism to obtain this value (SO_NWRITE includes both &quot;not sent&quot; and &quot;not acked&quot;).
+#if defined(__linux__)
+  int nsd;
+  if (ioctl(m_socket.native_handle(), SIOCOUTQNSD, &amp;nsd) &lt; 0) {
+    NFD_LOG_FACE_WARN(&quot;Failed to obtain send queue length from socket: &quot; &lt;&lt; std::strerror(errno));
+  }
+  else if (nsd &gt; 0) {
+    NFD_LOG_FACE_TRACE(&quot;SIOCOUTQNSD=&quot; &lt;&lt; nsd);
+    queueLength += nsd;
+  }
+#endif
+
+  return queueLength;
+}
+
+bool
+TcpTransport::canChangePersistencyToImpl(ndn::nfd::FacePersistency newPersistency) const
+{
+  return true;
+}
+
+void
+TcpTransport::afterChangePersistency(ndn::nfd::FacePersistency oldPersistency)
+{
+  // if persistency was changed from permanent to any other value
+  if (oldPersistency == ndn::nfd::FACE_PERSISTENCY_PERMANENT) {
+    if (this-&gt;getState() == TransportState::DOWN) {
+      // non-permanent transport cannot be in DOWN state, so fail hard
+      this-&gt;setState(TransportState::FAILED);
+      doClose();
+    }
+  }
+}
+
+void
+TcpTransport::handleError(const boost::system::error_code&amp; error)
+{
+  if (this-&gt;getPersistency() == ndn::nfd::FACE_PERSISTENCY_PERMANENT) {
+    NFD_LOG_FACE_TRACE(&quot;TCP socket error: &quot; &lt;&lt; error.message());
+    this-&gt;setState(TransportState::DOWN);
+
+    // cancel all outstanding operations
+    boost::system::error_code ec;
+    m_socket.cancel(ec);
+
+    // do this asynchronously because there could be some callbacks still pending
+    getGlobalIoService().post([this] { reconnect(); });
+  }
+  else {
+    StreamTransport::handleError(error);
+  }
+}
+
+void
+TcpTransport::reconnect()
+{
+  NFD_LOG_FACE_TRACE(__func__);
+
+  if (getState() == TransportState::CLOSING ||
+      getState() == TransportState::FAILED ||
+      getState() == TransportState::CLOSED) {
+    // transport is shutting down, don't attempt to reconnect
+    return;
+  }
+
+  BOOST_ASSERT(getPersistency() == ndn::nfd::FACE_PERSISTENCY_PERMANENT);
+  BOOST_ASSERT(getState() == TransportState::DOWN);
+
+  // recreate the socket
+  m_socket = protocol::socket(
+#if BOOST_VERSION &gt;= 107000
+                              m_socket.get_executor()
+#else
+                              m_socket.get_io_service()
+#endif // BOOST_VERSION &gt;= 107000
+                              );
+  this-&gt;resetReceiveBuffer();
+  this-&gt;resetSendQueue();
+<A NAME="0"></A>
+  m_reconnectEvent = getScheduler().schedule(m_nextReconnectWait,
+                                             [this] { this-&gt;handleReconnectTimeout(); });
+<FONT color="#0000ff"><div style="position:absolute;left:0"><A HREF="javascript:ZweiFrames('match637-0.html#0',2,'match637-top.html#0',1)"><IMG SRC="back.gif" ALT="other" BORDER="0" ALIGN="left"></A></div><B>  m_socket.async_connect(m_remoteEndpoint, [this] (const auto&amp; e) { this-&gt;handleReconnect(e); });
+}
+
+void
+TcpTransport::handleReconnect(const boost::system::error_code&amp; error)
+{
+  if (getState() == TransportState::CLOSING ||</B></FONT>
+      getState() == TransportState::FAILED ||
+      getState() == TransportState::CLOSED ||
+      error == boost::asio::error::operation_aborted) {
+    // transport is shutting down, abort the reconnection attempt and ignore any errors
+    return;
+  }
+
+  if (error) {
+    NFD_LOG_FACE_TRACE(&quot;Reconnection attempt failed: &quot; &lt;&lt; error.message());
+    return;
+  }
+
+  m_reconnectEvent.cancel();
+  m_nextReconnectWait = s_initialReconnectWait;
+
+  this-&gt;setLocalUri(FaceUri(m_socket.local_endpoint()));
+  NFD_LOG_FACE_TRACE(&quot;TCP connection reestablished&quot;);
+  this-&gt;setState(TransportState::UP);
+  this-&gt;startReceive();
+}
+
+void
+TcpTransport::handleReconnectTimeout()
+{
+  // abort the reconnection attempt
+  boost::system::error_code error;
+  m_socket.close(error);
+
+  // exponentially back off the reconnection timer
+  m_nextReconnectWait =
+      std::min(time::duration_cast&lt;time::milliseconds&gt;(m_nextReconnectWait * s_reconnectWaitMultiplier),
+               s_maxReconnectWait);
+
+  // do this asynchronously because there could be some callbacks still pending
+  getGlobalIoService().post([this] { reconnect(); });
+}
+
+void
+TcpTransport::doClose()
+{
+  m_reconnectEvent.cancel();
+  StreamTransport::doClose();
+}
+
+} // namespace face
+} // namespace nfd
+</PRE>
+</div>
+  </div>
+</body>
+</html>
