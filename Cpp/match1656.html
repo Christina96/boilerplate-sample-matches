@@ -40,414 +40,414 @@ Matches for ibex_Optimizer.cpp &amp; ibex_CompiledFunction.h
 </h3>
 <hr/>
 <pre>
-#include "ibex_Optimizer.h"
-#include "ibex_Timer.h"
-#include "ibex_Function.h"
-#include "ibex_NoBisectableVariableException.h"
-#include "ibex_BxpOptimData.h"
-#include "ibex_CovOptimData.h"
-#include &lt;float.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;iomanip&gt;
-using namespace std;
-namespace ibex {
-void Optimizer::write_ext_box(const IntervalVector&amp; box, IntervalVector&amp; ext_box) {
-	int i2=0;
-	for (int i=0; i&lt;n; i++,i2++) {
-		if (i2==goal_var) i2++; 		ext_box[i2]=box[i];
-	}
-}
-void Optimizer::read_ext_box(const IntervalVector&amp; ext_box, IntervalVector&amp; box) {
-	int i2=0;
-	for (int i=0; i&lt;n; i++,i2++) {
-		if (i2==goal_var) i2++; 		box[i]=ext_box[i2];
-	}
-}
-Optimizer::Optimizer(int n, Ctc&amp; ctc, Bsc&amp; bsc, LoupFinder&amp; finder,
-		CellBufferOptim&amp; buffer,
-		int goal_var, double eps_x, double rel_eps_f, double abs_eps_f) :
-                						n(n), goal_var(goal_var),
-										ctc(ctc), bsc(bsc), loup_finder(finder), buffer(buffer),
-										eps_x(eps_x), rel_eps_f(rel_eps_f), abs_eps_f(abs_eps_f),
-										trace(0), timeout(-1), extended_COV(true), anticipated_upper_bounding(true),
-										status(SUCCESS),
-										uplo(NEG_INFINITY), uplo_of_epsboxes(POS_INFINITY), loup(POS_INFINITY),
-										loup_point(IntervalVector::empty(n)), initial_loup(POS_INFINITY), loup_changed(false),
-										time(0), nb_cells(0), cov(NULL) {
-	if (trace) cout.precision(12);
-}
-Optimizer::Optimizer(OptimizerConfig&amp; config) :
-		n           (config.nb_var()),
-		goal_var    (config.goal_var()),
-		ctc         (config.get_ctc()),
-		bsc         (config.get_bsc()),
-		loup_finder (config.get_loup_finder()),
-		buffer      (config.get_cell_buffer()),
-		eps_x       (config.get_eps_x()),
-		rel_eps_f   (config.get_rel_eps_f()),
-		abs_eps_f   (config.get_abs_eps_f()),
-		trace       (config.get_trace()),
-		timeout     (config.get_timeout()),
-		extended_COV(config.with_extended_cov()),
-		anticipated_upper_bounding(config.with_anticipated_upper_bounding()),
-		status(SUCCESS),
-		uplo(NEG_INFINITY), uplo_of_epsboxes(POS_INFINITY), loup(POS_INFINITY),
-		loup_point(IntervalVector::empty(n)), initial_loup(POS_INFINITY), loup_changed(false),
-		time(0), nb_cells(0), cov(NULL) {
-}
-Optimizer::~Optimizer() {
-	if (cov) delete cov;
-}
-double Optimizer::compute_ymax() {
-	if (anticipated_upper_bounding) {
-		double ymax = loup&gt;0 ?
-				1/(1+rel_eps_f)*loup
-		:
-				1/(1-rel_eps_f)*loup;
-		if (loup - abs_eps_f &lt; ymax)
-			ymax = loup - abs_eps_f;
-		return next_float(ymax);
-	} else
-		return loup;
-}
-bool Optimizer::update_loup(const IntervalVector&amp; box, BoxProperties&amp; prop) {
-	try {
-		pair&lt;IntervalVector,double&gt; p=loup_finder.find(box,loup_point,loup,prop);
-		loup_point = p.first;
-		loup = p.second;
-		if (trace) {
-			cout &lt;&lt; "                    ";
-			cout &lt;&lt; "\033[32m loup= " &lt;&lt; loup &lt;&lt; "\033[0m" &lt;&lt; endl;
-		}
-		return true;
-	} catch(LoupFinder::NotFound&amp;) {
-		return false;
-	}
-}
-void Optimizer::update_uplo() {
-	double new_uplo=POS_INFINITY;
-	if (! buffer.empty()) {
-		new_uplo= buffer.minimum();
-		if (new_uplo &gt; loup &amp;&amp; uplo_of_epsboxes &gt; loup) {
-			cout &lt;&lt; " loup = " &lt;&lt; loup &lt;&lt; " new_uplo=" &lt;&lt; new_uplo &lt;&lt;  " uplo_of_epsboxes=" &lt;&lt; uplo_of_epsboxes &lt;&lt; endl;
-			ibex_error("optimizer: new_uplo&gt;loup (please report bug)");
-		}
-		if (new_uplo &lt; uplo) {
-			cout &lt;&lt; "uplo= " &lt;&lt; uplo &lt;&lt; " new_uplo=" &lt;&lt; new_uplo &lt;&lt; endl;
-			ibex_error("optimizer: new_uplo&lt;uplo (please report bug)");
-		}
-		if (new_uplo &lt; uplo_of_epsboxes) {
-			if (new_uplo &gt; uplo) {
-				uplo = new_uplo;
-				if (trace)
-					cout &lt;&lt; "\033[33m uplo= " &lt;&lt; uplo &lt;&lt; "\033[0m" &lt;&lt; endl;
-			}
-		}
-		else uplo = uplo_of_epsboxes;
-	}
-	else if (buffer.empty() &amp;&amp; loup != POS_INFINITY) {
-		new_uplo=compute_ymax(); 
-		double m = (new_uplo &lt; uplo_of_epsboxes) ? new_uplo :  uplo_of_epsboxes;
-		if (uplo &lt; m) uplo = m; 	}
-}
-void Optimizer::update_uplo_of_epsboxes(double ymin) {
-	assert (uplo_of_epsboxes &gt;= uplo);
-	assert(ymin &gt;= uplo);
-	if (uplo_of_epsboxes &gt; ymin) {
-		uplo_of_epsboxes = ymin;
-		if (trace) {
-			cout &lt;&lt; " unprocessable tiny box: now uplo&lt;=" &lt;&lt; setprecision(12) &lt;&lt;  uplo_of_epsboxes &lt;&lt; " uplo=" &lt;&lt; uplo &lt;&lt; endl;
-		}
-	}
-}
-void Optimizer::handle_cell(Cell&amp; c) {
-	contract_and_bound(c);
-	if (c.box.is_empty()) {
-		delete &amp;c;
-	} else {
-		buffer.push(&amp;c);
-	}
-}
-void Optimizer::contract_and_bound(Cell&amp; c) {
-	Interval&amp; y=c.box[goal_var];
-	double ymax;
-	if (loup==POS_INFINITY) ymax = POS_INFINITY;
-	else ymax = compute_ymax()+1.e-15;
-	y &amp;= Interval(NEG_INFINITY,ymax);
-	if (y.is_empty()) {
-		c.box.set_empty();
-		return;
-	} else {
-		c.prop.update(BoxEvent(c.box,BoxEvent::CONTRACT,BitSet::singleton(n+1,goal_var)));
-	}
-	ContractContext context(c.prop);
-	if (c.bisected_var!=-1) {
-		context.impact.clear();
-		context.impact.add(c.bisected_var);
-		context.impact.add(goal_var);
-	}
-	ctc.contract(c.box, context);
-	if (c.box.is_empty()) return;
-	IntervalVector tmp_box(n);
-	read_ext_box(c.box,tmp_box);
-	c.prop.update(BoxEvent(c.box,BoxEvent::CHANGE));
-	bool loup_ch=update_loup(tmp_box, c.prop);
-	if (loup_ch) {
-		y &amp;= Interval(NEG_INFINITY,compute_ymax());
-		c.prop.update(BoxEvent(c.box,BoxEvent::CONTRACT,BitSet::singleton(n+1,goal_var)));
-	}
-	loup_changed |= loup_ch;
-	if (y.is_empty()) { 		c.box.set_empty();
-		return;
-	}
-	if ((tmp_box.max_diam()&lt;=eps_x &amp;&amp; y.diam() &lt;=abs_eps_f) || !c.box.is_bisectable()) {
-		update_uplo_of_epsboxes(y.lb());
-		c.box.set_empty();
-		return;
-	}
-	if (tmp_box.is_empty()) {
-		c.box.set_empty();
-	} else {
-		write_ext_box(tmp_box,c.box);
-	}
-}
-Optimizer::Status Optimizer::optimize(const IntervalVector&amp; init_box, double obj_init_bound) {
-	start(init_box, obj_init_bound);
-	return optimize();
-}
-Optimizer::Status Optimizer::optimize(const CovOptimData&amp; data, double obj_init_bound) {
-	start(data, obj_init_bound);
-	return optimize();
-}
-Optimizer::Status Optimizer::optimize(const char* cov_file, double obj_init_bound) {
-	CovOptimData data(cov_file);
-	start(data, obj_init_bound);
-	return optimize();
-}
-void Optimizer::start(const IntervalVector&amp; init_box, double obj_init_bound) {
-	loup=obj_init_bound;
-	buffer.contract(loup);
-	uplo=NEG_INFINITY;
-	uplo_of_epsboxes=POS_INFINITY;
-	nb_cells=0;
-	buffer.flush();
-	Cell* root=new Cell(IntervalVector(n+1));
-	write_ext_box(init_box, root-&gt;box);
-	bsc.add_property(init_box, root-&gt;prop);
-	ctc.add_property(init_box, root-&gt;prop);
-	buffer.add_property(init_box, root-&gt;prop);
-	loup_finder.add_property(init_box, root-&gt;prop);
-	loup_changed=false;
-	initial_loup=obj_init_bound;
-	loup_point = init_box; //.set_empty();
-	time=0;
-	if (cov) delete cov;
-	cov = new CovOptimData(extended_COV? n+1 : n, extended_COV);
-	cov-&gt;data-&gt;_optim_time = 0;
-	cov-&gt;data-&gt;_optim_nb_cells = 0;
-	handle_cell(*root);
-}
-void Optimizer::start(const CovOptimData&amp; data, double obj_init_bound) {
-	loup=obj_init_bound;
-	buffer.contract(loup);
-	uplo=data.uplo();
-	loup=data.loup();
-	loup_point=data.loup_point();
-	uplo_of_epsboxes=POS_INFINITY;
-	nb_cells=0;
-	buffer.flush();
-	for (size_t i=loup_point.is_empty()? 0 : 1; i&lt;data.size(); i++) {
-		IntervalVector box(n+1);
-		if (data.is_extended_space())
-			box = data[i];
-		else {
-			write_ext_box(data[i], box);
-			box[goal_var] = Interval(uplo,loup);
-			ctc.contract(box);
-			if (box.is_empty()) continue;
-		}
-		Cell* cell=new Cell(box);
-		buffer.add_property(box, cell-&gt;prop);
-		bsc.add_property(box, cell-&gt;prop);
-		ctc.add_property(box, cell-&gt;prop);
-		loup_finder.add_property(box, cell-&gt;prop);
-		buffer.push(cell);
-	}
-	loup_changed=false;
-	initial_loup=obj_init_bound;
-	time=0;
-	if (cov) delete cov;
-	cov = new CovOptimData(extended_COV? n+1 : n, extended_COV);
-	cov-&gt;data-&gt;_optim_time = data.time();
-	cov-&gt;data-&gt;_optim_nb_cells = data.nb_cells();
-}
-Optimizer::Status Optimizer::optimize() {
-	Timer timer;
-	timer.start();
-	update_uplo();
-	try {
-	     while (!buffer.empty()) {
-			loup_changed=false;
-			Cell *c = buffer.top();
-			if (trace &gt;= 2) cout &lt;&lt; " current box " &lt;&lt; c-&gt;box &lt;&lt; endl;
-			try {
-				pair&lt;Cell*,Cell*&gt; new_cells=bsc.bisect(*c);
-				buffer.pop();
-				delete c; 
-				nb_cells+=2;  
-				handle_cell(*new_cells.first);
-				handle_cell(*new_cells.second);
-				if (uplo_of_epsboxes == NEG_INFINITY) {
-					break;
-				}
-				if (loup_changed) {
-					double ymax=compute_ymax();
-					buffer.contract(ymax);
-					if (ymax &lt;= NEG_INFINITY) {
-						if (trace) cout &lt;&lt; " infinite value for the minimum " &lt;&lt; endl;
-						break;
-					}
-				}
-				update_uplo();
-				if (!anticipated_upper_bounding) 					if (get_obj_rel_prec()&lt;rel_eps_f || get_obj_abs_prec()&lt;abs_eps_f)
-						break;
-				if (timeout&gt;0) timer.check(timeout); 				time = timer.get_time();
-			}
-			catch (NoBisectableVariableException&amp; ) {
-				update_uplo_of_epsboxes((c-&gt;box)[goal_var].lb());
-				buffer.pop();
-				delete c; 				update_uplo(); 
-			}
-		}
-	 	timer.stop();
-	 	time = timer.get_time();
-	 	if (uplo_of_epsboxes == NEG_INFINITY)
-	 		status = UNBOUNDED_OBJ;
-	 	else if (uplo_of_epsboxes == POS_INFINITY &amp;&amp; (loup==POS_INFINITY || (loup==initial_loup &amp;&amp; abs_eps_f==0 &amp;&amp; rel_eps_f==0)))
-	 		status = INFEASIBLE;
-	 	else if (loup==initial_loup)
-	 		status = NO_FEASIBLE_FOUND;
-	 	else if (get_obj_rel_prec()&gt;rel_eps_f &amp;&amp; get_obj_abs_prec()&gt;abs_eps_f)
-	 		status = UNREACHED_PREC;
-	 	else
-	 		status = SUCCESS;
-	}
-	catch (TimeOutException&amp; ) {
-		status = TIME_OUT;
-	}
-	for (int i=0; i&lt;(extended_COV ? n+1 : n); i++)
-		cov-&gt;data-&gt;_optim_var_names.push_back(string(""));
-	cov-&gt;data-&gt;_optim_optimizer_status = (unsigned int) status;
-	cov-&gt;data-&gt;_optim_uplo = uplo;
-	cov-&gt;data-&gt;_optim_uplo_of_epsboxes = uplo_of_epsboxes;
-	cov-&gt;data-&gt;_optim_loup = loup;
-	cov-&gt;data-&gt;_optim_time += time;
-	cov-&gt;data-&gt;_optim_nb_cells += nb_cells;
-	cov-&gt;data-&gt;_optim_loup_point = loup_point;
-	IntervalVector tmp(extended_COV ? n+1 : n);
-	if (extended_COV) {
-		write_ext_box(loup_point, tmp);
-		tmp[goal_var] = Interval(uplo,loup);
-		cov-&gt;add(tmp);
-	}
-	else {
-		cov-&gt;add(loup_point);
-	}
-	while (!buffer.empty()) {
-		Cell* cell=buffer.top();
-		if (extended_COV)
-			cov-&gt;add(cell-&gt;box);
-		else {
-			read_ext_box(cell-&gt;box,tmp);
-			cov-&gt;add(tmp);
-		}
-		delete buffer.pop();
-	}
-	return status;
-}
-namespace {
-const char* green() {
-#ifndef _WIN32
-	return "\033[32m";
-#else
-	return "";
-#endif
-}
-const char* red(){
-#ifndef _WIN32
-	return "\033[31m";
-#else
-	return "";
-#endif
-}
-const char* white() {
-#ifndef _WIN32
-	return "\033[0m";
-#else
-	return "";
-#endif
-}
-}
-void Optimizer::report() {
-	if (!cov || !buffer.empty()) { 		cout &lt;&lt; " not started." &lt;&lt; endl;
-<a name="0"></a>		return;
-	}
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	switch(status) {
-	case SUCCESS:
-		cout &lt;&lt; green() &lt;&lt; " optimization successful!" &lt;&lt; endl;
-		break;
-	case INFEASIBLE:
-		cout &lt;&lt; red() &lt;&lt; " infeasible problem" &lt;&lt; endl;
-		break;
-	case NO_FEASIBLE_FOUND:
-		cout &lt;&lt; red() &lt;&lt; " no feasible point found (the problem may be infeasible)" &lt;&lt; endl;
-		break;
-	case UNBOUNDED_OBJ:
-		cout &lt;&lt; red() &lt;&lt; " possibly unbounded objective (f*=-oo)" &lt;&lt; endl;
-		break;
-	case TIME_OUT:
-		cout &lt;&lt; red() &lt;&lt; " time limit " &lt;&lt; timeout &lt;&lt; "s. reached " &lt;&lt; endl;
-		break;
-	case UNREACHED_PREC:
-		cout &lt;&lt; red() &lt;&lt; " unreached precision" &lt;&lt; endl;
-		break;</b></font>
-	}
-	cout &lt;&lt; white() &lt;&lt;  endl;
-	if (status==INFEASIBLE) {
-		cout &lt;&lt; " infeasible problem " &lt;&lt; endl;
-	} else {
-		cout &lt;&lt; " f* in\t[" &lt;&lt; uplo &lt;&lt; "," &lt;&lt; loup &lt;&lt; "]" &lt;&lt; endl;
-		cout &lt;&lt; "\t(best bound)" &lt;&lt; endl &lt;&lt; endl;
-		if (loup==initial_loup)
-			cout &lt;&lt; " x* =\t--\n\t(no feasible point found)" &lt;&lt; endl;
-		else {
-			if (loup_finder.rigorous())
-				cout &lt;&lt; " x* in\t" &lt;&lt; loup_point &lt;&lt; endl;
-			else
-				cout &lt;&lt; " x* =\t" &lt;&lt; loup_point.lb() &lt;&lt; endl;
-			cout &lt;&lt; "\t(best feasible point)" &lt;&lt; endl;
-		}
-		cout &lt;&lt; endl;
-		double rel_prec=get_obj_rel_prec();
-		double abs_prec=get_obj_abs_prec();
-		cout &lt;&lt; " relative precision on f*:\t" &lt;&lt; rel_prec;
-		if (rel_prec &lt;= rel_eps_f)
-			cout &lt;&lt; green() &lt;&lt; " [passed] " &lt;&lt; white();
-		cout &lt;&lt; endl;
-		cout &lt;&lt; " absolute precision on f*:\t" &lt;&lt; abs_prec;
-		if (abs_prec &lt;= abs_eps_f)
-			cout &lt;&lt; green() &lt;&lt; " [passed] " &lt;&lt; white();
-		cout &lt;&lt; endl;
-	}
-	cout &lt;&lt; " cpu time used:\t\t\t" &lt;&lt; time &lt;&lt; "s";
-	if (cov-&gt;time()!=time)
-		cout &lt;&lt; " [total=" &lt;&lt; cov-&gt;time() &lt;&lt; "]";
-	cout &lt;&lt; endl;
-	cout &lt;&lt; " number of cells:\t\t" &lt;&lt; nb_cells;
-	if (cov-&gt;nb_cells()!=nb_cells)
-		cout &lt;&lt; " [total=" &lt;&lt; cov-&gt;nb_cells() &lt;&lt; "]";
-	cout &lt;&lt; endl &lt;&lt; endl;
-}
+1 #include "ibex_Optimizer.h"
+2 #include "ibex_Timer.h"
+3 #include "ibex_Function.h"
+4 #include "ibex_NoBisectableVariableException.h"
+5 #include "ibex_BxpOptimData.h"
+6 #include "ibex_CovOptimData.h"
+7 #include &lt;float.h&gt;
+8 #include &lt;stdlib.h&gt;
+9 #include &lt;iomanip&gt;
+10 using namespace std;
+11 namespace ibex {
+12 void Optimizer::write_ext_box(const IntervalVector&amp; box, IntervalVector&amp; ext_box) {
+13 	int i2=0;
+14 	for (int i=0; i&lt;n; i++,i2++) {
+15 		if (i2==goal_var) i2++; 		ext_box[i2]=box[i];
+16 	}
+17 }
+18 void Optimizer::read_ext_box(const IntervalVector&amp; ext_box, IntervalVector&amp; box) {
+19 	int i2=0;
+20 	for (int i=0; i&lt;n; i++,i2++) {
+21 		if (i2==goal_var) i2++; 		box[i]=ext_box[i2];
+22 	}
+23 }
+24 Optimizer::Optimizer(int n, Ctc&amp; ctc, Bsc&amp; bsc, LoupFinder&amp; finder,
+25 		CellBufferOptim&amp; buffer,
+26 		int goal_var, double eps_x, double rel_eps_f, double abs_eps_f) :
+27                 						n(n), goal_var(goal_var),
+28 										ctc(ctc), bsc(bsc), loup_finder(finder), buffer(buffer),
+29 										eps_x(eps_x), rel_eps_f(rel_eps_f), abs_eps_f(abs_eps_f),
+30 										trace(0), timeout(-1), extended_COV(true), anticipated_upper_bounding(true),
+31 										status(SUCCESS),
+32 										uplo(NEG_INFINITY), uplo_of_epsboxes(POS_INFINITY), loup(POS_INFINITY),
+33 										loup_point(IntervalVector::empty(n)), initial_loup(POS_INFINITY), loup_changed(false),
+34 										time(0), nb_cells(0), cov(NULL) {
+35 	if (trace) cout.precision(12);
+36 }
+37 Optimizer::Optimizer(OptimizerConfig&amp; config) :
+38 		n           (config.nb_var()),
+39 		goal_var    (config.goal_var()),
+40 		ctc         (config.get_ctc()),
+41 		bsc         (config.get_bsc()),
+42 		loup_finder (config.get_loup_finder()),
+43 		buffer      (config.get_cell_buffer()),
+44 		eps_x       (config.get_eps_x()),
+45 		rel_eps_f   (config.get_rel_eps_f()),
+46 		abs_eps_f   (config.get_abs_eps_f()),
+47 		trace       (config.get_trace()),
+48 		timeout     (config.get_timeout()),
+49 		extended_COV(config.with_extended_cov()),
+50 		anticipated_upper_bounding(config.with_anticipated_upper_bounding()),
+51 		status(SUCCESS),
+52 		uplo(NEG_INFINITY), uplo_of_epsboxes(POS_INFINITY), loup(POS_INFINITY),
+53 		loup_point(IntervalVector::empty(n)), initial_loup(POS_INFINITY), loup_changed(false),
+54 		time(0), nb_cells(0), cov(NULL) {
+55 }
+56 Optimizer::~Optimizer() {
+57 	if (cov) delete cov;
+58 }
+59 double Optimizer::compute_ymax() {
+60 	if (anticipated_upper_bounding) {
+61 		double ymax = loup&gt;0 ?
+62 				1/(1+rel_eps_f)*loup
+63 		:
+64 				1/(1-rel_eps_f)*loup;
+65 		if (loup - abs_eps_f &lt; ymax)
+66 			ymax = loup - abs_eps_f;
+67 		return next_float(ymax);
+68 	} else
+69 		return loup;
+70 }
+71 bool Optimizer::update_loup(const IntervalVector&amp; box, BoxProperties&amp; prop) {
+72 	try {
+73 		pair&lt;IntervalVector,double&gt; p=loup_finder.find(box,loup_point,loup,prop);
+74 		loup_point = p.first;
+75 		loup = p.second;
+76 		if (trace) {
+77 			cout &lt;&lt; "                    ";
+78 			cout &lt;&lt; "\033[32m loup= " &lt;&lt; loup &lt;&lt; "\033[0m" &lt;&lt; endl;
+79 		}
+80 		return true;
+81 	} catch(LoupFinder::NotFound&amp;) {
+82 		return false;
+83 	}
+84 }
+85 void Optimizer::update_uplo() {
+86 	double new_uplo=POS_INFINITY;
+87 	if (! buffer.empty()) {
+88 		new_uplo= buffer.minimum();
+89 		if (new_uplo &gt; loup &amp;&amp; uplo_of_epsboxes &gt; loup) {
+90 			cout &lt;&lt; " loup = " &lt;&lt; loup &lt;&lt; " new_uplo=" &lt;&lt; new_uplo &lt;&lt;  " uplo_of_epsboxes=" &lt;&lt; uplo_of_epsboxes &lt;&lt; endl;
+91 			ibex_error("optimizer: new_uplo&gt;loup (please report bug)");
+92 		}
+93 		if (new_uplo &lt; uplo) {
+94 			cout &lt;&lt; "uplo= " &lt;&lt; uplo &lt;&lt; " new_uplo=" &lt;&lt; new_uplo &lt;&lt; endl;
+95 			ibex_error("optimizer: new_uplo&lt;uplo (please report bug)");
+96 		}
+97 		if (new_uplo &lt; uplo_of_epsboxes) {
+98 			if (new_uplo &gt; uplo) {
+99 				uplo = new_uplo;
+100 				if (trace)
+101 					cout &lt;&lt; "\033[33m uplo= " &lt;&lt; uplo &lt;&lt; "\033[0m" &lt;&lt; endl;
+102 			}
+103 		}
+104 		else uplo = uplo_of_epsboxes;
+105 	}
+106 	else if (buffer.empty() &amp;&amp; loup != POS_INFINITY) {
+107 		new_uplo=compute_ymax(); 
+108 		double m = (new_uplo &lt; uplo_of_epsboxes) ? new_uplo :  uplo_of_epsboxes;
+109 		if (uplo &lt; m) uplo = m; 	}
+110 }
+111 void Optimizer::update_uplo_of_epsboxes(double ymin) {
+112 	assert (uplo_of_epsboxes &gt;= uplo);
+113 	assert(ymin &gt;= uplo);
+114 	if (uplo_of_epsboxes &gt; ymin) {
+115 		uplo_of_epsboxes = ymin;
+116 		if (trace) {
+117 			cout &lt;&lt; " unprocessable tiny box: now uplo&lt;=" &lt;&lt; setprecision(12) &lt;&lt;  uplo_of_epsboxes &lt;&lt; " uplo=" &lt;&lt; uplo &lt;&lt; endl;
+118 		}
+119 	}
+120 }
+121 void Optimizer::handle_cell(Cell&amp; c) {
+122 	contract_and_bound(c);
+123 	if (c.box.is_empty()) {
+124 		delete &amp;c;
+125 	} else {
+126 		buffer.push(&amp;c);
+127 	}
+128 }
+129 void Optimizer::contract_and_bound(Cell&amp; c) {
+130 	Interval&amp; y=c.box[goal_var];
+131 	double ymax;
+132 	if (loup==POS_INFINITY) ymax = POS_INFINITY;
+133 	else ymax = compute_ymax()+1.e-15;
+134 	y &amp;= Interval(NEG_INFINITY,ymax);
+135 	if (y.is_empty()) {
+136 		c.box.set_empty();
+137 		return;
+138 	} else {
+139 		c.prop.update(BoxEvent(c.box,BoxEvent::CONTRACT,BitSet::singleton(n+1,goal_var)));
+140 	}
+141 	ContractContext context(c.prop);
+142 	if (c.bisected_var!=-1) {
+143 		context.impact.clear();
+144 		context.impact.add(c.bisected_var);
+145 		context.impact.add(goal_var);
+146 	}
+147 	ctc.contract(c.box, context);
+148 	if (c.box.is_empty()) return;
+149 	IntervalVector tmp_box(n);
+150 	read_ext_box(c.box,tmp_box);
+151 	c.prop.update(BoxEvent(c.box,BoxEvent::CHANGE));
+152 	bool loup_ch=update_loup(tmp_box, c.prop);
+153 	if (loup_ch) {
+154 		y &amp;= Interval(NEG_INFINITY,compute_ymax());
+155 		c.prop.update(BoxEvent(c.box,BoxEvent::CONTRACT,BitSet::singleton(n+1,goal_var)));
+156 	}
+157 	loup_changed |= loup_ch;
+158 	if (y.is_empty()) { 		c.box.set_empty();
+159 		return;
+160 	}
+161 	if ((tmp_box.max_diam()&lt;=eps_x &amp;&amp; y.diam() &lt;=abs_eps_f) || !c.box.is_bisectable()) {
+162 		update_uplo_of_epsboxes(y.lb());
+163 		c.box.set_empty();
+164 		return;
+165 	}
+166 	if (tmp_box.is_empty()) {
+167 		c.box.set_empty();
+168 	} else {
+169 		write_ext_box(tmp_box,c.box);
+170 	}
+171 }
+172 Optimizer::Status Optimizer::optimize(const IntervalVector&amp; init_box, double obj_init_bound) {
+173 	start(init_box, obj_init_bound);
+174 	return optimize();
+175 }
+176 Optimizer::Status Optimizer::optimize(const CovOptimData&amp; data, double obj_init_bound) {
+177 	start(data, obj_init_bound);
+178 	return optimize();
+179 }
+180 Optimizer::Status Optimizer::optimize(const char* cov_file, double obj_init_bound) {
+181 	CovOptimData data(cov_file);
+182 	start(data, obj_init_bound);
+183 	return optimize();
+184 }
+185 void Optimizer::start(const IntervalVector&amp; init_box, double obj_init_bound) {
+186 	loup=obj_init_bound;
+187 	buffer.contract(loup);
+188 	uplo=NEG_INFINITY;
+189 	uplo_of_epsboxes=POS_INFINITY;
+190 	nb_cells=0;
+191 	buffer.flush();
+192 	Cell* root=new Cell(IntervalVector(n+1));
+193 	write_ext_box(init_box, root-&gt;box);
+194 	bsc.add_property(init_box, root-&gt;prop);
+195 	ctc.add_property(init_box, root-&gt;prop);
+196 	buffer.add_property(init_box, root-&gt;prop);
+197 	loup_finder.add_property(init_box, root-&gt;prop);
+198 	loup_changed=false;
+199 	initial_loup=obj_init_bound;
+200 	loup_point = init_box; //.set_empty();
+201 	time=0;
+202 	if (cov) delete cov;
+203 	cov = new CovOptimData(extended_COV? n+1 : n, extended_COV);
+204 	cov-&gt;data-&gt;_optim_time = 0;
+205 	cov-&gt;data-&gt;_optim_nb_cells = 0;
+206 	handle_cell(*root);
+207 }
+208 void Optimizer::start(const CovOptimData&amp; data, double obj_init_bound) {
+209 	loup=obj_init_bound;
+210 	buffer.contract(loup);
+211 	uplo=data.uplo();
+212 	loup=data.loup();
+213 	loup_point=data.loup_point();
+214 	uplo_of_epsboxes=POS_INFINITY;
+215 	nb_cells=0;
+216 	buffer.flush();
+217 	for (size_t i=loup_point.is_empty()? 0 : 1; i&lt;data.size(); i++) {
+218 		IntervalVector box(n+1);
+219 		if (data.is_extended_space())
+220 			box = data[i];
+221 		else {
+222 			write_ext_box(data[i], box);
+223 			box[goal_var] = Interval(uplo,loup);
+224 			ctc.contract(box);
+225 			if (box.is_empty()) continue;
+226 		}
+227 		Cell* cell=new Cell(box);
+228 		buffer.add_property(box, cell-&gt;prop);
+229 		bsc.add_property(box, cell-&gt;prop);
+230 		ctc.add_property(box, cell-&gt;prop);
+231 		loup_finder.add_property(box, cell-&gt;prop);
+232 		buffer.push(cell);
+233 	}
+234 	loup_changed=false;
+235 	initial_loup=obj_init_bound;
+236 	time=0;
+237 	if (cov) delete cov;
+238 	cov = new CovOptimData(extended_COV? n+1 : n, extended_COV);
+239 	cov-&gt;data-&gt;_optim_time = data.time();
+240 	cov-&gt;data-&gt;_optim_nb_cells = data.nb_cells();
+241 }
+242 Optimizer::Status Optimizer::optimize() {
+243 	Timer timer;
+244 	timer.start();
+245 	update_uplo();
+246 	try {
+247 	     while (!buffer.empty()) {
+248 			loup_changed=false;
+249 			Cell *c = buffer.top();
+250 			if (trace &gt;= 2) cout &lt;&lt; " current box " &lt;&lt; c-&gt;box &lt;&lt; endl;
+251 			try {
+252 				pair&lt;Cell*,Cell*&gt; new_cells=bsc.bisect(*c);
+253 				buffer.pop();
+254 				delete c; 
+255 				nb_cells+=2;  
+256 				handle_cell(*new_cells.first);
+257 				handle_cell(*new_cells.second);
+258 				if (uplo_of_epsboxes == NEG_INFINITY) {
+259 					break;
+260 				}
+261 				if (loup_changed) {
+262 					double ymax=compute_ymax();
+263 					buffer.contract(ymax);
+264 					if (ymax &lt;= NEG_INFINITY) {
+265 						if (trace) cout &lt;&lt; " infinite value for the minimum " &lt;&lt; endl;
+266 						break;
+267 					}
+268 				}
+269 				update_uplo();
+270 				if (!anticipated_upper_bounding) 					if (get_obj_rel_prec()&lt;rel_eps_f || get_obj_abs_prec()&lt;abs_eps_f)
+271 						break;
+272 				if (timeout&gt;0) timer.check(timeout); 				time = timer.get_time();
+273 			}
+274 			catch (NoBisectableVariableException&amp; ) {
+275 				update_uplo_of_epsboxes((c-&gt;box)[goal_var].lb());
+276 				buffer.pop();
+277 				delete c; 				update_uplo(); 
+278 			}
+279 		}
+280 	 	timer.stop();
+281 	 	time = timer.get_time();
+282 	 	if (uplo_of_epsboxes == NEG_INFINITY)
+283 	 		status = UNBOUNDED_OBJ;
+284 	 	else if (uplo_of_epsboxes == POS_INFINITY &amp;&amp; (loup==POS_INFINITY || (loup==initial_loup &amp;&amp; abs_eps_f==0 &amp;&amp; rel_eps_f==0)))
+285 	 		status = INFEASIBLE;
+286 	 	else if (loup==initial_loup)
+287 	 		status = NO_FEASIBLE_FOUND;
+288 	 	else if (get_obj_rel_prec()&gt;rel_eps_f &amp;&amp; get_obj_abs_prec()&gt;abs_eps_f)
+289 	 		status = UNREACHED_PREC;
+290 	 	else
+291 	 		status = SUCCESS;
+292 	}
+293 	catch (TimeOutException&amp; ) {
+294 		status = TIME_OUT;
+295 	}
+296 	for (int i=0; i&lt;(extended_COV ? n+1 : n); i++)
+297 		cov-&gt;data-&gt;_optim_var_names.push_back(string(""));
+298 	cov-&gt;data-&gt;_optim_optimizer_status = (unsigned int) status;
+299 	cov-&gt;data-&gt;_optim_uplo = uplo;
+300 	cov-&gt;data-&gt;_optim_uplo_of_epsboxes = uplo_of_epsboxes;
+301 	cov-&gt;data-&gt;_optim_loup = loup;
+302 	cov-&gt;data-&gt;_optim_time += time;
+303 	cov-&gt;data-&gt;_optim_nb_cells += nb_cells;
+304 	cov-&gt;data-&gt;_optim_loup_point = loup_point;
+305 	IntervalVector tmp(extended_COV ? n+1 : n);
+306 	if (extended_COV) {
+307 		write_ext_box(loup_point, tmp);
+308 		tmp[goal_var] = Interval(uplo,loup);
+309 		cov-&gt;add(tmp);
+310 	}
+311 	else {
+312 		cov-&gt;add(loup_point);
+313 	}
+314 	while (!buffer.empty()) {
+315 		Cell* cell=buffer.top();
+316 		if (extended_COV)
+317 			cov-&gt;add(cell-&gt;box);
+318 		else {
+319 			read_ext_box(cell-&gt;box,tmp);
+320 			cov-&gt;add(tmp);
+321 		}
+322 		delete buffer.pop();
+323 	}
+324 	return status;
+325 }
+326 namespace {
+327 const char* green() {
+328 #ifndef _WIN32
+329 	return "\033[32m";
+330 #else
+331 	return "";
+332 #endif
+333 }
+334 const char* red(){
+335 #ifndef _WIN32
+336 	return "\033[31m";
+337 #else
+338 	return "";
+339 #endif
+340 }
+341 const char* white() {
+342 #ifndef _WIN32
+343 	return "\033[0m";
+344 #else
+345 	return "";
+346 #endif
+347 }
+348 }
+349 void Optimizer::report() {
+350 	if (!cov || !buffer.empty()) { 		cout &lt;&lt; " not started." &lt;&lt; endl;
+351 <a name="0"></a>		return;
+352 	}
+353 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	switch(status) {
+354 	case SUCCESS:
+355 		cout &lt;&lt; green() &lt;&lt; " optimization successful!" &lt;&lt; endl;
+356 		break;
+357 	case INFEASIBLE:
+358 		cout &lt;&lt; red() &lt;&lt; " infeasible problem" &lt;&lt; endl;
+359 		break;
+360 	case NO_FEASIBLE_FOUND:
+361 		cout &lt;&lt; red() &lt;&lt; " no feasible point found (the problem may be infeasible)" &lt;&lt; endl;
+362 		break;
+363 	case UNBOUNDED_OBJ:
+364 		cout &lt;&lt; red() &lt;&lt; " possibly unbounded objective (f*=-oo)" &lt;&lt; endl;
+365 		break;
+366 	case TIME_OUT:
+367 		cout &lt;&lt; red() &lt;&lt; " time limit " &lt;&lt; timeout &lt;&lt; "s. reached " &lt;&lt; endl;
+368 		break;
+369 	case UNREACHED_PREC:
+370 		cout &lt;&lt; red() &lt;&lt; " unreached precision" &lt;&lt; endl;
+371 		break;</b></font>
+372 	}
+373 	cout &lt;&lt; white() &lt;&lt;  endl;
+374 	if (status==INFEASIBLE) {
+375 		cout &lt;&lt; " infeasible problem " &lt;&lt; endl;
+376 	} else {
+377 		cout &lt;&lt; " f* in\t[" &lt;&lt; uplo &lt;&lt; "," &lt;&lt; loup &lt;&lt; "]" &lt;&lt; endl;
+378 		cout &lt;&lt; "\t(best bound)" &lt;&lt; endl &lt;&lt; endl;
+379 		if (loup==initial_loup)
+380 			cout &lt;&lt; " x* =\t--\n\t(no feasible point found)" &lt;&lt; endl;
+381 		else {
+382 			if (loup_finder.rigorous())
+383 				cout &lt;&lt; " x* in\t" &lt;&lt; loup_point &lt;&lt; endl;
+384 			else
+385 				cout &lt;&lt; " x* =\t" &lt;&lt; loup_point.lb() &lt;&lt; endl;
+386 			cout &lt;&lt; "\t(best feasible point)" &lt;&lt; endl;
+387 		}
+388 		cout &lt;&lt; endl;
+389 		double rel_prec=get_obj_rel_prec();
+390 		double abs_prec=get_obj_abs_prec();
+391 		cout &lt;&lt; " relative precision on f*:\t" &lt;&lt; rel_prec;
+392 		if (rel_prec &lt;= rel_eps_f)
+393 			cout &lt;&lt; green() &lt;&lt; " [passed] " &lt;&lt; white();
+394 		cout &lt;&lt; endl;
+395 		cout &lt;&lt; " absolute precision on f*:\t" &lt;&lt; abs_prec;
+396 		if (abs_prec &lt;= abs_eps_f)
+397 			cout &lt;&lt; green() &lt;&lt; " [passed] " &lt;&lt; white();
+398 		cout &lt;&lt; endl;
+399 	}
+400 	cout &lt;&lt; " cpu time used:\t\t\t" &lt;&lt; time &lt;&lt; "s";
+401 	if (cov-&gt;time()!=time)
+402 		cout &lt;&lt; " [total=" &lt;&lt; cov-&gt;time() &lt;&lt; "]";
+403 	cout &lt;&lt; endl;
+404 	cout &lt;&lt; " number of cells:\t\t" &lt;&lt; nb_cells;
+405 	if (cov-&gt;nb_cells()!=nb_cells)
+406 		cout &lt;&lt; " [total=" &lt;&lt; cov-&gt;nb_cells() &lt;&lt; "]";
+407 	cout &lt;&lt; endl &lt;&lt; endl;
+408 }
 } </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -460,263 +460,263 @@ void Optimizer::report() {
 </h3>
 <hr/>
 <pre>
-#ifndef __IBEX_COMPILED_FUNCTION_H__
-#define __IBEX_COMPILED_FUNCTION_H__
-#include &lt;stack&gt;
-#include "ibex_Expr.h"
-#include "ibex_ExprVisitor.h"
-#include "ibex_ExprSubNodes.h"
-#include "ibex_FwdAlgorithm.h"
-#include "ibex_BwdAlgorithm.h"
-#include "ibex_Agenda.h"
-namespace ibex {
-class Function;
-template&lt;class T&gt;
-class ExprData;
-class CompiledFunction : public ExprVisitor&lt;void&gt; {
-public:
-	CompiledFunction();
-	void compile(Function&amp; f);
-	~CompiledFunction();
-	template&lt;class V&gt;
-	void forward(const V&amp; algo) const;
-	template&lt;class V&gt;
-	void forward(const V&amp; algo, const Agenda&amp; a) const;
-	template&lt;class V&gt;
-	void backward(const V&amp; algo) const;
-	template&lt;class V&gt;
-	void backward(const V&amp; algo, const Agenda&amp; a) const;
-	Agenda* agenda(int rank) const;
-	friend class Function;
-protected:
-	typedef enum {
-		IDX,    		IDX_CP, 		VEC, SYM, CST, APPLY, CHI,
-		ADD, MUL, SUB, DIV, MAX, MIN, ATAN2,
-		GEN1, GEN2, GENN,
-		MINUS, MINUS_V, MINUS_M,
-		TRANS_V, TRANS_M, SIGN, ABS, POWER,
-		SQR, SQRT, EXP, LOG,
-		COS,  SIN,  TAN,  ACOS,  ASIN,  ATAN,
-		COSH, SINH, TANH, ACOSH, ASINH, ATANH,
-		FLOOR,  CEIL, SAW,
-		ADD_V, ADD_M, SUB_V, SUB_M,
-		MUL_SV, MUL_SM, MUL_VV, MUL_MV, MUL_MM, MUL_VM
-	} operation;
-private:
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Woverloaded-virtual"
-#endif
-	void visit(const ExprNAryOp&amp; e, operation op);
-	void visit(const ExprBinaryOp&amp; b, operation op);
-	void visit(const ExprUnaryOp&amp; u, operation op);
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
-	void visit(const ExprNode&amp; e);
-	void visit(const ExprIndex&amp; i);
-	void visit(const ExprSymbol&amp; v);
-	void visit(const ExprConstant&amp; c);
-	void visit(const ExprVector&amp; e);
-	void visit(const ExprApply&amp; e);
-	void visit(const ExprChi&amp; e);
-	void visit(const ExprGenericBinaryOp&amp; e);
-	void visit(const ExprAdd&amp; e);
-	void visit(const ExprMul&amp; e);
-	void visit(const ExprSub&amp; e);
-	void visit(const ExprDiv&amp; e);
-	void visit(const ExprMax&amp; e);
-	void visit(const ExprMin&amp; e);
-	void visit(const ExprAtan2&amp; e);
-	void visit(const ExprGenericUnaryOp&amp; e);
-	void visit(const ExprMinus&amp; e);
-	void visit(const ExprTrans&amp; e);
-	void visit(const ExprSign&amp; e);
-	void visit(const ExprAbs&amp; e);
-	void visit(const ExprPower&amp; e);
-	void visit(const ExprSqr&amp; e);
-	void visit(const ExprSqrt&amp; e);
-	void visit(const ExprExp&amp; e);
-	void visit(const ExprLog&amp; e);
-	void visit(const ExprCos&amp; e);
-	void visit(const ExprSin&amp; e);
-	void visit(const ExprTan&amp; e);
-	void visit(const ExprCosh&amp; e);
-	void visit(const ExprSinh&amp; e);
-	void visit(const ExprTanh&amp; e);
-	void visit(const ExprAcos&amp; e);
-	void visit(const ExprAsin&amp; e);
-	void visit(const ExprAtan&amp; e);
-	void visit(const ExprAcosh&amp; e);
-	void visit(const ExprAsinh&amp; e);
-	void visit(const ExprAtanh&amp; e);
-	void visit(const ExprFloor&amp; e);
-	void visit(const ExprCeil&amp; e);
-	void visit(const ExprSaw&amp; e);
-private:
-	template&lt;class V&gt;
-	void forward(const V&amp; algo, int i) const;
-	template&lt;class V&gt;
-	void backward(const V&amp; algo, int i) const;
-	friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, const CompiledFunction&amp; data);
-	const char* op(operation o) const;
-	int n; 
-	int n_total; 
-	ExprSubNodes *nodes;
-	operation *code;
-	int* nb_args;
-	mutable int** args;
-	mutable int ptr;
-};
-std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, const CompiledFunction&amp; data);
-template&lt;class V&gt;
-inline void CompiledFunction::forward(const V&amp; algo) const {
-	assert(dynamic_cast&lt;const FwdAlgorithm* &gt;(&amp;algo)!=NULL);
-	for (int i=n-1; i&gt;=0; i--) {
-		forward(algo, i);
-	}
-}
-template&lt;class V&gt;
-inline void CompiledFunction::forward(const V&amp; algo, const Agenda&amp; a) const {
-	assert(dynamic_cast&lt;const FwdAlgorithm* &gt;(&amp;algo)!=NULL);
-	for (int i=a.first(); i!=a.end(); i=a.next(i)) {
-		forward(algo, i);
-	}
-}
-<a name="0"></a>
-template&lt;class V&gt;
-void CompiledFunction::forward(const V&amp; algo, int i) const {
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	switch(code[i]) {
-	case IDX:    ((V&amp;) algo).idx_fwd    (args[i][0], i); break;
-	case IDX_CP: ((V&amp;) algo).idx_cp_fwd (args[i][0], i); break;
-	case VEC:    ((V&amp;) algo).vector_fwd (args[i], i); break;
-	case SYM:    ((V&amp;) algo).symbol_fwd (i); break;
-	case CST:    ((V&amp;) algo).cst_fwd    (i); break;
-	case APPLY:  ((V&amp;) algo).apply_fwd  (args[i],i); break;</b></font>
-	case CHI:    ((V&amp;) algo).chi_fwd    (args[i][0], args[i][1], args[i][2], i); break;
-	case GEN2:   ((V&amp;) algo).gen2_fwd   (args[i][0], args[i][1], i); break;
-	case ADD:    ((V&amp;) algo).add_fwd    (args[i][0], args[i][1], i); break;
-	case ADD_V:  ((V&amp;) algo).add_V_fwd  (args[i][0], args[i][1], i); break;
-	case ADD_M:  ((V&amp;) algo).add_M_fwd  (args[i][0], args[i][1], i); break;
-	case MUL:    ((V&amp;) algo).mul_fwd    (args[i][0], args[i][1], i); break;
-	case MUL_SV: ((V&amp;) algo).mul_SV_fwd (args[i][0], args[i][1], i); break;
-	case MUL_SM: ((V&amp;) algo).mul_SM_fwd (args[i][0], args[i][1], i); break;
-	case MUL_VV: ((V&amp;) algo).mul_VV_fwd (args[i][0], args[i][1], i); break;
-	case MUL_MV: ((V&amp;) algo).mul_MV_fwd (args[i][0], args[i][1], i); break;
-	case MUL_MM: ((V&amp;) algo).mul_MM_fwd (args[i][0], args[i][1], i); break;
-	case MUL_VM: ((V&amp;) algo).mul_VM_fwd (args[i][0], args[i][1], i); break;
-	case SUB:    ((V&amp;) algo).sub_fwd    (args[i][0], args[i][1], i); break;
-	case SUB_V:  ((V&amp;) algo).sub_V_fwd  (args[i][0], args[i][1], i); break;
-	case SUB_M:  ((V&amp;) algo).sub_M_fwd  (args[i][0], args[i][1], i); break;
-	case DIV:    ((V&amp;) algo).div_fwd    (args[i][0], args[i][1], i); break;
-	case MAX:    ((V&amp;) algo).max_fwd    (args[i][0], args[i][1], i); break;
-	case MIN:    ((V&amp;) algo).min_fwd    (args[i][0], args[i][1], i); break;
-	case ATAN2:  ((V&amp;) algo).atan2_fwd  (args[i][0], args[i][1], i); break;
-	case GEN1:   ((V&amp;) algo).gen1_fwd   (args[i][0], i); break;
-	case MINUS:  ((V&amp;) algo).minus_fwd  (args[i][0], i); break;
-	case MINUS_V:((V&amp;) algo).minus_V_fwd(args[i][0], i); break;
-	case MINUS_M:((V&amp;) algo).minus_M_fwd(args[i][0], i); break;
-	case TRANS_V:((V&amp;) algo).trans_V_fwd(args[i][0], i); break;
-	case TRANS_M:((V&amp;) algo).trans_M_fwd(args[i][0], i); break;
-	case SIGN:   ((V&amp;) algo).sign_fwd   (args[i][0], i); break;
-	case ABS:    ((V&amp;) algo).abs_fwd    (args[i][0], i); break;
-	case POWER:  ((V&amp;) algo).power_fwd  (args[i][0], i, ((const ExprPower&amp;) (*nodes)[i]).expon); break;
-	case SQR:    ((V&amp;) algo).sqr_fwd    (args[i][0], i); break;
-	case SQRT:   ((V&amp;) algo).sqrt_fwd   (args[i][0], i); break;
-	case EXP:    ((V&amp;) algo).exp_fwd    (args[i][0], i); break;
-	case LOG:    ((V&amp;) algo).log_fwd    (args[i][0], i); break;
-	case COS:    ((V&amp;) algo).cos_fwd    (args[i][0], i); break;
-	case SIN:    ((V&amp;) algo).sin_fwd    (args[i][0], i); break;
-	case TAN:    ((V&amp;) algo).tan_fwd    (args[i][0], i); break;
-	case COSH:   ((V&amp;) algo).cosh_fwd   (args[i][0], i); break;
-	case SINH:   ((V&amp;) algo).sinh_fwd   (args[i][0], i); break;
-	case TANH:   ((V&amp;) algo).tanh_fwd   (args[i][0], i); break;
-	case ACOS:   ((V&amp;) algo).acos_fwd   (args[i][0], i); break;
-	case ASIN:   ((V&amp;) algo).asin_fwd   (args[i][0], i); break;
-	case ATAN:   ((V&amp;) algo).atan_fwd   (args[i][0], i); break;
-	case ACOSH:  ((V&amp;) algo).acosh_fwd  (args[i][0], i); break;
-	case ASINH:  ((V&amp;) algo).asinh_fwd  (args[i][0], i); break;
-	case ATANH:  ((V&amp;) algo).atanh_fwd  (args[i][0], i); break;
-	case FLOOR:  ((V&amp;) algo).floor_fwd  (args[i][0], i); break;
-	case CEIL:   ((V&amp;) algo).ceil_fwd   (args[i][0], i); break;
-	case SAW:    ((V&amp;) algo).saw_fwd    (args[i][0], i); break;
-	default: 	 assert(false);
-	}
-}
-template&lt;class V&gt;
-void CompiledFunction::backward(const V&amp; algo) const {
-	assert(dynamic_cast&lt;const BwdAlgorithm* &gt;(&amp;algo)!=NULL);
-	for (int i=0; i&lt;n; i++) {
-		backward(algo, i);
-	}
-}
-template&lt;class V&gt;
-void CompiledFunction::backward(const V&amp; algo, const Agenda&amp; a) const {
-	assert(dynamic_cast&lt;const BwdAlgorithm* &gt;(&amp;algo)!=NULL);
-	for (int i=a.first(); i!=a.end(); i=a.next(i)) {
-		backward(algo, i);
-	}
-}
-template&lt;class V&gt;
-void CompiledFunction::backward(const V&amp; algo, int i) const {
-	switch(code[i]) {
-	case IDX:    ((V&amp;) algo).idx_bwd    (args[i][0], i); break;
-	case IDX_CP: ((V&amp;) algo).idx_cp_bwd (args[i][0], i); break;
-	case VEC:    ((V&amp;) algo).vector_bwd (args[i], i); break;
-	case SYM:    ((V&amp;) algo).symbol_bwd (i); break;
-	case CST:    ((V&amp;) algo).cst_bwd    (i); break;
-	case APPLY:  ((V&amp;) algo).apply_bwd  (args[i], i); break;
-	case CHI:    ((V&amp;) algo).chi_bwd    (args[i][0], args[i][1], args[i][2], i); break;
-	case GEN2:   ((V&amp;) algo).gen2_bwd   (args[i][0], args[i][1], i); break;
-	case ADD:    ((V&amp;) algo).add_bwd    (args[i][0], args[i][1], i); break;
-	case ADD_V:  ((V&amp;) algo).add_V_bwd  (args[i][0], args[i][1], i); break;
-	case ADD_M:  ((V&amp;) algo).add_M_bwd  (args[i][0], args[i][1], i); break;
-	case MUL:    ((V&amp;) algo).mul_bwd    (args[i][0], args[i][1], i); break;
-	case MUL_SV: ((V&amp;) algo).mul_SV_bwd (args[i][0], args[i][1], i); break;
-	case MUL_SM: ((V&amp;) algo).mul_SM_bwd (args[i][0], args[i][1], i); break;
-	case MUL_VV: ((V&amp;) algo).mul_VV_bwd (args[i][0], args[i][1], i); break;
-	case MUL_MV: ((V&amp;) algo).mul_MV_bwd (args[i][0], args[i][1], i); break;
-	case MUL_MM: ((V&amp;) algo).mul_MM_bwd (args[i][0], args[i][1], i); break;
-	case MUL_VM: ((V&amp;) algo).mul_VM_bwd (args[i][0], args[i][1], i); break;
-	case SUB:    ((V&amp;) algo).sub_bwd    (args[i][0], args[i][1], i); break;
-	case SUB_V:  ((V&amp;) algo).sub_V_bwd  (args[i][0], args[i][1], i); break;
-	case SUB_M:  ((V&amp;) algo).sub_M_bwd  (args[i][0], args[i][1], i); break;
-	case DIV:    ((V&amp;) algo).div_bwd    (args[i][0], args[i][1], i); break;
-	case MAX:    ((V&amp;) algo).max_bwd    (args[i][0], args[i][1], i); break;
-	case MIN:    ((V&amp;) algo).min_bwd    (args[i][0], args[i][1], i); break;
-	case ATAN2:  ((V&amp;) algo).atan2_bwd  (args[i][0], args[i][1], i); break;
-	case GEN1:   ((V&amp;) algo).gen1_bwd   (args[i][0], i); break;
-	case MINUS:  ((V&amp;) algo).minus_bwd  (args[i][0], i); break;
-	case MINUS_V:((V&amp;) algo).minus_V_bwd(args[i][0], i); break;
-	case MINUS_M:((V&amp;) algo).minus_M_bwd(args[i][0], i); break;
-	case TRANS_V:((V&amp;) algo).trans_V_bwd(args[i][0], i); break;
-	case TRANS_M:((V&amp;) algo).trans_M_bwd(args[i][0], i); break;
-	case SIGN:   ((V&amp;) algo).sign_bwd   (args[i][0], i); break;
-	case ABS:    ((V&amp;) algo).abs_bwd    (args[i][0], i); break;
-	case POWER:  ((V&amp;) algo).power_bwd  (args[i][0], i, ((const ExprPower&amp;) (*nodes)[i]).expon); break;
-	case SQR:    ((V&amp;) algo).sqr_bwd    (args[i][0], i); break;
-	case SQRT:   ((V&amp;) algo).sqrt_bwd   (args[i][0], i); break;
-	case EXP:    ((V&amp;) algo).exp_bwd    (args[i][0], i); break;
-	case LOG:    ((V&amp;) algo).log_bwd    (args[i][0], i); break;
-	case COS:    ((V&amp;) algo).cos_bwd    (args[i][0], i); break;
-	case SIN:    ((V&amp;) algo).sin_bwd    (args[i][0], i); break;
-	case TAN:    ((V&amp;) algo).tan_bwd    (args[i][0], i); break;
-	case COSH:   ((V&amp;) algo).cosh_bwd   (args[i][0], i); break;
-	case SINH:   ((V&amp;) algo).sinh_bwd   (args[i][0], i); break;
-	case TANH:   ((V&amp;) algo).tanh_bwd   (args[i][0], i); break;
-	case ACOS:   ((V&amp;) algo).acos_bwd   (args[i][0], i); break;
-	case ASIN:   ((V&amp;) algo).asin_bwd   (args[i][0], i); break;
-	case ATAN:   ((V&amp;) algo).atan_bwd   (args[i][0], i); break;
-	case ACOSH:  ((V&amp;) algo).acosh_bwd  (args[i][0], i); break;
-	case ASINH:  ((V&amp;) algo).asinh_bwd  (args[i][0], i); break;
-	case ATANH:  ((V&amp;) algo).atanh_bwd  (args[i][0], i); break;
-	case FLOOR:  ((V&amp;) algo).floor_bwd  (args[i][0], i); break;
-	case CEIL:   ((V&amp;) algo).ceil_bwd   (args[i][0], i); break;
-	case SAW:    ((V&amp;) algo).saw_bwd    (args[i][0], i); break;
-	default: 	 assert(false);
-	}
-}
-} 
+1 #ifndef __IBEX_COMPILED_FUNCTION_H__
+2 #define __IBEX_COMPILED_FUNCTION_H__
+3 #include &lt;stack&gt;
+4 #include "ibex_Expr.h"
+5 #include "ibex_ExprVisitor.h"
+6 #include "ibex_ExprSubNodes.h"
+7 #include "ibex_FwdAlgorithm.h"
+8 #include "ibex_BwdAlgorithm.h"
+9 #include "ibex_Agenda.h"
+10 namespace ibex {
+11 class Function;
+12 template&lt;class T&gt;
+13 class ExprData;
+14 class CompiledFunction : public ExprVisitor&lt;void&gt; {
+15 public:
+16 	CompiledFunction();
+17 	void compile(Function&amp; f);
+18 	~CompiledFunction();
+19 	template&lt;class V&gt;
+20 	void forward(const V&amp; algo) const;
+21 	template&lt;class V&gt;
+22 	void forward(const V&amp; algo, const Agenda&amp; a) const;
+23 	template&lt;class V&gt;
+24 	void backward(const V&amp; algo) const;
+25 	template&lt;class V&gt;
+26 	void backward(const V&amp; algo, const Agenda&amp; a) const;
+27 	Agenda* agenda(int rank) const;
+28 	friend class Function;
+29 protected:
+30 	typedef enum {
+31 		IDX,    		IDX_CP, 		VEC, SYM, CST, APPLY, CHI,
+32 		ADD, MUL, SUB, DIV, MAX, MIN, ATAN2,
+33 		GEN1, GEN2, GENN,
+34 		MINUS, MINUS_V, MINUS_M,
+35 		TRANS_V, TRANS_M, SIGN, ABS, POWER,
+36 		SQR, SQRT, EXP, LOG,
+37 		COS,  SIN,  TAN,  ACOS,  ASIN,  ATAN,
+38 		COSH, SINH, TANH, ACOSH, ASINH, ATANH,
+39 		FLOOR,  CEIL, SAW,
+40 		ADD_V, ADD_M, SUB_V, SUB_M,
+41 		MUL_SV, MUL_SM, MUL_VV, MUL_MV, MUL_MM, MUL_VM
+42 	} operation;
+43 private:
+44 #ifdef __clang__
+45 #pragma clang diagnostic push
+46 #pragma clang diagnostic ignored "-Woverloaded-virtual"
+47 #endif
+48 	void visit(const ExprNAryOp&amp; e, operation op);
+49 	void visit(const ExprBinaryOp&amp; b, operation op);
+50 	void visit(const ExprUnaryOp&amp; u, operation op);
+51 #ifdef __clang__
+52 #pragma clang diagnostic pop
+53 #endif
+54 	void visit(const ExprNode&amp; e);
+55 	void visit(const ExprIndex&amp; i);
+56 	void visit(const ExprSymbol&amp; v);
+57 	void visit(const ExprConstant&amp; c);
+58 	void visit(const ExprVector&amp; e);
+59 	void visit(const ExprApply&amp; e);
+60 	void visit(const ExprChi&amp; e);
+61 	void visit(const ExprGenericBinaryOp&amp; e);
+62 	void visit(const ExprAdd&amp; e);
+63 	void visit(const ExprMul&amp; e);
+64 	void visit(const ExprSub&amp; e);
+65 	void visit(const ExprDiv&amp; e);
+66 	void visit(const ExprMax&amp; e);
+67 	void visit(const ExprMin&amp; e);
+68 	void visit(const ExprAtan2&amp; e);
+69 	void visit(const ExprGenericUnaryOp&amp; e);
+70 	void visit(const ExprMinus&amp; e);
+71 	void visit(const ExprTrans&amp; e);
+72 	void visit(const ExprSign&amp; e);
+73 	void visit(const ExprAbs&amp; e);
+74 	void visit(const ExprPower&amp; e);
+75 	void visit(const ExprSqr&amp; e);
+76 	void visit(const ExprSqrt&amp; e);
+77 	void visit(const ExprExp&amp; e);
+78 	void visit(const ExprLog&amp; e);
+79 	void visit(const ExprCos&amp; e);
+80 	void visit(const ExprSin&amp; e);
+81 	void visit(const ExprTan&amp; e);
+82 	void visit(const ExprCosh&amp; e);
+83 	void visit(const ExprSinh&amp; e);
+84 	void visit(const ExprTanh&amp; e);
+85 	void visit(const ExprAcos&amp; e);
+86 	void visit(const ExprAsin&amp; e);
+87 	void visit(const ExprAtan&amp; e);
+88 	void visit(const ExprAcosh&amp; e);
+89 	void visit(const ExprAsinh&amp; e);
+90 	void visit(const ExprAtanh&amp; e);
+91 	void visit(const ExprFloor&amp; e);
+92 	void visit(const ExprCeil&amp; e);
+93 	void visit(const ExprSaw&amp; e);
+94 private:
+95 	template&lt;class V&gt;
+96 	void forward(const V&amp; algo, int i) const;
+97 	template&lt;class V&gt;
+98 	void backward(const V&amp; algo, int i) const;
+99 	friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, const CompiledFunction&amp; data);
+100 	const char* op(operation o) const;
+101 	int n; 
+102 	int n_total; 
+103 	ExprSubNodes *nodes;
+104 	operation *code;
+105 	int* nb_args;
+106 	mutable int** args;
+107 	mutable int ptr;
+108 };
+109 std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, const CompiledFunction&amp; data);
+110 template&lt;class V&gt;
+111 inline void CompiledFunction::forward(const V&amp; algo) const {
+112 	assert(dynamic_cast&lt;const FwdAlgorithm* &gt;(&amp;algo)!=NULL);
+113 	for (int i=n-1; i&gt;=0; i--) {
+114 		forward(algo, i);
+115 	}
+116 }
+117 template&lt;class V&gt;
+118 inline void CompiledFunction::forward(const V&amp; algo, const Agenda&amp; a) const {
+119 	assert(dynamic_cast&lt;const FwdAlgorithm* &gt;(&amp;algo)!=NULL);
+120 	for (int i=a.first(); i!=a.end(); i=a.next(i)) {
+121 		forward(algo, i);
+122 	}
+123 }
+124 <a name="0"></a>
+125 template&lt;class V&gt;
+126 void CompiledFunction::forward(const V&amp; algo, int i) const {
+127 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	switch(code[i]) {
+128 	case IDX:    ((V&amp;) algo).idx_fwd    (args[i][0], i); break;
+129 	case IDX_CP: ((V&amp;) algo).idx_cp_fwd (args[i][0], i); break;
+130 	case VEC:    ((V&amp;) algo).vector_fwd (args[i], i); break;
+131 	case SYM:    ((V&amp;) algo).symbol_fwd (i); break;
+132 	case CST:    ((V&amp;) algo).cst_fwd    (i); break;
+133 	case APPLY:  ((V&amp;) algo).apply_fwd  (args[i],i); break;</b></font>
+134 	case CHI:    ((V&amp;) algo).chi_fwd    (args[i][0], args[i][1], args[i][2], i); break;
+135 	case GEN2:   ((V&amp;) algo).gen2_fwd   (args[i][0], args[i][1], i); break;
+136 	case ADD:    ((V&amp;) algo).add_fwd    (args[i][0], args[i][1], i); break;
+137 	case ADD_V:  ((V&amp;) algo).add_V_fwd  (args[i][0], args[i][1], i); break;
+138 	case ADD_M:  ((V&amp;) algo).add_M_fwd  (args[i][0], args[i][1], i); break;
+139 	case MUL:    ((V&amp;) algo).mul_fwd    (args[i][0], args[i][1], i); break;
+140 	case MUL_SV: ((V&amp;) algo).mul_SV_fwd (args[i][0], args[i][1], i); break;
+141 	case MUL_SM: ((V&amp;) algo).mul_SM_fwd (args[i][0], args[i][1], i); break;
+142 	case MUL_VV: ((V&amp;) algo).mul_VV_fwd (args[i][0], args[i][1], i); break;
+143 	case MUL_MV: ((V&amp;) algo).mul_MV_fwd (args[i][0], args[i][1], i); break;
+144 	case MUL_MM: ((V&amp;) algo).mul_MM_fwd (args[i][0], args[i][1], i); break;
+145 	case MUL_VM: ((V&amp;) algo).mul_VM_fwd (args[i][0], args[i][1], i); break;
+146 	case SUB:    ((V&amp;) algo).sub_fwd    (args[i][0], args[i][1], i); break;
+147 	case SUB_V:  ((V&amp;) algo).sub_V_fwd  (args[i][0], args[i][1], i); break;
+148 	case SUB_M:  ((V&amp;) algo).sub_M_fwd  (args[i][0], args[i][1], i); break;
+149 	case DIV:    ((V&amp;) algo).div_fwd    (args[i][0], args[i][1], i); break;
+150 	case MAX:    ((V&amp;) algo).max_fwd    (args[i][0], args[i][1], i); break;
+151 	case MIN:    ((V&amp;) algo).min_fwd    (args[i][0], args[i][1], i); break;
+152 	case ATAN2:  ((V&amp;) algo).atan2_fwd  (args[i][0], args[i][1], i); break;
+153 	case GEN1:   ((V&amp;) algo).gen1_fwd   (args[i][0], i); break;
+154 	case MINUS:  ((V&amp;) algo).minus_fwd  (args[i][0], i); break;
+155 	case MINUS_V:((V&amp;) algo).minus_V_fwd(args[i][0], i); break;
+156 	case MINUS_M:((V&amp;) algo).minus_M_fwd(args[i][0], i); break;
+157 	case TRANS_V:((V&amp;) algo).trans_V_fwd(args[i][0], i); break;
+158 	case TRANS_M:((V&amp;) algo).trans_M_fwd(args[i][0], i); break;
+159 	case SIGN:   ((V&amp;) algo).sign_fwd   (args[i][0], i); break;
+160 	case ABS:    ((V&amp;) algo).abs_fwd    (args[i][0], i); break;
+161 	case POWER:  ((V&amp;) algo).power_fwd  (args[i][0], i, ((const ExprPower&amp;) (*nodes)[i]).expon); break;
+162 	case SQR:    ((V&amp;) algo).sqr_fwd    (args[i][0], i); break;
+163 	case SQRT:   ((V&amp;) algo).sqrt_fwd   (args[i][0], i); break;
+164 	case EXP:    ((V&amp;) algo).exp_fwd    (args[i][0], i); break;
+165 	case LOG:    ((V&amp;) algo).log_fwd    (args[i][0], i); break;
+166 	case COS:    ((V&amp;) algo).cos_fwd    (args[i][0], i); break;
+167 	case SIN:    ((V&amp;) algo).sin_fwd    (args[i][0], i); break;
+168 	case TAN:    ((V&amp;) algo).tan_fwd    (args[i][0], i); break;
+169 	case COSH:   ((V&amp;) algo).cosh_fwd   (args[i][0], i); break;
+170 	case SINH:   ((V&amp;) algo).sinh_fwd   (args[i][0], i); break;
+171 	case TANH:   ((V&amp;) algo).tanh_fwd   (args[i][0], i); break;
+172 	case ACOS:   ((V&amp;) algo).acos_fwd   (args[i][0], i); break;
+173 	case ASIN:   ((V&amp;) algo).asin_fwd   (args[i][0], i); break;
+174 	case ATAN:   ((V&amp;) algo).atan_fwd   (args[i][0], i); break;
+175 	case ACOSH:  ((V&amp;) algo).acosh_fwd  (args[i][0], i); break;
+176 	case ASINH:  ((V&amp;) algo).asinh_fwd  (args[i][0], i); break;
+177 	case ATANH:  ((V&amp;) algo).atanh_fwd  (args[i][0], i); break;
+178 	case FLOOR:  ((V&amp;) algo).floor_fwd  (args[i][0], i); break;
+179 	case CEIL:   ((V&amp;) algo).ceil_fwd   (args[i][0], i); break;
+180 	case SAW:    ((V&amp;) algo).saw_fwd    (args[i][0], i); break;
+181 	default: 	 assert(false);
+182 	}
+183 }
+184 template&lt;class V&gt;
+185 void CompiledFunction::backward(const V&amp; algo) const {
+186 	assert(dynamic_cast&lt;const BwdAlgorithm* &gt;(&amp;algo)!=NULL);
+187 	for (int i=0; i&lt;n; i++) {
+188 		backward(algo, i);
+189 	}
+190 }
+191 template&lt;class V&gt;
+192 void CompiledFunction::backward(const V&amp; algo, const Agenda&amp; a) const {
+193 	assert(dynamic_cast&lt;const BwdAlgorithm* &gt;(&amp;algo)!=NULL);
+194 	for (int i=a.first(); i!=a.end(); i=a.next(i)) {
+195 		backward(algo, i);
+196 	}
+197 }
+198 template&lt;class V&gt;
+199 void CompiledFunction::backward(const V&amp; algo, int i) const {
+200 	switch(code[i]) {
+201 	case IDX:    ((V&amp;) algo).idx_bwd    (args[i][0], i); break;
+202 	case IDX_CP: ((V&amp;) algo).idx_cp_bwd (args[i][0], i); break;
+203 	case VEC:    ((V&amp;) algo).vector_bwd (args[i], i); break;
+204 	case SYM:    ((V&amp;) algo).symbol_bwd (i); break;
+205 	case CST:    ((V&amp;) algo).cst_bwd    (i); break;
+206 	case APPLY:  ((V&amp;) algo).apply_bwd  (args[i], i); break;
+207 	case CHI:    ((V&amp;) algo).chi_bwd    (args[i][0], args[i][1], args[i][2], i); break;
+208 	case GEN2:   ((V&amp;) algo).gen2_bwd   (args[i][0], args[i][1], i); break;
+209 	case ADD:    ((V&amp;) algo).add_bwd    (args[i][0], args[i][1], i); break;
+210 	case ADD_V:  ((V&amp;) algo).add_V_bwd  (args[i][0], args[i][1], i); break;
+211 	case ADD_M:  ((V&amp;) algo).add_M_bwd  (args[i][0], args[i][1], i); break;
+212 	case MUL:    ((V&amp;) algo).mul_bwd    (args[i][0], args[i][1], i); break;
+213 	case MUL_SV: ((V&amp;) algo).mul_SV_bwd (args[i][0], args[i][1], i); break;
+214 	case MUL_SM: ((V&amp;) algo).mul_SM_bwd (args[i][0], args[i][1], i); break;
+215 	case MUL_VV: ((V&amp;) algo).mul_VV_bwd (args[i][0], args[i][1], i); break;
+216 	case MUL_MV: ((V&amp;) algo).mul_MV_bwd (args[i][0], args[i][1], i); break;
+217 	case MUL_MM: ((V&amp;) algo).mul_MM_bwd (args[i][0], args[i][1], i); break;
+218 	case MUL_VM: ((V&amp;) algo).mul_VM_bwd (args[i][0], args[i][1], i); break;
+219 	case SUB:    ((V&amp;) algo).sub_bwd    (args[i][0], args[i][1], i); break;
+220 	case SUB_V:  ((V&amp;) algo).sub_V_bwd  (args[i][0], args[i][1], i); break;
+221 	case SUB_M:  ((V&amp;) algo).sub_M_bwd  (args[i][0], args[i][1], i); break;
+222 	case DIV:    ((V&amp;) algo).div_bwd    (args[i][0], args[i][1], i); break;
+223 	case MAX:    ((V&amp;) algo).max_bwd    (args[i][0], args[i][1], i); break;
+224 	case MIN:    ((V&amp;) algo).min_bwd    (args[i][0], args[i][1], i); break;
+225 	case ATAN2:  ((V&amp;) algo).atan2_bwd  (args[i][0], args[i][1], i); break;
+226 	case GEN1:   ((V&amp;) algo).gen1_bwd   (args[i][0], i); break;
+227 	case MINUS:  ((V&amp;) algo).minus_bwd  (args[i][0], i); break;
+228 	case MINUS_V:((V&amp;) algo).minus_V_bwd(args[i][0], i); break;
+229 	case MINUS_M:((V&amp;) algo).minus_M_bwd(args[i][0], i); break;
+230 	case TRANS_V:((V&amp;) algo).trans_V_bwd(args[i][0], i); break;
+231 	case TRANS_M:((V&amp;) algo).trans_M_bwd(args[i][0], i); break;
+232 	case SIGN:   ((V&amp;) algo).sign_bwd   (args[i][0], i); break;
+233 	case ABS:    ((V&amp;) algo).abs_bwd    (args[i][0], i); break;
+234 	case POWER:  ((V&amp;) algo).power_bwd  (args[i][0], i, ((const ExprPower&amp;) (*nodes)[i]).expon); break;
+235 	case SQR:    ((V&amp;) algo).sqr_bwd    (args[i][0], i); break;
+236 	case SQRT:   ((V&amp;) algo).sqrt_bwd   (args[i][0], i); break;
+237 	case EXP:    ((V&amp;) algo).exp_bwd    (args[i][0], i); break;
+238 	case LOG:    ((V&amp;) algo).log_bwd    (args[i][0], i); break;
+239 	case COS:    ((V&amp;) algo).cos_bwd    (args[i][0], i); break;
+240 	case SIN:    ((V&amp;) algo).sin_bwd    (args[i][0], i); break;
+241 	case TAN:    ((V&amp;) algo).tan_bwd    (args[i][0], i); break;
+242 	case COSH:   ((V&amp;) algo).cosh_bwd   (args[i][0], i); break;
+243 	case SINH:   ((V&amp;) algo).sinh_bwd   (args[i][0], i); break;
+244 	case TANH:   ((V&amp;) algo).tanh_bwd   (args[i][0], i); break;
+245 	case ACOS:   ((V&amp;) algo).acos_bwd   (args[i][0], i); break;
+246 	case ASIN:   ((V&amp;) algo).asin_bwd   (args[i][0], i); break;
+247 	case ATAN:   ((V&amp;) algo).atan_bwd   (args[i][0], i); break;
+248 	case ACOSH:  ((V&amp;) algo).acosh_bwd  (args[i][0], i); break;
+249 	case ASINH:  ((V&amp;) algo).asinh_bwd  (args[i][0], i); break;
+250 	case ATANH:  ((V&amp;) algo).atanh_bwd  (args[i][0], i); break;
+251 	case FLOOR:  ((V&amp;) algo).floor_bwd  (args[i][0], i); break;
+252 	case CEIL:   ((V&amp;) algo).ceil_bwd   (args[i][0], i); break;
+253 	case SAW:    ((V&amp;) algo).saw_bwd    (args[i][0], i); break;
+254 	default: 	 assert(false);
+255 	}
+256 }
+257 } 
 #endif </pre>
 </div>
 </div>

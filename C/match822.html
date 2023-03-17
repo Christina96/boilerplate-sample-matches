@@ -41,333 +41,333 @@ Matches for omhiredis.c &amp; mmnormalize.c
 </h3>
 <hr/>
 <pre>
-#include "config.h"
-#include &lt;stdio.h&gt;
-#include &lt;string.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;ctype.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;time.h&gt;
-#include &lt;hiredis/hiredis.h&gt;
-#include "rsyslog.h"
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "template.h"
-#include "module-template.h"
-#include "errmsg.h"
-#include "cfsysline.h"
-#include "unicode-helper.h"
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("omhiredis")
-DEF_OMOD_STATIC_DATA
-#define OMHIREDIS_MODE_TEMPLATE 0
-#define OMHIREDIS_MODE_QUEUE 1
-#define OMHIREDIS_MODE_PUBLISH 2
-#define OMHIREDIS_MODE_SET 3
-typedef struct _instanceData {
-	uchar *server; 	int port; 	uchar *serverpassword; 	uchar *tplName; 	char *modeDescription; 	int mode; 	uchar *key; 	int expiration; 	sbool dynaKey; 	sbool useRPush; } instanceData;
-typedef struct wrkrInstanceData {
-	instanceData *pData; 	redisContext *conn; 	int count; } wrkrInstanceData_t;
-static struct cnfparamdescr actpdescr[] = {
-	{ "server", eCmdHdlrGetWord, 0 },
-<a name="0"></a>	{ "serverport", eCmdHdlrInt, 0 },
-	{ "serverpassword", eCmdHdlrGetWord, 0 },
-	{ "template", eCmdHdlrGetWord, 0 },
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "mode", eCmdHdlrGetWord, 0 },
-	{ "key", eCmdHdlrGetWord, 0 },
-	{ "expiration", eCmdHdlrInt, 0 },
-	{ "dynakey", eCmdHdlrBinary, 0 },
-	{ "userpush", eCmdHdlrBinary, 0 },
-};
-static struct cnfparamblk actpblk = {
-	CNFPARAMBLK_VERSION,
-	sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	actpdescr
-};</b></font>
-BEGINcreateInstance
-CODESTARTcreateInstance
-ENDcreateInstance
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-	pWrkrData-&gt;conn = NULL; ENDcreateWrkrInstance
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURERepeatedMsgReduction)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-static void closeHiredis(wrkrInstanceData_t *pWrkrData)
-{
-	if(pWrkrData-&gt;conn != NULL) {
-		redisFree(pWrkrData-&gt;conn);
-		pWrkrData-&gt;conn = NULL;
-	}
-}
-BEGINfreeInstance
-CODESTARTfreeInstance
-	if (pData-&gt;server != NULL) {
-		free(pData-&gt;server);
-	}
-	free(pData-&gt;key);
-	free(pData-&gt;modeDescription);
-	free(pData-&gt;serverpassword);
-ENDfreeInstance
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-	closeHiredis(pWrkrData);
-ENDfreeWrkrInstance
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-ENDdbgPrintInstInfo
-static rsRetVal initHiredis(wrkrInstanceData_t *pWrkrData, int bSilent)
-{
-	char *server;
-	char *serverpasswd;
-	DEFiRet;
-	server = (pWrkrData-&gt;pData-&gt;server == NULL) ? (char *)"127.0.0.1" :
-			(char*) pWrkrData-&gt;pData-&gt;server;
-	DBGPRINTF("omhiredis: trying connect to '%s' at port %d\n", server,
-			pWrkrData-&gt;pData-&gt;port);
-	struct timeval timeout = { 1, 500000 }; 	pWrkrData-&gt;conn = redisConnectWithTimeout(server, pWrkrData-&gt;pData-&gt;port,
-			timeout);
-	if (pWrkrData-&gt;conn-&gt;err) {
-		if(!bSilent)
-			LogError(0, RS_RET_SUSPENDED,
-				"can not initialize redis handle");
-		ABORT_FINALIZE(RS_RET_SUSPENDED);
-	}
-	if (pWrkrData-&gt;pData-&gt;serverpassword != NULL) {
-		serverpasswd = (char*) pWrkrData-&gt;pData-&gt;serverpassword;
-		int rc;
-		rc = redisAppendCommand(pWrkrData-&gt;conn, "AUTH %s", serverpasswd);
-		if (rc == REDIS_ERR) {
-			LogError(0, NO_ERRCODE, "omhiredis: %s", pWrkrData-&gt;conn-&gt;errstr);
-			ABORT_FINALIZE(RS_RET_ERR);
-		} else {
-			pWrkrData-&gt;count++;
-		}
-	}
-finalize_it:
-	RETiRet;
-}
-static rsRetVal writeHiredis(uchar* key, uchar *message, wrkrInstanceData_t *pWrkrData)
-{
-	DEFiRet;
-	int rc, expire;
-	size_t msgLen;
-	char *formattedMsg = NULL;
-	if(pWrkrData-&gt;conn == NULL)
-		CHKiRet(initHiredis(pWrkrData, 0));
-	switch(pWrkrData-&gt;pData-&gt;mode) {
-		case OMHIREDIS_MODE_TEMPLATE:
-			rc = redisAppendCommand(pWrkrData-&gt;conn, (char*)message);
-			break;
-		case OMHIREDIS_MODE_QUEUE:
-			rc = redisAppendCommand(pWrkrData-&gt;conn,
-				pWrkrData-&gt;pData-&gt;useRPush ? "RPUSH %s %s" : "LPUSH %s %s",
-				key, (char*)message);
-			break;
-		case OMHIREDIS_MODE_PUBLISH:
-			rc = redisAppendCommand(pWrkrData-&gt;conn, "PUBLISH %s %s", key, (char*)message);
-			break;
-		case OMHIREDIS_MODE_SET:
-			expire = pWrkrData-&gt;pData-&gt;expiration;
-			if (expire &gt; 0)
-				msgLen = redisFormatCommand(&amp;formattedMsg, "SETEX %s %d %s", key, expire, message);
-			else
-				msgLen = redisFormatCommand(&amp;formattedMsg, "SET %s %s", key, message);
-			if (msgLen)
-				rc = redisAppendFormattedCommand(pWrkrData-&gt;conn, formattedMsg, msgLen);
-			else {
-				dbgprintf("omhiredis: could not append SET command\n");
-				rc = REDIS_ERR;
-			}
-			break;
-		default:
-			dbgprintf("omhiredis: mode %d is invalid something is really wrong\n",
-				pWrkrData-&gt;pData-&gt;mode);
-			ABORT_FINALIZE(RS_RET_ERR);
-	}
-	if (rc == REDIS_ERR) {
-		LogError(0, NO_ERRCODE, "omhiredis: %s", pWrkrData-&gt;conn-&gt;errstr);
-		dbgprintf("omhiredis: %s\n", pWrkrData-&gt;conn-&gt;errstr);
-		ABORT_FINALIZE(RS_RET_ERR);
-	} else {
-		pWrkrData-&gt;count++;
-	}
-finalize_it:
-	free(formattedMsg);
-	RETiRet;
-}
-BEGINtryResume
-CODESTARTtryResume
-	if(pWrkrData-&gt;conn == NULL)
-		iRet = initHiredis(pWrkrData, 0);
-ENDtryResume
-BEGINbeginTransaction
-CODESTARTbeginTransaction
-	dbgprintf("omhiredis: beginTransaction called\n");
-	pWrkrData-&gt;count = 0;
-ENDbeginTransaction
-BEGINdoAction
-CODESTARTdoAction
-	if(pWrkrData-&gt;pData-&gt;dynaKey) {
-		CHKiRet(writeHiredis(ppString[1], ppString[0], pWrkrData));
-	}
-	else {
-		CHKiRet(writeHiredis(pWrkrData-&gt;pData-&gt;key, ppString[0], pWrkrData));
-	}
-	iRet = RS_RET_DEFER_COMMIT;
-finalize_it:
-ENDdoAction
-BEGINendTransaction
-CODESTARTendTransaction
-	dbgprintf("omhiredis: endTransaction called\n");
-	redisReply *reply;
-	int i;
-	for ( i = 0; i &lt; pWrkrData-&gt;count; i++ ) {
-		redisGetReply ( pWrkrData-&gt;conn, (void*)&amp;reply);
-		if( pWrkrData-&gt;conn-&gt;err ){
-			dbgprintf("omhiredis: %s\n", pWrkrData-&gt;conn-&gt;errstr);
-			closeHiredis(pWrkrData);
-			ABORT_FINALIZE(RS_RET_SUSPENDED);
-		}
-		else {
-			freeReplyObject(reply);
-		}
-	}
-finalize_it:
-ENDendTransaction
-static void
-setInstParamDefaults(instanceData *pData)
-{
-	pData-&gt;server = NULL;
-	pData-&gt;port = 6379;
-	pData-&gt;serverpassword = NULL;
-	pData-&gt;tplName = NULL;
-	pData-&gt;mode = OMHIREDIS_MODE_TEMPLATE;
-	pData-&gt;expiration = 0;
-	pData-&gt;modeDescription = NULL;
-	pData-&gt;key = NULL;
-	pData-&gt;useRPush = 0;
-}
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	int i;
-	int iNumTpls;
-	uchar *keydup = NULL;
-CODESTARTnewActInst
-	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL)
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	CHKiRet(createInstance(&amp;pData));
-	setInstParamDefaults(pData);
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-<a name="1"></a>	
-		if(!strcmp(actpblk.descr[i].name, "server")) {
-			pData-&gt;server = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		} else if(!strcmp(actpblk.descr[i].name, "serverport")) {
-			pData-&gt;port = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "serverpassword")) {
-			pData-&gt;serverpassword = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "template")) {
-			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
-		} else if(!strcmp(actpblk.descr[i].name, "dynakey")) {
-			pData-&gt;dynaKey = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "userpush")) {
-			pData-&gt;useRPush = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "mode")) {
-			pData-&gt;modeDescription = es_str2cstr(pvals[i].val.d.estr, NULL);
-			if (!strcmp(pData-&gt;modeDescription, "template")) {
-				pData-&gt;mode = OMHIREDIS_MODE_TEMPLATE;
-			} else if (!strcmp(pData-&gt;modeDescription, "queue")) {
-				pData-&gt;mode = OMHIREDIS_MODE_QUEUE;
-			} else if (!strcmp(pData-&gt;modeDescription, "publish")) {
-				pData-&gt;mode = OMHIREDIS_MODE_PUBLISH;
-			} else if (!strcmp(pData-&gt;modeDescription, "set")) {
-				pData-&gt;mode = OMHIREDIS_MODE_SET;
-			} else {
-				dbgprintf("omhiredis: unsupported mode %s\n", actpblk.descr[i].name);
-				ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "key")) {
-			pData-&gt;key = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "expiration")) {
-			pData-&gt;expiration = pvals[i].val.d.n;
-			dbgprintf("omhiredis: expiration set to %d\n", pData-&gt;expiration);
-		} else {
-			dbgprintf("omhiredis: program error, non-handled "
-				"param '%s'\n", actpblk.descr[i].name);
-		}
-	}
-	dbgprintf("omhiredis: checking config sanity\n");
-	if (!pData-&gt;modeDescription) {
-		dbgprintf("omhiredis: no mode specified, setting it to 'template'\n");
-		pData-&gt;mode = OMHIREDIS_MODE_TEMPLATE;
-	}
-	switch(pData-&gt;mode) {
-		case OMHIREDIS_MODE_QUEUE:
-		case OMHIREDIS_MODE_PUBLISH:
-		case OMHIREDIS_MODE_SET:
-			if (pData-&gt;key == NULL) {
-				dbgprintf("omhiredis: mode %s requires a key\n", pData-&gt;modeDescription);
-				ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-			}
-			if (pData-&gt;tplName == NULL) {
-				dbgprintf("omhiredis: using default RSYSLOG_ForwardFormat template\n");
-				CHKmalloc(pData-&gt;tplName = ustrdup("RSYSLOG_ForwardFormat"));
-			}
-			if (pData-&gt;expiration &amp;&amp; strcmp(pData-&gt;modeDescription, "set")) {
-				LogError(0, RS_RET_CONF_PARSE_WARNING, "omhiredis: expiration set but mode is not "\
-				"'set', expiration will be ignored");
-			}
-			break;
-		case OMHIREDIS_MODE_TEMPLATE:
-			if (pData-&gt;tplName == NULL) {
-				dbgprintf("omhiredis: selected mode requires template\n");
-				ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-			}
-			break;
-	}
-	iNumTpls = 1;
-	if (pData-&gt;dynaKey) {
-		assert(pData-&gt;key != NULL);
-		iNumTpls = 2;
-	}
-	CODE_STD_STRING_REQUESTnewActInst(iNumTpls);
-	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)pData-&gt;tplName, OMSR_NO_RQD_TPL_OPTS));
-	if (pData-&gt;dynaKey) {
-		CHKmalloc(keydup = ustrdup(pData-&gt;key));
-		CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData-&gt;key), OMSR_NO_RQD_TPL_OPTS));
-		keydup = NULL; 	}
-CODE_STD_FINALIZERnewActInst
-	cnfparamvalsDestruct(pvals, &amp;actpblk);
-	free(keydup);
-ENDnewActInst
-NO_LEGACY_CONF_parseSelectorAct
-BEGINmodExit
-CODESTARTmodExit
-ENDmodExit
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_OMOD_QUERIES
-CODEqueryEtryPt_STD_OMOD8_QUERIES
-CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-CODEqueryEtryPt_TXIF_OMOD_QUERIES ENDqueryEtryPt
-BEGINmodInit()
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
-	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
-	if (!bCoreSupportsBatching) {
-		LogError(0, NO_ERRCODE, "omhiredis: rsyslog core does not support batching - abort");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	DBGPRINTF("omhiredis: module compiled with rsyslog version %s.\n", VERSION);
-ENDmodInit
+1 #include "config.h"
+2 #include &lt;stdio.h&gt;
+3 #include &lt;string.h&gt;
+4 #include &lt;stdlib.h&gt;
+5 #include &lt;ctype.h&gt;
+6 #include &lt;errno.h&gt;
+7 #include &lt;assert.h&gt;
+8 #include &lt;signal.h&gt;
+9 #include &lt;time.h&gt;
+10 #include &lt;hiredis/hiredis.h&gt;
+11 #include "rsyslog.h"
+12 #include "conf.h"
+13 #include "syslogd-types.h"
+14 #include "srUtils.h"
+15 #include "template.h"
+16 #include "module-template.h"
+17 #include "errmsg.h"
+18 #include "cfsysline.h"
+19 #include "unicode-helper.h"
+20 MODULE_TYPE_OUTPUT
+21 MODULE_TYPE_NOKEEP
+22 MODULE_CNFNAME("omhiredis")
+23 DEF_OMOD_STATIC_DATA
+24 #define OMHIREDIS_MODE_TEMPLATE 0
+25 #define OMHIREDIS_MODE_QUEUE 1
+26 #define OMHIREDIS_MODE_PUBLISH 2
+27 #define OMHIREDIS_MODE_SET 3
+28 typedef struct _instanceData {
+29 	uchar *server; 	int port; 	uchar *serverpassword; 	uchar *tplName; 	char *modeDescription; 	int mode; 	uchar *key; 	int expiration; 	sbool dynaKey; 	sbool useRPush; } instanceData;
+30 typedef struct wrkrInstanceData {
+31 	instanceData *pData; 	redisContext *conn; 	int count; } wrkrInstanceData_t;
+32 static struct cnfparamdescr actpdescr[] = {
+33 	{ "server", eCmdHdlrGetWord, 0 },
+34 <a name="0"></a>	{ "serverport", eCmdHdlrInt, 0 },
+35 	{ "serverpassword", eCmdHdlrGetWord, 0 },
+36 	{ "template", eCmdHdlrGetWord, 0 },
+37 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "mode", eCmdHdlrGetWord, 0 },
+38 	{ "key", eCmdHdlrGetWord, 0 },
+39 	{ "expiration", eCmdHdlrInt, 0 },
+40 	{ "dynakey", eCmdHdlrBinary, 0 },
+41 	{ "userpush", eCmdHdlrBinary, 0 },
+42 };
+43 static struct cnfparamblk actpblk = {
+44 	CNFPARAMBLK_VERSION,
+45 	sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+46 	actpdescr
+47 };</b></font>
+48 BEGINcreateInstance
+49 CODESTARTcreateInstance
+50 ENDcreateInstance
+51 BEGINcreateWrkrInstance
+52 CODESTARTcreateWrkrInstance
+53 	pWrkrData-&gt;conn = NULL; ENDcreateWrkrInstance
+54 BEGINisCompatibleWithFeature
+55 CODESTARTisCompatibleWithFeature
+56 	if(eFeat == sFEATURERepeatedMsgReduction)
+57 		iRet = RS_RET_OK;
+58 ENDisCompatibleWithFeature
+59 static void closeHiredis(wrkrInstanceData_t *pWrkrData)
+60 {
+61 	if(pWrkrData-&gt;conn != NULL) {
+62 		redisFree(pWrkrData-&gt;conn);
+63 		pWrkrData-&gt;conn = NULL;
+64 	}
+65 }
+66 BEGINfreeInstance
+67 CODESTARTfreeInstance
+68 	if (pData-&gt;server != NULL) {
+69 		free(pData-&gt;server);
+70 	}
+71 	free(pData-&gt;key);
+72 	free(pData-&gt;modeDescription);
+73 	free(pData-&gt;serverpassword);
+74 ENDfreeInstance
+75 BEGINfreeWrkrInstance
+76 CODESTARTfreeWrkrInstance
+77 	closeHiredis(pWrkrData);
+78 ENDfreeWrkrInstance
+79 BEGINdbgPrintInstInfo
+80 CODESTARTdbgPrintInstInfo
+81 ENDdbgPrintInstInfo
+82 static rsRetVal initHiredis(wrkrInstanceData_t *pWrkrData, int bSilent)
+83 {
+84 	char *server;
+85 	char *serverpasswd;
+86 	DEFiRet;
+87 	server = (pWrkrData-&gt;pData-&gt;server == NULL) ? (char *)"127.0.0.1" :
+88 			(char*) pWrkrData-&gt;pData-&gt;server;
+89 	DBGPRINTF("omhiredis: trying connect to '%s' at port %d\n", server,
+90 			pWrkrData-&gt;pData-&gt;port);
+91 	struct timeval timeout = { 1, 500000 }; 	pWrkrData-&gt;conn = redisConnectWithTimeout(server, pWrkrData-&gt;pData-&gt;port,
+92 			timeout);
+93 	if (pWrkrData-&gt;conn-&gt;err) {
+94 		if(!bSilent)
+95 			LogError(0, RS_RET_SUSPENDED,
+96 				"can not initialize redis handle");
+97 		ABORT_FINALIZE(RS_RET_SUSPENDED);
+98 	}
+99 	if (pWrkrData-&gt;pData-&gt;serverpassword != NULL) {
+100 		serverpasswd = (char*) pWrkrData-&gt;pData-&gt;serverpassword;
+101 		int rc;
+102 		rc = redisAppendCommand(pWrkrData-&gt;conn, "AUTH %s", serverpasswd);
+103 		if (rc == REDIS_ERR) {
+104 			LogError(0, NO_ERRCODE, "omhiredis: %s", pWrkrData-&gt;conn-&gt;errstr);
+105 			ABORT_FINALIZE(RS_RET_ERR);
+106 		} else {
+107 			pWrkrData-&gt;count++;
+108 		}
+109 	}
+110 finalize_it:
+111 	RETiRet;
+112 }
+113 static rsRetVal writeHiredis(uchar* key, uchar *message, wrkrInstanceData_t *pWrkrData)
+114 {
+115 	DEFiRet;
+116 	int rc, expire;
+117 	size_t msgLen;
+118 	char *formattedMsg = NULL;
+119 	if(pWrkrData-&gt;conn == NULL)
+120 		CHKiRet(initHiredis(pWrkrData, 0));
+121 	switch(pWrkrData-&gt;pData-&gt;mode) {
+122 		case OMHIREDIS_MODE_TEMPLATE:
+123 			rc = redisAppendCommand(pWrkrData-&gt;conn, (char*)message);
+124 			break;
+125 		case OMHIREDIS_MODE_QUEUE:
+126 			rc = redisAppendCommand(pWrkrData-&gt;conn,
+127 				pWrkrData-&gt;pData-&gt;useRPush ? "RPUSH %s %s" : "LPUSH %s %s",
+128 				key, (char*)message);
+129 			break;
+130 		case OMHIREDIS_MODE_PUBLISH:
+131 			rc = redisAppendCommand(pWrkrData-&gt;conn, "PUBLISH %s %s", key, (char*)message);
+132 			break;
+133 		case OMHIREDIS_MODE_SET:
+134 			expire = pWrkrData-&gt;pData-&gt;expiration;
+135 			if (expire &gt; 0)
+136 				msgLen = redisFormatCommand(&amp;formattedMsg, "SETEX %s %d %s", key, expire, message);
+137 			else
+138 				msgLen = redisFormatCommand(&amp;formattedMsg, "SET %s %s", key, message);
+139 			if (msgLen)
+140 				rc = redisAppendFormattedCommand(pWrkrData-&gt;conn, formattedMsg, msgLen);
+141 			else {
+142 				dbgprintf("omhiredis: could not append SET command\n");
+143 				rc = REDIS_ERR;
+144 			}
+145 			break;
+146 		default:
+147 			dbgprintf("omhiredis: mode %d is invalid something is really wrong\n",
+148 				pWrkrData-&gt;pData-&gt;mode);
+149 			ABORT_FINALIZE(RS_RET_ERR);
+150 	}
+151 	if (rc == REDIS_ERR) {
+152 		LogError(0, NO_ERRCODE, "omhiredis: %s", pWrkrData-&gt;conn-&gt;errstr);
+153 		dbgprintf("omhiredis: %s\n", pWrkrData-&gt;conn-&gt;errstr);
+154 		ABORT_FINALIZE(RS_RET_ERR);
+155 	} else {
+156 		pWrkrData-&gt;count++;
+157 	}
+158 finalize_it:
+159 	free(formattedMsg);
+160 	RETiRet;
+161 }
+162 BEGINtryResume
+163 CODESTARTtryResume
+164 	if(pWrkrData-&gt;conn == NULL)
+165 		iRet = initHiredis(pWrkrData, 0);
+166 ENDtryResume
+167 BEGINbeginTransaction
+168 CODESTARTbeginTransaction
+169 	dbgprintf("omhiredis: beginTransaction called\n");
+170 	pWrkrData-&gt;count = 0;
+171 ENDbeginTransaction
+172 BEGINdoAction
+173 CODESTARTdoAction
+174 	if(pWrkrData-&gt;pData-&gt;dynaKey) {
+175 		CHKiRet(writeHiredis(ppString[1], ppString[0], pWrkrData));
+176 	}
+177 	else {
+178 		CHKiRet(writeHiredis(pWrkrData-&gt;pData-&gt;key, ppString[0], pWrkrData));
+179 	}
+180 	iRet = RS_RET_DEFER_COMMIT;
+181 finalize_it:
+182 ENDdoAction
+183 BEGINendTransaction
+184 CODESTARTendTransaction
+185 	dbgprintf("omhiredis: endTransaction called\n");
+186 	redisReply *reply;
+187 	int i;
+188 	for ( i = 0; i &lt; pWrkrData-&gt;count; i++ ) {
+189 		redisGetReply ( pWrkrData-&gt;conn, (void*)&amp;reply);
+190 		if( pWrkrData-&gt;conn-&gt;err ){
+191 			dbgprintf("omhiredis: %s\n", pWrkrData-&gt;conn-&gt;errstr);
+192 			closeHiredis(pWrkrData);
+193 			ABORT_FINALIZE(RS_RET_SUSPENDED);
+194 		}
+195 		else {
+196 			freeReplyObject(reply);
+197 		}
+198 	}
+199 finalize_it:
+200 ENDendTransaction
+201 static void
+202 setInstParamDefaults(instanceData *pData)
+203 {
+204 	pData-&gt;server = NULL;
+205 	pData-&gt;port = 6379;
+206 	pData-&gt;serverpassword = NULL;
+207 	pData-&gt;tplName = NULL;
+208 	pData-&gt;mode = OMHIREDIS_MODE_TEMPLATE;
+209 	pData-&gt;expiration = 0;
+210 	pData-&gt;modeDescription = NULL;
+211 	pData-&gt;key = NULL;
+212 	pData-&gt;useRPush = 0;
+213 }
+214 BEGINnewActInst
+215 	struct cnfparamvals *pvals;
+216 	int i;
+217 	int iNumTpls;
+218 	uchar *keydup = NULL;
+219 CODESTARTnewActInst
+220 	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL)
+221 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+222 	CHKiRet(createInstance(&amp;pData));
+223 	setInstParamDefaults(pData);
+224 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+225 		if(!pvals[i].bUsed)
+226 			continue;
+227 <a name="1"></a>	
+228 		if(!strcmp(actpblk.descr[i].name, "server")) {
+229 			pData-&gt;server = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+230 <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		} else if(!strcmp(actpblk.descr[i].name, "serverport")) {
+231 			pData-&gt;port = (int) pvals[i].val.d.n;
+232 		} else if(!strcmp(actpblk.descr[i].name, "serverpassword")) {
+233 			pData-&gt;serverpassword = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+234 		} else if(!strcmp(actpblk.descr[i].name, "template")) {
+235 			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
+236 		} else if(!strcmp(actpblk.descr[i].name, "dynakey")) {
+237 			pData-&gt;dynaKey = pvals[i].val.d.n;
+238 		} else if(!strcmp(actpblk.descr[i].name, "userpush")) {
+239 			pData-&gt;useRPush = pvals[i].val.d.n;
+240 		} else if(!strcmp(actpblk.descr[i].name, "mode")) {
+241 			pData-&gt;modeDescription = es_str2cstr(pvals[i].val.d.estr, NULL);
+242 			if (!strcmp(pData-&gt;modeDescription, "template")) {
+243 				pData-&gt;mode = OMHIREDIS_MODE_TEMPLATE;
+244 			} else if (!strcmp(pData-&gt;modeDescription, "queue")) {
+245 				pData-&gt;mode = OMHIREDIS_MODE_QUEUE;
+246 			} else if (!strcmp(pData-&gt;modeDescription, "publish")) {
+247 				pData-&gt;mode = OMHIREDIS_MODE_PUBLISH;
+248 			} else if (!strcmp(pData-&gt;modeDescription, "set")) {
+249 				pData-&gt;mode = OMHIREDIS_MODE_SET;
+250 			} else {
+251 				dbgprintf("omhiredis: unsupported mode %s\n", actpblk.descr[i].name);
+252 				ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+253 			}
+254 		} else if(!strcmp(actpblk.descr[i].name, "key")) {
+255 			pData-&gt;key = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+256 		} else if(!strcmp(actpblk.descr[i].name, "expiration")) {
+257 			pData-&gt;expiration = pvals[i].val.d.n;
+258 			dbgprintf("omhiredis: expiration set to %d\n", pData-&gt;expiration);
+259 		} else {
+260 			dbgprintf("omhiredis: program error, non-handled "
+261 				"param '%s'\n", actpblk.descr[i].name);
+262 		}
+263 	}
+264 	dbgprintf("omhiredis: checking config sanity\n");
+265 	if (!pData-&gt;modeDescription) {
+266 		dbgprintf("omhiredis: no mode specified, setting it to 'template'\n");
+267 		pData-&gt;mode = OMHIREDIS_MODE_TEMPLATE;
+268 	}
+269 	switch(pData-&gt;mode) {
+270 		case OMHIREDIS_MODE_QUEUE:
+271 		case OMHIREDIS_MODE_PUBLISH:
+272 		case OMHIREDIS_MODE_SET:
+273 			if (pData-&gt;key == NULL) {
+274 				dbgprintf("omhiredis: mode %s requires a key\n", pData-&gt;modeDescription);
+275 				ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+276 			}
+277 			if (pData-&gt;tplName == NULL) {
+278 				dbgprintf("omhiredis: using default RSYSLOG_ForwardFormat template\n");
+279 				CHKmalloc(pData-&gt;tplName = ustrdup("RSYSLOG_ForwardFormat"));
+280 			}
+281 			if (pData-&gt;expiration &amp;&amp; strcmp(pData-&gt;modeDescription, "set")) {
+282 				LogError(0, RS_RET_CONF_PARSE_WARNING, "omhiredis: expiration set but mode is not "\
+283 				"'set', expiration will be ignored");
+284 			}
+285 			break;
+286 		case OMHIREDIS_MODE_TEMPLATE:
+287 			if (pData-&gt;tplName == NULL) {
+288 				dbgprintf("omhiredis: selected mode requires template\n");
+289 				ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+290 			}
+291 			break;
+292 	}
+293 	iNumTpls = 1;
+294 	if (pData-&gt;dynaKey) {
+295 		assert(pData-&gt;key != NULL);
+296 		iNumTpls = 2;
+297 	}
+298 	CODE_STD_STRING_REQUESTnewActInst(iNumTpls);
+299 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)pData-&gt;tplName, OMSR_NO_RQD_TPL_OPTS));
+300 	if (pData-&gt;dynaKey) {
+301 		CHKmalloc(keydup = ustrdup(pData-&gt;key));
+302 		CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData-&gt;key), OMSR_NO_RQD_TPL_OPTS));
+303 		keydup = NULL; 	}
+304 CODE_STD_FINALIZERnewActInst
+305 	cnfparamvalsDestruct(pvals, &amp;actpblk);
+306 	free(keydup);
+307 ENDnewActInst
+308 NO_LEGACY_CONF_parseSelectorAct
+309 BEGINmodExit
+310 CODESTARTmodExit
+311 ENDmodExit
+312 BEGINqueryEtryPt
+313 CODESTARTqueryEtryPt
+314 CODEqueryEtryPt_STD_OMOD_QUERIES
+315 CODEqueryEtryPt_STD_OMOD8_QUERIES
+316 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+317 CODEqueryEtryPt_TXIF_OMOD_QUERIES ENDqueryEtryPt
+318 BEGINmodInit()
+319 CODESTARTmodInit
+320 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+321 	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
+322 	if (!bCoreSupportsBatching) {
+323 		LogError(0, NO_ERRCODE, "omhiredis: rsyslog core does not support batching - abort");
+324 		ABORT_FINALIZE(RS_RET_ERR);
+325 	}
+326 	DBGPRINTF("omhiredis: module compiled with rsyslog version %s.\n", VERSION);
+327 ENDmodInit
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -380,417 +380,417 @@ ENDmodInit
 </h3>
 <hr/>
 <pre>
-#include "config.h"
-#include "rsyslog.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;libestr.h&gt;
-#include &lt;json.h&gt;
-#include &lt;liblognorm.h&gt;
-#include "conf.h"
-#include "syslogd-types.h"
-#include "template.h"
-#include "module-template.h"
-#include "errmsg.h"
-#include "cfsysline.h"
-#include "dirty.h"
-#include "unicode-helper.h"
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("mmnormalize")
-static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal);
-DEF_OMOD_STATIC_DATA
-static struct cnfparamdescr modpdescr[] = {
-	{ "allowregex", eCmdHdlrBinary, 0 }
-};
-static struct cnfparamblk modpblk = {
-	CNFPARAMBLK_VERSION,
-	sizeof(modpdescr)/sizeof(struct cnfparamdescr),
-	modpdescr
-};
-typedef struct _instanceData {
-} instanceData;
-typedef struct wrkrInstanceData {
-	instanceData *pData;
-} wrkrInstanceData_t;
-typedef struct configSettings_s {
-	uchar *rule;
-} configSettings_t;
-static configSettings_t cs;
-<a name="0"></a>static struct cnfparamdescr actpdescr[] = {
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "rulebase", eCmdHdlrGetWord, 0 },
-	{ "rule", eCmdHdlrArray, 0 },
-	{ "path", eCmdHdlrGetWord, 0 },
-	{ "userawmsg", eCmdHdlrBinary, 0 },
-	{ "variable", eCmdHdlrGetWord, 0 }
-};
-static struct cnfparamblk actpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	  actpdescr
-	};</b></font>
-struct modConfData_s {
-	rsconf_t *pConf;		int allow_regex;
-};
-static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;
-static void
-errCallBack(void __attribute__((unused)) *cookie, const char *msg,
-	    size_t __attribute__((unused)) lenMsg)
-{
-	LogError(0, RS_RET_ERR_LIBLOGNORM, "liblognorm error: %s", msg);
-}
-static rsRetVal
-buildInstance(instanceData *pData)
-{
-	DEFiRet;
-	if((pData-&gt;ctxln = ln_initCtx()) == NULL) {
-		LogError(0, RS_RET_ERR_LIBLOGNORM_INIT, "error: could not initialize "
-				"liblognorm ctx, cannot activate action");
-		ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_INIT);
-	}
-	ln_setCtxOpts(pData-&gt;ctxln, loadModConf-&gt;allow_regex);
-	ln_setErrMsgCB(pData-&gt;ctxln, errCallBack, NULL);
-	if(pData-&gt;rule !=NULL &amp;&amp; pData-&gt;rulebase == NULL) {
-		if(ln_loadSamplesFromString(pData-&gt;ctxln, (char*) pData-&gt;rule) !=0) {
-			LogError(0, RS_RET_NO_RULEBASE, "error: normalization rule '%s' "
-					"could not be loaded cannot activate action", pData-&gt;rule);
-			ln_exitCtx(pData-&gt;ctxln);
-			ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
-		}
-		free(pData-&gt;rule);
-		pData-&gt;rule = NULL;
-	} else if(pData-&gt;rule ==NULL &amp;&amp; pData-&gt;rulebase != NULL) {
-		if(ln_loadSamples(pData-&gt;ctxln, (char*) pData-&gt;rulebase) != 0) {
-			LogError(0, RS_RET_NO_RULEBASE, "error: normalization rulebase '%s' "
-					"could not be loaded cannot activate action", pData-&gt;rulebase);
-			ln_exitCtx(pData-&gt;ctxln);
-			ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
-		}
-	}
-finalize_it:
-	RETiRet;
-}
-BEGINinitConfVars		CODESTARTinitConfVars
-	resetConfigVariables(NULL, NULL);
-ENDinitConfVars
-BEGINcreateInstance
-CODESTARTcreateInstance
-ENDcreateInstance
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-ENDcreateWrkrInstance
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	loadModConf = pModConf;
-	pModConf-&gt;pConf = pConf;
-ENDbeginCnfLoad
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-	loadModConf = NULL; 	free(cs.rulebase);
-	free(cs.rule);
-	cs.rulebase = NULL;
-	cs.rule = NULL;
-ENDendCnfLoad
-BEGINcheckCnf
-CODESTARTcheckCnf
-ENDcheckCnf
-BEGINactivateCnf
-CODESTARTactivateCnf
-	runModConf = pModConf;
-ENDactivateCnf
-BEGINfreeCnf
-CODESTARTfreeCnf
-ENDfreeCnf
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-ENDisCompatibleWithFeature
-BEGINfreeInstance
-CODESTARTfreeInstance
-	free(pData-&gt;rulebase);
-	free(pData-&gt;rule);
-	ln_exitCtx(pData-&gt;ctxln);
-	free(pData-&gt;pszPath);
-	msgPropDescrDestruct(pData-&gt;varDescr);
-	free(pData-&gt;varDescr);
-ENDfreeInstance
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-ENDfreeWrkrInstance
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-	dbgprintf("mmnormalize\n");
-	dbgprintf("\tvariable='%s'\n", pData-&gt;varDescr-&gt;name);
-	dbgprintf("\trulebase='%s'\n", pData-&gt;rulebase);
-	dbgprintf("\trule='%s'\n", pData-&gt;rule);
-	dbgprintf("\tpath='%s'\n", pData-&gt;pszPath);
-	dbgprintf("\tbUseRawMsg='%d'\n", pData-&gt;bUseRawMsg);
-ENDdbgPrintInstInfo
-BEGINtryResume
-CODESTARTtryResume
-ENDtryResume
-BEGINdoAction_NoStrings
-	smsg_t **ppMsg = (smsg_t **) pMsgData;
-	smsg_t *pMsg = ppMsg[0];
-	uchar *buf;
-	rs_size_t len;
-	int r;
-	struct json_object *json = NULL;
-	unsigned short freeBuf = 0;
-CODESTARTdoAction
-	if(pWrkrData-&gt;pData-&gt;bUseRawMsg) {
-		getRawMsg(pMsg, &amp;buf, &amp;len);
-	} else if (pWrkrData-&gt;pData-&gt;varDescr) {
-		buf = MsgGetProp(pMsg, NULL, pWrkrData-&gt;pData-&gt;varDescr, &amp;len, &amp;freeBuf, NULL);
-	} else {
-		buf = getMSG(pMsg);
-		len = getMSGLen(pMsg);
-	}
-	r = ln_normalize(pWrkrData-&gt;pData-&gt;ctxln, (char*)buf, len, &amp;json);
-	if (freeBuf) {
-		free(buf);
-		buf = NULL;
-	}
-	if(r != 0) {
-		DBGPRINTF("error %d during ln_normalize\n", r);
-		MsgSetParseSuccess(pMsg, 0);
-	} else {
-		MsgSetParseSuccess(pMsg, 1);
-	}
-	msgAddJSON(pMsg, (uchar*)pWrkrData-&gt;pData-&gt;pszPath + 1, json, 0, 0);
-ENDdoAction
-static void
-setInstParamDefaults(instanceData *pData)
-{
-	pData-&gt;rulebase = NULL;
-	pData-&gt;rule = NULL;
-	pData-&gt;bUseRawMsg = 0;
-	pData-&gt;pszPath = strdup("$!");
-	pData-&gt;varDescr = NULL;
-}
-BEGINsetModCnf
-	struct cnfparamvals *pvals = NULL;
-	int i;
-CODESTARTsetModCnf
-	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
-	if(pvals == NULL) {
-		LogError(0, RS_RET_MISSING_CNFPARAMS, "mmnormalize: error processing module "
-						"config parameters missing [module(...)]");
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-	if(Debug) {
-		dbgprintf("module (global) param blk for mmnormalize:\n");
-		cnfparamsPrint(&amp;modpblk, pvals);
-	}
-	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(modpblk.descr[i].name, "allowregex")) {
-			loadModConf-&gt;allow_regex = (int) pvals[i].val.d.n;
-		} else {
-			dbgprintf("mmnormalize: program error, non-handled "
-					  "param '%s' in setModCnf\n", modpblk.descr[i].name);
-		}
-	}
-finalize_it:
-	if(pvals != NULL)
-		cnfparamvalsDestruct(pvals, &amp;modpblk);
-ENDsetModCnf
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	int i;
-	int bDestructPValsOnExit;
-	char *cstr;
-	char *varName = NULL;
-	char *buffer;
-	char *tStr;
-	int size = 0;
-CODESTARTnewActInst
-	DBGPRINTF("newActInst (mmnormalize)\n");
-	bDestructPValsOnExit = 0;
-	pvals = nvlstGetParams(lst, &amp;actpblk, NULL);
-	if(pvals == NULL) {
-		LogError(0, RS_RET_MISSING_CNFPARAMS, "mmnormalize: error reading "
-				"config parameters");
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-	bDestructPValsOnExit = 1;
-	if(Debug) {
-		dbgprintf("action param blk in mmnormalize:\n");
-		cnfparamsPrint(&amp;actpblk, pvals);
-	}
-	CHKiRet(createInstance(&amp;pData));
-	setInstParamDefaults(pData);
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(actpblk.descr[i].name, "rulebase")) {
-			pData-&gt;rulebase = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "rule")) {
-			for(int j=0; j &lt; pvals[i].val.d.ar-&gt;nmemb; ++j) {
-				tStr = (char*)es_str2cstr(pvals[i].val.d.ar-&gt;arr[j], NULL);
-				size += strlen(tStr);
-				free(tStr);
-			}
-			buffer = malloc(size + pvals[i].val.d.ar-&gt;nmemb + 1);
-			tStr = (char*)es_str2cstr(pvals[i].val.d.ar-&gt;arr[0], NULL);
-			strcpy(buffer, tStr);
-			free(tStr);
-			strcat(buffer, "\n");
-			for(int j=1; j &lt; pvals[i].val.d.ar-&gt;nmemb; ++j) {
-				tStr = (char*)es_str2cstr(pvals[i].val.d.ar-&gt;arr[j], NULL);
-				strcat(buffer, tStr);
-				free(tStr);
-				strcat(buffer, "\n");
-<a name="1"></a>			}
-			strcat(buffer, "\0");
-			pData-&gt;rule = (uchar*)buffer;
-<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		} else if(!strcmp(actpblk.descr[i].name, "userawmsg")) {
-			pData-&gt;bUseRawMsg = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "variable")) {
-			varName = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "path")) {
-			cstr = es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
-			if (strlen(cstr) &lt; 2) {
-				LogError(0, RS_RET_VALUE_NOT_SUPPORTED,
-						"mmnormalize: valid path name should be at least "
-						"2 symbols long, got %s",	cstr);
-				free(cstr);
-			} else if (cstr[0] != '$') {
-				LogError(0, RS_RET_VALUE_NOT_SUPPORTED,
-						"mmnormalize: valid path name should start with $,"
-						"got %s", cstr);
-				free(cstr);
-			} else {
-				free(pData-&gt;pszPath);
-				pData-&gt;pszPath = cstr;
-			}
-			continue;
-		} else {
-			DBGPRINTF("mmnormalize: program error, non-handled "
-			  "param '%s'\n", actpblk.descr[i].name);
-		}
-	}
-	if (varName) {
-		if(pData-&gt;bUseRawMsg) {
-			LogError(0, RS_RET_CONFIG_ERROR,
-			                "mmnormalize: 'variable' param can't be used with 'useRawMsg'. "
-			                "Ignoring 'variable', will use raw message.");
-		} else {
-			CHKmalloc(pData-&gt;varDescr = malloc(sizeof(msgPropDescr_t)));
-			CHKiRet(msgPropDescrFill(pData-&gt;varDescr, (uchar*) varName, strlen(varName)));
-		}
-		free(varName);
-		varName = NULL;
-	}
-	if(!pData-&gt;rulebase) {
-		if(!pData-&gt;rule) {
-			LogError(0, RS_RET_CONFIG_ERROR, "mmnormalize: rulebase needed. "
-					"Use option rulebase or rule.");
-		}
-	}
-	if(pData-&gt;rulebase) {
-		if(pData-&gt;rule) {
-			LogError(0, RS_RET_CONFIG_ERROR,
-					"mmnormalize: only one rulebase possible, rulebase "
-					"can't be used with rule");
-		}
-	}
-	CODE_STD_STRING_REQUESTnewActInst(1)
-	CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
-	iRet = buildInstance(pData);
-CODE_STD_FINALIZERnewActInst
-	if(bDestructPValsOnExit)
-		cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-BEGINparseSelectorAct
-CODESTARTparseSelectorAct
-CODE_STD_STRING_REQUESTparseSelectorAct(1)
-	if(strncmp((char*) p, ":mmnormalize:", sizeof(":mmnormalize:") - 1)) {
-		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
-	}
-	if(cs.rulebase == NULL &amp;&amp; cs.rule == NULL) {
-		LogError(0, RS_RET_NO_RULEBASE, "error: no normalization rulebase was specified, use "
-				"$MMNormalizeSampleDB directive first!");
-		ABORT_FINALIZE(RS_RET_NO_RULEBASE);
-	}
-	p += sizeof(":mmnormalize:") - 1; 	CHKiRet(createInstance(&amp;pData));
-	pData-&gt;rulebase = cs.rulebase;
-	pData-&gt;rule = cs.rule;
-	pData-&gt;bUseRawMsg = cs.bUseRawMsg;
-	pData-&gt;pszPath = strdup("$!"); 	cs.bUseRawMsg = 0;
-	cs.rulebase = NULL; 	cs.rule = NULL;
-	if(*(p-1) == ';')
-		--p;
-	CHKiRet(cflineParseTemplateName(&amp;p, *ppOMSR, 0, OMSR_TPL_AS_MSG, (uchar*) "RSYSLOG_FileFormat"));
-	CHKiRet(buildInstance(pData));
-CODE_STD_FINALIZERparseSelectorAct
-ENDparseSelectorAct
-BEGINmodExit
-CODESTARTmodExit
-ENDmodExit
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_OMOD_QUERIES
-CODEqueryEtryPt_STD_OMOD8_QUERIES
-CODEqueryEtryPt_STD_CONF2_QUERIES
-CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
-CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-ENDqueryEtryPt
-static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
-{
-	DEFiRet;
-	cs.rulebase = NULL;
-	cs.rule = NULL;
-	cs.bUseRawMsg = 0;
-	RETiRet;
-}
-static rsRetVal
-setRuleBase(void __attribute__((unused)) *pVal, uchar *pszName)
-{
-	DEFiRet;
-	cs.rulebase = pszName;
-	pszName = NULL;
-	RETiRet;
-}
-BEGINmodInit()
-	rsRetVal localRet;
-	rsRetVal (*pomsrGetSupportedTplOpts)(unsigned long *pOpts);
-	unsigned long opts;
-	int bMsgPassingSupported;
-CODESTARTmodInit
-INITLegCnfVars
-	*ipIFVersProvided = CURR_MOD_IF_VERSION;
-CODEmodInit_QueryRegCFSLineHdlr
-	DBGPRINTF("mmnormalize: module compiled with rsyslog version %s.\n", VERSION);
-	bMsgPassingSupported = 0;
-	localRet = pHostQueryEtryPt((uchar*)"OMSRgetSupportedTplOpts",
-			&amp;pomsrGetSupportedTplOpts);
-	if(localRet == RS_RET_OK) {
-		CHKiRet((*pomsrGetSupportedTplOpts)(&amp;opts));
-		if(opts &amp; OMSR_TPL_AS_MSG)
-			bMsgPassingSupported = 1;
-	} else if(localRet != RS_RET_ENTRY_POINT_NOT_FOUND) {
-		ABORT_FINALIZE(localRet); 	}
-	if(!bMsgPassingSupported) {
-		DBGPRINTF("mmnormalize: msg-passing is not supported by rsyslog core, "
-			  "can not continue.\n");
-		ABORT_FINALIZE(RS_RET_NO_MSG_PASSING);
-	}
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"mmnormalizerulebase", 0, eCmdHdlrGetWord,
-				    setRuleBase, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"mmnormalizerule", 0, eCmdHdlrGetWord, NULL,
-				NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"mmnormalizeuserawmsg", 0, eCmdHdlrBinary,
-				NULL, &amp;cs.bUseRawMsg, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler,
-				    resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
-ENDmodInit
+1 #include "config.h"
+2 #include "rsyslog.h"
+3 #include &lt;stdio.h&gt;
+4 #include &lt;stdarg.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;assert.h&gt;
+8 #include &lt;signal.h&gt;
+9 #include &lt;errno.h&gt;
+10 #include &lt;unistd.h&gt;
+11 #include &lt;libestr.h&gt;
+12 #include &lt;json.h&gt;
+13 #include &lt;liblognorm.h&gt;
+14 #include "conf.h"
+15 #include "syslogd-types.h"
+16 #include "template.h"
+17 #include "module-template.h"
+18 #include "errmsg.h"
+19 #include "cfsysline.h"
+20 #include "dirty.h"
+21 #include "unicode-helper.h"
+22 MODULE_TYPE_OUTPUT
+23 MODULE_TYPE_NOKEEP
+24 MODULE_CNFNAME("mmnormalize")
+25 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal);
+26 DEF_OMOD_STATIC_DATA
+27 static struct cnfparamdescr modpdescr[] = {
+28 	{ "allowregex", eCmdHdlrBinary, 0 }
+29 };
+30 static struct cnfparamblk modpblk = {
+31 	CNFPARAMBLK_VERSION,
+32 	sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+33 	modpdescr
+34 };
+35 typedef struct _instanceData {
+36 } instanceData;
+37 typedef struct wrkrInstanceData {
+38 	instanceData *pData;
+39 } wrkrInstanceData_t;
+40 typedef struct configSettings_s {
+41 	uchar *rule;
+42 } configSettings_t;
+43 static configSettings_t cs;
+44 <a name="0"></a>static struct cnfparamdescr actpdescr[] = {
+45 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "rulebase", eCmdHdlrGetWord, 0 },
+46 	{ "rule", eCmdHdlrArray, 0 },
+47 	{ "path", eCmdHdlrGetWord, 0 },
+48 	{ "userawmsg", eCmdHdlrBinary, 0 },
+49 	{ "variable", eCmdHdlrGetWord, 0 }
+50 };
+51 static struct cnfparamblk actpblk =
+52 	{ CNFPARAMBLK_VERSION,
+53 	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+54 	  actpdescr
+55 	};</b></font>
+56 struct modConfData_s {
+57 	rsconf_t *pConf;		int allow_regex;
+58 };
+59 static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;
+60 static void
+61 errCallBack(void __attribute__((unused)) *cookie, const char *msg,
+62 	    size_t __attribute__((unused)) lenMsg)
+63 {
+64 	LogError(0, RS_RET_ERR_LIBLOGNORM, "liblognorm error: %s", msg);
+65 }
+66 static rsRetVal
+67 buildInstance(instanceData *pData)
+68 {
+69 	DEFiRet;
+70 	if((pData-&gt;ctxln = ln_initCtx()) == NULL) {
+71 		LogError(0, RS_RET_ERR_LIBLOGNORM_INIT, "error: could not initialize "
+72 				"liblognorm ctx, cannot activate action");
+73 		ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_INIT);
+74 	}
+75 	ln_setCtxOpts(pData-&gt;ctxln, loadModConf-&gt;allow_regex);
+76 	ln_setErrMsgCB(pData-&gt;ctxln, errCallBack, NULL);
+77 	if(pData-&gt;rule !=NULL &amp;&amp; pData-&gt;rulebase == NULL) {
+78 		if(ln_loadSamplesFromString(pData-&gt;ctxln, (char*) pData-&gt;rule) !=0) {
+79 			LogError(0, RS_RET_NO_RULEBASE, "error: normalization rule '%s' "
+80 					"could not be loaded cannot activate action", pData-&gt;rule);
+81 			ln_exitCtx(pData-&gt;ctxln);
+82 			ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
+83 		}
+84 		free(pData-&gt;rule);
+85 		pData-&gt;rule = NULL;
+86 	} else if(pData-&gt;rule ==NULL &amp;&amp; pData-&gt;rulebase != NULL) {
+87 		if(ln_loadSamples(pData-&gt;ctxln, (char*) pData-&gt;rulebase) != 0) {
+88 			LogError(0, RS_RET_NO_RULEBASE, "error: normalization rulebase '%s' "
+89 					"could not be loaded cannot activate action", pData-&gt;rulebase);
+90 			ln_exitCtx(pData-&gt;ctxln);
+91 			ABORT_FINALIZE(RS_RET_ERR_LIBLOGNORM_SAMPDB_LOAD);
+92 		}
+93 	}
+94 finalize_it:
+95 	RETiRet;
+96 }
+97 BEGINinitConfVars		CODESTARTinitConfVars
+98 	resetConfigVariables(NULL, NULL);
+99 ENDinitConfVars
+100 BEGINcreateInstance
+101 CODESTARTcreateInstance
+102 ENDcreateInstance
+103 BEGINcreateWrkrInstance
+104 CODESTARTcreateWrkrInstance
+105 ENDcreateWrkrInstance
+106 BEGINbeginCnfLoad
+107 CODESTARTbeginCnfLoad
+108 	loadModConf = pModConf;
+109 	pModConf-&gt;pConf = pConf;
+110 ENDbeginCnfLoad
+111 BEGINendCnfLoad
+112 CODESTARTendCnfLoad
+113 	loadModConf = NULL; 	free(cs.rulebase);
+114 	free(cs.rule);
+115 	cs.rulebase = NULL;
+116 	cs.rule = NULL;
+117 ENDendCnfLoad
+118 BEGINcheckCnf
+119 CODESTARTcheckCnf
+120 ENDcheckCnf
+121 BEGINactivateCnf
+122 CODESTARTactivateCnf
+123 	runModConf = pModConf;
+124 ENDactivateCnf
+125 BEGINfreeCnf
+126 CODESTARTfreeCnf
+127 ENDfreeCnf
+128 BEGINisCompatibleWithFeature
+129 CODESTARTisCompatibleWithFeature
+130 ENDisCompatibleWithFeature
+131 BEGINfreeInstance
+132 CODESTARTfreeInstance
+133 	free(pData-&gt;rulebase);
+134 	free(pData-&gt;rule);
+135 	ln_exitCtx(pData-&gt;ctxln);
+136 	free(pData-&gt;pszPath);
+137 	msgPropDescrDestruct(pData-&gt;varDescr);
+138 	free(pData-&gt;varDescr);
+139 ENDfreeInstance
+140 BEGINfreeWrkrInstance
+141 CODESTARTfreeWrkrInstance
+142 ENDfreeWrkrInstance
+143 BEGINdbgPrintInstInfo
+144 CODESTARTdbgPrintInstInfo
+145 	dbgprintf("mmnormalize\n");
+146 	dbgprintf("\tvariable='%s'\n", pData-&gt;varDescr-&gt;name);
+147 	dbgprintf("\trulebase='%s'\n", pData-&gt;rulebase);
+148 	dbgprintf("\trule='%s'\n", pData-&gt;rule);
+149 	dbgprintf("\tpath='%s'\n", pData-&gt;pszPath);
+150 	dbgprintf("\tbUseRawMsg='%d'\n", pData-&gt;bUseRawMsg);
+151 ENDdbgPrintInstInfo
+152 BEGINtryResume
+153 CODESTARTtryResume
+154 ENDtryResume
+155 BEGINdoAction_NoStrings
+156 	smsg_t **ppMsg = (smsg_t **) pMsgData;
+157 	smsg_t *pMsg = ppMsg[0];
+158 	uchar *buf;
+159 	rs_size_t len;
+160 	int r;
+161 	struct json_object *json = NULL;
+162 	unsigned short freeBuf = 0;
+163 CODESTARTdoAction
+164 	if(pWrkrData-&gt;pData-&gt;bUseRawMsg) {
+165 		getRawMsg(pMsg, &amp;buf, &amp;len);
+166 	} else if (pWrkrData-&gt;pData-&gt;varDescr) {
+167 		buf = MsgGetProp(pMsg, NULL, pWrkrData-&gt;pData-&gt;varDescr, &amp;len, &amp;freeBuf, NULL);
+168 	} else {
+169 		buf = getMSG(pMsg);
+170 		len = getMSGLen(pMsg);
+171 	}
+172 	r = ln_normalize(pWrkrData-&gt;pData-&gt;ctxln, (char*)buf, len, &amp;json);
+173 	if (freeBuf) {
+174 		free(buf);
+175 		buf = NULL;
+176 	}
+177 	if(r != 0) {
+178 		DBGPRINTF("error %d during ln_normalize\n", r);
+179 		MsgSetParseSuccess(pMsg, 0);
+180 	} else {
+181 		MsgSetParseSuccess(pMsg, 1);
+182 	}
+183 	msgAddJSON(pMsg, (uchar*)pWrkrData-&gt;pData-&gt;pszPath + 1, json, 0, 0);
+184 ENDdoAction
+185 static void
+186 setInstParamDefaults(instanceData *pData)
+187 {
+188 	pData-&gt;rulebase = NULL;
+189 	pData-&gt;rule = NULL;
+190 	pData-&gt;bUseRawMsg = 0;
+191 	pData-&gt;pszPath = strdup("$!");
+192 	pData-&gt;varDescr = NULL;
+193 }
+194 BEGINsetModCnf
+195 	struct cnfparamvals *pvals = NULL;
+196 	int i;
+197 CODESTARTsetModCnf
+198 	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
+199 	if(pvals == NULL) {
+200 		LogError(0, RS_RET_MISSING_CNFPARAMS, "mmnormalize: error processing module "
+201 						"config parameters missing [module(...)]");
+202 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+203 	}
+204 	if(Debug) {
+205 		dbgprintf("module (global) param blk for mmnormalize:\n");
+206 		cnfparamsPrint(&amp;modpblk, pvals);
+207 	}
+208 	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
+209 		if(!pvals[i].bUsed)
+210 			continue;
+211 		if(!strcmp(modpblk.descr[i].name, "allowregex")) {
+212 			loadModConf-&gt;allow_regex = (int) pvals[i].val.d.n;
+213 		} else {
+214 			dbgprintf("mmnormalize: program error, non-handled "
+215 					  "param '%s' in setModCnf\n", modpblk.descr[i].name);
+216 		}
+217 	}
+218 finalize_it:
+219 	if(pvals != NULL)
+220 		cnfparamvalsDestruct(pvals, &amp;modpblk);
+221 ENDsetModCnf
+222 BEGINnewActInst
+223 	struct cnfparamvals *pvals;
+224 	int i;
+225 	int bDestructPValsOnExit;
+226 	char *cstr;
+227 	char *varName = NULL;
+228 	char *buffer;
+229 	char *tStr;
+230 	int size = 0;
+231 CODESTARTnewActInst
+232 	DBGPRINTF("newActInst (mmnormalize)\n");
+233 	bDestructPValsOnExit = 0;
+234 	pvals = nvlstGetParams(lst, &amp;actpblk, NULL);
+235 	if(pvals == NULL) {
+236 		LogError(0, RS_RET_MISSING_CNFPARAMS, "mmnormalize: error reading "
+237 				"config parameters");
+238 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+239 	}
+240 	bDestructPValsOnExit = 1;
+241 	if(Debug) {
+242 		dbgprintf("action param blk in mmnormalize:\n");
+243 		cnfparamsPrint(&amp;actpblk, pvals);
+244 	}
+245 	CHKiRet(createInstance(&amp;pData));
+246 	setInstParamDefaults(pData);
+247 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+248 		if(!pvals[i].bUsed)
+249 			continue;
+250 		if(!strcmp(actpblk.descr[i].name, "rulebase")) {
+251 			pData-&gt;rulebase = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+252 		} else if(!strcmp(actpblk.descr[i].name, "rule")) {
+253 			for(int j=0; j &lt; pvals[i].val.d.ar-&gt;nmemb; ++j) {
+254 				tStr = (char*)es_str2cstr(pvals[i].val.d.ar-&gt;arr[j], NULL);
+255 				size += strlen(tStr);
+256 				free(tStr);
+257 			}
+258 			buffer = malloc(size + pvals[i].val.d.ar-&gt;nmemb + 1);
+259 			tStr = (char*)es_str2cstr(pvals[i].val.d.ar-&gt;arr[0], NULL);
+260 			strcpy(buffer, tStr);
+261 			free(tStr);
+262 			strcat(buffer, "\n");
+263 			for(int j=1; j &lt; pvals[i].val.d.ar-&gt;nmemb; ++j) {
+264 				tStr = (char*)es_str2cstr(pvals[i].val.d.ar-&gt;arr[j], NULL);
+265 				strcat(buffer, tStr);
+266 				free(tStr);
+267 				strcat(buffer, "\n");
+268 <a name="1"></a>			}
+269 			strcat(buffer, "\0");
+270 			pData-&gt;rule = (uchar*)buffer;
+271 <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		} else if(!strcmp(actpblk.descr[i].name, "userawmsg")) {
+272 			pData-&gt;bUseRawMsg = (int) pvals[i].val.d.n;
+273 		} else if(!strcmp(actpblk.descr[i].name, "variable")) {
+274 			varName = es_str2cstr(pvals[i].val.d.estr, NULL);
+275 		} else if(!strcmp(actpblk.descr[i].name, "path")) {
+276 			cstr = es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
+277 			if (strlen(cstr) &lt; 2) {
+278 				LogError(0, RS_RET_VALUE_NOT_SUPPORTED,
+279 						"mmnormalize: valid path name should be at least "
+280 						"2 symbols long, got %s",	cstr);
+281 				free(cstr);
+282 			} else if (cstr[0] != '$') {
+283 				LogError(0, RS_RET_VALUE_NOT_SUPPORTED,
+284 						"mmnormalize: valid path name should start with $,"
+285 						"got %s", cstr);
+286 				free(cstr);
+287 			} else {
+288 				free(pData-&gt;pszPath);
+289 				pData-&gt;pszPath = cstr;
+290 			}
+291 			continue;
+292 		} else {
+293 			DBGPRINTF("mmnormalize: program error, non-handled "
+294 			  "param '%s'\n", actpblk.descr[i].name);
+295 		}
+296 	}
+297 	if (varName) {
+298 		if(pData-&gt;bUseRawMsg) {
+299 			LogError(0, RS_RET_CONFIG_ERROR,
+300 			                "mmnormalize: 'variable' param can't be used with 'useRawMsg'. "
+301 			                "Ignoring 'variable', will use raw message.");
+302 		} else {
+303 			CHKmalloc(pData-&gt;varDescr = malloc(sizeof(msgPropDescr_t)));
+304 			CHKiRet(msgPropDescrFill(pData-&gt;varDescr, (uchar*) varName, strlen(varName)));
+305 		}
+306 		free(varName);
+307 		varName = NULL;
+308 	}
+309 	if(!pData-&gt;rulebase) {
+310 		if(!pData-&gt;rule) {
+311 			LogError(0, RS_RET_CONFIG_ERROR, "mmnormalize: rulebase needed. "
+312 					"Use option rulebase or rule.");
+313 		}
+314 	}
+315 	if(pData-&gt;rulebase) {
+316 		if(pData-&gt;rule) {
+317 			LogError(0, RS_RET_CONFIG_ERROR,
+318 					"mmnormalize: only one rulebase possible, rulebase "
+319 					"can't be used with rule");
+320 		}
+321 	}
+322 	CODE_STD_STRING_REQUESTnewActInst(1)
+323 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
+324 	iRet = buildInstance(pData);
+325 CODE_STD_FINALIZERnewActInst
+326 	if(bDestructPValsOnExit)
+327 		cnfparamvalsDestruct(pvals, &amp;actpblk);
+328 ENDnewActInst
+329 BEGINparseSelectorAct
+330 CODESTARTparseSelectorAct
+331 CODE_STD_STRING_REQUESTparseSelectorAct(1)
+332 	if(strncmp((char*) p, ":mmnormalize:", sizeof(":mmnormalize:") - 1)) {
+333 		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
+334 	}
+335 	if(cs.rulebase == NULL &amp;&amp; cs.rule == NULL) {
+336 		LogError(0, RS_RET_NO_RULEBASE, "error: no normalization rulebase was specified, use "
+337 				"$MMNormalizeSampleDB directive first!");
+338 		ABORT_FINALIZE(RS_RET_NO_RULEBASE);
+339 	}
+340 	p += sizeof(":mmnormalize:") - 1; 	CHKiRet(createInstance(&amp;pData));
+341 	pData-&gt;rulebase = cs.rulebase;
+342 	pData-&gt;rule = cs.rule;
+343 	pData-&gt;bUseRawMsg = cs.bUseRawMsg;
+344 	pData-&gt;pszPath = strdup("$!"); 	cs.bUseRawMsg = 0;
+345 	cs.rulebase = NULL; 	cs.rule = NULL;
+346 	if(*(p-1) == ';')
+347 		--p;
+348 	CHKiRet(cflineParseTemplateName(&amp;p, *ppOMSR, 0, OMSR_TPL_AS_MSG, (uchar*) "RSYSLOG_FileFormat"));
+349 	CHKiRet(buildInstance(pData));
+350 CODE_STD_FINALIZERparseSelectorAct
+351 ENDparseSelectorAct
+352 BEGINmodExit
+353 CODESTARTmodExit
+354 ENDmodExit
+355 BEGINqueryEtryPt
+356 CODESTARTqueryEtryPt
+357 CODEqueryEtryPt_STD_OMOD_QUERIES
+358 CODEqueryEtryPt_STD_OMOD8_QUERIES
+359 CODEqueryEtryPt_STD_CONF2_QUERIES
+360 CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+361 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+362 ENDqueryEtryPt
+363 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
+364 {
+365 	DEFiRet;
+366 	cs.rulebase = NULL;
+367 	cs.rule = NULL;
+368 	cs.bUseRawMsg = 0;
+369 	RETiRet;
+370 }
+371 static rsRetVal
+372 setRuleBase(void __attribute__((unused)) *pVal, uchar *pszName)
+373 {
+374 	DEFiRet;
+375 	cs.rulebase = pszName;
+376 	pszName = NULL;
+377 	RETiRet;
+378 }
+379 BEGINmodInit()
+380 	rsRetVal localRet;
+381 	rsRetVal (*pomsrGetSupportedTplOpts)(unsigned long *pOpts);
+382 	unsigned long opts;
+383 	int bMsgPassingSupported;
+384 CODESTARTmodInit
+385 INITLegCnfVars
+386 	*ipIFVersProvided = CURR_MOD_IF_VERSION;
+387 CODEmodInit_QueryRegCFSLineHdlr
+388 	DBGPRINTF("mmnormalize: module compiled with rsyslog version %s.\n", VERSION);
+389 	bMsgPassingSupported = 0;
+390 	localRet = pHostQueryEtryPt((uchar*)"OMSRgetSupportedTplOpts",
+391 			&amp;pomsrGetSupportedTplOpts);
+392 	if(localRet == RS_RET_OK) {
+393 		CHKiRet((*pomsrGetSupportedTplOpts)(&amp;opts));
+394 		if(opts &amp; OMSR_TPL_AS_MSG)
+395 			bMsgPassingSupported = 1;
+396 	} else if(localRet != RS_RET_ENTRY_POINT_NOT_FOUND) {
+397 		ABORT_FINALIZE(localRet); 	}
+398 	if(!bMsgPassingSupported) {
+399 		DBGPRINTF("mmnormalize: msg-passing is not supported by rsyslog core, "
+400 			  "can not continue.\n");
+401 		ABORT_FINALIZE(RS_RET_NO_MSG_PASSING);
+402 	}
+403 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"mmnormalizerulebase", 0, eCmdHdlrGetWord,
+404 				    setRuleBase, NULL, STD_LOADABLE_MODULE_ID));
+405 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"mmnormalizerule", 0, eCmdHdlrGetWord, NULL,
+406 				NULL, STD_LOADABLE_MODULE_ID));
+407 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"mmnormalizeuserawmsg", 0, eCmdHdlrBinary,
+408 				NULL, &amp;cs.bUseRawMsg, STD_LOADABLE_MODULE_ID));
+409 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler,
+410 				    resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+411 ENDmodInit
 </pre>
 </div>
 </div>

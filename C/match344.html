@@ -44,500 +44,500 @@ Matches for impstats.c &amp; omrelp.c
 </h3>
 <hr/>
 <pre>
-#include "config.h"
-#include "rsyslog.h"
-#include &lt;stdlib.h&gt;
-#include &lt;stdio.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;string.h&gt;
-#include &lt;pthread.h&gt;
-#include &lt;fcntl.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;sys/uio.h&gt;
-#include &lt;sys/stat.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;sys/time.h&gt;
-#include &lt;sys/resource.h&gt;
-#ifdef OS_LINUX
-#include &lt;sys/types.h&gt;
-#include &lt;dirent.h&gt;
-#endif
-#include "dirty.h"
-#include "cfsysline.h"
-#include "module-template.h"
-#include "errmsg.h"
-#include "msg.h"
-#include "srUtils.h"
-#include "unicode-helper.h"
-#include "glbl.h"
-#include "statsobj.h"
-#include "prop.h"
-#include "ruleset.h"
-#include "parserif.h"
-MODULE_TYPE_INPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("impstats")
-#define DEFAULT_STATS_PERIOD (5 * 60)
-#define DEFAULT_FACILITY 5 #define DEFAULT_SEVERITY 6 
-DEF_IMOD_STATIC_DATA
-DEFobjCurrIf(glbl)
-DEFobjCurrIf(prop)
-DEFobjCurrIf(statsobj)
-DEFobjCurrIf(ruleset)
-typedef struct configSettings_s {
-	int iStatsInterval;
-	int iFacility;
-	int iSeverity;
-	int bJSON;
-	int bCEE;
-} configSettings_t;
-struct modConfData_s {
-	rsconf_t *pConf; 	int iStatsInterval;
-	int iFacility;
-	int iSeverity;
-	int logfd; 	ruleset_t *pBindRuleset;		statsFmtType_t statsFmt;
-	sbool bLogToSyslog;
-	sbool bResetCtrs;
-	sbool bBracketing;
-	char *logfile;
-	sbool configSetViaV2Method;
-	uchar *pszBindRuleset;		};
-static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;
-static configSettings_t cs;
-static int bLegacyCnfModGlobalsPermitted;static prop_t *pInputName = NULL;
-<a name="0"></a>
-static struct cnfparamdescr modpdescr[] = {
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "interval", eCmdHdlrInt, 0 },
-	{ "facility", eCmdHdlrInt, 0 },
-	{ "severity", eCmdHdlrInt, 0 },
-	{ "bracketing", eCmdHdlrBinary, 0 },
-	{ "log.syslog", eCmdHdlrBinary, 0 },
-	{ "resetcounters", eCmdHdlrBinary, 0 },
-	{ "log.file", eCmdHdlrGetWord, 0 },
-	{ "format", eCmdHdlrGetWord, 0 },
-	{ "ruleset", eCmdHdlrString, 0 }
-};
-static struct cnfparamblk modpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
-	  modpdescr
-	};
-#ifdef OS_LINUX
-static int st_openfiles;</b></font>
-#endif
-static intctr_t st_ru_utime;
-static intctr_t st_ru_stime;
-static intctr_t st_ru_maxrss;
-static intctr_t st_ru_minflt;
-static intctr_t st_ru_majflt;
-static intctr_t st_ru_inblock;
-static intctr_t st_ru_oublock;
-static intctr_t st_ru_nvcsw;
-static intctr_t st_ru_nivcsw;
-static statsobj_t *statsobj_resources;
-static pthread_mutex_t hup_mutex = PTHREAD_MUTEX_INITIALIZER;
-BEGINmodExit
-CODESTARTmodExit
-	prop.Destruct(&amp;pInputName);
-	objRelease(glbl, CORE_COMPONENT);
-	objRelease(prop, CORE_COMPONENT);
-	objRelease(statsobj, CORE_COMPONENT);
-	objRelease(ruleset, CORE_COMPONENT);
-ENDmodExit
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURENonCancelInputTermination)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-#ifdef OS_LINUX
-static void
-countOpenFiles(void)
-{
-	char proc_path[MAXFNAME];
-	DIR *dp;
-	struct dirent *files;
-	st_openfiles = 0;
-	snprintf(proc_path, sizeof(proc_path), "/proc/%d/fd", glblGetOurPid());
-	if((dp = opendir(proc_path)) == NULL) {
-		LogError(errno, RS_RET_ERR, "impstats: error reading %s\n", proc_path);
-		goto done;
-	}
-	while((files=readdir(dp)) != NULL) {
-		if(!strcmp(files-&gt;d_name, ".") || !strcmp(files-&gt;d_name, ".."))
-			continue;
-		st_openfiles++;
-	}
-	closedir(dp);
-done:
-	return;
-}
-#endif
-static void
-initConfigSettings(void)
-{
-	cs.iStatsInterval = DEFAULT_STATS_PERIOD;
-	cs.iFacility = DEFAULT_FACILITY;
-	cs.iSeverity = DEFAULT_SEVERITY;
-	cs.bJSON = 0;
-	cs.bCEE = 0;
-}
-static void
-doSubmitMsg(uchar *line)
-{
-	smsg_t *pMsg;
-	if(msgConstruct(&amp;pMsg) != RS_RET_OK)
-		goto finalize_it;
-	MsgSetInputName(pMsg, pInputName);
-	MsgSetRawMsgWOSize(pMsg, (char*)line);
-	MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
-	MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
-	MsgSetRcvFromIP(pMsg, glbl.GetLocalHostIP());
-	MsgSetMSGoffs(pMsg, 0);
-	MsgSetRuleset(pMsg, runModConf-&gt;pBindRuleset);
-	MsgSetTAG(pMsg, UCHAR_CONSTANT("rsyslogd-pstats:"), sizeof("rsyslogd-pstats:") - 1);
-	pMsg-&gt;iFacility = runModConf-&gt;iFacility;
-	pMsg-&gt;iSeverity = runModConf-&gt;iSeverity;
-	pMsg-&gt;msgFlags  = 0;
-	submitMsg2(pMsg);
-	DBGPRINTF("impstats: submit [%d,%d] msg '%s'\n", runModConf-&gt;iFacility,
-	          runModConf-&gt;iSeverity, line);
-finalize_it:
-	return;
-}
-static void
-doLogToFile(const char *ln, const size_t lenLn)
-{
-	struct iovec iov[4];
-	ssize_t nwritten;
-	ssize_t nexpect;
-	time_t t;
-	char timebuf[32];
-	pthread_mutex_lock(&amp;hup_mutex);
-	if(lenLn == 0)
-		goto done;
-	if(runModConf-&gt;logfd == -1) {
-		runModConf-&gt;logfd = open(runModConf-&gt;logfile, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR);
-		if(runModConf-&gt;logfd == -1) {
-			DBGPRINTF("impstats: error opening stats file %s\n",
-				runModConf-&gt;logfile);
-			goto done;
-		} else {
-			DBGPRINTF("impstats: opened stats file %s\n",
-				runModConf-&gt;logfile);
-		}
-	}
-	time(&amp;t);
-	iov[0].iov_base = ctime_r(&amp;t, timebuf);
-	iov[0].iov_len = nexpect = strlen(iov[0].iov_base) - 1; 	iov[1].iov_base = (void*)": ";
-	iov[1].iov_len = 2;
-	nexpect += 2;
-	iov[2].iov_base = (void*)ln;
-	iov[2].iov_len = lenLn;
-	nexpect += lenLn;
-	iov[3].iov_base = (void*)"\n";
-	iov[3].iov_len = 1;
-	nexpect++;
-	nwritten = writev(runModConf-&gt;logfd, iov, 4);
-	if(nwritten != nexpect) {
-			dbgprintf("error writing stats file %s, nwritten %lld, expected %lld\n",
-				  runModConf-&gt;logfile, (long long) nwritten, (long long) nexpect);
-	}
-done:
-	pthread_mutex_unlock(&amp;hup_mutex);
-	return;
-}
-static rsRetVal
-submitLine(const char *const ln, const size_t lenLn)
-{
-	DEFiRet;
-	if(runModConf-&gt;bLogToSyslog)
-		doSubmitMsg((uchar*)ln);
-	if(runModConf-&gt;logfile != NULL)
-		doLogToFile(ln, lenLn);
-	RETiRet;
-}
-static rsRetVal
-doStatsLine(void __attribute__((unused)) *usrptr, const char *const str)
-{
-	DEFiRet;
-	iRet = submitLine(str, strlen(str));
-	RETiRet;
-}
-static void
-generateStatsMsgs(void)
-{
-	struct rusage ru;
-	int r;
-	r = getrusage(RUSAGE_SELF, &amp;ru);
-	if(r != 0) {
-		dbgprintf("impstats: getrusage() failed with error %d, zeroing out\n", errno);
-		memset(&amp;ru, 0, sizeof(ru));
-	}
-#	ifdef OS_LINUX
-	countOpenFiles();
-#	endif
-	st_ru_utime = ru.ru_utime.tv_sec * 1000000 + ru.ru_utime.tv_usec;
-	st_ru_stime = ru.ru_stime.tv_sec * 1000000 + ru.ru_stime.tv_usec;
-	st_ru_maxrss = ru.ru_maxrss;
-	st_ru_minflt = ru.ru_minflt;
-	st_ru_majflt = ru.ru_majflt;
-	st_ru_inblock = ru.ru_inblock;
-	st_ru_oublock = ru.ru_oublock;
-	st_ru_nvcsw = ru.ru_nvcsw;
-	st_ru_nivcsw = ru.ru_nivcsw;
-	statsobj.GetAllStatsLines(doStatsLine, NULL, runModConf-&gt;statsFmt, runModConf-&gt;bResetCtrs);
-}
-<a name="4"></a>BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	loadModConf = pModConf;
-<font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	pModConf-&gt;pConf = pConf;
-	loadModConf-&gt;configSetViaV2Method = 0;
-	loadModConf-&gt;iStatsInterval = DEFAULT_STATS_PERIOD;
-	loadModConf-&gt;iFacility = DEFAULT_FACILITY;
-	loadModConf-&gt;iSeverity = DEFAULT_SEVERITY;
-	loadModConf-&gt;statsFmt = statsFmt_Legacy;
-	loadModConf-&gt;logfd = -1;
-	loadModConf-&gt;logfile = NULL;
-	loadModConf-&gt;pszBindRuleset = NULL;
-	loadModConf-&gt;bLogToSyslog = 1;</b></font>
-	loadModConf-&gt;bBracketing = 0;
-	loadModConf-&gt;bResetCtrs = 0;
-	bLegacyCnfModGlobalsPermitted = 1;
-	initConfigSettings();
-ENDbeginCnfLoad
-<a name="1"></a>BEGINsetModCnf
-	struct cnfparamvals *pvals = NULL;
-	char *mode;
-<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	int i;
-CODESTARTsetModCnf
-	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
-	if(pvals == NULL) {
-		LogError(0, RS_RET_MISSING_CNFPARAMS, "error processing module "
-				"config parameters [module(...)]");
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-	if(Debug) {
-		dbgprintf("module (global) param blk for impstats:\n");
-		cnfparamsPrint(&amp;modpblk, pvals);
-	}
-	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)</b></font>
-			continue;
-		if(!strcmp(modpblk.descr[i].name, "interval")) {
-			loadModConf-&gt;iStatsInterval = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "facility")) {
-			loadModConf-&gt;iFacility = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "severity")) {
-			loadModConf-&gt;iSeverity = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "bracketing")) {
-			loadModConf-&gt;bBracketing = (sbool) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "log.syslog")) {
-<a name="3"></a>			loadModConf-&gt;bLogToSyslog = (sbool) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "resetcounters")) {
-			loadModConf-&gt;bResetCtrs = (sbool) pvals[i].val.d.n;
-<font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		} else if(!strcmp(modpblk.descr[i].name, "log.file")) {
-			loadModConf-&gt;logfile = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(modpblk.descr[i].name, "format")) {
-			mode = es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
-			if(!strcasecmp(mode, "json")) {
-				loadModConf-&gt;statsFmt = statsFmt_JSON;
-			} else if(!strcasecmp(mode, "json-elasticsearch")) {
-				loadModConf-&gt;statsFmt = statsFmt_JSON_ES;
-			} else if(!strcasecmp(mode, "cee")) {
-<a name="2"></a>				loadModConf-&gt;statsFmt = statsFmt_CEE;
-			} else if(!strcasecmp(mode, "legacy")) {
-				loadModConf-&gt;statsFmt = statsFmt_Legacy;
-<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>			} else {
-				LogError(0, RS_RET_ERR, "impstats: invalid format %s",
-						mode);
-			}
-			free(mode);
-		} else if(!strcmp(modpblk.descr[i].name, "ruleset")) {
-			loadModConf-&gt;pszBindRuleset = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else {</b></font>
-			dbgprintf("impstats: program error, non-handled "
-			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
-		}
-	}
-	if(loadModConf-&gt;pszBindRuleset != NULL &amp;&amp; loadModConf-&gt;bLogToSyslog == 0) {
-		parser_warnmsg("impstats: log.syslog set to \"off\" but ruleset specified - with "
-			"these settings, the ruleset will never be used, because regular syslog "
-			"processing is turned off - ruleset parameter is ignored");
-		free(loadModConf-&gt;pszBindRuleset);
-		loadModConf-&gt;pszBindRuleset = NULL;
-	}
-	loadModConf-&gt;configSetViaV2Method = 1;
-	bLegacyCnfModGlobalsPermitted = 0;
-finalize_it:
-	if(pvals != NULL)
-		cnfparamvalsDestruct(pvals, &amp;modpblk);
-ENDsetModCnf
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-	if(!loadModConf-&gt;configSetViaV2Method) {
-		loadModConf-&gt;iStatsInterval = cs.iStatsInterval;
-		loadModConf-&gt;iFacility = cs.iFacility;
-		loadModConf-&gt;iSeverity = cs.iSeverity;
-		if (cs.bCEE == 1) {
-			loadModConf-&gt;statsFmt = statsFmt_CEE;
-		} else if (cs.bJSON == 1) {
-			loadModConf-&gt;statsFmt = statsFmt_JSON;
-		} else {
-			loadModConf-&gt;statsFmt = statsFmt_Legacy;
-		}
-	}
-ENDendCnfLoad
-static rsRetVal
-checkRuleset(modConfData_t *modConf)
-{
-	ruleset_t *pRuleset;
-	rsRetVal localRet;
-	DEFiRet;
-	modConf-&gt;pBindRuleset = NULL;	
-	if(modConf-&gt;pszBindRuleset == NULL)
-		FINALIZE;
-	localRet = ruleset.GetRuleset(modConf-&gt;pConf, &amp;pRuleset, modConf-&gt;pszBindRuleset);
-	if(localRet == RS_RET_NOT_FOUND) {
-		LogError(0, NO_ERRCODE, "impstats: ruleset '%s' not found - "
-				"using default ruleset instead", modConf-&gt;pszBindRuleset);
-	}
-	CHKiRet(localRet);
-	modConf-&gt;pBindRuleset = pRuleset;
-finalize_it:
-	RETiRet;
-}
-typedef struct _instanceData {
-	int dummy;
-} instanceData;
-BEGINdoHUP
-CODESTARTdoHUP
-	DBGPRINTF("impstats: received HUP\n")
-	pthread_mutex_lock(&amp;hup_mutex);
-	if(runModConf-&gt;logfd != -1) {
-		DBGPRINTF("impstats: closing log file due to HUP\n");
-		close(runModConf-&gt;logfd);
-		runModConf-&gt;logfd = -1;
-	}
-	pthread_mutex_unlock(&amp;hup_mutex);
-ENDdoHUP
-BEGINcheckCnf
-CODESTARTcheckCnf
-	if(pModConf-&gt;iStatsInterval == 0) {
-		LogError(0, NO_ERRCODE, "impstats: stats interval zero not permitted, using "
-				"default of %d seconds", DEFAULT_STATS_PERIOD);
-		pModConf-&gt;iStatsInterval = DEFAULT_STATS_PERIOD;
-	}
-	checkRuleset(pModConf);
-ENDcheckCnf
-BEGINactivateCnf
-	rsRetVal localRet;
-CODESTARTactivateCnf
-	runModConf = pModConf;
-	DBGPRINTF("impstats: stats interval %d seconds, reset %d, logToSyslog %d, logFile %s\n",
-		  runModConf-&gt;iStatsInterval, runModConf-&gt;bResetCtrs, runModConf-&gt;bLogToSyslog,
-		  runModConf-&gt;logfile == NULL ? "deactivated" : (char*)runModConf-&gt;logfile);
-	localRet = statsobj.EnableStats();
-	if(localRet != RS_RET_OK) {
-		LogError(0, localRet, "impstats: error enabling statistics gathering");
-		ABORT_FINALIZE(RS_RET_NO_RUN);
-	}
-	CHKiRet(statsobj.Construct(&amp;statsobj_resources));
-	CHKiRet(statsobj.SetName(statsobj_resources, (uchar*)"resource-usage"));
-	CHKiRet(statsobj.SetOrigin(statsobj_resources, (uchar*)"impstats"));
-	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("utime"),
-		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_utime));
-	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("stime"),
-		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_stime));
-	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("maxrss"),
-		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_maxrss));
-	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("minflt"),
-		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_minflt));
-	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("majflt"),
-		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_majflt));
-	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("inblock"),
-		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_inblock));
-	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("oublock"),
-		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_oublock));
-	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("nvcsw"),
-		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_nvcsw));
-	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("nivcsw"),
-		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_nivcsw));
-#	ifdef OS_LINUX
-	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("openfiles"),
-		ctrType_Int, CTR_FLAG_NONE, &amp;st_openfiles));
-#	endif
-	CHKiRet(statsobj.ConstructFinalize(statsobj_resources));
-finalize_it:
-	if(iRet != RS_RET_OK) {
-		LogError(0, iRet, "impstats: error activating module");
-		iRet = RS_RET_NO_RUN;
-	}
-ENDactivateCnf
-BEGINfreeCnf
-CODESTARTfreeCnf
-	if(runModConf-&gt;logfd != -1)
-		close(runModConf-&gt;logfd);
-	free(runModConf-&gt;logfile);
-	free(runModConf-&gt;pszBindRuleset);
-ENDfreeCnf
-BEGINrunInput
-CODESTARTrunInput
-	while(glbl.GetGlobalInputTermState() == 0) {
-		srSleep(runModConf-&gt;iStatsInterval, 0); 		DBGPRINTF("impstats: woke up, generating messages\n");
-		if(runModConf-&gt;bBracketing)
-			submitLine("BEGIN", sizeof("BEGIN")-1);
-		generateStatsMsgs();
-		if(runModConf-&gt;bBracketing)
-			submitLine("END", sizeof("END")-1);
-	}
-ENDrunInput
-BEGINwillRun
-CODESTARTwillRun
-ENDwillRun
-BEGINafterRun
-CODESTARTafterRun
-ENDafterRun
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_IMOD_QUERIES
-CODEqueryEtryPt_STD_CONF2_QUERIES
-CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
-CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
-CODEqueryEtryPt_doHUP
-ENDqueryEtryPt
-static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
-{
-	initConfigSettings();
-	return RS_RET_OK;
-}
-BEGINmodInit()
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
-	DBGPRINTF("impstats version %s loading\n", VERSION);
-	initConfigSettings();
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-	CHKiRet(objUse(prop, CORE_COMPONENT));
-	CHKiRet(objUse(statsobj, CORE_COMPONENT));
-	CHKiRet(objUse(ruleset, CORE_COMPONENT));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatsinterval", 0, eCmdHdlrInt, NULL, &amp;cs.iStatsInterval,
-	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatinterval", 0, eCmdHdlrInt, NULL, &amp;cs.iStatsInterval,
-	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatfacility", 0, eCmdHdlrInt, NULL, &amp;cs.iFacility,
-	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatseverity", 0, eCmdHdlrInt, NULL, &amp;cs.iSeverity,
-	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatjson", 0, eCmdHdlrBinary, NULL, &amp;cs.bJSON,
-	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatcee", 0, eCmdHdlrBinary, NULL, &amp;cs.bCEE,
-	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
-	NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(prop.Construct(&amp;pInputName));
-	CHKiRet(prop.SetString(pInputName, UCHAR_CONSTANT("impstats"), sizeof("impstats") - 1));
-	CHKiRet(prop.ConstructFinalize(pInputName));
-ENDmodInit
+1 #include "config.h"
+2 #include "rsyslog.h"
+3 #include &lt;stdlib.h&gt;
+4 #include &lt;stdio.h&gt;
+5 #include &lt;assert.h&gt;
+6 #include &lt;signal.h&gt;
+7 #include &lt;string.h&gt;
+8 #include &lt;pthread.h&gt;
+9 #include &lt;fcntl.h&gt;
+10 #include &lt;unistd.h&gt;
+11 #include &lt;sys/uio.h&gt;
+12 #include &lt;sys/stat.h&gt;
+13 #include &lt;errno.h&gt;
+14 #include &lt;sys/time.h&gt;
+15 #include &lt;sys/resource.h&gt;
+16 #ifdef OS_LINUX
+17 #include &lt;sys/types.h&gt;
+18 #include &lt;dirent.h&gt;
+19 #endif
+20 #include "dirty.h"
+21 #include "cfsysline.h"
+22 #include "module-template.h"
+23 #include "errmsg.h"
+24 #include "msg.h"
+25 #include "srUtils.h"
+26 #include "unicode-helper.h"
+27 #include "glbl.h"
+28 #include "statsobj.h"
+29 #include "prop.h"
+30 #include "ruleset.h"
+31 #include "parserif.h"
+32 MODULE_TYPE_INPUT
+33 MODULE_TYPE_NOKEEP
+34 MODULE_CNFNAME("impstats")
+35 #define DEFAULT_STATS_PERIOD (5 * 60)
+36 #define DEFAULT_FACILITY 5 #define DEFAULT_SEVERITY 6 
+37 DEF_IMOD_STATIC_DATA
+38 DEFobjCurrIf(glbl)
+39 DEFobjCurrIf(prop)
+40 DEFobjCurrIf(statsobj)
+41 DEFobjCurrIf(ruleset)
+42 typedef struct configSettings_s {
+43 	int iStatsInterval;
+44 	int iFacility;
+45 	int iSeverity;
+46 	int bJSON;
+47 	int bCEE;
+48 } configSettings_t;
+49 struct modConfData_s {
+50 	rsconf_t *pConf; 	int iStatsInterval;
+51 	int iFacility;
+52 	int iSeverity;
+53 	int logfd; 	ruleset_t *pBindRuleset;		statsFmtType_t statsFmt;
+54 	sbool bLogToSyslog;
+55 	sbool bResetCtrs;
+56 	sbool bBracketing;
+57 	char *logfile;
+58 	sbool configSetViaV2Method;
+59 	uchar *pszBindRuleset;		};
+60 static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;
+61 static configSettings_t cs;
+62 static int bLegacyCnfModGlobalsPermitted;static prop_t *pInputName = NULL;
+63 <a name="0"></a>
+64 static struct cnfparamdescr modpdescr[] = {
+65 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "interval", eCmdHdlrInt, 0 },
+66 	{ "facility", eCmdHdlrInt, 0 },
+67 	{ "severity", eCmdHdlrInt, 0 },
+68 	{ "bracketing", eCmdHdlrBinary, 0 },
+69 	{ "log.syslog", eCmdHdlrBinary, 0 },
+70 	{ "resetcounters", eCmdHdlrBinary, 0 },
+71 	{ "log.file", eCmdHdlrGetWord, 0 },
+72 	{ "format", eCmdHdlrGetWord, 0 },
+73 	{ "ruleset", eCmdHdlrString, 0 }
+74 };
+75 static struct cnfparamblk modpblk =
+76 	{ CNFPARAMBLK_VERSION,
+77 	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+78 	  modpdescr
+79 	};
+80 #ifdef OS_LINUX
+81 static int st_openfiles;</b></font>
+82 #endif
+83 static intctr_t st_ru_utime;
+84 static intctr_t st_ru_stime;
+85 static intctr_t st_ru_maxrss;
+86 static intctr_t st_ru_minflt;
+87 static intctr_t st_ru_majflt;
+88 static intctr_t st_ru_inblock;
+89 static intctr_t st_ru_oublock;
+90 static intctr_t st_ru_nvcsw;
+91 static intctr_t st_ru_nivcsw;
+92 static statsobj_t *statsobj_resources;
+93 static pthread_mutex_t hup_mutex = PTHREAD_MUTEX_INITIALIZER;
+94 BEGINmodExit
+95 CODESTARTmodExit
+96 	prop.Destruct(&amp;pInputName);
+97 	objRelease(glbl, CORE_COMPONENT);
+98 	objRelease(prop, CORE_COMPONENT);
+99 	objRelease(statsobj, CORE_COMPONENT);
+100 	objRelease(ruleset, CORE_COMPONENT);
+101 ENDmodExit
+102 BEGINisCompatibleWithFeature
+103 CODESTARTisCompatibleWithFeature
+104 	if(eFeat == sFEATURENonCancelInputTermination)
+105 		iRet = RS_RET_OK;
+106 ENDisCompatibleWithFeature
+107 #ifdef OS_LINUX
+108 static void
+109 countOpenFiles(void)
+110 {
+111 	char proc_path[MAXFNAME];
+112 	DIR *dp;
+113 	struct dirent *files;
+114 	st_openfiles = 0;
+115 	snprintf(proc_path, sizeof(proc_path), "/proc/%d/fd", glblGetOurPid());
+116 	if((dp = opendir(proc_path)) == NULL) {
+117 		LogError(errno, RS_RET_ERR, "impstats: error reading %s\n", proc_path);
+118 		goto done;
+119 	}
+120 	while((files=readdir(dp)) != NULL) {
+121 		if(!strcmp(files-&gt;d_name, ".") || !strcmp(files-&gt;d_name, ".."))
+122 			continue;
+123 		st_openfiles++;
+124 	}
+125 	closedir(dp);
+126 done:
+127 	return;
+128 }
+129 #endif
+130 static void
+131 initConfigSettings(void)
+132 {
+133 	cs.iStatsInterval = DEFAULT_STATS_PERIOD;
+134 	cs.iFacility = DEFAULT_FACILITY;
+135 	cs.iSeverity = DEFAULT_SEVERITY;
+136 	cs.bJSON = 0;
+137 	cs.bCEE = 0;
+138 }
+139 static void
+140 doSubmitMsg(uchar *line)
+141 {
+142 	smsg_t *pMsg;
+143 	if(msgConstruct(&amp;pMsg) != RS_RET_OK)
+144 		goto finalize_it;
+145 	MsgSetInputName(pMsg, pInputName);
+146 	MsgSetRawMsgWOSize(pMsg, (char*)line);
+147 	MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
+148 	MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
+149 	MsgSetRcvFromIP(pMsg, glbl.GetLocalHostIP());
+150 	MsgSetMSGoffs(pMsg, 0);
+151 	MsgSetRuleset(pMsg, runModConf-&gt;pBindRuleset);
+152 	MsgSetTAG(pMsg, UCHAR_CONSTANT("rsyslogd-pstats:"), sizeof("rsyslogd-pstats:") - 1);
+153 	pMsg-&gt;iFacility = runModConf-&gt;iFacility;
+154 	pMsg-&gt;iSeverity = runModConf-&gt;iSeverity;
+155 	pMsg-&gt;msgFlags  = 0;
+156 	submitMsg2(pMsg);
+157 	DBGPRINTF("impstats: submit [%d,%d] msg '%s'\n", runModConf-&gt;iFacility,
+158 	          runModConf-&gt;iSeverity, line);
+159 finalize_it:
+160 	return;
+161 }
+162 static void
+163 doLogToFile(const char *ln, const size_t lenLn)
+164 {
+165 	struct iovec iov[4];
+166 	ssize_t nwritten;
+167 	ssize_t nexpect;
+168 	time_t t;
+169 	char timebuf[32];
+170 	pthread_mutex_lock(&amp;hup_mutex);
+171 	if(lenLn == 0)
+172 		goto done;
+173 	if(runModConf-&gt;logfd == -1) {
+174 		runModConf-&gt;logfd = open(runModConf-&gt;logfile, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, S_IRUSR|S_IWUSR);
+175 		if(runModConf-&gt;logfd == -1) {
+176 			DBGPRINTF("impstats: error opening stats file %s\n",
+177 				runModConf-&gt;logfile);
+178 			goto done;
+179 		} else {
+180 			DBGPRINTF("impstats: opened stats file %s\n",
+181 				runModConf-&gt;logfile);
+182 		}
+183 	}
+184 	time(&amp;t);
+185 	iov[0].iov_base = ctime_r(&amp;t, timebuf);
+186 	iov[0].iov_len = nexpect = strlen(iov[0].iov_base) - 1; 	iov[1].iov_base = (void*)": ";
+187 	iov[1].iov_len = 2;
+188 	nexpect += 2;
+189 	iov[2].iov_base = (void*)ln;
+190 	iov[2].iov_len = lenLn;
+191 	nexpect += lenLn;
+192 	iov[3].iov_base = (void*)"\n";
+193 	iov[3].iov_len = 1;
+194 	nexpect++;
+195 	nwritten = writev(runModConf-&gt;logfd, iov, 4);
+196 	if(nwritten != nexpect) {
+197 			dbgprintf("error writing stats file %s, nwritten %lld, expected %lld\n",
+198 				  runModConf-&gt;logfile, (long long) nwritten, (long long) nexpect);
+199 	}
+200 done:
+201 	pthread_mutex_unlock(&amp;hup_mutex);
+202 	return;
+203 }
+204 static rsRetVal
+205 submitLine(const char *const ln, const size_t lenLn)
+206 {
+207 	DEFiRet;
+208 	if(runModConf-&gt;bLogToSyslog)
+209 		doSubmitMsg((uchar*)ln);
+210 	if(runModConf-&gt;logfile != NULL)
+211 		doLogToFile(ln, lenLn);
+212 	RETiRet;
+213 }
+214 static rsRetVal
+215 doStatsLine(void __attribute__((unused)) *usrptr, const char *const str)
+216 {
+217 	DEFiRet;
+218 	iRet = submitLine(str, strlen(str));
+219 	RETiRet;
+220 }
+221 static void
+222 generateStatsMsgs(void)
+223 {
+224 	struct rusage ru;
+225 	int r;
+226 	r = getrusage(RUSAGE_SELF, &amp;ru);
+227 	if(r != 0) {
+228 		dbgprintf("impstats: getrusage() failed with error %d, zeroing out\n", errno);
+229 		memset(&amp;ru, 0, sizeof(ru));
+230 	}
+231 #	ifdef OS_LINUX
+232 	countOpenFiles();
+233 #	endif
+234 	st_ru_utime = ru.ru_utime.tv_sec * 1000000 + ru.ru_utime.tv_usec;
+235 	st_ru_stime = ru.ru_stime.tv_sec * 1000000 + ru.ru_stime.tv_usec;
+236 	st_ru_maxrss = ru.ru_maxrss;
+237 	st_ru_minflt = ru.ru_minflt;
+238 	st_ru_majflt = ru.ru_majflt;
+239 	st_ru_inblock = ru.ru_inblock;
+240 	st_ru_oublock = ru.ru_oublock;
+241 	st_ru_nvcsw = ru.ru_nvcsw;
+242 	st_ru_nivcsw = ru.ru_nivcsw;
+243 	statsobj.GetAllStatsLines(doStatsLine, NULL, runModConf-&gt;statsFmt, runModConf-&gt;bResetCtrs);
+244 }
+245 <a name="4"></a>BEGINbeginCnfLoad
+246 CODESTARTbeginCnfLoad
+247 	loadModConf = pModConf;
+248 <font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	pModConf-&gt;pConf = pConf;
+249 	loadModConf-&gt;configSetViaV2Method = 0;
+250 	loadModConf-&gt;iStatsInterval = DEFAULT_STATS_PERIOD;
+251 	loadModConf-&gt;iFacility = DEFAULT_FACILITY;
+252 	loadModConf-&gt;iSeverity = DEFAULT_SEVERITY;
+253 	loadModConf-&gt;statsFmt = statsFmt_Legacy;
+254 	loadModConf-&gt;logfd = -1;
+255 	loadModConf-&gt;logfile = NULL;
+256 	loadModConf-&gt;pszBindRuleset = NULL;
+257 	loadModConf-&gt;bLogToSyslog = 1;</b></font>
+258 	loadModConf-&gt;bBracketing = 0;
+259 	loadModConf-&gt;bResetCtrs = 0;
+260 	bLegacyCnfModGlobalsPermitted = 1;
+261 	initConfigSettings();
+262 ENDbeginCnfLoad
+263 <a name="1"></a>BEGINsetModCnf
+264 	struct cnfparamvals *pvals = NULL;
+265 	char *mode;
+266 <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	int i;
+267 CODESTARTsetModCnf
+268 	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
+269 	if(pvals == NULL) {
+270 		LogError(0, RS_RET_MISSING_CNFPARAMS, "error processing module "
+271 				"config parameters [module(...)]");
+272 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+273 	}
+274 	if(Debug) {
+275 		dbgprintf("module (global) param blk for impstats:\n");
+276 		cnfparamsPrint(&amp;modpblk, pvals);
+277 	}
+278 	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
+279 		if(!pvals[i].bUsed)</b></font>
+280 			continue;
+281 		if(!strcmp(modpblk.descr[i].name, "interval")) {
+282 			loadModConf-&gt;iStatsInterval = (int) pvals[i].val.d.n;
+283 		} else if(!strcmp(modpblk.descr[i].name, "facility")) {
+284 			loadModConf-&gt;iFacility = (int) pvals[i].val.d.n;
+285 		} else if(!strcmp(modpblk.descr[i].name, "severity")) {
+286 			loadModConf-&gt;iSeverity = (int) pvals[i].val.d.n;
+287 		} else if(!strcmp(modpblk.descr[i].name, "bracketing")) {
+288 			loadModConf-&gt;bBracketing = (sbool) pvals[i].val.d.n;
+289 		} else if(!strcmp(modpblk.descr[i].name, "log.syslog")) {
+290 <a name="3"></a>			loadModConf-&gt;bLogToSyslog = (sbool) pvals[i].val.d.n;
+291 		} else if(!strcmp(modpblk.descr[i].name, "resetcounters")) {
+292 			loadModConf-&gt;bResetCtrs = (sbool) pvals[i].val.d.n;
+293 <font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		} else if(!strcmp(modpblk.descr[i].name, "log.file")) {
+294 			loadModConf-&gt;logfile = es_str2cstr(pvals[i].val.d.estr, NULL);
+295 		} else if(!strcmp(modpblk.descr[i].name, "format")) {
+296 			mode = es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
+297 			if(!strcasecmp(mode, "json")) {
+298 				loadModConf-&gt;statsFmt = statsFmt_JSON;
+299 			} else if(!strcasecmp(mode, "json-elasticsearch")) {
+300 				loadModConf-&gt;statsFmt = statsFmt_JSON_ES;
+301 			} else if(!strcasecmp(mode, "cee")) {
+302 <a name="2"></a>				loadModConf-&gt;statsFmt = statsFmt_CEE;
+303 			} else if(!strcasecmp(mode, "legacy")) {
+304 				loadModConf-&gt;statsFmt = statsFmt_Legacy;
+305 <font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>			} else {
+306 				LogError(0, RS_RET_ERR, "impstats: invalid format %s",
+307 						mode);
+308 			}
+309 			free(mode);
+310 		} else if(!strcmp(modpblk.descr[i].name, "ruleset")) {
+311 			loadModConf-&gt;pszBindRuleset = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+312 		} else {</b></font>
+313 			dbgprintf("impstats: program error, non-handled "
+314 			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
+315 		}
+316 	}
+317 	if(loadModConf-&gt;pszBindRuleset != NULL &amp;&amp; loadModConf-&gt;bLogToSyslog == 0) {
+318 		parser_warnmsg("impstats: log.syslog set to \"off\" but ruleset specified - with "
+319 			"these settings, the ruleset will never be used, because regular syslog "
+320 			"processing is turned off - ruleset parameter is ignored");
+321 		free(loadModConf-&gt;pszBindRuleset);
+322 		loadModConf-&gt;pszBindRuleset = NULL;
+323 	}
+324 	loadModConf-&gt;configSetViaV2Method = 1;
+325 	bLegacyCnfModGlobalsPermitted = 0;
+326 finalize_it:
+327 	if(pvals != NULL)
+328 		cnfparamvalsDestruct(pvals, &amp;modpblk);
+329 ENDsetModCnf
+330 BEGINendCnfLoad
+331 CODESTARTendCnfLoad
+332 	if(!loadModConf-&gt;configSetViaV2Method) {
+333 		loadModConf-&gt;iStatsInterval = cs.iStatsInterval;
+334 		loadModConf-&gt;iFacility = cs.iFacility;
+335 		loadModConf-&gt;iSeverity = cs.iSeverity;
+336 		if (cs.bCEE == 1) {
+337 			loadModConf-&gt;statsFmt = statsFmt_CEE;
+338 		} else if (cs.bJSON == 1) {
+339 			loadModConf-&gt;statsFmt = statsFmt_JSON;
+340 		} else {
+341 			loadModConf-&gt;statsFmt = statsFmt_Legacy;
+342 		}
+343 	}
+344 ENDendCnfLoad
+345 static rsRetVal
+346 checkRuleset(modConfData_t *modConf)
+347 {
+348 	ruleset_t *pRuleset;
+349 	rsRetVal localRet;
+350 	DEFiRet;
+351 	modConf-&gt;pBindRuleset = NULL;	
+352 	if(modConf-&gt;pszBindRuleset == NULL)
+353 		FINALIZE;
+354 	localRet = ruleset.GetRuleset(modConf-&gt;pConf, &amp;pRuleset, modConf-&gt;pszBindRuleset);
+355 	if(localRet == RS_RET_NOT_FOUND) {
+356 		LogError(0, NO_ERRCODE, "impstats: ruleset '%s' not found - "
+357 				"using default ruleset instead", modConf-&gt;pszBindRuleset);
+358 	}
+359 	CHKiRet(localRet);
+360 	modConf-&gt;pBindRuleset = pRuleset;
+361 finalize_it:
+362 	RETiRet;
+363 }
+364 typedef struct _instanceData {
+365 	int dummy;
+366 } instanceData;
+367 BEGINdoHUP
+368 CODESTARTdoHUP
+369 	DBGPRINTF("impstats: received HUP\n")
+370 	pthread_mutex_lock(&amp;hup_mutex);
+371 	if(runModConf-&gt;logfd != -1) {
+372 		DBGPRINTF("impstats: closing log file due to HUP\n");
+373 		close(runModConf-&gt;logfd);
+374 		runModConf-&gt;logfd = -1;
+375 	}
+376 	pthread_mutex_unlock(&amp;hup_mutex);
+377 ENDdoHUP
+378 BEGINcheckCnf
+379 CODESTARTcheckCnf
+380 	if(pModConf-&gt;iStatsInterval == 0) {
+381 		LogError(0, NO_ERRCODE, "impstats: stats interval zero not permitted, using "
+382 				"default of %d seconds", DEFAULT_STATS_PERIOD);
+383 		pModConf-&gt;iStatsInterval = DEFAULT_STATS_PERIOD;
+384 	}
+385 	checkRuleset(pModConf);
+386 ENDcheckCnf
+387 BEGINactivateCnf
+388 	rsRetVal localRet;
+389 CODESTARTactivateCnf
+390 	runModConf = pModConf;
+391 	DBGPRINTF("impstats: stats interval %d seconds, reset %d, logToSyslog %d, logFile %s\n",
+392 		  runModConf-&gt;iStatsInterval, runModConf-&gt;bResetCtrs, runModConf-&gt;bLogToSyslog,
+393 		  runModConf-&gt;logfile == NULL ? "deactivated" : (char*)runModConf-&gt;logfile);
+394 	localRet = statsobj.EnableStats();
+395 	if(localRet != RS_RET_OK) {
+396 		LogError(0, localRet, "impstats: error enabling statistics gathering");
+397 		ABORT_FINALIZE(RS_RET_NO_RUN);
+398 	}
+399 	CHKiRet(statsobj.Construct(&amp;statsobj_resources));
+400 	CHKiRet(statsobj.SetName(statsobj_resources, (uchar*)"resource-usage"));
+401 	CHKiRet(statsobj.SetOrigin(statsobj_resources, (uchar*)"impstats"));
+402 	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("utime"),
+403 		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_utime));
+404 	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("stime"),
+405 		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_stime));
+406 	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("maxrss"),
+407 		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_maxrss));
+408 	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("minflt"),
+409 		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_minflt));
+410 	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("majflt"),
+411 		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_majflt));
+412 	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("inblock"),
+413 		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_inblock));
+414 	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("oublock"),
+415 		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_oublock));
+416 	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("nvcsw"),
+417 		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_nvcsw));
+418 	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("nivcsw"),
+419 		ctrType_IntCtr, CTR_FLAG_NONE, &amp;st_ru_nivcsw));
+420 #	ifdef OS_LINUX
+421 	CHKiRet(statsobj.AddCounter(statsobj_resources, UCHAR_CONSTANT("openfiles"),
+422 		ctrType_Int, CTR_FLAG_NONE, &amp;st_openfiles));
+423 #	endif
+424 	CHKiRet(statsobj.ConstructFinalize(statsobj_resources));
+425 finalize_it:
+426 	if(iRet != RS_RET_OK) {
+427 		LogError(0, iRet, "impstats: error activating module");
+428 		iRet = RS_RET_NO_RUN;
+429 	}
+430 ENDactivateCnf
+431 BEGINfreeCnf
+432 CODESTARTfreeCnf
+433 	if(runModConf-&gt;logfd != -1)
+434 		close(runModConf-&gt;logfd);
+435 	free(runModConf-&gt;logfile);
+436 	free(runModConf-&gt;pszBindRuleset);
+437 ENDfreeCnf
+438 BEGINrunInput
+439 CODESTARTrunInput
+440 	while(glbl.GetGlobalInputTermState() == 0) {
+441 		srSleep(runModConf-&gt;iStatsInterval, 0); 		DBGPRINTF("impstats: woke up, generating messages\n");
+442 		if(runModConf-&gt;bBracketing)
+443 			submitLine("BEGIN", sizeof("BEGIN")-1);
+444 		generateStatsMsgs();
+445 		if(runModConf-&gt;bBracketing)
+446 			submitLine("END", sizeof("END")-1);
+447 	}
+448 ENDrunInput
+449 BEGINwillRun
+450 CODESTARTwillRun
+451 ENDwillRun
+452 BEGINafterRun
+453 CODESTARTafterRun
+454 ENDafterRun
+455 BEGINqueryEtryPt
+456 CODESTARTqueryEtryPt
+457 CODEqueryEtryPt_STD_IMOD_QUERIES
+458 CODEqueryEtryPt_STD_CONF2_QUERIES
+459 CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+460 CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
+461 CODEqueryEtryPt_doHUP
+462 ENDqueryEtryPt
+463 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
+464 {
+465 	initConfigSettings();
+466 	return RS_RET_OK;
+467 }
+468 BEGINmodInit()
+469 CODESTARTmodInit
+470 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+471 	DBGPRINTF("impstats version %s loading\n", VERSION);
+472 	initConfigSettings();
+473 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+474 	CHKiRet(objUse(prop, CORE_COMPONENT));
+475 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
+476 	CHKiRet(objUse(ruleset, CORE_COMPONENT));
+477 	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatsinterval", 0, eCmdHdlrInt, NULL, &amp;cs.iStatsInterval,
+478 	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+479 	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatinterval", 0, eCmdHdlrInt, NULL, &amp;cs.iStatsInterval,
+480 	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+481 	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatfacility", 0, eCmdHdlrInt, NULL, &amp;cs.iFacility,
+482 	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+483 	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatseverity", 0, eCmdHdlrInt, NULL, &amp;cs.iSeverity,
+484 	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+485 	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatjson", 0, eCmdHdlrBinary, NULL, &amp;cs.bJSON,
+486 	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+487 	CHKiRet(regCfSysLineHdlr2((uchar *)"pstatcee", 0, eCmdHdlrBinary, NULL, &amp;cs.bCEE,
+488 	STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+489 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
+490 	NULL, STD_LOADABLE_MODULE_ID));
+491 	CHKiRet(prop.Construct(&amp;pInputName));
+492 	CHKiRet(prop.SetString(pInputName, UCHAR_CONSTANT("impstats"), sizeof("impstats") - 1));
+493 	CHKiRet(prop.ConstructFinalize(pInputName));
+494 ENDmodInit
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -550,657 +550,657 @@ ENDmodInit
 </h3>
 <hr/>
 <pre>
-#include "config.h"
-#include "rsyslog.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;ctype.h&gt;
-#include &lt;librelp.h&gt;
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "cfsysline.h"
-#include "module-template.h"
-#include "glbl.h"
-#include "errmsg.h"
-#include "debug.h"
-#include "parserif.h"
-#include "unicode-helper.h"
-#ifndef RELP_DFLT_PT
-#	define RELP_DFLT_PT "514"
-#endif
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("omrelp")
-DEF_OMOD_STATIC_DATA
-DEFobjCurrIf(glbl)
-#define DFLT_ENABLE_TLS 0
-#define DFLT_ENABLE_TLSZIP 0
-static relpEngine_t *pRelpEngine;	
-typedef struct _instanceData {
-	uchar *target;
-	uchar *port;
-	unsigned timeout;
-	int connTimeout;
-	unsigned rebindInterval;
-	sbool bEnableTLS;
-	sbool bEnableTLSZip;
-	uchar *pristring;			uchar *authmode;
-	uchar *caCertFile;
-	uchar *myCertFile;
-	uchar *myPrivKeyFile;
-#if defined(HAVE_RELPENGINESETTLSCFGCMD)
-	uchar *tlscfgcmd;
-#endif
-	uchar *tplName;
-	uchar *localClientIP;
-	struct {
-		int nmemb;
-		uchar **name;
-	} permittedPeers;
-} instanceData;
-typedef struct wrkrInstanceData {
-	instanceData *pData;
-	int bInitialConnect; 	int bIsConnected; 	int bIsSuspended; 	relpClt_t *pRelpClt; 	unsigned nSent; } wrkrInstanceData_t;
-typedef struct configSettings_s {
-	EMPTY_STRUCT
-} configSettings_t;
-static configSettings_t __attribute__((unused)) cs;
-static rsRetVal doCreateRelpClient(instanceData *pData, relpClt_t **pRelpClt);
-struct modConfData_s {
-	rsconf_t *pConf;		const char  *tlslib;
-};
-static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;
-static struct cnfparamdescr modpdescr[] = {
-	{ "tls.tlslib", eCmdHdlrString, 0 }
-};
-static struct cnfparamblk modpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
-	  modpdescr
-	};
-static struct cnfparamdescr actpdescr[] = {
-	{ "target", eCmdHdlrGetWord, 1 },
-	{ "tls", eCmdHdlrBinary, 0 },
-	{ "tls.compression", eCmdHdlrBinary, 0 },
-	{ "tls.prioritystring", eCmdHdlrString, 0 },
-	{ "tls.cacert", eCmdHdlrString, 0 },
-<a name="0"></a>	{ "tls.mycert", eCmdHdlrString, 0 },
-	{ "tls.myprivkey", eCmdHdlrString, 0 },
-	{ "tls.authmode", eCmdHdlrString, 0 },
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "tls.tlscfgcmd", eCmdHdlrString, 0 },
-	{ "tls.permittedpeer", eCmdHdlrArray, 0 },
-	{ "port", eCmdHdlrGetWord, 0 },
-	{ "rebindinterval", eCmdHdlrInt, 0 },
-	{ "windowsize", eCmdHdlrInt, 0 },
-	{ "timeout", eCmdHdlrInt, 0 },
-	{ "conn.timeout", eCmdHdlrInt, 0 },
-	{ "localclientip", eCmdHdlrGetWord, 0 },
-	{ "template", eCmdHdlrGetWord, 0 }
-};
-static struct cnfparamblk actpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	  actpdescr
-	};
-BEGINinitConfVars		CODESTARTinitConfVars
-ENDinitConfVars
-PRAGMA_DIAGNOSTIC_PUSH
-PRAGMA_IGNORE_Wformat_nonliteral
-static void __attribute__((format(printf, 1, 2)))</b></font>
-omrelp_dbgprintf(const char *fmt, ...)
-{
-	va_list ap;
-	char pszWriteBuf[32*1024+1]; //this function has to be able to
-	if(!(Debug &amp;&amp; debugging_on)) {
-		return;
-	}
-	va_start(ap, fmt);
-	vsnprintf(pszWriteBuf, sizeof(pszWriteBuf), fmt, ap);
-	va_end(ap);
-	r_dbgprintf("omrelp.c", "%s", pszWriteBuf);
-}
-PRAGMA_DIAGNOSTIC_POP
-static uchar *getRelpPt(instanceData *pData)
-{
-	assert(pData != NULL);
-	if(pData-&gt;port == NULL)
-		return((uchar*)RELP_DFLT_PT);
-	else
-		return(pData-&gt;port);
-}
-static void
-onErr(void *pUsr, char *objinfo, char* errmesg, __attribute__((unused)) relpRetVal errcode)
-{
-	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*) pUsr;
-	LogError(0, RS_RET_RELP_AUTH_FAIL, "omrelp[%s:%s]: error '%s', object "
-			" '%s' - action may not work as intended",
-			pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port, errmesg, objinfo);
-}
-static void
-onGenericErr(char *objinfo, char* errmesg, __attribute__((unused)) relpRetVal errcode)
-{
-	LogError(0, RS_RET_RELP_ERR, "omrelp: librelp error '%s', object "
-			"'%s' - action may not work as intended",
-			errmesg, objinfo);
-}
-static void
-onAuthErr(void *pUsr, char *authinfo, char* errmesg, __attribute__((unused)) relpRetVal errcode)
-{
-	instanceData *pData = ((wrkrInstanceData_t*) pUsr)-&gt;pData;
-	LogError(0, RS_RET_RELP_AUTH_FAIL, "omrelp[%s:%s]: authentication error '%s', peer "
-			"is '%s' - DISABLING action", pData-&gt;target, pData-&gt;port, errmesg, authinfo);
-	pData-&gt;bHadAuthFail = 1;
-}
-static rsRetVal
-doCreateRelpClient(instanceData *pData, relpClt_t **pRelpClt)
-{
-	int i;
-	DEFiRet;
-	if(relpEngineCltConstruct(pRelpEngine, pRelpClt) != RELP_RET_OK)
-		ABORT_FINALIZE(RS_RET_RELP_ERR);
-	if(relpCltSetTimeout(*pRelpClt, pData-&gt;timeout) != RELP_RET_OK)
-		ABORT_FINALIZE(RS_RET_RELP_ERR);
-	if(relpCltSetConnTimeout(*pRelpClt, pData-&gt;connTimeout) != RELP_RET_OK) {
-		ABORT_FINALIZE(RS_RET_RELP_ERR);
-	}
-	if(relpCltSetWindowSize(*pRelpClt, pData-&gt;sizeWindow) != RELP_RET_OK)
-		ABORT_FINALIZE(RS_RET_RELP_ERR);
-	if(pData-&gt;bEnableTLS) {
-		if(relpCltEnableTLS(*pRelpClt) != RELP_RET_OK)
-			ABORT_FINALIZE(RS_RET_RELP_ERR);
-		if(pData-&gt;bEnableTLSZip) {
-			if(relpCltEnableTLSZip(*pRelpClt) != RELP_RET_OK)
-				ABORT_FINALIZE(RS_RET_RELP_ERR);
-		}
-		if(relpCltSetGnuTLSPriString(*pRelpClt, (char*) pData-&gt;pristring) != RELP_RET_OK)
-			ABORT_FINALIZE(RS_RET_RELP_ERR);
-		if(relpCltSetAuthMode(*pRelpClt, (char*) pData-&gt;authmode) != RELP_RET_OK) {
-			LogError(0, RS_RET_RELP_ERR,
-					"omrelp: invalid auth mode '%s'\n", pData-&gt;authmode);
-			ABORT_FINALIZE(RS_RET_RELP_ERR);
-		}
-		if(relpCltSetCACert(*pRelpClt, (char*) pData-&gt;caCertFile) != RELP_RET_OK)
-			ABORT_FINALIZE(RS_RET_RELP_ERR);
-		if(relpCltSetOwnCert(*pRelpClt, (char*) pData-&gt;myCertFile) != RELP_RET_OK)
-			ABORT_FINALIZE(RS_RET_RELP_ERR);
-		if(relpCltSetPrivKey(*pRelpClt, (char*) pData-&gt;myPrivKeyFile) != RELP_RET_OK)
-			ABORT_FINALIZE(RS_RET_RELP_ERR);
-#if defined(HAVE_RELPENGINESETTLSCFGCMD)
-		if (pData-&gt;tlscfgcmd != NULL) {
-			if(relpCltSetTlsConfigCmd(*pRelpClt, (char*) pData-&gt;tlscfgcmd) != RELP_RET_OK)
-				ABORT_FINALIZE(RS_RET_RELP_ERR);
-		}
-#endif
-		for(i = 0 ; i &lt;  pData-&gt;permittedPeers.nmemb ; ++i) {
-			relpCltAddPermittedPeer(*pRelpClt, (char*)pData-&gt;permittedPeers.name[i]);
-		}
-	}
-	if(pData-&gt;localClientIP != NULL) {
-		if(relpCltSetClientIP(*pRelpClt, pData-&gt;localClientIP) != RELP_RET_OK)
-			ABORT_FINALIZE(RS_RET_RELP_ERR);
-	}
-finalize_it:
-	RETiRet;
-}
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-	loadModConf = NULL;
-	runModConf = pModConf;
-ENDendCnfLoad
-BEGINcheckCnf
-CODESTARTcheckCnf
-ENDcheckCnf
-BEGINactivateCnf
-CODESTARTactivateCnf
-ENDactivateCnf
-BEGINfreeCnf
-CODESTARTfreeCnf
-	free((void*)pModConf-&gt;tlslib);
-ENDfreeCnf
-<a name="4"></a>
-BEGINcreateInstance
-CODESTARTcreateInstance
-<font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	pData-&gt;sizeWindow = 0;
-	pData-&gt;timeout = 90;
-	pData-&gt;connTimeout = 10;
-	pData-&gt;rebindInterval = 0;
-	pData-&gt;bEnableTLS = DFLT_ENABLE_TLS;
-	pData-&gt;bEnableTLSZip = DFLT_ENABLE_TLSZIP;
-	pData-&gt;bHadAuthFail = 0;
-	pData-&gt;pristring = NULL;
-	pData-&gt;authmode = NULL;
-	pData-&gt;localClientIP = NULL;</b></font>
-	pData-&gt;caCertFile = NULL;
-	pData-&gt;myCertFile = NULL;
-	pData-&gt;myPrivKeyFile = NULL;
-#if defined(HAVE_RELPENGINESETTLSCFGCMD)
-	pData-&gt;tlscfgcmd = NULL;
-#endif
-	pData-&gt;permittedPeers.nmemb = 0;
-ENDcreateInstance
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-	pWrkrData-&gt;pRelpClt = NULL;
-	iRet = doCreateRelpClient(pWrkrData-&gt;pData, &amp;pWrkrData-&gt;pRelpClt);
-	if(relpCltSetUsrPtr(pWrkrData-&gt;pRelpClt, pWrkrData) != RELP_RET_OK)
-		LogError(0, RS_RET_NO_ERRCODE, "omrelp: error when creating relp client");
-	pWrkrData-&gt;bInitialConnect = 1;
-	pWrkrData-&gt;nSent = 0;
-ENDcreateWrkrInstance
-BEGINfreeInstance
-	int i;
-CODESTARTfreeInstance
-	free(pData-&gt;target);
-	free(pData-&gt;port);
-	free(pData-&gt;tplName);
-	free(pData-&gt;pristring);
-	free(pData-&gt;authmode);
-	free(pData-&gt;localClientIP);
-	free(pData-&gt;caCertFile);
-	free(pData-&gt;myCertFile);
-	free(pData-&gt;myPrivKeyFile);
-#if defined(HAVE_RELPENGINESETTLSCFGCMD)
-	free(pData-&gt;tlscfgcmd);
-#endif
-	if(pData-&gt;permittedPeers.name != NULL) {
-		for(i = 0 ; i &lt;  pData-&gt;permittedPeers.nmemb ; ++i) {
-			free(pData-&gt;permittedPeers.name[i]);
-		}
-	}
-ENDfreeInstance
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-	if(pWrkrData-&gt;pRelpClt != NULL)
-		relpEngineCltDestruct(pRelpEngine, &amp;pWrkrData-&gt;pRelpClt);
-ENDfreeWrkrInstance
-static void
-setInstParamDefaults(instanceData *pData)
-{
-	pData-&gt;target = NULL;
-	pData-&gt;port = NULL;
-	pData-&gt;tplName = NULL;
-	pData-&gt;timeout = 90;
-	pData-&gt;connTimeout = 10;
-	pData-&gt;sizeWindow = 0;
-	pData-&gt;rebindInterval = 0;
-	pData-&gt;bEnableTLS = DFLT_ENABLE_TLS;
-	pData-&gt;bEnableTLSZip = DFLT_ENABLE_TLSZIP;
-	pData-&gt;pristring = NULL;
-	pData-&gt;authmode = NULL;
-	if(glbl.GetSourceIPofLocalClient() == NULL)
-		pData-&gt;localClientIP = NULL;
-	else
-		pData-&gt;localClientIP = (uchar*)strdup((char*)glbl.GetSourceIPofLocalClient());
-	pData-&gt;caCertFile = NULL;
-	pData-&gt;myCertFile = NULL;
-	pData-&gt;myPrivKeyFile = NULL;
-#if defined(HAVE_RELPENGINESETTLSCFGCMD)
-	pData-&gt;tlscfgcmd = NULL;
-#endif
-	pData-&gt;permittedPeers.name = NULL;
-	pData-&gt;permittedPeers.nmemb = 0;
-}
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	loadModConf = pModConf;
-	pModConf-&gt;pConf = pConf;
-	pModConf-&gt;tlslib = NULL;
-	CHKiRet(relpEngineConstruct(&amp;pRelpEngine));
-	CHKiRet(relpEngineSetDbgprint(pRelpEngine, (void (*)(char *, ...))omrelp_dbgprintf));
-	CHKiRet(relpEngineSetOnAuthErr(pRelpEngine, onAuthErr));
-	CHKiRet(relpEngineSetOnGenericErr(pRelpEngine, onGenericErr));
-	CHKiRet(relpEngineSetOnErr(pRelpEngine, onErr));
-	CHKiRet(relpEngineSetEnableCmd(pRelpEngine, (uchar*) "syslog", eRelpCmdState_Required));
-finalize_it:
-ENDbeginCnfLoad
-<a name="1"></a>
-BEGINsetModCnf
-	struct cnfparamvals *pvals = NULL;
-<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	int i;
-CODESTARTsetModCnf
-	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
-	if(pvals == NULL) {
-		parser_errmsg("imrelp: error processing module config parameters [module(...)]");
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-	if(Debug) {
-		dbgprintf("module (global) param blk for omrelp:\n");
-		cnfparamsPrint(&amp;modpblk, pvals);
-	}
-	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed) {</b></font>
-			continue;
-		}
-		if(!strcmp(modpblk.descr[i].name, "tls.tlslib")) {
-			#if defined(HAVE_RELPENGINESETTLSLIBBYNAME)
-				loadModConf-&gt;tlslib = es_str2cstr(pvals[i].val.d.estr, NULL);
-				if(relpEngineSetTLSLibByName(pRelpEngine, loadModConf-&gt;tlslib) != RELP_RET_OK) {
-					LogMsg(0, RS_RET_CONF_PARAM_INVLD, LOG_WARNING,
-						"omrelp: tlslib '%s' not accepted as valid by librelp - using default",
-						loadModConf-&gt;tlslib);
-				}
-			#else
-				LogError(0, RS_RET_NOT_IMPLEMENTED,
-					"omrelp warning: parameter tls.tlslib ignored - librelp does not support "
-					"this API call. Using whatever librelp was compiled with.");
-			#endif
-		} else {
-			dbgprintf("imfile: program error, non-handled "
-			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
-		}
-	}
-finalize_it:
-	if(pvals != NULL)
-		cnfparamvalsDestruct(pvals, &amp;modpblk);
-ENDsetModCnf
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	int i,j;
-	FILE *fp;
-	relpClt_t *pRelpClt = NULL;
-CODESTARTnewActInst
-	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-	CHKiRet(createInstance(&amp;pData));
-	setInstParamDefaults(pData);
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-<a name="3"></a>			continue;
-		if(!strcmp(actpblk.descr[i].name, "target")) {
-			pData-&gt;target = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-<font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		} else if(!strcmp(actpblk.descr[i].name, "port")) {
-			pData-&gt;port = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "template")) {
-			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
-		} else if(!strcmp(actpblk.descr[i].name, "localclientip")) {
-			pData-&gt;localClientIP = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "timeout")) {
-			pData-&gt;timeout = (unsigned) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "conn.timeout")) {
-			pData-&gt;connTimeout = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "rebindinterval")) {
-			pData-&gt;rebindInterval = (unsigned) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "windowsize")) {
-			pData-&gt;sizeWindow = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "tls")) {
-			pData-&gt;bEnableTLS = (unsigned) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "tls.compression")) {
-			pData-&gt;bEnableTLSZip = (unsigned) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "tls.prioritystring")) {
-			pData-&gt;pristring = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "tls.cacert")) {
-			pData-&gt;caCertFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			fp = fopen((const char*)pData-&gt;caCertFile, "r");
-			if(fp == NULL) {
-				char errStr[1024];
-				rs_strerror_r(errno, errStr, sizeof(errStr));
-				LogError(0, RS_RET_NO_FILE_ACCESS,
-				"error: certificate file %s couldn't be accessed: %s\n",
-				pData-&gt;caCertFile, errStr);
-			} else {
-				fclose(fp);
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "tls.mycert")) {
-			pData-&gt;myCertFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			fp = fopen((const char*)pData-&gt;myCertFile, "r");
-			if(fp == NULL) {
-				char errStr[1024];
-				rs_strerror_r(errno, errStr, sizeof(errStr));
-				LogError(0, RS_RET_NO_FILE_ACCESS,
-				"error: certificate file %s couldn't be accessed: %s\n",
-				pData-&gt;myCertFile, errStr);
-			} else {
-				fclose(fp);
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "tls.myprivkey")) {
-			pData-&gt;myPrivKeyFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			fp = fopen((const char*)pData-&gt;myPrivKeyFile, "r");
-			if(fp == NULL) {
-				char errStr[1024];
-				rs_strerror_r(errno, errStr, sizeof(errStr));
-<a name="2"></a>				LogError(0, RS_RET_NO_FILE_ACCESS,
-				"error: certificate file %s couldn't be accessed: %s\n",
-				pData-&gt;myPrivKeyFile, errStr);
-<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>			} else {
-				fclose(fp);
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "tls.tlscfgcmd")) {
-#if defined(HAVE_RELPENGINESETTLSCFGCMD)
-			pData-&gt;tlscfgcmd = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-#else
-			LogError(0, RS_RET_NOT_IMPLEMENTED, "omrelp: librelp does not support input parameter "
-				"'tls.tlscfgcmd'; it probably is too old (1.5.0 or higher should be fine); "
-				"ignoring setting now.");
-#endif
-		} else if(!strcmp(actpblk.descr[i].name, "tls.authmode")) {</b></font>
-			pData-&gt;authmode = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "tls.permittedpeer")) {
-			pData-&gt;permittedPeers.nmemb = pvals[i].val.d.ar-&gt;nmemb;
-			CHKmalloc(pData-&gt;permittedPeers.name =
-				malloc(sizeof(uchar*) * pData-&gt;permittedPeers.nmemb));
-			for(j = 0 ; j &lt;  pData-&gt;permittedPeers.nmemb ; ++j) {
-				pData-&gt;permittedPeers.name[j] = (uchar*)es_str2cstr(pvals[i].val.d.ar-&gt;arr[j], NULL);
-			}
-		} else {
-			dbgprintf("omrelp: program error, non-handled "
-			  "param '%s'\n", actpblk.descr[i].name);
-		}
-	}
-	CODE_STD_STRING_REQUESTnewActInst(1)
-	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup((pData-&gt;tplName == NULL) ?
-			    "RSYSLOG_ForwardFormat" : (char*)pData-&gt;tplName),
-	   		    OMSR_NO_RQD_TPL_OPTS));
-	iRet = doCreateRelpClient(pData, &amp;pRelpClt);
-	if(pRelpClt != NULL)
-		relpEngineCltDestruct(pRelpEngine, &amp;pRelpClt);
-CODE_STD_FINALIZERnewActInst
-	if(pvals != NULL)
-		cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURERepeatedMsgReduction)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-BEGINSetShutdownImmdtPtr
-CODESTARTSetShutdownImmdtPtr
-	relpEngineSetShutdownImmdtPtr(pRelpEngine, pPtr);
-	DBGPRINTF("omrelp: shutdownImmediate ptr now is %p\n", pPtr);
-ENDSetShutdownImmdtPtr
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-	dbgprintf("RELP/%s", pData-&gt;target);
-ENDdbgPrintInstInfo
-static rsRetVal ATTR_NONNULL()
-doConnect(wrkrInstanceData_t *const pWrkrData)
-{
-	DEFiRet;
-	if(pWrkrData-&gt;bInitialConnect) {
-		iRet = relpCltConnect(pWrkrData-&gt;pRelpClt, glbl.GetDefPFFamily(runModConf-&gt;pConf),
-				      getRelpPt(pWrkrData-&gt;pData), pWrkrData-&gt;pData-&gt;target);
-		if(iRet == RELP_RET_OK)
-			pWrkrData-&gt;bInitialConnect = 0;
-	} else {
-		iRet = relpCltReconnect(pWrkrData-&gt;pRelpClt);
-	}
-	if(iRet == RELP_RET_OK) {
-		pWrkrData-&gt;bIsConnected = 1;
-	} else if(iRet == RELP_RET_ERR_NO_TLS) {
-		LogError(0, iRet, "omrelp: Could not connect, librelp does NOT "
-				"support TLS (most probably GnuTLS lib "
-				"is too old)!");
-		FINALIZE;
-	} else if(iRet == RELP_RET_ERR_NO_TLS_AUTH) {
-		LogError(0, iRet, "omrelp: could not activate relp TLS with "
-				"authentication, librelp does not support it "
-				"(most probably GnuTLS lib is too old)! "
-				"Note: anonymous TLS is probably supported.");
-		FINALIZE;
-	} else {
-		if(pWrkrData-&gt;bIsSuspended == 0) {
-			LogError(0, RS_RET_RELP_ERR, "omrelp: could not connect to "
-				"remote server, librelp error %d", iRet);
-		}
-		pWrkrData-&gt;bIsConnected = 0;
-		pWrkrData-&gt;bIsSuspended = 1;
-		iRet = RS_RET_SUSPENDED;
-	}
-finalize_it:
-	RETiRet;
-}
-BEGINtryResume
-CODESTARTtryResume
-	if(pWrkrData-&gt;pData-&gt;bHadAuthFail) {
-		ABORT_FINALIZE(RS_RET_DISABLE_ACTION);
-	}
-	iRet = doConnect(pWrkrData);
-finalize_it:
-ENDtryResume
-static rsRetVal
-doRebind(wrkrInstanceData_t *pWrkrData)
-{
-	DEFiRet;
-	DBGPRINTF("omrelp: destructing relp client due to rebindInterval\n");
-	CHKiRet(relpEngineCltDestruct(pRelpEngine, &amp;pWrkrData-&gt;pRelpClt));
-	pWrkrData-&gt;bIsConnected = 0;
-	CHKiRet(doCreateRelpClient(pWrkrData-&gt;pData, &amp;pWrkrData-&gt;pRelpClt));
-	if(relpCltSetUsrPtr(pWrkrData-&gt;pRelpClt, pWrkrData) != RELP_RET_OK)
-		LogError(0, RS_RET_NO_ERRCODE, "omrelp: error when creating relp client");
-	pWrkrData-&gt;bInitialConnect = 1;
-	pWrkrData-&gt;nSent = 0;
-finalize_it:
-	RETiRet;
-}
-BEGINbeginTransaction
-CODESTARTbeginTransaction
-	DBGPRINTF("omrelp: beginTransaction\n");
-	if(!pWrkrData-&gt;bIsConnected) {
-		CHKiRet(doConnect(pWrkrData));
-	}
-	relpCltHintBurstBegin(pWrkrData-&gt;pRelpClt);
-finalize_it:
-ENDbeginTransaction
-BEGINdoAction
-	uchar *pMsg; 	size_t lenMsg;
-	relpRetVal ret;
-	instanceData *pData;
-CODESTARTdoAction
-	pData = pWrkrData-&gt;pData;
-	dbgprintf(" %s:%s/RELP\n", pData-&gt;target, getRelpPt(pData));
-	if(!pWrkrData-&gt;bIsConnected) {
-		CHKiRet(doConnect(pWrkrData));
-	}
-	pMsg = ppString[0];
-	lenMsg = strlen((char*) pMsg); 
-	if((int) lenMsg &gt; glbl.GetMaxLine(runModConf-&gt;pConf))
-		lenMsg = glbl.GetMaxLine(runModConf-&gt;pConf);
-	ret = relpCltSendSyslog(pWrkrData-&gt;pRelpClt, (uchar*) pMsg, lenMsg);
-	if(ret != RELP_RET_OK) {
-		LogError(0, RS_RET_RELP_ERR, "librelp error %d%s forwarding "
-				"to server %s:%s - suspending\n", ret,
-				(ret == RELP_RET_SESSION_BROKEN) ?
-					"[connection broken]" : "",
-				pData-&gt;target, getRelpPt(pData));
-		ABORT_FINALIZE(RS_RET_SUSPENDED);
-	}
-	if(pData-&gt;rebindInterval != 0 &amp;&amp;
-	   (++pWrkrData-&gt;nSent &gt;= pData-&gt;rebindInterval)) {
-	   	doRebind(pWrkrData);
-	}
-finalize_it:
-	if(pData-&gt;bHadAuthFail)
-		iRet = RS_RET_DISABLE_ACTION;
-	if(iRet == RS_RET_OK) {
-		iRet = RS_RET_PREVIOUS_COMMITTED;
-	} else if(iRet == RS_RET_SUSPENDED) {
-		pWrkrData-&gt;bIsSuspended = 1;
-	}
-ENDdoAction
-BEGINendTransaction
-CODESTARTendTransaction
-	DBGPRINTF("omrelp: endTransaction, connected %d\n", pWrkrData-&gt;bIsConnected);
-	if(pWrkrData-&gt;bIsConnected) {
-		relpCltHintBurstEnd(pWrkrData-&gt;pRelpClt);
-	}
-ENDendTransaction
-BEGINparseSelectorAct
-	uchar *q;
-	int i;
-	int bErr;
-CODESTARTparseSelectorAct
-CODE_STD_STRING_REQUESTparseSelectorAct(1)
-	if(!strncmp((char*) p, ":omrelp:", sizeof(":omrelp:") - 1)) {
-		p += sizeof(":omrelp:") - 1; 	} else {
-		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
-	}
-	if((iRet = createInstance(&amp;pData)) != RS_RET_OK)
-		FINALIZE;
-	if(*p == '[') { 		++p; 		for(q = p ; *p &amp;&amp; *p != ']' ; ++p)
-		if(*p == ']') {
-			*p = '\0'; 			++p; 		}
-	} else { 		for(q = p ; *p &amp;&amp; *p != ';' &amp;&amp; *p != ':' &amp;&amp; *p != '#' ; ++p)
-	}
-	pData-&gt;port = NULL;
-	if(*p == ':') { 		uchar * tmp;
-		*p = '\0'; 		tmp = ++p;
-		for(i=0 ; *p &amp;&amp; isdigit((int) *p) ; ++p, ++i)
-		pData-&gt;port = malloc(i + 1);
-		if(pData-&gt;port == NULL) {
-			LogError(0, NO_ERRCODE, "Could not get memory to store relp port, "
-				 "using default port, results may not be what you intend\n");
-		} else {
-			memcpy(pData-&gt;port, tmp, i);
-			*(pData-&gt;port + i) = '\0';
-		}
-	}
-	bErr = 0;
-	while(*p &amp;&amp; *p != ';') {
-		if(*p &amp;&amp; *p != ';' &amp;&amp; !isspace((int) *p)) {
-			if(bErr == 0) { 				bErr = 1;
-				errno = 0;
-				LogError(0, NO_ERRCODE, "invalid selector line (port), probably not doing "
-					 "what was intended");
-			}
-		}
-		++p;
-	}
-	if(*p == ';') {
-		*p = '\0'; 		CHKmalloc(pData-&gt;target = ustrdup(q));
-		*p = ';';
-	} else {
-		CHKmalloc(pData-&gt;target = ustrdup(q));
-	}
-	CHKiRet(cflineParseTemplateName(&amp;p, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS, (uchar*) "RSYSLOG_ForwardFormat"));
-CODE_STD_FINALIZERparseSelectorAct
-ENDparseSelectorAct
-BEGINmodExit
-CODESTARTmodExit
-	relpEngineDestruct(&amp;pRelpEngine);
-	objRelease(glbl, CORE_COMPONENT);
-ENDmodExit
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_OMOD_QUERIES
-CODEqueryEtryPt_STD_OMOD8_QUERIES
-CODEqueryEtryPt_STD_CONF2_QUERIES
-CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES
-CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
-CODEqueryEtryPt_TXIF_OMOD_QUERIES
-CODEqueryEtryPt_SetShutdownImmdtPtr
-ENDqueryEtryPt
-BEGINmodInit()
-CODESTARTmodInit
-INITLegCnfVars
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-ENDmodInit
+1 #include "config.h"
+2 #include "rsyslog.h"
+3 #include &lt;stdio.h&gt;
+4 #include &lt;stdarg.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;assert.h&gt;
+8 #include &lt;errno.h&gt;
+9 #include &lt;ctype.h&gt;
+10 #include &lt;librelp.h&gt;
+11 #include "conf.h"
+12 #include "syslogd-types.h"
+13 #include "srUtils.h"
+14 #include "cfsysline.h"
+15 #include "module-template.h"
+16 #include "glbl.h"
+17 #include "errmsg.h"
+18 #include "debug.h"
+19 #include "parserif.h"
+20 #include "unicode-helper.h"
+21 #ifndef RELP_DFLT_PT
+22 #	define RELP_DFLT_PT "514"
+23 #endif
+24 MODULE_TYPE_OUTPUT
+25 MODULE_TYPE_NOKEEP
+26 MODULE_CNFNAME("omrelp")
+27 DEF_OMOD_STATIC_DATA
+28 DEFobjCurrIf(glbl)
+29 #define DFLT_ENABLE_TLS 0
+30 #define DFLT_ENABLE_TLSZIP 0
+31 static relpEngine_t *pRelpEngine;	
+32 typedef struct _instanceData {
+33 	uchar *target;
+34 	uchar *port;
+35 	unsigned timeout;
+36 	int connTimeout;
+37 	unsigned rebindInterval;
+38 	sbool bEnableTLS;
+39 	sbool bEnableTLSZip;
+40 	uchar *pristring;			uchar *authmode;
+41 	uchar *caCertFile;
+42 	uchar *myCertFile;
+43 	uchar *myPrivKeyFile;
+44 #if defined(HAVE_RELPENGINESETTLSCFGCMD)
+45 	uchar *tlscfgcmd;
+46 #endif
+47 	uchar *tplName;
+48 	uchar *localClientIP;
+49 	struct {
+50 		int nmemb;
+51 		uchar **name;
+52 	} permittedPeers;
+53 } instanceData;
+54 typedef struct wrkrInstanceData {
+55 	instanceData *pData;
+56 	int bInitialConnect; 	int bIsConnected; 	int bIsSuspended; 	relpClt_t *pRelpClt; 	unsigned nSent; } wrkrInstanceData_t;
+57 typedef struct configSettings_s {
+58 	EMPTY_STRUCT
+59 } configSettings_t;
+60 static configSettings_t __attribute__((unused)) cs;
+61 static rsRetVal doCreateRelpClient(instanceData *pData, relpClt_t **pRelpClt);
+62 struct modConfData_s {
+63 	rsconf_t *pConf;		const char  *tlslib;
+64 };
+65 static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;
+66 static struct cnfparamdescr modpdescr[] = {
+67 	{ "tls.tlslib", eCmdHdlrString, 0 }
+68 };
+69 static struct cnfparamblk modpblk =
+70 	{ CNFPARAMBLK_VERSION,
+71 	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+72 	  modpdescr
+73 	};
+74 static struct cnfparamdescr actpdescr[] = {
+75 	{ "target", eCmdHdlrGetWord, 1 },
+76 	{ "tls", eCmdHdlrBinary, 0 },
+77 	{ "tls.compression", eCmdHdlrBinary, 0 },
+78 	{ "tls.prioritystring", eCmdHdlrString, 0 },
+79 	{ "tls.cacert", eCmdHdlrString, 0 },
+80 <a name="0"></a>	{ "tls.mycert", eCmdHdlrString, 0 },
+81 	{ "tls.myprivkey", eCmdHdlrString, 0 },
+82 	{ "tls.authmode", eCmdHdlrString, 0 },
+83 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "tls.tlscfgcmd", eCmdHdlrString, 0 },
+84 	{ "tls.permittedpeer", eCmdHdlrArray, 0 },
+85 	{ "port", eCmdHdlrGetWord, 0 },
+86 	{ "rebindinterval", eCmdHdlrInt, 0 },
+87 	{ "windowsize", eCmdHdlrInt, 0 },
+88 	{ "timeout", eCmdHdlrInt, 0 },
+89 	{ "conn.timeout", eCmdHdlrInt, 0 },
+90 	{ "localclientip", eCmdHdlrGetWord, 0 },
+91 	{ "template", eCmdHdlrGetWord, 0 }
+92 };
+93 static struct cnfparamblk actpblk =
+94 	{ CNFPARAMBLK_VERSION,
+95 	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+96 	  actpdescr
+97 	};
+98 BEGINinitConfVars		CODESTARTinitConfVars
+99 ENDinitConfVars
+100 PRAGMA_DIAGNOSTIC_PUSH
+101 PRAGMA_IGNORE_Wformat_nonliteral
+102 static void __attribute__((format(printf, 1, 2)))</b></font>
+103 omrelp_dbgprintf(const char *fmt, ...)
+104 {
+105 	va_list ap;
+106 	char pszWriteBuf[32*1024+1]; //this function has to be able to
+107 	if(!(Debug &amp;&amp; debugging_on)) {
+108 		return;
+109 	}
+110 	va_start(ap, fmt);
+111 	vsnprintf(pszWriteBuf, sizeof(pszWriteBuf), fmt, ap);
+112 	va_end(ap);
+113 	r_dbgprintf("omrelp.c", "%s", pszWriteBuf);
+114 }
+115 PRAGMA_DIAGNOSTIC_POP
+116 static uchar *getRelpPt(instanceData *pData)
+117 {
+118 	assert(pData != NULL);
+119 	if(pData-&gt;port == NULL)
+120 		return((uchar*)RELP_DFLT_PT);
+121 	else
+122 		return(pData-&gt;port);
+123 }
+124 static void
+125 onErr(void *pUsr, char *objinfo, char* errmesg, __attribute__((unused)) relpRetVal errcode)
+126 {
+127 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*) pUsr;
+128 	LogError(0, RS_RET_RELP_AUTH_FAIL, "omrelp[%s:%s]: error '%s', object "
+129 			" '%s' - action may not work as intended",
+130 			pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port, errmesg, objinfo);
+131 }
+132 static void
+133 onGenericErr(char *objinfo, char* errmesg, __attribute__((unused)) relpRetVal errcode)
+134 {
+135 	LogError(0, RS_RET_RELP_ERR, "omrelp: librelp error '%s', object "
+136 			"'%s' - action may not work as intended",
+137 			errmesg, objinfo);
+138 }
+139 static void
+140 onAuthErr(void *pUsr, char *authinfo, char* errmesg, __attribute__((unused)) relpRetVal errcode)
+141 {
+142 	instanceData *pData = ((wrkrInstanceData_t*) pUsr)-&gt;pData;
+143 	LogError(0, RS_RET_RELP_AUTH_FAIL, "omrelp[%s:%s]: authentication error '%s', peer "
+144 			"is '%s' - DISABLING action", pData-&gt;target, pData-&gt;port, errmesg, authinfo);
+145 	pData-&gt;bHadAuthFail = 1;
+146 }
+147 static rsRetVal
+148 doCreateRelpClient(instanceData *pData, relpClt_t **pRelpClt)
+149 {
+150 	int i;
+151 	DEFiRet;
+152 	if(relpEngineCltConstruct(pRelpEngine, pRelpClt) != RELP_RET_OK)
+153 		ABORT_FINALIZE(RS_RET_RELP_ERR);
+154 	if(relpCltSetTimeout(*pRelpClt, pData-&gt;timeout) != RELP_RET_OK)
+155 		ABORT_FINALIZE(RS_RET_RELP_ERR);
+156 	if(relpCltSetConnTimeout(*pRelpClt, pData-&gt;connTimeout) != RELP_RET_OK) {
+157 		ABORT_FINALIZE(RS_RET_RELP_ERR);
+158 	}
+159 	if(relpCltSetWindowSize(*pRelpClt, pData-&gt;sizeWindow) != RELP_RET_OK)
+160 		ABORT_FINALIZE(RS_RET_RELP_ERR);
+161 	if(pData-&gt;bEnableTLS) {
+162 		if(relpCltEnableTLS(*pRelpClt) != RELP_RET_OK)
+163 			ABORT_FINALIZE(RS_RET_RELP_ERR);
+164 		if(pData-&gt;bEnableTLSZip) {
+165 			if(relpCltEnableTLSZip(*pRelpClt) != RELP_RET_OK)
+166 				ABORT_FINALIZE(RS_RET_RELP_ERR);
+167 		}
+168 		if(relpCltSetGnuTLSPriString(*pRelpClt, (char*) pData-&gt;pristring) != RELP_RET_OK)
+169 			ABORT_FINALIZE(RS_RET_RELP_ERR);
+170 		if(relpCltSetAuthMode(*pRelpClt, (char*) pData-&gt;authmode) != RELP_RET_OK) {
+171 			LogError(0, RS_RET_RELP_ERR,
+172 					"omrelp: invalid auth mode '%s'\n", pData-&gt;authmode);
+173 			ABORT_FINALIZE(RS_RET_RELP_ERR);
+174 		}
+175 		if(relpCltSetCACert(*pRelpClt, (char*) pData-&gt;caCertFile) != RELP_RET_OK)
+176 			ABORT_FINALIZE(RS_RET_RELP_ERR);
+177 		if(relpCltSetOwnCert(*pRelpClt, (char*) pData-&gt;myCertFile) != RELP_RET_OK)
+178 			ABORT_FINALIZE(RS_RET_RELP_ERR);
+179 		if(relpCltSetPrivKey(*pRelpClt, (char*) pData-&gt;myPrivKeyFile) != RELP_RET_OK)
+180 			ABORT_FINALIZE(RS_RET_RELP_ERR);
+181 #if defined(HAVE_RELPENGINESETTLSCFGCMD)
+182 		if (pData-&gt;tlscfgcmd != NULL) {
+183 			if(relpCltSetTlsConfigCmd(*pRelpClt, (char*) pData-&gt;tlscfgcmd) != RELP_RET_OK)
+184 				ABORT_FINALIZE(RS_RET_RELP_ERR);
+185 		}
+186 #endif
+187 		for(i = 0 ; i &lt;  pData-&gt;permittedPeers.nmemb ; ++i) {
+188 			relpCltAddPermittedPeer(*pRelpClt, (char*)pData-&gt;permittedPeers.name[i]);
+189 		}
+190 	}
+191 	if(pData-&gt;localClientIP != NULL) {
+192 		if(relpCltSetClientIP(*pRelpClt, pData-&gt;localClientIP) != RELP_RET_OK)
+193 			ABORT_FINALIZE(RS_RET_RELP_ERR);
+194 	}
+195 finalize_it:
+196 	RETiRet;
+197 }
+198 BEGINendCnfLoad
+199 CODESTARTendCnfLoad
+200 	loadModConf = NULL;
+201 	runModConf = pModConf;
+202 ENDendCnfLoad
+203 BEGINcheckCnf
+204 CODESTARTcheckCnf
+205 ENDcheckCnf
+206 BEGINactivateCnf
+207 CODESTARTactivateCnf
+208 ENDactivateCnf
+209 BEGINfreeCnf
+210 CODESTARTfreeCnf
+211 	free((void*)pModConf-&gt;tlslib);
+212 ENDfreeCnf
+213 <a name="4"></a>
+214 BEGINcreateInstance
+215 CODESTARTcreateInstance
+216 <font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	pData-&gt;sizeWindow = 0;
+217 	pData-&gt;timeout = 90;
+218 	pData-&gt;connTimeout = 10;
+219 	pData-&gt;rebindInterval = 0;
+220 	pData-&gt;bEnableTLS = DFLT_ENABLE_TLS;
+221 	pData-&gt;bEnableTLSZip = DFLT_ENABLE_TLSZIP;
+222 	pData-&gt;bHadAuthFail = 0;
+223 	pData-&gt;pristring = NULL;
+224 	pData-&gt;authmode = NULL;
+225 	pData-&gt;localClientIP = NULL;</b></font>
+226 	pData-&gt;caCertFile = NULL;
+227 	pData-&gt;myCertFile = NULL;
+228 	pData-&gt;myPrivKeyFile = NULL;
+229 #if defined(HAVE_RELPENGINESETTLSCFGCMD)
+230 	pData-&gt;tlscfgcmd = NULL;
+231 #endif
+232 	pData-&gt;permittedPeers.nmemb = 0;
+233 ENDcreateInstance
+234 BEGINcreateWrkrInstance
+235 CODESTARTcreateWrkrInstance
+236 	pWrkrData-&gt;pRelpClt = NULL;
+237 	iRet = doCreateRelpClient(pWrkrData-&gt;pData, &amp;pWrkrData-&gt;pRelpClt);
+238 	if(relpCltSetUsrPtr(pWrkrData-&gt;pRelpClt, pWrkrData) != RELP_RET_OK)
+239 		LogError(0, RS_RET_NO_ERRCODE, "omrelp: error when creating relp client");
+240 	pWrkrData-&gt;bInitialConnect = 1;
+241 	pWrkrData-&gt;nSent = 0;
+242 ENDcreateWrkrInstance
+243 BEGINfreeInstance
+244 	int i;
+245 CODESTARTfreeInstance
+246 	free(pData-&gt;target);
+247 	free(pData-&gt;port);
+248 	free(pData-&gt;tplName);
+249 	free(pData-&gt;pristring);
+250 	free(pData-&gt;authmode);
+251 	free(pData-&gt;localClientIP);
+252 	free(pData-&gt;caCertFile);
+253 	free(pData-&gt;myCertFile);
+254 	free(pData-&gt;myPrivKeyFile);
+255 #if defined(HAVE_RELPENGINESETTLSCFGCMD)
+256 	free(pData-&gt;tlscfgcmd);
+257 #endif
+258 	if(pData-&gt;permittedPeers.name != NULL) {
+259 		for(i = 0 ; i &lt;  pData-&gt;permittedPeers.nmemb ; ++i) {
+260 			free(pData-&gt;permittedPeers.name[i]);
+261 		}
+262 	}
+263 ENDfreeInstance
+264 BEGINfreeWrkrInstance
+265 CODESTARTfreeWrkrInstance
+266 	if(pWrkrData-&gt;pRelpClt != NULL)
+267 		relpEngineCltDestruct(pRelpEngine, &amp;pWrkrData-&gt;pRelpClt);
+268 ENDfreeWrkrInstance
+269 static void
+270 setInstParamDefaults(instanceData *pData)
+271 {
+272 	pData-&gt;target = NULL;
+273 	pData-&gt;port = NULL;
+274 	pData-&gt;tplName = NULL;
+275 	pData-&gt;timeout = 90;
+276 	pData-&gt;connTimeout = 10;
+277 	pData-&gt;sizeWindow = 0;
+278 	pData-&gt;rebindInterval = 0;
+279 	pData-&gt;bEnableTLS = DFLT_ENABLE_TLS;
+280 	pData-&gt;bEnableTLSZip = DFLT_ENABLE_TLSZIP;
+281 	pData-&gt;pristring = NULL;
+282 	pData-&gt;authmode = NULL;
+283 	if(glbl.GetSourceIPofLocalClient() == NULL)
+284 		pData-&gt;localClientIP = NULL;
+285 	else
+286 		pData-&gt;localClientIP = (uchar*)strdup((char*)glbl.GetSourceIPofLocalClient());
+287 	pData-&gt;caCertFile = NULL;
+288 	pData-&gt;myCertFile = NULL;
+289 	pData-&gt;myPrivKeyFile = NULL;
+290 #if defined(HAVE_RELPENGINESETTLSCFGCMD)
+291 	pData-&gt;tlscfgcmd = NULL;
+292 #endif
+293 	pData-&gt;permittedPeers.name = NULL;
+294 	pData-&gt;permittedPeers.nmemb = 0;
+295 }
+296 BEGINbeginCnfLoad
+297 CODESTARTbeginCnfLoad
+298 	loadModConf = pModConf;
+299 	pModConf-&gt;pConf = pConf;
+300 	pModConf-&gt;tlslib = NULL;
+301 	CHKiRet(relpEngineConstruct(&amp;pRelpEngine));
+302 	CHKiRet(relpEngineSetDbgprint(pRelpEngine, (void (*)(char *, ...))omrelp_dbgprintf));
+303 	CHKiRet(relpEngineSetOnAuthErr(pRelpEngine, onAuthErr));
+304 	CHKiRet(relpEngineSetOnGenericErr(pRelpEngine, onGenericErr));
+305 	CHKiRet(relpEngineSetOnErr(pRelpEngine, onErr));
+306 	CHKiRet(relpEngineSetEnableCmd(pRelpEngine, (uchar*) "syslog", eRelpCmdState_Required));
+307 finalize_it:
+308 ENDbeginCnfLoad
+309 <a name="1"></a>
+310 BEGINsetModCnf
+311 	struct cnfparamvals *pvals = NULL;
+312 <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	int i;
+313 CODESTARTsetModCnf
+314 	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
+315 	if(pvals == NULL) {
+316 		parser_errmsg("imrelp: error processing module config parameters [module(...)]");
+317 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+318 	}
+319 	if(Debug) {
+320 		dbgprintf("module (global) param blk for omrelp:\n");
+321 		cnfparamsPrint(&amp;modpblk, pvals);
+322 	}
+323 	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
+324 		if(!pvals[i].bUsed) {</b></font>
+325 			continue;
+326 		}
+327 		if(!strcmp(modpblk.descr[i].name, "tls.tlslib")) {
+328 			#if defined(HAVE_RELPENGINESETTLSLIBBYNAME)
+329 				loadModConf-&gt;tlslib = es_str2cstr(pvals[i].val.d.estr, NULL);
+330 				if(relpEngineSetTLSLibByName(pRelpEngine, loadModConf-&gt;tlslib) != RELP_RET_OK) {
+331 					LogMsg(0, RS_RET_CONF_PARAM_INVLD, LOG_WARNING,
+332 						"omrelp: tlslib '%s' not accepted as valid by librelp - using default",
+333 						loadModConf-&gt;tlslib);
+334 				}
+335 			#else
+336 				LogError(0, RS_RET_NOT_IMPLEMENTED,
+337 					"omrelp warning: parameter tls.tlslib ignored - librelp does not support "
+338 					"this API call. Using whatever librelp was compiled with.");
+339 			#endif
+340 		} else {
+341 			dbgprintf("imfile: program error, non-handled "
+342 			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
+343 		}
+344 	}
+345 finalize_it:
+346 	if(pvals != NULL)
+347 		cnfparamvalsDestruct(pvals, &amp;modpblk);
+348 ENDsetModCnf
+349 BEGINnewActInst
+350 	struct cnfparamvals *pvals;
+351 	int i,j;
+352 	FILE *fp;
+353 	relpClt_t *pRelpClt = NULL;
+354 CODESTARTnewActInst
+355 	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
+356 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+357 	}
+358 	CHKiRet(createInstance(&amp;pData));
+359 	setInstParamDefaults(pData);
+360 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+361 		if(!pvals[i].bUsed)
+362 <a name="3"></a>			continue;
+363 		if(!strcmp(actpblk.descr[i].name, "target")) {
+364 			pData-&gt;target = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+365 <font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		} else if(!strcmp(actpblk.descr[i].name, "port")) {
+366 			pData-&gt;port = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+367 		} else if(!strcmp(actpblk.descr[i].name, "template")) {
+368 			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
+369 		} else if(!strcmp(actpblk.descr[i].name, "localclientip")) {
+370 			pData-&gt;localClientIP = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+371 		} else if(!strcmp(actpblk.descr[i].name, "timeout")) {
+372 			pData-&gt;timeout = (unsigned) pvals[i].val.d.n;
+373 		} else if(!strcmp(actpblk.descr[i].name, "conn.timeout")) {
+374 			pData-&gt;connTimeout = (int) pvals[i].val.d.n;
+375 		} else if(!strcmp(actpblk.descr[i].name, "rebindinterval")) {
+376 			pData-&gt;rebindInterval = (unsigned) pvals[i].val.d.n;
+377 		} else if(!strcmp(actpblk.descr[i].name, "windowsize")) {
+378 			pData-&gt;sizeWindow = (int) pvals[i].val.d.n;
+379 		} else if(!strcmp(actpblk.descr[i].name, "tls")) {
+380 			pData-&gt;bEnableTLS = (unsigned) pvals[i].val.d.n;
+381 		} else if(!strcmp(actpblk.descr[i].name, "tls.compression")) {
+382 			pData-&gt;bEnableTLSZip = (unsigned) pvals[i].val.d.n;
+383 		} else if(!strcmp(actpblk.descr[i].name, "tls.prioritystring")) {
+384 			pData-&gt;pristring = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+385 		} else if(!strcmp(actpblk.descr[i].name, "tls.cacert")) {
+386 			pData-&gt;caCertFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+387 			fp = fopen((const char*)pData-&gt;caCertFile, "r");
+388 			if(fp == NULL) {
+389 				char errStr[1024];
+390 				rs_strerror_r(errno, errStr, sizeof(errStr));
+391 				LogError(0, RS_RET_NO_FILE_ACCESS,
+392 				"error: certificate file %s couldn't be accessed: %s\n",
+393 				pData-&gt;caCertFile, errStr);
+394 			} else {
+395 				fclose(fp);
+396 			}
+397 		} else if(!strcmp(actpblk.descr[i].name, "tls.mycert")) {
+398 			pData-&gt;myCertFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+399 			fp = fopen((const char*)pData-&gt;myCertFile, "r");
+400 			if(fp == NULL) {
+401 				char errStr[1024];
+402 				rs_strerror_r(errno, errStr, sizeof(errStr));
+403 				LogError(0, RS_RET_NO_FILE_ACCESS,
+404 				"error: certificate file %s couldn't be accessed: %s\n",
+405 				pData-&gt;myCertFile, errStr);
+406 			} else {
+407 				fclose(fp);
+408 			}
+409 		} else if(!strcmp(actpblk.descr[i].name, "tls.myprivkey")) {
+410 			pData-&gt;myPrivKeyFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+411 			fp = fopen((const char*)pData-&gt;myPrivKeyFile, "r");
+412 			if(fp == NULL) {
+413 				char errStr[1024];
+414 				rs_strerror_r(errno, errStr, sizeof(errStr));
+415 <a name="2"></a>				LogError(0, RS_RET_NO_FILE_ACCESS,
+416 				"error: certificate file %s couldn't be accessed: %s\n",
+417 				pData-&gt;myPrivKeyFile, errStr);
+418 <font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>			} else {
+419 				fclose(fp);
+420 			}
+421 		} else if(!strcmp(actpblk.descr[i].name, "tls.tlscfgcmd")) {
+422 #if defined(HAVE_RELPENGINESETTLSCFGCMD)
+423 			pData-&gt;tlscfgcmd = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+424 #else
+425 			LogError(0, RS_RET_NOT_IMPLEMENTED, "omrelp: librelp does not support input parameter "
+426 				"'tls.tlscfgcmd'; it probably is too old (1.5.0 or higher should be fine); "
+427 				"ignoring setting now.");
+428 #endif
+429 		} else if(!strcmp(actpblk.descr[i].name, "tls.authmode")) {</b></font>
+430 			pData-&gt;authmode = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+431 		} else if(!strcmp(actpblk.descr[i].name, "tls.permittedpeer")) {
+432 			pData-&gt;permittedPeers.nmemb = pvals[i].val.d.ar-&gt;nmemb;
+433 			CHKmalloc(pData-&gt;permittedPeers.name =
+434 				malloc(sizeof(uchar*) * pData-&gt;permittedPeers.nmemb));
+435 			for(j = 0 ; j &lt;  pData-&gt;permittedPeers.nmemb ; ++j) {
+436 				pData-&gt;permittedPeers.name[j] = (uchar*)es_str2cstr(pvals[i].val.d.ar-&gt;arr[j], NULL);
+437 			}
+438 		} else {
+439 			dbgprintf("omrelp: program error, non-handled "
+440 			  "param '%s'\n", actpblk.descr[i].name);
+441 		}
+442 	}
+443 	CODE_STD_STRING_REQUESTnewActInst(1)
+444 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup((pData-&gt;tplName == NULL) ?
+445 			    "RSYSLOG_ForwardFormat" : (char*)pData-&gt;tplName),
+446 	   		    OMSR_NO_RQD_TPL_OPTS));
+447 	iRet = doCreateRelpClient(pData, &amp;pRelpClt);
+448 	if(pRelpClt != NULL)
+449 		relpEngineCltDestruct(pRelpEngine, &amp;pRelpClt);
+450 CODE_STD_FINALIZERnewActInst
+451 	if(pvals != NULL)
+452 		cnfparamvalsDestruct(pvals, &amp;actpblk);
+453 ENDnewActInst
+454 BEGINisCompatibleWithFeature
+455 CODESTARTisCompatibleWithFeature
+456 	if(eFeat == sFEATURERepeatedMsgReduction)
+457 		iRet = RS_RET_OK;
+458 ENDisCompatibleWithFeature
+459 BEGINSetShutdownImmdtPtr
+460 CODESTARTSetShutdownImmdtPtr
+461 	relpEngineSetShutdownImmdtPtr(pRelpEngine, pPtr);
+462 	DBGPRINTF("omrelp: shutdownImmediate ptr now is %p\n", pPtr);
+463 ENDSetShutdownImmdtPtr
+464 BEGINdbgPrintInstInfo
+465 CODESTARTdbgPrintInstInfo
+466 	dbgprintf("RELP/%s", pData-&gt;target);
+467 ENDdbgPrintInstInfo
+468 static rsRetVal ATTR_NONNULL()
+469 doConnect(wrkrInstanceData_t *const pWrkrData)
+470 {
+471 	DEFiRet;
+472 	if(pWrkrData-&gt;bInitialConnect) {
+473 		iRet = relpCltConnect(pWrkrData-&gt;pRelpClt, glbl.GetDefPFFamily(runModConf-&gt;pConf),
+474 				      getRelpPt(pWrkrData-&gt;pData), pWrkrData-&gt;pData-&gt;target);
+475 		if(iRet == RELP_RET_OK)
+476 			pWrkrData-&gt;bInitialConnect = 0;
+477 	} else {
+478 		iRet = relpCltReconnect(pWrkrData-&gt;pRelpClt);
+479 	}
+480 	if(iRet == RELP_RET_OK) {
+481 		pWrkrData-&gt;bIsConnected = 1;
+482 	} else if(iRet == RELP_RET_ERR_NO_TLS) {
+483 		LogError(0, iRet, "omrelp: Could not connect, librelp does NOT "
+484 				"support TLS (most probably GnuTLS lib "
+485 				"is too old)!");
+486 		FINALIZE;
+487 	} else if(iRet == RELP_RET_ERR_NO_TLS_AUTH) {
+488 		LogError(0, iRet, "omrelp: could not activate relp TLS with "
+489 				"authentication, librelp does not support it "
+490 				"(most probably GnuTLS lib is too old)! "
+491 				"Note: anonymous TLS is probably supported.");
+492 		FINALIZE;
+493 	} else {
+494 		if(pWrkrData-&gt;bIsSuspended == 0) {
+495 			LogError(0, RS_RET_RELP_ERR, "omrelp: could not connect to "
+496 				"remote server, librelp error %d", iRet);
+497 		}
+498 		pWrkrData-&gt;bIsConnected = 0;
+499 		pWrkrData-&gt;bIsSuspended = 1;
+500 		iRet = RS_RET_SUSPENDED;
+501 	}
+502 finalize_it:
+503 	RETiRet;
+504 }
+505 BEGINtryResume
+506 CODESTARTtryResume
+507 	if(pWrkrData-&gt;pData-&gt;bHadAuthFail) {
+508 		ABORT_FINALIZE(RS_RET_DISABLE_ACTION);
+509 	}
+510 	iRet = doConnect(pWrkrData);
+511 finalize_it:
+512 ENDtryResume
+513 static rsRetVal
+514 doRebind(wrkrInstanceData_t *pWrkrData)
+515 {
+516 	DEFiRet;
+517 	DBGPRINTF("omrelp: destructing relp client due to rebindInterval\n");
+518 	CHKiRet(relpEngineCltDestruct(pRelpEngine, &amp;pWrkrData-&gt;pRelpClt));
+519 	pWrkrData-&gt;bIsConnected = 0;
+520 	CHKiRet(doCreateRelpClient(pWrkrData-&gt;pData, &amp;pWrkrData-&gt;pRelpClt));
+521 	if(relpCltSetUsrPtr(pWrkrData-&gt;pRelpClt, pWrkrData) != RELP_RET_OK)
+522 		LogError(0, RS_RET_NO_ERRCODE, "omrelp: error when creating relp client");
+523 	pWrkrData-&gt;bInitialConnect = 1;
+524 	pWrkrData-&gt;nSent = 0;
+525 finalize_it:
+526 	RETiRet;
+527 }
+528 BEGINbeginTransaction
+529 CODESTARTbeginTransaction
+530 	DBGPRINTF("omrelp: beginTransaction\n");
+531 	if(!pWrkrData-&gt;bIsConnected) {
+532 		CHKiRet(doConnect(pWrkrData));
+533 	}
+534 	relpCltHintBurstBegin(pWrkrData-&gt;pRelpClt);
+535 finalize_it:
+536 ENDbeginTransaction
+537 BEGINdoAction
+538 	uchar *pMsg; 	size_t lenMsg;
+539 	relpRetVal ret;
+540 	instanceData *pData;
+541 CODESTARTdoAction
+542 	pData = pWrkrData-&gt;pData;
+543 	dbgprintf(" %s:%s/RELP\n", pData-&gt;target, getRelpPt(pData));
+544 	if(!pWrkrData-&gt;bIsConnected) {
+545 		CHKiRet(doConnect(pWrkrData));
+546 	}
+547 	pMsg = ppString[0];
+548 	lenMsg = strlen((char*) pMsg); 
+549 	if((int) lenMsg &gt; glbl.GetMaxLine(runModConf-&gt;pConf))
+550 		lenMsg = glbl.GetMaxLine(runModConf-&gt;pConf);
+551 	ret = relpCltSendSyslog(pWrkrData-&gt;pRelpClt, (uchar*) pMsg, lenMsg);
+552 	if(ret != RELP_RET_OK) {
+553 		LogError(0, RS_RET_RELP_ERR, "librelp error %d%s forwarding "
+554 				"to server %s:%s - suspending\n", ret,
+555 				(ret == RELP_RET_SESSION_BROKEN) ?
+556 					"[connection broken]" : "",
+557 				pData-&gt;target, getRelpPt(pData));
+558 		ABORT_FINALIZE(RS_RET_SUSPENDED);
+559 	}
+560 	if(pData-&gt;rebindInterval != 0 &amp;&amp;
+561 	   (++pWrkrData-&gt;nSent &gt;= pData-&gt;rebindInterval)) {
+562 	   	doRebind(pWrkrData);
+563 	}
+564 finalize_it:
+565 	if(pData-&gt;bHadAuthFail)
+566 		iRet = RS_RET_DISABLE_ACTION;
+567 	if(iRet == RS_RET_OK) {
+568 		iRet = RS_RET_PREVIOUS_COMMITTED;
+569 	} else if(iRet == RS_RET_SUSPENDED) {
+570 		pWrkrData-&gt;bIsSuspended = 1;
+571 	}
+572 ENDdoAction
+573 BEGINendTransaction
+574 CODESTARTendTransaction
+575 	DBGPRINTF("omrelp: endTransaction, connected %d\n", pWrkrData-&gt;bIsConnected);
+576 	if(pWrkrData-&gt;bIsConnected) {
+577 		relpCltHintBurstEnd(pWrkrData-&gt;pRelpClt);
+578 	}
+579 ENDendTransaction
+580 BEGINparseSelectorAct
+581 	uchar *q;
+582 	int i;
+583 	int bErr;
+584 CODESTARTparseSelectorAct
+585 CODE_STD_STRING_REQUESTparseSelectorAct(1)
+586 	if(!strncmp((char*) p, ":omrelp:", sizeof(":omrelp:") - 1)) {
+587 		p += sizeof(":omrelp:") - 1; 	} else {
+588 		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
+589 	}
+590 	if((iRet = createInstance(&amp;pData)) != RS_RET_OK)
+591 		FINALIZE;
+592 	if(*p == '[') { 		++p; 		for(q = p ; *p &amp;&amp; *p != ']' ; ++p)
+593 		if(*p == ']') {
+594 			*p = '\0'; 			++p; 		}
+595 	} else { 		for(q = p ; *p &amp;&amp; *p != ';' &amp;&amp; *p != ':' &amp;&amp; *p != '#' ; ++p)
+596 	}
+597 	pData-&gt;port = NULL;
+598 	if(*p == ':') { 		uchar * tmp;
+599 		*p = '\0'; 		tmp = ++p;
+600 		for(i=0 ; *p &amp;&amp; isdigit((int) *p) ; ++p, ++i)
+601 		pData-&gt;port = malloc(i + 1);
+602 		if(pData-&gt;port == NULL) {
+603 			LogError(0, NO_ERRCODE, "Could not get memory to store relp port, "
+604 				 "using default port, results may not be what you intend\n");
+605 		} else {
+606 			memcpy(pData-&gt;port, tmp, i);
+607 			*(pData-&gt;port + i) = '\0';
+608 		}
+609 	}
+610 	bErr = 0;
+611 	while(*p &amp;&amp; *p != ';') {
+612 		if(*p &amp;&amp; *p != ';' &amp;&amp; !isspace((int) *p)) {
+613 			if(bErr == 0) { 				bErr = 1;
+614 				errno = 0;
+615 				LogError(0, NO_ERRCODE, "invalid selector line (port), probably not doing "
+616 					 "what was intended");
+617 			}
+618 		}
+619 		++p;
+620 	}
+621 	if(*p == ';') {
+622 		*p = '\0'; 		CHKmalloc(pData-&gt;target = ustrdup(q));
+623 		*p = ';';
+624 	} else {
+625 		CHKmalloc(pData-&gt;target = ustrdup(q));
+626 	}
+627 	CHKiRet(cflineParseTemplateName(&amp;p, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS, (uchar*) "RSYSLOG_ForwardFormat"));
+628 CODE_STD_FINALIZERparseSelectorAct
+629 ENDparseSelectorAct
+630 BEGINmodExit
+631 CODESTARTmodExit
+632 	relpEngineDestruct(&amp;pRelpEngine);
+633 	objRelease(glbl, CORE_COMPONENT);
+634 ENDmodExit
+635 BEGINqueryEtryPt
+636 CODESTARTqueryEtryPt
+637 CODEqueryEtryPt_STD_OMOD_QUERIES
+638 CODEqueryEtryPt_STD_OMOD8_QUERIES
+639 CODEqueryEtryPt_STD_CONF2_QUERIES
+640 CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES
+641 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+642 CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+643 CODEqueryEtryPt_TXIF_OMOD_QUERIES
+644 CODEqueryEtryPt_SetShutdownImmdtPtr
+645 ENDqueryEtryPt
+646 BEGINmodInit()
+647 CODESTARTmodInit
+648 INITLegCnfVars
+649 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+650 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+651 ENDmodInit
 </pre>
 </div>
 </div>

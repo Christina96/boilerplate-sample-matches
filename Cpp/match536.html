@@ -40,213 +40,213 @@ Matches for service.cpp &amp; measurements.t.cpp
 </h3>
 <hr/>
 <pre>
-#include "service.hpp"
-#include "fib-updater.hpp"
-#include "readvertise/client-to-nlsr-readvertise-policy.hpp"
-#include "readvertise/host-to-gateway-readvertise-policy.hpp"
-#include "readvertise/nfd-rib-readvertise-destination.hpp"
-#include "readvertise/readvertise.hpp"
-#include "common/global.hpp"
-#include "common/logger.hpp"
-#include &lt;boost/property_tree/info_parser.hpp&gt;
-#include &lt;ndn-cxx/transport/tcp-transport.hpp&gt;
-#include &lt;ndn-cxx/transport/unix-transport.hpp&gt;
-namespace nfd {
-namespace rib {
-<a name="0"></a>
-NFD_LOG_INIT(RibService);
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>Service* Service::s_instance = nullptr;
-const std::string CFG_RIB = "rib";
-const std::string CFG_LOCALHOST_SECURITY = "localhost_security";
-const std::string CFG_LOCALHOP_SECURITY = "localhop_security";
-const std::string CFG_PA_VALIDATION = "prefix_announcement_validation";
-const std::string CFG_PREFIX_PROPAGATE = "auto_prefix_propagate";</b></font>
-const std::string CFG_READVERTISE_NLSR = "readvertise_nlsr";
-const Name READVERTISE_NLSR_PREFIX = "/localhost/nlsr";
-const uint64_t PROPAGATE_DEFAULT_COST = 15;
-const time::milliseconds PROPAGATE_DEFAULT_TIMEOUT = 10_s;
-static ConfigSection
-loadConfigSectionFromFile(const std::string&amp; filename)
-{
-  ConfigSection config;
-  boost::property_tree::read_info(filename, config);
-  return config;
-}
-static shared_ptr&lt;ndn::Transport&gt;
-makeLocalNfdTransport(const ConfigSection&amp; config)
-{
-  if (config.get_child_optional("face_system.unix")) {
-#ifdef __linux__
-    auto path = config.get&lt;std::string&gt;("face_system.unix.path", "/run/nfd.sock");
-#else
-    auto path = config.get&lt;std::string&gt;("face_system.unix.path", "/var/run/nfd.sock");
-#endif     return make_shared&lt;ndn::UnixTransport&gt;(path);
-  }
-  else if (config.get_child_optional("face_system.tcp") &amp;&amp;
-           config.get&lt;std::string&gt;("face_system.tcp.listen", "yes") == "yes") {
-    auto port = config.get&lt;std::string&gt;("face_system.tcp.port", "6363");
-    return make_shared&lt;ndn::TcpTransport&gt;("localhost", port);
-  }
-  else {
-    NDN_THROW(ConfigFile::Error("No transport is available to communicate with NFD"));
-  }
-}
-Service::Service(const std::string&amp; configFile, ndn::KeyChain&amp; keyChain)
-  : Service(keyChain, makeLocalNfdTransport(loadConfigSectionFromFile(configFile)),
-            [&amp;configFile] (ConfigFile&amp; config, bool isDryRun) {
-              config.parse(configFile, isDryRun);
-            })
-{
-}
-Service::Service(const ConfigSection&amp; configSection, ndn::KeyChain&amp; keyChain)
-  : Service(keyChain, makeLocalNfdTransport(configSection),
-            [&amp;configSection] (ConfigFile&amp; config, bool isDryRun) {
-              config.parse(configSection, isDryRun, "internal://nfd.conf");
-            })
-{
-}
-template&lt;typename ConfigParseFunc&gt;
-Service::Service(ndn::KeyChain&amp; keyChain, shared_ptr&lt;ndn::Transport&gt; localNfdTransport,
-                 const ConfigParseFunc&amp; configParse)
-  : m_keyChain(keyChain)
-  , m_face(std::move(localNfdTransport), getGlobalIoService(), m_keyChain)
-  , m_nfdController(m_face, m_keyChain)
-  , m_fibUpdater(m_rib, m_nfdController)
-  , m_dispatcher(m_face, m_keyChain)
-  , m_ribManager(m_rib, m_face, m_keyChain, m_nfdController, m_dispatcher)
-{
-  if (s_instance != nullptr) {
-    NDN_THROW(std::logic_error("RIB service cannot be instantiated more than once"));
-  }
-  if (&amp;getGlobalIoService() != &amp;getRibIoService()) {
-    NDN_THROW(std::logic_error("RIB service must run on RIB thread"));
-  }
-  s_instance = this;
-  ConfigFile config(ConfigFile::ignoreUnknownSection);
-  config.addSectionHandler(CFG_RIB, [this] (auto&amp;&amp;... args) {
-    processConfig(std::forward&lt;decltype(args)&gt;(args)...);
-  });
-  configParse(config, true);
-  configParse(config, false);
-  m_ribManager.registerWithNfd();
-  m_ribManager.enableLocalFields();
-}
-Service::~Service()
-{
-  s_instance = nullptr;
-}
-Service&amp;
-Service::get()
-{
-  if (s_instance == nullptr) {
-    NDN_THROW(std::logic_error("RIB service is not instantiated"));
-  }
-  if (&amp;getGlobalIoService() != &amp;getRibIoService()) {
-    NDN_THROW(std::logic_error("Must get RIB service on RIB thread"));
-  }
-  return *s_instance;
-}
-void
-Service::processConfig(const ConfigSection&amp; section, bool isDryRun, const std::string&amp; filename)
-{
-  if (isDryRun) {
-    checkConfig(section, filename);
-  }
-  else {
-    applyConfig(section, filename);
-  }
-}
-void
-Service::checkConfig(const ConfigSection&amp; section, const std::string&amp; filename)
-{
-  bool hasLocalhop = false;
-  bool hasPropagate = false;
-  for (const auto&amp; item : section) {
-    const std::string&amp; key = item.first;
-    const ConfigSection&amp; value = item.second;
-    if (key == CFG_LOCALHOST_SECURITY || key == CFG_PA_VALIDATION) {
-      ndn::ValidatorConfig testValidator(m_face);
-      testValidator.load(value, filename);
-    }
-    else if (key == CFG_LOCALHOP_SECURITY) {
-      hasLocalhop = true;
-      ndn::ValidatorConfig testValidator(m_face);
-      testValidator.load(value, filename);
-    }
-    else if (key == CFG_PREFIX_PROPAGATE) {
-      hasPropagate = true;
-    }
-    else if (key == CFG_READVERTISE_NLSR) {
-      ConfigFile::parseYesNo(item, CFG_RIB + "." + CFG_READVERTISE_NLSR);
-    }
-    else {
-      NDN_THROW(ConfigFile::Error("Unrecognized option " + CFG_RIB + "." + key));
-    }
-  }
-  if (hasLocalhop &amp;&amp; hasPropagate) {
-    NDN_THROW(ConfigFile::Error(CFG_LOCALHOP_SECURITY + " and " + CFG_PREFIX_PROPAGATE +
-                                " cannot be enabled at the same time"));
-  }
-}
-void
-Service::applyConfig(const ConfigSection&amp; section, const std::string&amp; filename)
-{
-  bool wantPrefixPropagate = false;
-  bool wantReadvertiseNlsr = false;
-  for (const auto&amp; item : section) {
-    const std::string&amp; key = item.first;
-    const ConfigSection&amp; value = item.second;
-    if (key == CFG_LOCALHOST_SECURITY) {
-      m_ribManager.applyLocalhostConfig(value, filename);
-    }
-    else if (key == CFG_LOCALHOP_SECURITY) {
-      m_ribManager.enableLocalhop(value, filename);
-    }
-    else if (key == CFG_PA_VALIDATION) {
-      m_ribManager.applyPaConfig(value, filename);
-    }
-    else if (key == CFG_PREFIX_PROPAGATE) {
-      wantPrefixPropagate = true;
-      if (!m_readvertisePropagation) {
-        NFD_LOG_DEBUG("Enabling automatic prefix propagation");
-        auto cost = item.second.get_optional&lt;uint64_t&gt;("cost");
-        auto parameters = ndn::nfd::ControlParameters()
-                          .setCost(cost.value_or(PROPAGATE_DEFAULT_COST))
-                          .setOrigin(ndn::nfd::ROUTE_ORIGIN_CLIENT);
-        auto timeout = item.second.get_optional&lt;uint64_t&gt;("timeout");
-        auto options = ndn::nfd::CommandOptions()
-                       .setPrefix(RibManager::LOCALHOP_TOP_PREFIX)
-                       .setTimeout(timeout ? time::milliseconds(*timeout) : PROPAGATE_DEFAULT_TIMEOUT);
-        m_readvertisePropagation = make_unique&lt;Readvertise&gt;(
-          m_rib,
-          make_unique&lt;HostToGatewayReadvertisePolicy&gt;(m_keyChain, item.second),
-          make_unique&lt;NfdRibReadvertiseDestination&gt;(m_nfdController, m_rib, options, parameters));
-      }
-    }
-    else if (key == CFG_READVERTISE_NLSR) {
-      wantReadvertiseNlsr = ConfigFile::parseYesNo(item, CFG_RIB + "." + CFG_READVERTISE_NLSR);
-    }
-    else {
-      NDN_THROW(ConfigFile::Error("Unrecognized option " + CFG_RIB + "." + key));
-    }
-  }
-  if (!wantPrefixPropagate &amp;&amp; m_readvertisePropagation != nullptr) {
-    NFD_LOG_DEBUG("Disabling automatic prefix propagation");
-    m_readvertisePropagation.reset();
-  }
-  if (wantReadvertiseNlsr &amp;&amp; m_readvertiseNlsr == nullptr) {
-    NFD_LOG_DEBUG("Enabling readvertise-to-nlsr");
-    auto options = ndn::nfd::CommandOptions().setPrefix(READVERTISE_NLSR_PREFIX);
-    m_readvertiseNlsr = make_unique&lt;Readvertise&gt;(
-      m_rib,
-      make_unique&lt;ClientToNlsrReadvertisePolicy&gt;(),
-      make_unique&lt;NfdRibReadvertiseDestination&gt;(m_nfdController, m_rib, options));
-  }
-  else if (!wantReadvertiseNlsr &amp;&amp; m_readvertiseNlsr != nullptr) {
-    NFD_LOG_DEBUG("Disabling readvertise-to-nlsr");
-    m_readvertiseNlsr.reset();
-  }
-}
+1 #include "service.hpp"
+2 #include "fib-updater.hpp"
+3 #include "readvertise/client-to-nlsr-readvertise-policy.hpp"
+4 #include "readvertise/host-to-gateway-readvertise-policy.hpp"
+5 #include "readvertise/nfd-rib-readvertise-destination.hpp"
+6 #include "readvertise/readvertise.hpp"
+7 #include "common/global.hpp"
+8 #include "common/logger.hpp"
+9 #include &lt;boost/property_tree/info_parser.hpp&gt;
+10 #include &lt;ndn-cxx/transport/tcp-transport.hpp&gt;
+11 #include &lt;ndn-cxx/transport/unix-transport.hpp&gt;
+12 namespace nfd {
+13 namespace rib {
+14 <a name="0"></a>
+15 NFD_LOG_INIT(RibService);
+16 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>Service* Service::s_instance = nullptr;
+17 const std::string CFG_RIB = "rib";
+18 const std::string CFG_LOCALHOST_SECURITY = "localhost_security";
+19 const std::string CFG_LOCALHOP_SECURITY = "localhop_security";
+20 const std::string CFG_PA_VALIDATION = "prefix_announcement_validation";
+21 const std::string CFG_PREFIX_PROPAGATE = "auto_prefix_propagate";</b></font>
+22 const std::string CFG_READVERTISE_NLSR = "readvertise_nlsr";
+23 const Name READVERTISE_NLSR_PREFIX = "/localhost/nlsr";
+24 const uint64_t PROPAGATE_DEFAULT_COST = 15;
+25 const time::milliseconds PROPAGATE_DEFAULT_TIMEOUT = 10_s;
+26 static ConfigSection
+27 loadConfigSectionFromFile(const std::string&amp; filename)
+28 {
+29   ConfigSection config;
+30   boost::property_tree::read_info(filename, config);
+31   return config;
+32 }
+33 static shared_ptr&lt;ndn::Transport&gt;
+34 makeLocalNfdTransport(const ConfigSection&amp; config)
+35 {
+36   if (config.get_child_optional("face_system.unix")) {
+37 #ifdef __linux__
+38     auto path = config.get&lt;std::string&gt;("face_system.unix.path", "/run/nfd.sock");
+39 #else
+40     auto path = config.get&lt;std::string&gt;("face_system.unix.path", "/var/run/nfd.sock");
+41 #endif     return make_shared&lt;ndn::UnixTransport&gt;(path);
+42   }
+43   else if (config.get_child_optional("face_system.tcp") &amp;&amp;
+44            config.get&lt;std::string&gt;("face_system.tcp.listen", "yes") == "yes") {
+45     auto port = config.get&lt;std::string&gt;("face_system.tcp.port", "6363");
+46     return make_shared&lt;ndn::TcpTransport&gt;("localhost", port);
+47   }
+48   else {
+49     NDN_THROW(ConfigFile::Error("No transport is available to communicate with NFD"));
+50   }
+51 }
+52 Service::Service(const std::string&amp; configFile, ndn::KeyChain&amp; keyChain)
+53   : Service(keyChain, makeLocalNfdTransport(loadConfigSectionFromFile(configFile)),
+54             [&amp;configFile] (ConfigFile&amp; config, bool isDryRun) {
+55               config.parse(configFile, isDryRun);
+56             })
+57 {
+58 }
+59 Service::Service(const ConfigSection&amp; configSection, ndn::KeyChain&amp; keyChain)
+60   : Service(keyChain, makeLocalNfdTransport(configSection),
+61             [&amp;configSection] (ConfigFile&amp; config, bool isDryRun) {
+62               config.parse(configSection, isDryRun, "internal://nfd.conf");
+63             })
+64 {
+65 }
+66 template&lt;typename ConfigParseFunc&gt;
+67 Service::Service(ndn::KeyChain&amp; keyChain, shared_ptr&lt;ndn::Transport&gt; localNfdTransport,
+68                  const ConfigParseFunc&amp; configParse)
+69   : m_keyChain(keyChain)
+70   , m_face(std::move(localNfdTransport), getGlobalIoService(), m_keyChain)
+71   , m_nfdController(m_face, m_keyChain)
+72   , m_fibUpdater(m_rib, m_nfdController)
+73   , m_dispatcher(m_face, m_keyChain)
+74   , m_ribManager(m_rib, m_face, m_keyChain, m_nfdController, m_dispatcher)
+75 {
+76   if (s_instance != nullptr) {
+77     NDN_THROW(std::logic_error("RIB service cannot be instantiated more than once"));
+78   }
+79   if (&amp;getGlobalIoService() != &amp;getRibIoService()) {
+80     NDN_THROW(std::logic_error("RIB service must run on RIB thread"));
+81   }
+82   s_instance = this;
+83   ConfigFile config(ConfigFile::ignoreUnknownSection);
+84   config.addSectionHandler(CFG_RIB, [this] (auto&amp;&amp;... args) {
+85     processConfig(std::forward&lt;decltype(args)&gt;(args)...);
+86   });
+87   configParse(config, true);
+88   configParse(config, false);
+89   m_ribManager.registerWithNfd();
+90   m_ribManager.enableLocalFields();
+91 }
+92 Service::~Service()
+93 {
+94   s_instance = nullptr;
+95 }
+96 Service&amp;
+97 Service::get()
+98 {
+99   if (s_instance == nullptr) {
+100     NDN_THROW(std::logic_error("RIB service is not instantiated"));
+101   }
+102   if (&amp;getGlobalIoService() != &amp;getRibIoService()) {
+103     NDN_THROW(std::logic_error("Must get RIB service on RIB thread"));
+104   }
+105   return *s_instance;
+106 }
+107 void
+108 Service::processConfig(const ConfigSection&amp; section, bool isDryRun, const std::string&amp; filename)
+109 {
+110   if (isDryRun) {
+111     checkConfig(section, filename);
+112   }
+113   else {
+114     applyConfig(section, filename);
+115   }
+116 }
+117 void
+118 Service::checkConfig(const ConfigSection&amp; section, const std::string&amp; filename)
+119 {
+120   bool hasLocalhop = false;
+121   bool hasPropagate = false;
+122   for (const auto&amp; item : section) {
+123     const std::string&amp; key = item.first;
+124     const ConfigSection&amp; value = item.second;
+125     if (key == CFG_LOCALHOST_SECURITY || key == CFG_PA_VALIDATION) {
+126       ndn::ValidatorConfig testValidator(m_face);
+127       testValidator.load(value, filename);
+128     }
+129     else if (key == CFG_LOCALHOP_SECURITY) {
+130       hasLocalhop = true;
+131       ndn::ValidatorConfig testValidator(m_face);
+132       testValidator.load(value, filename);
+133     }
+134     else if (key == CFG_PREFIX_PROPAGATE) {
+135       hasPropagate = true;
+136     }
+137     else if (key == CFG_READVERTISE_NLSR) {
+138       ConfigFile::parseYesNo(item, CFG_RIB + "." + CFG_READVERTISE_NLSR);
+139     }
+140     else {
+141       NDN_THROW(ConfigFile::Error("Unrecognized option " + CFG_RIB + "." + key));
+142     }
+143   }
+144   if (hasLocalhop &amp;&amp; hasPropagate) {
+145     NDN_THROW(ConfigFile::Error(CFG_LOCALHOP_SECURITY + " and " + CFG_PREFIX_PROPAGATE +
+146                                 " cannot be enabled at the same time"));
+147   }
+148 }
+149 void
+150 Service::applyConfig(const ConfigSection&amp; section, const std::string&amp; filename)
+151 {
+152   bool wantPrefixPropagate = false;
+153   bool wantReadvertiseNlsr = false;
+154   for (const auto&amp; item : section) {
+155     const std::string&amp; key = item.first;
+156     const ConfigSection&amp; value = item.second;
+157     if (key == CFG_LOCALHOST_SECURITY) {
+158       m_ribManager.applyLocalhostConfig(value, filename);
+159     }
+160     else if (key == CFG_LOCALHOP_SECURITY) {
+161       m_ribManager.enableLocalhop(value, filename);
+162     }
+163     else if (key == CFG_PA_VALIDATION) {
+164       m_ribManager.applyPaConfig(value, filename);
+165     }
+166     else if (key == CFG_PREFIX_PROPAGATE) {
+167       wantPrefixPropagate = true;
+168       if (!m_readvertisePropagation) {
+169         NFD_LOG_DEBUG("Enabling automatic prefix propagation");
+170         auto cost = item.second.get_optional&lt;uint64_t&gt;("cost");
+171         auto parameters = ndn::nfd::ControlParameters()
+172                           .setCost(cost.value_or(PROPAGATE_DEFAULT_COST))
+173                           .setOrigin(ndn::nfd::ROUTE_ORIGIN_CLIENT);
+174         auto timeout = item.second.get_optional&lt;uint64_t&gt;("timeout");
+175         auto options = ndn::nfd::CommandOptions()
+176                        .setPrefix(RibManager::LOCALHOP_TOP_PREFIX)
+177                        .setTimeout(timeout ? time::milliseconds(*timeout) : PROPAGATE_DEFAULT_TIMEOUT);
+178         m_readvertisePropagation = make_unique&lt;Readvertise&gt;(
+179           m_rib,
+180           make_unique&lt;HostToGatewayReadvertisePolicy&gt;(m_keyChain, item.second),
+181           make_unique&lt;NfdRibReadvertiseDestination&gt;(m_nfdController, m_rib, options, parameters));
+182       }
+183     }
+184     else if (key == CFG_READVERTISE_NLSR) {
+185       wantReadvertiseNlsr = ConfigFile::parseYesNo(item, CFG_RIB + "." + CFG_READVERTISE_NLSR);
+186     }
+187     else {
+188       NDN_THROW(ConfigFile::Error("Unrecognized option " + CFG_RIB + "." + key));
+189     }
+190   }
+191   if (!wantPrefixPropagate &amp;&amp; m_readvertisePropagation != nullptr) {
+192     NFD_LOG_DEBUG("Disabling automatic prefix propagation");
+193     m_readvertisePropagation.reset();
+194   }
+195   if (wantReadvertiseNlsr &amp;&amp; m_readvertiseNlsr == nullptr) {
+196     NFD_LOG_DEBUG("Enabling readvertise-to-nlsr");
+197     auto options = ndn::nfd::CommandOptions().setPrefix(READVERTISE_NLSR_PREFIX);
+198     m_readvertiseNlsr = make_unique&lt;Readvertise&gt;(
+199       m_rib,
+200       make_unique&lt;ClientToNlsrReadvertisePolicy&gt;(),
+201       make_unique&lt;NfdRibReadvertiseDestination&gt;(m_nfdController, m_rib, options));
+202   }
+203   else if (!wantReadvertiseNlsr &amp;&amp; m_readvertiseNlsr != nullptr) {
+204     NFD_LOG_DEBUG("Disabling readvertise-to-nlsr");
+205     m_readvertiseNlsr.reset();
+206   }
+207 }
 } } </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -259,188 +259,188 @@ Service::applyConfig(const ConfigSection&amp; section, const std::string&amp; fi
 </h3>
 <hr/>
 <pre>
-#include "table/measurements.hpp"
-#include "table/fib.hpp"
-#include "table/pit.hpp"
-#include "tests/test-common.hpp"
-#include "tests/daemon/global-io-fixture.hpp"
-namespace nfd {
-namespace measurements {
-namespace tests {
-using namespace nfd::tests;
-BOOST_AUTO_TEST_SUITE(Table)
-class MeasurementsFixture : public GlobalIoTimeFixture
-{
-public:
-  MeasurementsFixture()
-    : measurements(nameTree)
-  {
-  }
-public:
-  NameTree nameTree;
-  Measurements measurements;
-};
-BOOST_FIXTURE_TEST_SUITE(TestMeasurements, MeasurementsFixture)
-BOOST_AUTO_TEST_CASE(Get_Parent)
-{
-  Entry&amp; entryAB = measurements.get("/A/B");
-  BOOST_CHECK_EQUAL(entryAB.getName(), "/A/B");
-  Entry&amp; entry0 = measurements.get("/");
-  BOOST_CHECK_EQUAL(entry0.getName(), "/");
-  Entry* entryA = measurements.getParent(entryAB);
-  BOOST_REQUIRE(entryA != nullptr);
-  BOOST_CHECK_EQUAL(entryA-&gt;getName(), "/A");
-  Entry* entry0c = measurements.getParent(*entryA);
-  BOOST_REQUIRE(entry0c != nullptr);
-  BOOST_CHECK_EQUAL(&amp;entry0, entry0c);
-}
-BOOST_AUTO_TEST_CASE(GetLongName)
-{
-  Name n;
-  while (n.size() &lt; NameTree::getMaxDepth() - 1) {
-    n.append("A");
-  }
-  Entry&amp; entry1 = measurements.get(n);
-  BOOST_CHECK_EQUAL(entry1.getName().size(), NameTree::getMaxDepth() - 1);
-  n.append("B");
-  Entry&amp; entry2 = measurements.get(n);
-  BOOST_CHECK_EQUAL(entry2.getName().size(), NameTree::getMaxDepth());
-  n.append("C");
-  Entry&amp; entry3 = measurements.get(n);
-  BOOST_CHECK_EQUAL(entry3.getName().size(), NameTree::getMaxDepth());
-}
-BOOST_AUTO_TEST_CASE(GetWithFibEntry)
-{
-  Fib fib(nameTree);
-  const fib::Entry* fibA = fib.insert("/A").first;
-  const fib::Entry* fibAB = fib.insert("/A/B").first;
-  Entry&amp; entryA = measurements.get(*fibA);
-  BOOST_CHECK_EQUAL(entryA.getName(), "/A");
-  Entry&amp; entryAB = measurements.get(*fibAB);
-  BOOST_CHECK_EQUAL(entryAB.getName(), "/A/B");
-}
-BOOST_AUTO_TEST_CASE(GetWithEmptyFibEntry) {
-  Fib fib(nameTree);
-  const fib::Entry&amp; fib0 = fib.findLongestPrefixMatch("/");
-  Entry&amp; entry0 = measurements.get(fib0);
-  BOOST_CHECK_EQUAL(entry0.getName(), "/");
-}
-BOOST_AUTO_TEST_CASE(GetWithPitEntry)
-{
-  Pit pit(nameTree);
-  shared_ptr&lt;Interest&gt; interestA = makeInterest("/A");
-  shared_ptr&lt;pit::Entry&gt; pitA = pit.insert(*interestA).first;
-  shared_ptr&lt;Data&gt; dataABC = makeData("/A/B/C");
-  Name fullName = dataABC-&gt;getFullName();
-  shared_ptr&lt;Interest&gt; interestFull = makeInterest(fullName);
-  shared_ptr&lt;pit::Entry&gt; pitFull = pit.insert(*interestFull).first;
-  Entry&amp; entryA = measurements.get(*pitA);
-  BOOST_CHECK_EQUAL(entryA.getName(), "/A");
-  Entry&amp; entryFull = measurements.get(*pitFull);
-  BOOST_CHECK_EQUAL(entryFull.getName(), fullName);
-}
-class DummyStrategyInfo1 : public fw::StrategyInfo
-{
-public:
-  static constexpr int
-  getTypeId()
-  {
-    return 21;
-  }
-};
-class DummyStrategyInfo2 : public fw::StrategyInfo
-{
-public:
-  static constexpr int
-  getTypeId()
-  {
-    return 22;
-  }
-};
-BOOST_AUTO_TEST_CASE(FindLongestPrefixMatch)
-{
-  measurements.get("/A");
-  measurements.get("/A/B/C").insertStrategyInfo&lt;DummyStrategyInfo1&gt;();
-  measurements.get("/A/B/C/D");
-  Entry* found1 = measurements.findLongestPrefixMatch("/A/B/C/D/E");
-  BOOST_REQUIRE(found1 != nullptr);
-  BOOST_CHECK_EQUAL(found1-&gt;getName(), "/A/B/C/D");
-  Entry* found2 = measurements.findLongestPrefixMatch("/A/B/C/D/E",
-      EntryWithStrategyInfo&lt;DummyStrategyInfo1&gt;());
-  BOOST_REQUIRE(found2 != nullptr);
-  BOOST_CHECK_EQUAL(found2-&gt;getName(), "/A/B/C");
-  Entry* found3 = measurements.findLongestPrefixMatch("/A/B/C/D/E",
-      EntryWithStrategyInfo&lt;DummyStrategyInfo2&gt;());
-  BOOST_CHECK(found3 == nullptr);
-}
-BOOST_AUTO_TEST_CASE(FindLongestPrefixMatchWithPitEntry)
-{
-  Pit pit(nameTree);
-  measurements.get("/A");
-  measurements.get("/A/B/C").insertStrategyInfo&lt;DummyStrategyInfo1&gt;();
-  measurements.get("/A/B/C/D");
-  shared_ptr&lt;Interest&gt; interest = makeInterest("/A/B/C/D/E");
-  shared_ptr&lt;pit::Entry&gt; pitEntry = pit.insert(*interest).first;
-  Entry* found1 = measurements.findLongestPrefixMatch(*pitEntry);
-  BOOST_REQUIRE(found1 != nullptr);
-  BOOST_CHECK_EQUAL(found1-&gt;getName(), "/A/B/C/D");
-  Entry* found2 = measurements.findLongestPrefixMatch(*pitEntry,
-      EntryWithStrategyInfo&lt;DummyStrategyInfo1&gt;());
-  BOOST_REQUIRE(found2 != nullptr);
-  BOOST_CHECK_EQUAL(found2-&gt;getName(), "/A/B/C");
-  Entry* found3 = measurements.findLongestPrefixMatch(*pitEntry,
-      EntryWithStrategyInfo&lt;DummyStrategyInfo2&gt;());
-  BOOST_CHECK(found3 == nullptr);
-}
-BOOST_AUTO_TEST_CASE(Lifetime)
-{
-  Name nameA("ndn:/A");
-  Name nameB("ndn:/B");
-  Name nameC("ndn:/C");
-  BOOST_CHECK_EQUAL(measurements.size(), 0);
-<a name="0"></a>
-  Entry&amp; entryA = measurements.get(nameA);
-  measurements.get(nameB);
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>  Entry&amp; entryC = measurements.get(nameC);
-  BOOST_CHECK_EQUAL(measurements.size(), 3);
-  const time::nanoseconds EXTEND_A = 2_s;
-  const time::nanoseconds CHECK1 = 3_s;
-  const time::nanoseconds CHECK2 = 5_s;
-  const time::nanoseconds EXTEND_C = 6_s;
-  const time::nanoseconds CHECK3 = 7_s;</b></font>
-  BOOST_ASSERT(EXTEND_A &lt; CHECK1);
-  BOOST_ASSERT(CHECK1 &lt; Measurements::getInitialLifetime());
-  BOOST_ASSERT(Measurements::getInitialLifetime() &lt; CHECK2);
-  BOOST_ASSERT(CHECK2 &lt; EXTEND_C);
-  BOOST_ASSERT(EXTEND_C &lt; CHECK3);
-  measurements.extendLifetime(entryA, EXTEND_A);
-  measurements.extendLifetime(entryC, EXTEND_C);
-  this-&gt;advanceClocks(100_ms, CHECK1);
-  BOOST_CHECK(measurements.findExactMatch(nameA) != nullptr);
-  BOOST_CHECK(measurements.findExactMatch(nameB) != nullptr);
-  BOOST_CHECK(measurements.findExactMatch(nameC) != nullptr);
-  BOOST_CHECK_EQUAL(measurements.size(), 3);
-  this-&gt;advanceClocks(100_ms, CHECK2 - CHECK1);
-  BOOST_CHECK(measurements.findExactMatch(nameA) == nullptr);
-  BOOST_CHECK(measurements.findExactMatch(nameB) == nullptr);
-  BOOST_CHECK(measurements.findExactMatch(nameC) != nullptr);
-  BOOST_CHECK_EQUAL(measurements.size(), 1);
-  this-&gt;advanceClocks(100_ms, CHECK3 - CHECK2);
-  BOOST_CHECK(measurements.findExactMatch(nameA) == nullptr);
-  BOOST_CHECK(measurements.findExactMatch(nameB) == nullptr);
-  BOOST_CHECK(measurements.findExactMatch(nameC) == nullptr);
-  BOOST_CHECK_EQUAL(measurements.size(), 0);
-}
-BOOST_AUTO_TEST_CASE(EraseNameTreeEntry)
-{
-  size_t nNameTreeEntriesBefore = nameTree.size();
-  measurements.get("/A");
-  BOOST_CHECK_EQUAL(measurements.size(), 1);
-  this-&gt;advanceClocks(Measurements::getInitialLifetime() + 10_ms);
-  BOOST_CHECK_EQUAL(measurements.size(), 0);
-  BOOST_CHECK_EQUAL(nameTree.size(), nNameTreeEntriesBefore);
-}
-BOOST_AUTO_TEST_SUITE_END() BOOST_AUTO_TEST_SUITE_END() 
+1 #include "table/measurements.hpp"
+2 #include "table/fib.hpp"
+3 #include "table/pit.hpp"
+4 #include "tests/test-common.hpp"
+5 #include "tests/daemon/global-io-fixture.hpp"
+6 namespace nfd {
+7 namespace measurements {
+8 namespace tests {
+9 using namespace nfd::tests;
+10 BOOST_AUTO_TEST_SUITE(Table)
+11 class MeasurementsFixture : public GlobalIoTimeFixture
+12 {
+13 public:
+14   MeasurementsFixture()
+15     : measurements(nameTree)
+16   {
+17   }
+18 public:
+19   NameTree nameTree;
+20   Measurements measurements;
+21 };
+22 BOOST_FIXTURE_TEST_SUITE(TestMeasurements, MeasurementsFixture)
+23 BOOST_AUTO_TEST_CASE(Get_Parent)
+24 {
+25   Entry&amp; entryAB = measurements.get("/A/B");
+26   BOOST_CHECK_EQUAL(entryAB.getName(), "/A/B");
+27   Entry&amp; entry0 = measurements.get("/");
+28   BOOST_CHECK_EQUAL(entry0.getName(), "/");
+29   Entry* entryA = measurements.getParent(entryAB);
+30   BOOST_REQUIRE(entryA != nullptr);
+31   BOOST_CHECK_EQUAL(entryA-&gt;getName(), "/A");
+32   Entry* entry0c = measurements.getParent(*entryA);
+33   BOOST_REQUIRE(entry0c != nullptr);
+34   BOOST_CHECK_EQUAL(&amp;entry0, entry0c);
+35 }
+36 BOOST_AUTO_TEST_CASE(GetLongName)
+37 {
+38   Name n;
+39   while (n.size() &lt; NameTree::getMaxDepth() - 1) {
+40     n.append("A");
+41   }
+42   Entry&amp; entry1 = measurements.get(n);
+43   BOOST_CHECK_EQUAL(entry1.getName().size(), NameTree::getMaxDepth() - 1);
+44   n.append("B");
+45   Entry&amp; entry2 = measurements.get(n);
+46   BOOST_CHECK_EQUAL(entry2.getName().size(), NameTree::getMaxDepth());
+47   n.append("C");
+48   Entry&amp; entry3 = measurements.get(n);
+49   BOOST_CHECK_EQUAL(entry3.getName().size(), NameTree::getMaxDepth());
+50 }
+51 BOOST_AUTO_TEST_CASE(GetWithFibEntry)
+52 {
+53   Fib fib(nameTree);
+54   const fib::Entry* fibA = fib.insert("/A").first;
+55   const fib::Entry* fibAB = fib.insert("/A/B").first;
+56   Entry&amp; entryA = measurements.get(*fibA);
+57   BOOST_CHECK_EQUAL(entryA.getName(), "/A");
+58   Entry&amp; entryAB = measurements.get(*fibAB);
+59   BOOST_CHECK_EQUAL(entryAB.getName(), "/A/B");
+60 }
+61 BOOST_AUTO_TEST_CASE(GetWithEmptyFibEntry) {
+62   Fib fib(nameTree);
+63   const fib::Entry&amp; fib0 = fib.findLongestPrefixMatch("/");
+64   Entry&amp; entry0 = measurements.get(fib0);
+65   BOOST_CHECK_EQUAL(entry0.getName(), "/");
+66 }
+67 BOOST_AUTO_TEST_CASE(GetWithPitEntry)
+68 {
+69   Pit pit(nameTree);
+70   shared_ptr&lt;Interest&gt; interestA = makeInterest("/A");
+71   shared_ptr&lt;pit::Entry&gt; pitA = pit.insert(*interestA).first;
+72   shared_ptr&lt;Data&gt; dataABC = makeData("/A/B/C");
+73   Name fullName = dataABC-&gt;getFullName();
+74   shared_ptr&lt;Interest&gt; interestFull = makeInterest(fullName);
+75   shared_ptr&lt;pit::Entry&gt; pitFull = pit.insert(*interestFull).first;
+76   Entry&amp; entryA = measurements.get(*pitA);
+77   BOOST_CHECK_EQUAL(entryA.getName(), "/A");
+78   Entry&amp; entryFull = measurements.get(*pitFull);
+79   BOOST_CHECK_EQUAL(entryFull.getName(), fullName);
+80 }
+81 class DummyStrategyInfo1 : public fw::StrategyInfo
+82 {
+83 public:
+84   static constexpr int
+85   getTypeId()
+86   {
+87     return 21;
+88   }
+89 };
+90 class DummyStrategyInfo2 : public fw::StrategyInfo
+91 {
+92 public:
+93   static constexpr int
+94   getTypeId()
+95   {
+96     return 22;
+97   }
+98 };
+99 BOOST_AUTO_TEST_CASE(FindLongestPrefixMatch)
+100 {
+101   measurements.get("/A");
+102   measurements.get("/A/B/C").insertStrategyInfo&lt;DummyStrategyInfo1&gt;();
+103   measurements.get("/A/B/C/D");
+104   Entry* found1 = measurements.findLongestPrefixMatch("/A/B/C/D/E");
+105   BOOST_REQUIRE(found1 != nullptr);
+106   BOOST_CHECK_EQUAL(found1-&gt;getName(), "/A/B/C/D");
+107   Entry* found2 = measurements.findLongestPrefixMatch("/A/B/C/D/E",
+108       EntryWithStrategyInfo&lt;DummyStrategyInfo1&gt;());
+109   BOOST_REQUIRE(found2 != nullptr);
+110   BOOST_CHECK_EQUAL(found2-&gt;getName(), "/A/B/C");
+111   Entry* found3 = measurements.findLongestPrefixMatch("/A/B/C/D/E",
+112       EntryWithStrategyInfo&lt;DummyStrategyInfo2&gt;());
+113   BOOST_CHECK(found3 == nullptr);
+114 }
+115 BOOST_AUTO_TEST_CASE(FindLongestPrefixMatchWithPitEntry)
+116 {
+117   Pit pit(nameTree);
+118   measurements.get("/A");
+119   measurements.get("/A/B/C").insertStrategyInfo&lt;DummyStrategyInfo1&gt;();
+120   measurements.get("/A/B/C/D");
+121   shared_ptr&lt;Interest&gt; interest = makeInterest("/A/B/C/D/E");
+122   shared_ptr&lt;pit::Entry&gt; pitEntry = pit.insert(*interest).first;
+123   Entry* found1 = measurements.findLongestPrefixMatch(*pitEntry);
+124   BOOST_REQUIRE(found1 != nullptr);
+125   BOOST_CHECK_EQUAL(found1-&gt;getName(), "/A/B/C/D");
+126   Entry* found2 = measurements.findLongestPrefixMatch(*pitEntry,
+127       EntryWithStrategyInfo&lt;DummyStrategyInfo1&gt;());
+128   BOOST_REQUIRE(found2 != nullptr);
+129   BOOST_CHECK_EQUAL(found2-&gt;getName(), "/A/B/C");
+130   Entry* found3 = measurements.findLongestPrefixMatch(*pitEntry,
+131       EntryWithStrategyInfo&lt;DummyStrategyInfo2&gt;());
+132   BOOST_CHECK(found3 == nullptr);
+133 }
+134 BOOST_AUTO_TEST_CASE(Lifetime)
+135 {
+136   Name nameA("ndn:/A");
+137   Name nameB("ndn:/B");
+138   Name nameC("ndn:/C");
+139   BOOST_CHECK_EQUAL(measurements.size(), 0);
+140 <a name="0"></a>
+141   Entry&amp; entryA = measurements.get(nameA);
+142   measurements.get(nameB);
+143 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>  Entry&amp; entryC = measurements.get(nameC);
+144   BOOST_CHECK_EQUAL(measurements.size(), 3);
+145   const time::nanoseconds EXTEND_A = 2_s;
+146   const time::nanoseconds CHECK1 = 3_s;
+147   const time::nanoseconds CHECK2 = 5_s;
+148   const time::nanoseconds EXTEND_C = 6_s;
+149   const time::nanoseconds CHECK3 = 7_s;</b></font>
+150   BOOST_ASSERT(EXTEND_A &lt; CHECK1);
+151   BOOST_ASSERT(CHECK1 &lt; Measurements::getInitialLifetime());
+152   BOOST_ASSERT(Measurements::getInitialLifetime() &lt; CHECK2);
+153   BOOST_ASSERT(CHECK2 &lt; EXTEND_C);
+154   BOOST_ASSERT(EXTEND_C &lt; CHECK3);
+155   measurements.extendLifetime(entryA, EXTEND_A);
+156   measurements.extendLifetime(entryC, EXTEND_C);
+157   this-&gt;advanceClocks(100_ms, CHECK1);
+158   BOOST_CHECK(measurements.findExactMatch(nameA) != nullptr);
+159   BOOST_CHECK(measurements.findExactMatch(nameB) != nullptr);
+160   BOOST_CHECK(measurements.findExactMatch(nameC) != nullptr);
+161   BOOST_CHECK_EQUAL(measurements.size(), 3);
+162   this-&gt;advanceClocks(100_ms, CHECK2 - CHECK1);
+163   BOOST_CHECK(measurements.findExactMatch(nameA) == nullptr);
+164   BOOST_CHECK(measurements.findExactMatch(nameB) == nullptr);
+165   BOOST_CHECK(measurements.findExactMatch(nameC) != nullptr);
+166   BOOST_CHECK_EQUAL(measurements.size(), 1);
+167   this-&gt;advanceClocks(100_ms, CHECK3 - CHECK2);
+168   BOOST_CHECK(measurements.findExactMatch(nameA) == nullptr);
+169   BOOST_CHECK(measurements.findExactMatch(nameB) == nullptr);
+170   BOOST_CHECK(measurements.findExactMatch(nameC) == nullptr);
+171   BOOST_CHECK_EQUAL(measurements.size(), 0);
+172 }
+173 BOOST_AUTO_TEST_CASE(EraseNameTreeEntry)
+174 {
+175   size_t nNameTreeEntriesBefore = nameTree.size();
+176   measurements.get("/A");
+177   BOOST_CHECK_EQUAL(measurements.size(), 1);
+178   this-&gt;advanceClocks(Measurements::getInitialLifetime() + 10_ms);
+179   BOOST_CHECK_EQUAL(measurements.size(), 0);
+180   BOOST_CHECK_EQUAL(nameTree.size(), nNameTreeEntriesBefore);
+181 }
+182 BOOST_AUTO_TEST_SUITE_END() BOOST_AUTO_TEST_SUITE_END() 
 } } } </pre>
 </div>
 </div>

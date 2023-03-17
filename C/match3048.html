@@ -40,891 +40,891 @@ Matches for inf-test-traffic-replay.c &amp; inf-gtk-browser-store.c
 </h3>
 <hr/>
 <pre>
-#define _XOPEN_SOURCE 700
-#include "util/inf-test-util.h"
-#include &lt;libinfinity/server/infd-xml-server.h&gt;
-#include &lt;libinfinity/server/infd-xmpp-server.h&gt;
-#include &lt;libinfinity/common/inf-standalone-io.h&gt;
-#include &lt;libinfinity/common/inf-cert-util.h&gt;
-#include &lt;libinfinity/common/inf-init.h&gt;
-#include &lt;gnutls/gnutls.h&gt;
-#include &lt;gnutls/x509.h&gt;
-#include &lt;libxml/xmlsave.h&gt;
-#include &lt;time.h&gt;
-#include &lt;string.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;assert.h&gt;
-typedef struct _InfTestTrafficReplay InfTestTrafficReplay;
-struct _InfTestTrafficReplay {
-  InfStandaloneIo* io;
-  guint port;
-  InfdXmppServer* xmpp;
-  const gchar* filename;
-<a name="0"></a>  GSList* conns;
-};
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>typedef enum _InfTestTrafficReplayMessageType {
-  INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING,
-  INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING,
-  INF_TEST_TRAFFIC_REPLAY_MESSAGE_CONNECT,
-  INF_TEST_TRAFFIC_REPLAY_MESSAGE_DISCONNECT,
-  INF_TEST_TRAFFIC_REPLAY_MESSAGE_ERROR
-} InfTestTrafficReplayMessageType;
-typedef struct _InfTestTrafficReplayMessage InfTestTrafficReplayMessage;
-struct _InfTestTrafficReplayMessage {
-  gint64 timestamp;   InfTestTrafficReplayMessageType type;
-  xmlNodePtr xml;
-  xmlNodePtr xml_iter;
-};
-typedef struct _InfTestTrafficReplayConnection InfTestTrafficReplayConnection;
-struct _InfTestTrafficReplayConnection {
-  gchar* name;
-  InfTestTrafficReplay* replay;
-  InfCertificateCredentials* creds;
-  InfXmppConnection* xmpp;
-  FILE* file;
-  InfTestTrafficReplayMessage* message;
-  GHashTable* group_queues; };</b></font>
-typedef enum _InfTestTrafficReplayError {
-  INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
-  INF_TEST_TRAFFIC_REPLAY_ERROR_UNEXPECTED_EOF
-} InfTestTrafficReplayError;
-static GQuark
-inf_test_traffic_replay_error_quark()
-{
-  return g_quark_from_static_string("INF_TEST_TRAFFIC_REPLAY_ERROR");
-}
-static void
-inf_test_traffic_replay_received_cb(InfXmppConnection* connection,
-                                    xmlNodePtr xml,
-                                    gpointer user_data);
-static void
-inf_test_traffic_replay_notify_status_cb(GObject* object,
-                                         GParamSpec* pspec,
-                                         gpointer user_data);
-static void
-inf_test_traffic_replay_queue_free(GQueue* queue)
-{
-  g_queue_free_full(queue, (GDestroyNotify)xmlFreeDoc);
-}
-static void
-inf_test_traffic_replay_message_free(InfTestTrafficReplayMessage* message)
-{
-  if(message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING ||
-     message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING)
-  {
-    if(message-&gt;xml != NULL)
-      xmlFreeNode(message-&gt;xml);
-  }
-  g_slice_free(InfTestTrafficReplayMessage, message);
-}
-static char*
-inf_test_traffic_replay_get_next_line(InfTestTrafficReplayConnection* conn,
-                                      size_t* len,
-                                      GError** error)
-{
-  char* line;
-  size_t n;
-  ssize_t len_;
-  int err;
-  line = NULL;
-  n = 0;
-  len_ = getline(&amp;line, &amp;n, conn-&gt;file);
-  if(len_ &gt;= 0)
-  {
-    *len = len_;
-    return line;
-  }
-  else
-  {
-    if(feof(conn-&gt;file))
-    {
-      g_set_error(
-        error,
-        inf_test_traffic_replay_error_quark(),
-        INF_TEST_TRAFFIC_REPLAY_ERROR_UNEXPECTED_EOF,
-        "Unexpected end of file"
-      );
-    }
-    else
-    {
-      err = ferror(conn-&gt;file);
-      g_set_error_literal(
-        error,
-        G_FILE_ERROR,
-        g_file_error_from_errno(err),
-        strerror(err)
-      );
-    }
-    return NULL;
-  }
-}
-static InfTestTrafficReplayMessage*
-inf_test_traffic_replay_get_next_message(InfTestTrafficReplayConnection* conn,
-                                         GError** error)
-{
-  char* line;
-  size_t len;
-  size_t n;
-  struct tm tm;
-  char* end;
-  gulong msecs;
-  InfTestTrafficReplayMessageType type;
-  xmlDocPtr xml;
-  GString* str;
-  InfTestTrafficReplayMessage* message;
-  line = inf_test_traffic_replay_get_next_line(conn, &amp;len, error);
-  if(!line) return NULL;
-  if(line[0] != '[')
-  {
-    g_set_error(
-      error,
-      inf_test_traffic_replay_error_quark(),
-      INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
-      "Line does not start with a timestamp"
-    );
-    free(line);
-    return FALSE;
-  }
-  end = strptime(&amp;line[1], "%a %d %b %Y %I:%M:%S %p %Z", &amp;tm);
-  if(end == NULL || *end != ' ' || *(end+1) != '.')
-  {
-    g_set_error(
-      error,
-      inf_test_traffic_replay_error_quark(),
-      INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
-      "Failed to parse timestamp"
-    );
-    free(line);
-    return FALSE;
-  }
-  errno = 0;
-  msecs = strtoul(&amp;end[2], &amp;end, 10);
-  if(errno != 0 || *end != ']' || msecs &gt;= 1000000)
-  {
-    g_set_error(
-      error,
-      inf_test_traffic_replay_error_quark(),
-      INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
-      "Failed to parse timestamp"
-    );
-    free(line);
-    return FALSE;
-  }
-  ++end;
-  tm.tm_isdst = 1;
-  n = (end - line) + 1;
-  if(line[n] == '!')
-  {
-    if(strstr(line + n + 4, "connected") != NULL)
-      type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_CONNECT;
-    else if(strstr(line + n + 4, "Connection error") != NULL)
-      type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_ERROR;
-    else if(strstr(line + n + 4, "closed") != NULL)
-      type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_DISCONNECT;
-    else
-    {
-      g_set_error(
-        error,
-        inf_test_traffic_replay_error_quark(),
-        INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
-        "Unknown connection event \"%s\"",
-        line + n + 4
-      );
-      free(line);
-      return FALSE;
-    }
-  }
-  else if(line[n] == '&lt;')
-  {
-    if(FALSE)       type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING;
-    else
-      type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING;
-  }
-  else if(line[n] == '&gt;')
-  {
-      type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING;
-    else
-      type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING;
-  }
-  else
-  {
-    g_set_error(
-      error,
-      inf_test_traffic_replay_error_quark(),
-      INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
-      "Unknown control character \"%c\" (%d)",
-      line[n],
-      (int)line[n]
-    );
-    free(line);
-    return FALSE;
-  }
-  if(type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING ||
-     type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING)
-  {
-    str = g_string_new_len(line + n + 4, len - n - 5);
-    xml = xmlReadDoc(str-&gt;str, NULL, "UTF-8", XML_PARSE_NOWARNING | XML_PARSE_NOERROR);
-    while(!xml)
-    {
-      free(line);
-      line = inf_test_traffic_replay_get_next_line(conn, &amp;len, error);
-      if(!line)
-      {
-        g_string_free(str, TRUE);
-        return NULL;
-      }
-      g_string_append_c(str, '\n');
-      g_string_append_len(str, line, len - 1);
-      xml = xmlReadDoc(str-&gt;str, NULL, "UTF-8", XML_PARSE_NOWARNING | XML_PARSE_NOERROR);
-    }
-    g_string_free(str, TRUE);
-  }
-  free(line);
-  message = g_slice_new(InfTestTrafficReplayMessage);
-  message-&gt;timestamp = (gint64)mktime(&amp;tm) * 1000000 + msecs;
-  message-&gt;type = type;
-  if(type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING ||
-     type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING)
-  {
-    message-&gt;xml = xmlCopyNode(xmlDocGetRootElement(xml), 1);
-    if(type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING)
-      message-&gt;xml_iter = message-&gt;xml-&gt;children;
-    xmlFreeDoc(xml);
-  }
-  return message;
-}
-static void
-inf_test_traffic_replay_connection_close(InfTestTrafficReplayConnection* conn)
-{
-  InfXmlConnectionStatus status;
-  g_signal_handlers_disconnect_by_func(
-    G_OBJECT(conn-&gt;xmpp),
-    G_CALLBACK(inf_test_traffic_replay_received_cb),
-    conn
-  );
-  g_signal_handlers_disconnect_by_func(
-    G_OBJECT(conn-&gt;xmpp),
-    G_CALLBACK(inf_test_traffic_replay_notify_status_cb),
-    conn
-  );
-  if(conn-&gt;xmpp != NULL)
-  {
-    g_object_get(G_OBJECT(conn-&gt;xmpp), "status", &amp;status, NULL);
-    if(status == INF_XML_CONNECTION_OPEN ||
-       status == INF_XML_CONNECTION_OPENING)
-    {
-      inf_xml_connection_close(INF_XML_CONNECTION(conn-&gt;xmpp));
-    }
-  }
-  if(conn-&gt;creds != NULL)
-    inf_certificate_credentials_unref(conn-&gt;creds);
-  g_object_unref(conn-&gt;xmpp);
-  if(conn-&gt;file != NULL) fclose(conn-&gt;file);
-  g_hash_table_destroy(conn-&gt;group_queues);
-  fprintf(stderr, "[%s] Disconnected\n", conn-&gt;name);
-  g_free(conn-&gt;name);
-  conn-&gt;replay-&gt;conns = g_slist_remove(conn-&gt;replay-&gt;conns, conn);
-  if(conn-&gt;replay-&gt;conns == NULL)
-    inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
-  g_slice_free(InfTestTrafficReplayConnection, conn);
-}
-static void
-inf_test_traffic_replay_connection_check_message(
-  InfTestTrafficReplayConnection* conn,
-  xmlNodePtr xml)
-{
-  xmlBufferPtr received_buffer;
-  xmlBufferPtr expected_buffer;
-  xmlSaveCtxtPtr ctx;
-  received_buffer = xmlBufferCreate();
-  expected_buffer = xmlBufferCreate();
-  if(strcmp(conn-&gt;message-&gt;xml_iter-&gt;name, "message") == 0)
-    xmlSetProp(conn-&gt;message-&gt;xml_iter, "time", NULL);
-  if(strcmp(xml-&gt;name, "message") == 0)
-    xmlSetProp(xml, "time", NULL);
-  ctx = xmlSaveToBuffer(expected_buffer, "UTF-8", 0);
-  xmlSaveTree(ctx, conn-&gt;message-&gt;xml_iter);
-  xmlSaveClose(ctx);
-  ctx = xmlSaveToBuffer(received_buffer, "UTF-8", 0);
-  xmlSaveTree(ctx, xml);
-  xmlSaveClose(ctx);
-  if(strcmp(xmlBufferContent(expected_buffer), xmlBufferContent(received_buffer)) != 0)
-  {
-    fprintf(
-      stderr,
-      "[WARNING] [%s] Mismatch between expected and received: "
-      "\n\n\"%s\"\n\nvs.\n\n\"%s\"\n",
-      conn-&gt;name,
-      (const gchar*)xmlBufferContent(expected_buffer),
-      (const gchar*)xmlBufferContent(received_buffer)
-    );
-    xmlBufferFree(expected_buffer);
-    xmlBufferFree(received_buffer);
-    if(inf_standalone_io_loop_running(conn-&gt;replay-&gt;io))
-      inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
-    return;
-  }
-  xmlBufferFree(expected_buffer);
-  xmlBufferFree(received_buffer);
-}
-static gboolean
-inf_test_traffic_replay_connection_process_next_message(
-  InfTestTrafficReplayConnection* conn)
-{
-  InfIpAddress* addr;
-  InfTcpConnection* tcp;
-  GError* error;
-  xmlChar* group;
-  GQueue* queue;
-  switch(conn-&gt;message-&gt;type)
-  {
-  case INF_TEST_TRAFFIC_REPLAY_MESSAGE_CONNECT:
-    if(conn-&gt;xmpp != NULL)
-      return FALSE;
-    fprintf(stderr, "[%s] Connecting...\n", conn-&gt;name);
-    addr = inf_ip_address_new_loopback4();
-    tcp = inf_tcp_connection_new(
-      INF_IO(conn-&gt;replay-&gt;io),
-      addr,
-      conn-&gt;replay-&gt;port
-    );
-    inf_ip_address_free(addr);
-    conn-&gt;xmpp = inf_xmpp_connection_new(
-      tcp,
-      INF_XMPP_CONNECTION_CLIENT,
-      NULL,
-      "localhost",
-      INF_XMPP_CONNECTION_SECURITY_ONLY_TLS,
-      conn-&gt;creds,
-      NULL,
-      NULL
-    );
-    g_signal_connect(
-      G_OBJECT(conn-&gt;xmpp),
-      "received",
-      G_CALLBACK(inf_test_traffic_replay_received_cb),
-      conn
-    );
-    g_signal_connect(
-      G_OBJECT(conn-&gt;xmpp),
-      "notify::status",
-      G_CALLBACK(inf_test_traffic_replay_notify_status_cb),
-      conn
-    );
-    error = NULL;
-    if(!inf_tcp_connection_open(tcp, &amp;error))
-    {
-      fprintf(stderr, "[ERROR] [%s] %s\n", conn-&gt;name, error-&gt;message);
-      g_error_free(error);
-      if(inf_standalone_io_loop_running(conn-&gt;replay-&gt;io))
-        inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
-      return FALSE;
-    }
-    g_object_unref(tcp);
-    return FALSE;
-  case INF_TEST_TRAFFIC_REPLAY_MESSAGE_DISCONNECT:
-    g_assert(conn-&gt;xmpp != NULL);
-    inf_test_traffic_replay_connection_close(conn);
-    return TRUE;
-  case INF_TEST_TRAFFIC_REPLAY_MESSAGE_ERROR:
-    g_assert(conn-&gt;xmpp != NULL);
-    fprintf(stderr, "[%s] Recorded connection error, ignored\n", conn-&gt;name);
-    return TRUE;
-  case INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING:
-    g_assert(conn-&gt;xmpp != NULL);
-    group = xmlGetProp(conn-&gt;message-&gt;xml, "name");
-    fprintf(stderr, "[%s] Expecting data (%s, %s)\n", conn-&gt;name, group, conn-&gt;message-&gt;xml_iter-&gt;name);     queue = g_hash_table_lookup(conn-&gt;group_queues, group);
-    xmlFree(group);
-    g_assert(queue == NULL || g_queue_is_empty(queue));
-    return FALSE;
-  case INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING:
-    g_assert(conn-&gt;xmpp != NULL);
-    group = xmlGetProp(conn-&gt;message-&gt;xml, "name");
-    fprintf(stderr, "[%s] Sending data (%s, %s)\n", conn-&gt;name, group, conn-&gt;message-&gt;xml-&gt;children-&gt;name);     xmlFree(group);
-    inf_xml_connection_send(
-      INF_XML_CONNECTION(conn-&gt;xmpp),
-      conn-&gt;message-&gt;xml
-    );
-    conn-&gt;message-&gt;xml = NULL;
-    return TRUE;
-  default:
-    g_assert_not_reached();
-    break;
-  }
-}
-static void
-inf_test_traffic_replay_process_next_message(InfTestTrafficReplay* replay);
-static void
-inf_test_traffic_replay_connection_fetch_next_message(
-  InfTestTrafficReplayConnection* conn)
-{
-  xmlChar* group;
-  GQueue* queue;
-  xmlNodePtr xml;
-  if(!inf_standalone_io_loop_running(conn-&gt;replay-&gt;io))
-    return;
-  if(conn-&gt;message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING &amp;&amp;
-     conn-&gt;message-&gt;xml_iter-&gt;next != NULL)
-  {
-    conn-&gt;message-&gt;xml_iter = conn-&gt;message-&gt;xml_iter-&gt;next;
-  }
-  else
-  {
-    GError* error;
-    inf_test_traffic_replay_message_free(conn-&gt;message);
-    error = NULL;
-    conn-&gt;message = inf_test_traffic_replay_get_next_message(conn, &amp;error);
-    if(error != NULL)
-    {
-      fprintf(
-        stderr,
-        "[ERROR] [%s] Failed to fetch message: %s\n",
-        conn-&gt;name,
-        error-&gt;message
-      );
-      g_error_free(error);
-      if(inf_standalone_io_loop_running(conn-&gt;replay-&gt;io))
-        inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
-      return;
-    }
-  }
-  if(conn-&gt;message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING)
-  {
-    group = xmlGetProp(conn-&gt;message-&gt;xml, "name");
-    queue = g_hash_table_lookup(conn-&gt;group_queues, group);
-    if(queue != NULL &amp;&amp; !g_queue_is_empty(queue))
-    {
-      xml = g_queue_pop_head(queue);
-      fprintf(stderr, "[%s] Replay data (%s, %s)\n", conn-&gt;name, group, xml-&gt;name);
-      inf_test_traffic_replay_connection_check_message(conn, xml);
-      inf_test_traffic_replay_connection_fetch_next_message(conn);
-      xmlFree(group);
-      return;
-    }
-    xmlFree(group);
-  }
-  inf_test_traffic_replay_process_next_message(conn-&gt;replay);
-}
-static void
-inf_test_traffic_replay_process_next_message(InfTestTrafficReplay* replay)
-{
-  GSList* item;
-  InfTestTrafficReplayConnection* conn;
-  InfTestTrafficReplayConnection* low;
-  if(!inf_standalone_io_loop_running(replay-&gt;io))
-    return;
-  low = NULL;
-  for(item = replay-&gt;conns; item != NULL; item = item-&gt;next)
-  {
-    conn = (InfTestTrafficReplayConnection*)item-&gt;data;
-    if(low == NULL || conn-&gt;message-&gt;timestamp &lt; low-&gt;message-&gt;timestamp)
-      low = conn;
-    else if(conn-&gt;message-&gt;timestamp == low-&gt;message-&gt;timestamp)
-    {
-      if(conn-&gt;message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING &amp;&amp;
-         low-&gt;message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING)
-      {
-        low = conn;
-      }
-    }
-  }
-  if(inf_test_traffic_replay_connection_process_next_message(low))
-  {
-    if(g_slist_find(replay-&gt;conns, low))
-      inf_test_traffic_replay_connection_fetch_next_message(low);
-    else
-      inf_test_traffic_replay_process_next_message(replay);
-  }
-}
-static void
-inf_test_traffic_replay_received_cb(InfXmppConnection* connection,
-                                    xmlNodePtr xml,
-                                    gpointer user_data)
-{
-  InfTestTrafficReplayConnection* conn;
-  xmlBufferPtr buffer;
-  xmlSaveCtxtPtr ctx;
-  xmlNodePtr child;
-  GQueue* queue;
-  xmlChar* received_group;
-  xmlChar* expected_group;
-  conn = (InfTestTrafficReplayConnection*)user_data;
-  g_assert(strcmp(xml-&gt;name, "group") == 0);
-  for(child = xml-&gt;children; child != NULL; child = child-&gt;next)
-  {
-    if(!inf_standalone_io_loop_running(conn-&gt;replay-&gt;io))
-      break;
-    if(!conn-&gt;message ||
-       conn-&gt;message-&gt;type != INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING)
-    {
-      buffer = xmlBufferCreate();
-      ctx = xmlSaveToBuffer(buffer, "UTF-8", 0);
-      xmlSaveTree(ctx, child);
-      xmlSaveClose(ctx);
-      fprintf(
-        stderr,
-        "[ERROR] [%s] Received text \"%s\" without expecting any\n",
-        conn-&gt;name,
-        (const gchar*)xmlBufferContent(buffer)
-      );
-      xmlBufferFree(buffer);
-      inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
-      return;
-    }
-    received_group = xmlGetProp(xml, "name");
-    expected_group = xmlGetProp(conn-&gt;message-&gt;xml, "name");
-    fprintf(
-      stderr,
-      "[%s] Received data (%s, %s), expected %s\n",
-      conn-&gt;name,
-      received_group,
-      child-&gt;name,
-      expected_group
-    );
-    queue = g_hash_table_lookup(conn-&gt;group_queues, expected_group);
-    g_assert(queue == NULL || g_queue_is_empty(queue));
-    if(strcmp(received_group, expected_group) != 0)
-    {
-      queue = g_hash_table_lookup(conn-&gt;group_queues, received_group);
-      if(!queue)
-      {
-        queue = g_queue_new();
-        g_hash_table_insert(
-          conn-&gt;group_queues,
-          g_strdup(received_group),
-          queue
-        );
-      }
-      g_queue_push_tail(queue, xmlCopyNode(child, 1));
-      xmlFree(received_group);
-      xmlFree(expected_group);
-    }
-    else
-    {
-      xmlFree(received_group);
-      xmlFree(expected_group);
-      inf_test_traffic_replay_connection_check_message(conn, child);
-      inf_test_traffic_replay_connection_fetch_next_message(conn);
-    }
-  }
-}
-static void
-inf_test_traffic_replay_notify_status_cb(GObject* object,
-                                         GParamSpec* pspec,
-                                         gpointer user_data)
-{
-  InfTestTrafficReplayConnection* conn;
-  InfXmlConnectionStatus status;
-  conn = (InfTestTrafficReplayConnection*)user_data;
-  g_object_get(object, "status", &amp;status, NULL);
-  switch(status)
-  {
-  case INF_XML_CONNECTION_OPENING:
-    break;
-  case INF_XML_CONNECTION_OPEN:
-    fprintf(stderr, "[%s] Connected\n", conn-&gt;name);
-    inf_test_traffic_replay_connection_fetch_next_message(conn);
-    break;
-  case INF_XML_CONNECTION_CLOSING:
-  case INF_XML_CONNECTION_CLOSED:
-    fprintf(stderr, "[ERROR] [%s] Remote connection closed\n", conn-&gt;name);
-    inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
-    break;
-  }
-}
-static void
-inf_test_traffic_replay_new_connection_cb(InfdXmppServer* server,
-                                          InfXmppConnection* xmpp,
-                                          gpointer user_data)
-{
-  InfTestTrafficReplayConnection* conn;
-  InfTestTrafficReplay* replay;
-  InfXmlConnectionStatus status;
-  GError* error;
-  conn = g_slice_new(InfTestTrafficReplayConnection);
-  replay = (InfTestTrafficReplay*)user_data;
-  conn-&gt;name = g_strdup("server");
-  conn-&gt;replay = replay;
-  conn-&gt;creds = NULL;
-  conn-&gt;xmpp = xmpp;
-  conn-&gt;group_queues = g_hash_table_new_full(
-    g_str_hash,
-    g_str_equal,
-    g_free,
-    (GDestroyNotify)inf_test_traffic_replay_queue_free
-  );
-  error = NULL;
-  conn-&gt;message = inf_test_traffic_replay_get_next_message(conn, &amp;error);
-  if(error != NULL)
-  {
-    fprintf(
-      stderr,
-      "Failed to read initial message for %s: %s\n",
-      conn-&gt;name,
-      error-&gt;message
-    );
-    inf_test_traffic_replay_connection_close(conn);
-  }
-  replay-&gt;conns = g_slist_prepend(replay-&gt;conns, conn);
-  g_object_ref(xmpp);
-  g_signal_connect(
-    G_OBJECT(xmpp),
-    "received",
-    G_CALLBACK(inf_test_traffic_replay_received_cb),
-    conn
-  );
-  g_signal_connect(
-    G_OBJECT(conn-&gt;xmpp),
-    "notify::status",
-    G_CALLBACK(inf_test_traffic_replay_notify_status_cb),
-    conn
-  );
-  conn-&gt;file = fopen(replay-&gt;filename, "r");
-  if(!conn-&gt;file)
-  {
-    fprintf(
-      stderr,
-      "Failed to open %s: %s\n",
-      replay-&gt;filename,
-      strerror(errno)
-    );
-    inf_test_traffic_replay_connection_close(conn);
-  }
-  else
-  {
-    g_object_get(G_OBJECT(conn-&gt;xmpp), "status", &amp;status, NULL);
-    if(status == INF_XML_CONNECTION_OPEN)
-    {
-      inf_test_traffic_replay_connection_fetch_next_message(conn);
-    }
-  }
-}
-static InfCertificateCredentials*
-inf_test_traffic_replay_load_server_credentials(GError** error)
-{
-  GPtrArray* array;
-  gnutls_x509_privkey_t key;
-  InfCertificateCredentials* creds;
-  gnutls_certificate_credentials_t gcreds;
-  guint i;
-  key = inf_cert_util_read_private_key(
-    "/home/armin/kombia/kombia.cert",
-    error
-  );
-  if(!key) return NULL;
-  array = inf_cert_util_read_certificate(
-    "/home/armin/kombia/kombia.cert",
-    NULL,
-    error
-  );
-  if(!array) return NULL;
-  creds = inf_certificate_credentials_new();
-  gcreds = inf_certificate_credentials_get(creds);
-  gnutls_certificate_set_x509_key(
-    gcreds,
-    (gnutls_x509_crt_t*)array-&gt;pdata,
-    array-&gt;len,
-    key
-  );
-  gnutls_certificate_set_x509_trust(
-    gcreds,
-    (gnutls_x509_crt_t*)array-&gt;pdata,
-    array-&gt;len
-  );
-  gnutls_x509_privkey_deinit(key);
-  for(i = 0; i &lt; array-&gt;len; ++i)
-    gnutls_x509_crt_deinit(array-&gt;pdata[i]);
-  g_ptr_array_free(array, TRUE);
-  return creds;
-}
-static InfCertificateCredentials*
-inf_test_traffic_replay_load_client_credentials(const gchar* path,
-                                                GError** error)
-{
-  gchar* basename;
-  gchar* dirname;
-  gchar* full;
-  GPtrArray* array;
-  gnutls_x509_privkey_t key;
-  InfCertificateCredentials* creds;
-  gnutls_certificate_credentials_t gcreds;
-  guint i;
-  basename = g_path_get_basename(path);
-  dirname = g_path_get_dirname(path);
-  full = g_build_filename(dirname, "certs", basename, NULL);
-  g_free(basename);
-  g_free(dirname);
-  key = inf_cert_util_read_private_key(full, error);
-  if(!key) { g_free(full); return NULL; }
-  array = inf_cert_util_read_certificate(full, NULL, error);
-  if(!array) { g_free(full); return NULL; }
-  g_free(full);
-  creds = inf_certificate_credentials_new();
-  gcreds = inf_certificate_credentials_get(creds);
-  gnutls_certificate_set_x509_key(
-    gcreds,
-    (gnutls_x509_crt_t*)array-&gt;pdata,
-    array-&gt;len,
-    key
-  );
-  gnutls_certificate_set_x509_trust(
-    gcreds,
-    (gnutls_x509_crt_t*)&amp;array-&gt;pdata[array-&gt;len - 1],
-    1
-  );
-  gnutls_x509_privkey_deinit(key);
-  for(i = 0; i &lt; array-&gt;len; ++i)
-    gnutls_x509_crt_deinit(array-&gt;pdata[i]);
-  g_ptr_array_free(array, TRUE);
-  return creds;
-}
-static void
-inf_test_traffic_replay_start_func(gpointer user_data)
-{
-  inf_test_traffic_replay_process_next_message(user_data);
-}
-int main(int argc, char* argv[])
-{
-  InfTestTrafficReplay replay;
-  InfdTcpServer* server;
-  InfCertificateCredentials* creds;
-  GError* error;
-  gboolean as_server;
-  guint port;
-  int i;
-  FILE* f;
-  InfTestTrafficReplayConnection* conn;
-  as_server = FALSE;
-  port = 6524;
-  if(argc &lt; 2)
-  {
-    fprintf(stderr, "Usage: %s &lt;traffic-log&gt;\n", argv[0]);
-    return -1;
-  }
-  error = NULL;
-  if(!inf_init(&amp;error))
-  {
-    fprintf(stderr, "%s\n", error-&gt;message);
-    g_error_free(error);
-    return -1;
-  }
-  replay.io = inf_standalone_io_new();
-  replay.port = port;
-  replay.xmpp = NULL;
-  replay.conns = NULL;
-  if(as_server == TRUE)
-  {
-    replay.filename = argv[1];
-    creds = inf_test_traffic_replay_load_server_credentials(&amp;error);
-    if(!creds)
-    {
-      fprintf(stderr, "%s\n", error-&gt;message);
-      g_error_free(error);
-      return -1;
-    }
-    server = g_object_new(
-      INFD_TYPE_TCP_SERVER,
-      "io", replay.io,
-      "local-address", NULL,
-      "local-port", port,
-      NULL
-    );
-    replay.xmpp = infd_xmpp_server_new(
-      server,
-      INF_XMPP_CONNECTION_SECURITY_ONLY_TLS,
-      creds,
-      NULL,
-      NULL
-    );
-    inf_certificate_credentials_unref(creds);
-    g_signal_connect(
-      G_OBJECT(replay.xmpp),
-      "new-connection",
-      G_CALLBACK(inf_test_traffic_replay_new_connection_cb),
-      &amp;replay
-    );
-    if(!infd_tcp_server_open(server, &amp;error))
-    {
-      fprintf(stderr, "%s\n", error-&gt;message);
-      g_error_free(error);
-      return 1;
-    }
-    g_object_unref(server);
-  }
-  else
-  {
-    replay.filename = NULL;
-    for(i = 1; i &lt; argc; ++i)
-    {
-      f = fopen(argv[i], "r");
-      if(!f)
-      {
-        fprintf(
-          stderr,
-          "Failed to open %s: %s\n",
-          argv[i],
-          strerror(errno)
-        );
-        return 1;
-      }
-      conn = g_slice_new(InfTestTrafficReplayConnection);
-      conn-&gt;replay = &amp;replay;
-      conn-&gt;name = g_strdup_printf("client %d (%s)", i, argv[i]);
-      conn-&gt;xmpp = NULL;
-      conn-&gt;file = f;
-      conn-&gt;group_queues = g_hash_table_new_full(
-        g_str_hash,
-        g_str_equal,
-        g_free,
-        (GDestroyNotify)inf_test_traffic_replay_queue_free
-      );
-      conn-&gt;creds = inf_test_traffic_replay_load_client_credentials(argv[i], &amp;error);
-      if(error != NULL)
-      {
-        if(error-&gt;domain == G_FILE_ERROR &amp;&amp; error-&gt;code == G_FILE_ERROR_NOENT)
-        {
-          printf("No client credentials for %s\n", conn-&gt;name);
-          g_error_free(error);
-          error = NULL;
-        }
-        else
-        {
-          fprintf(
-            stderr,
-            "Failed to load client credentials for %s: %s\n",
-            conn-&gt;name,
-            error-&gt;message
-          );
-          return 1;
-        }
-      }
-      else
-      {
-        printf("Loaded client credentials for %s\n", conn-&gt;name);
-      }
-      replay.conns = g_slist_prepend(replay.conns, conn);
-      conn-&gt;message = inf_test_traffic_replay_get_next_message(conn, &amp;error);
-      if(error != NULL)
-      {
-        fprintf(
-          stderr,
-          "Failed to read initial message for %s: %s\n",
-          conn-&gt;name,
-          error-&gt;message
-        );
-        return 1;
-      }
-    }
-    inf_io_add_dispatch(
-      INF_IO(replay.io),
-      inf_test_traffic_replay_start_func,
-      &amp;replay,
-      NULL
-    );
-  }
-  inf_standalone_io_loop(replay.io);
-  return 0;
-}
+1 #define _XOPEN_SOURCE 700
+2 #include "util/inf-test-util.h"
+3 #include &lt;libinfinity/server/infd-xml-server.h&gt;
+4 #include &lt;libinfinity/server/infd-xmpp-server.h&gt;
+5 #include &lt;libinfinity/common/inf-standalone-io.h&gt;
+6 #include &lt;libinfinity/common/inf-cert-util.h&gt;
+7 #include &lt;libinfinity/common/inf-init.h&gt;
+8 #include &lt;gnutls/gnutls.h&gt;
+9 #include &lt;gnutls/x509.h&gt;
+10 #include &lt;libxml/xmlsave.h&gt;
+11 #include &lt;time.h&gt;
+12 #include &lt;string.h&gt;
+13 #include &lt;errno.h&gt;
+14 #include &lt;assert.h&gt;
+15 typedef struct _InfTestTrafficReplay InfTestTrafficReplay;
+16 struct _InfTestTrafficReplay {
+17   InfStandaloneIo* io;
+18   guint port;
+19   InfdXmppServer* xmpp;
+20   const gchar* filename;
+21 <a name="0"></a>  GSList* conns;
+22 };
+23 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>typedef enum _InfTestTrafficReplayMessageType {
+24   INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING,
+25   INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING,
+26   INF_TEST_TRAFFIC_REPLAY_MESSAGE_CONNECT,
+27   INF_TEST_TRAFFIC_REPLAY_MESSAGE_DISCONNECT,
+28   INF_TEST_TRAFFIC_REPLAY_MESSAGE_ERROR
+29 } InfTestTrafficReplayMessageType;
+30 typedef struct _InfTestTrafficReplayMessage InfTestTrafficReplayMessage;
+31 struct _InfTestTrafficReplayMessage {
+32   gint64 timestamp;   InfTestTrafficReplayMessageType type;
+33   xmlNodePtr xml;
+34   xmlNodePtr xml_iter;
+35 };
+36 typedef struct _InfTestTrafficReplayConnection InfTestTrafficReplayConnection;
+37 struct _InfTestTrafficReplayConnection {
+38   gchar* name;
+39   InfTestTrafficReplay* replay;
+40   InfCertificateCredentials* creds;
+41   InfXmppConnection* xmpp;
+42   FILE* file;
+43   InfTestTrafficReplayMessage* message;
+44   GHashTable* group_queues; };</b></font>
+45 typedef enum _InfTestTrafficReplayError {
+46   INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
+47   INF_TEST_TRAFFIC_REPLAY_ERROR_UNEXPECTED_EOF
+48 } InfTestTrafficReplayError;
+49 static GQuark
+50 inf_test_traffic_replay_error_quark()
+51 {
+52   return g_quark_from_static_string("INF_TEST_TRAFFIC_REPLAY_ERROR");
+53 }
+54 static void
+55 inf_test_traffic_replay_received_cb(InfXmppConnection* connection,
+56                                     xmlNodePtr xml,
+57                                     gpointer user_data);
+58 static void
+59 inf_test_traffic_replay_notify_status_cb(GObject* object,
+60                                          GParamSpec* pspec,
+61                                          gpointer user_data);
+62 static void
+63 inf_test_traffic_replay_queue_free(GQueue* queue)
+64 {
+65   g_queue_free_full(queue, (GDestroyNotify)xmlFreeDoc);
+66 }
+67 static void
+68 inf_test_traffic_replay_message_free(InfTestTrafficReplayMessage* message)
+69 {
+70   if(message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING ||
+71      message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING)
+72   {
+73     if(message-&gt;xml != NULL)
+74       xmlFreeNode(message-&gt;xml);
+75   }
+76   g_slice_free(InfTestTrafficReplayMessage, message);
+77 }
+78 static char*
+79 inf_test_traffic_replay_get_next_line(InfTestTrafficReplayConnection* conn,
+80                                       size_t* len,
+81                                       GError** error)
+82 {
+83   char* line;
+84   size_t n;
+85   ssize_t len_;
+86   int err;
+87   line = NULL;
+88   n = 0;
+89   len_ = getline(&amp;line, &amp;n, conn-&gt;file);
+90   if(len_ &gt;= 0)
+91   {
+92     *len = len_;
+93     return line;
+94   }
+95   else
+96   {
+97     if(feof(conn-&gt;file))
+98     {
+99       g_set_error(
+100         error,
+101         inf_test_traffic_replay_error_quark(),
+102         INF_TEST_TRAFFIC_REPLAY_ERROR_UNEXPECTED_EOF,
+103         "Unexpected end of file"
+104       );
+105     }
+106     else
+107     {
+108       err = ferror(conn-&gt;file);
+109       g_set_error_literal(
+110         error,
+111         G_FILE_ERROR,
+112         g_file_error_from_errno(err),
+113         strerror(err)
+114       );
+115     }
+116     return NULL;
+117   }
+118 }
+119 static InfTestTrafficReplayMessage*
+120 inf_test_traffic_replay_get_next_message(InfTestTrafficReplayConnection* conn,
+121                                          GError** error)
+122 {
+123   char* line;
+124   size_t len;
+125   size_t n;
+126   struct tm tm;
+127   char* end;
+128   gulong msecs;
+129   InfTestTrafficReplayMessageType type;
+130   xmlDocPtr xml;
+131   GString* str;
+132   InfTestTrafficReplayMessage* message;
+133   line = inf_test_traffic_replay_get_next_line(conn, &amp;len, error);
+134   if(!line) return NULL;
+135   if(line[0] != '[')
+136   {
+137     g_set_error(
+138       error,
+139       inf_test_traffic_replay_error_quark(),
+140       INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
+141       "Line does not start with a timestamp"
+142     );
+143     free(line);
+144     return FALSE;
+145   }
+146   end = strptime(&amp;line[1], "%a %d %b %Y %I:%M:%S %p %Z", &amp;tm);
+147   if(end == NULL || *end != ' ' || *(end+1) != '.')
+148   {
+149     g_set_error(
+150       error,
+151       inf_test_traffic_replay_error_quark(),
+152       INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
+153       "Failed to parse timestamp"
+154     );
+155     free(line);
+156     return FALSE;
+157   }
+158   errno = 0;
+159   msecs = strtoul(&amp;end[2], &amp;end, 10);
+160   if(errno != 0 || *end != ']' || msecs &gt;= 1000000)
+161   {
+162     g_set_error(
+163       error,
+164       inf_test_traffic_replay_error_quark(),
+165       INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
+166       "Failed to parse timestamp"
+167     );
+168     free(line);
+169     return FALSE;
+170   }
+171   ++end;
+172   tm.tm_isdst = 1;
+173   n = (end - line) + 1;
+174   if(line[n] == '!')
+175   {
+176     if(strstr(line + n + 4, "connected") != NULL)
+177       type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_CONNECT;
+178     else if(strstr(line + n + 4, "Connection error") != NULL)
+179       type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_ERROR;
+180     else if(strstr(line + n + 4, "closed") != NULL)
+181       type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_DISCONNECT;
+182     else
+183     {
+184       g_set_error(
+185         error,
+186         inf_test_traffic_replay_error_quark(),
+187         INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
+188         "Unknown connection event \"%s\"",
+189         line + n + 4
+190       );
+191       free(line);
+192       return FALSE;
+193     }
+194   }
+195   else if(line[n] == '&lt;')
+196   {
+197     if(FALSE)       type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING;
+198     else
+199       type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING;
+200   }
+201   else if(line[n] == '&gt;')
+202   {
+203       type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING;
+204     else
+205       type = INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING;
+206   }
+207   else
+208   {
+209     g_set_error(
+210       error,
+211       inf_test_traffic_replay_error_quark(),
+212       INF_TEST_TRAFFIC_REPLAY_ERROR_INVALID_LINE,
+213       "Unknown control character \"%c\" (%d)",
+214       line[n],
+215       (int)line[n]
+216     );
+217     free(line);
+218     return FALSE;
+219   }
+220   if(type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING ||
+221      type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING)
+222   {
+223     str = g_string_new_len(line + n + 4, len - n - 5);
+224     xml = xmlReadDoc(str-&gt;str, NULL, "UTF-8", XML_PARSE_NOWARNING | XML_PARSE_NOERROR);
+225     while(!xml)
+226     {
+227       free(line);
+228       line = inf_test_traffic_replay_get_next_line(conn, &amp;len, error);
+229       if(!line)
+230       {
+231         g_string_free(str, TRUE);
+232         return NULL;
+233       }
+234       g_string_append_c(str, '\n');
+235       g_string_append_len(str, line, len - 1);
+236       xml = xmlReadDoc(str-&gt;str, NULL, "UTF-8", XML_PARSE_NOWARNING | XML_PARSE_NOERROR);
+237     }
+238     g_string_free(str, TRUE);
+239   }
+240   free(line);
+241   message = g_slice_new(InfTestTrafficReplayMessage);
+242   message-&gt;timestamp = (gint64)mktime(&amp;tm) * 1000000 + msecs;
+243   message-&gt;type = type;
+244   if(type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING ||
+245      type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING)
+246   {
+247     message-&gt;xml = xmlCopyNode(xmlDocGetRootElement(xml), 1);
+248     if(type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING)
+249       message-&gt;xml_iter = message-&gt;xml-&gt;children;
+250     xmlFreeDoc(xml);
+251   }
+252   return message;
+253 }
+254 static void
+255 inf_test_traffic_replay_connection_close(InfTestTrafficReplayConnection* conn)
+256 {
+257   InfXmlConnectionStatus status;
+258   g_signal_handlers_disconnect_by_func(
+259     G_OBJECT(conn-&gt;xmpp),
+260     G_CALLBACK(inf_test_traffic_replay_received_cb),
+261     conn
+262   );
+263   g_signal_handlers_disconnect_by_func(
+264     G_OBJECT(conn-&gt;xmpp),
+265     G_CALLBACK(inf_test_traffic_replay_notify_status_cb),
+266     conn
+267   );
+268   if(conn-&gt;xmpp != NULL)
+269   {
+270     g_object_get(G_OBJECT(conn-&gt;xmpp), "status", &amp;status, NULL);
+271     if(status == INF_XML_CONNECTION_OPEN ||
+272        status == INF_XML_CONNECTION_OPENING)
+273     {
+274       inf_xml_connection_close(INF_XML_CONNECTION(conn-&gt;xmpp));
+275     }
+276   }
+277   if(conn-&gt;creds != NULL)
+278     inf_certificate_credentials_unref(conn-&gt;creds);
+279   g_object_unref(conn-&gt;xmpp);
+280   if(conn-&gt;file != NULL) fclose(conn-&gt;file);
+281   g_hash_table_destroy(conn-&gt;group_queues);
+282   fprintf(stderr, "[%s] Disconnected\n", conn-&gt;name);
+283   g_free(conn-&gt;name);
+284   conn-&gt;replay-&gt;conns = g_slist_remove(conn-&gt;replay-&gt;conns, conn);
+285   if(conn-&gt;replay-&gt;conns == NULL)
+286     inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
+287   g_slice_free(InfTestTrafficReplayConnection, conn);
+288 }
+289 static void
+290 inf_test_traffic_replay_connection_check_message(
+291   InfTestTrafficReplayConnection* conn,
+292   xmlNodePtr xml)
+293 {
+294   xmlBufferPtr received_buffer;
+295   xmlBufferPtr expected_buffer;
+296   xmlSaveCtxtPtr ctx;
+297   received_buffer = xmlBufferCreate();
+298   expected_buffer = xmlBufferCreate();
+299   if(strcmp(conn-&gt;message-&gt;xml_iter-&gt;name, "message") == 0)
+300     xmlSetProp(conn-&gt;message-&gt;xml_iter, "time", NULL);
+301   if(strcmp(xml-&gt;name, "message") == 0)
+302     xmlSetProp(xml, "time", NULL);
+303   ctx = xmlSaveToBuffer(expected_buffer, "UTF-8", 0);
+304   xmlSaveTree(ctx, conn-&gt;message-&gt;xml_iter);
+305   xmlSaveClose(ctx);
+306   ctx = xmlSaveToBuffer(received_buffer, "UTF-8", 0);
+307   xmlSaveTree(ctx, xml);
+308   xmlSaveClose(ctx);
+309   if(strcmp(xmlBufferContent(expected_buffer), xmlBufferContent(received_buffer)) != 0)
+310   {
+311     fprintf(
+312       stderr,
+313       "[WARNING] [%s] Mismatch between expected and received: "
+314       "\n\n\"%s\"\n\nvs.\n\n\"%s\"\n",
+315       conn-&gt;name,
+316       (const gchar*)xmlBufferContent(expected_buffer),
+317       (const gchar*)xmlBufferContent(received_buffer)
+318     );
+319     xmlBufferFree(expected_buffer);
+320     xmlBufferFree(received_buffer);
+321     if(inf_standalone_io_loop_running(conn-&gt;replay-&gt;io))
+322       inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
+323     return;
+324   }
+325   xmlBufferFree(expected_buffer);
+326   xmlBufferFree(received_buffer);
+327 }
+328 static gboolean
+329 inf_test_traffic_replay_connection_process_next_message(
+330   InfTestTrafficReplayConnection* conn)
+331 {
+332   InfIpAddress* addr;
+333   InfTcpConnection* tcp;
+334   GError* error;
+335   xmlChar* group;
+336   GQueue* queue;
+337   switch(conn-&gt;message-&gt;type)
+338   {
+339   case INF_TEST_TRAFFIC_REPLAY_MESSAGE_CONNECT:
+340     if(conn-&gt;xmpp != NULL)
+341       return FALSE;
+342     fprintf(stderr, "[%s] Connecting...\n", conn-&gt;name);
+343     addr = inf_ip_address_new_loopback4();
+344     tcp = inf_tcp_connection_new(
+345       INF_IO(conn-&gt;replay-&gt;io),
+346       addr,
+347       conn-&gt;replay-&gt;port
+348     );
+349     inf_ip_address_free(addr);
+350     conn-&gt;xmpp = inf_xmpp_connection_new(
+351       tcp,
+352       INF_XMPP_CONNECTION_CLIENT,
+353       NULL,
+354       "localhost",
+355       INF_XMPP_CONNECTION_SECURITY_ONLY_TLS,
+356       conn-&gt;creds,
+357       NULL,
+358       NULL
+359     );
+360     g_signal_connect(
+361       G_OBJECT(conn-&gt;xmpp),
+362       "received",
+363       G_CALLBACK(inf_test_traffic_replay_received_cb),
+364       conn
+365     );
+366     g_signal_connect(
+367       G_OBJECT(conn-&gt;xmpp),
+368       "notify::status",
+369       G_CALLBACK(inf_test_traffic_replay_notify_status_cb),
+370       conn
+371     );
+372     error = NULL;
+373     if(!inf_tcp_connection_open(tcp, &amp;error))
+374     {
+375       fprintf(stderr, "[ERROR] [%s] %s\n", conn-&gt;name, error-&gt;message);
+376       g_error_free(error);
+377       if(inf_standalone_io_loop_running(conn-&gt;replay-&gt;io))
+378         inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
+379       return FALSE;
+380     }
+381     g_object_unref(tcp);
+382     return FALSE;
+383   case INF_TEST_TRAFFIC_REPLAY_MESSAGE_DISCONNECT:
+384     g_assert(conn-&gt;xmpp != NULL);
+385     inf_test_traffic_replay_connection_close(conn);
+386     return TRUE;
+387   case INF_TEST_TRAFFIC_REPLAY_MESSAGE_ERROR:
+388     g_assert(conn-&gt;xmpp != NULL);
+389     fprintf(stderr, "[%s] Recorded connection error, ignored\n", conn-&gt;name);
+390     return TRUE;
+391   case INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING:
+392     g_assert(conn-&gt;xmpp != NULL);
+393     group = xmlGetProp(conn-&gt;message-&gt;xml, "name");
+394     fprintf(stderr, "[%s] Expecting data (%s, %s)\n", conn-&gt;name, group, conn-&gt;message-&gt;xml_iter-&gt;name);     queue = g_hash_table_lookup(conn-&gt;group_queues, group);
+395     xmlFree(group);
+396     g_assert(queue == NULL || g_queue_is_empty(queue));
+397     return FALSE;
+398   case INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING:
+399     g_assert(conn-&gt;xmpp != NULL);
+400     group = xmlGetProp(conn-&gt;message-&gt;xml, "name");
+401     fprintf(stderr, "[%s] Sending data (%s, %s)\n", conn-&gt;name, group, conn-&gt;message-&gt;xml-&gt;children-&gt;name);     xmlFree(group);
+402     inf_xml_connection_send(
+403       INF_XML_CONNECTION(conn-&gt;xmpp),
+404       conn-&gt;message-&gt;xml
+405     );
+406     conn-&gt;message-&gt;xml = NULL;
+407     return TRUE;
+408   default:
+409     g_assert_not_reached();
+410     break;
+411   }
+412 }
+413 static void
+414 inf_test_traffic_replay_process_next_message(InfTestTrafficReplay* replay);
+415 static void
+416 inf_test_traffic_replay_connection_fetch_next_message(
+417   InfTestTrafficReplayConnection* conn)
+418 {
+419   xmlChar* group;
+420   GQueue* queue;
+421   xmlNodePtr xml;
+422   if(!inf_standalone_io_loop_running(conn-&gt;replay-&gt;io))
+423     return;
+424   if(conn-&gt;message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING &amp;&amp;
+425      conn-&gt;message-&gt;xml_iter-&gt;next != NULL)
+426   {
+427     conn-&gt;message-&gt;xml_iter = conn-&gt;message-&gt;xml_iter-&gt;next;
+428   }
+429   else
+430   {
+431     GError* error;
+432     inf_test_traffic_replay_message_free(conn-&gt;message);
+433     error = NULL;
+434     conn-&gt;message = inf_test_traffic_replay_get_next_message(conn, &amp;error);
+435     if(error != NULL)
+436     {
+437       fprintf(
+438         stderr,
+439         "[ERROR] [%s] Failed to fetch message: %s\n",
+440         conn-&gt;name,
+441         error-&gt;message
+442       );
+443       g_error_free(error);
+444       if(inf_standalone_io_loop_running(conn-&gt;replay-&gt;io))
+445         inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
+446       return;
+447     }
+448   }
+449   if(conn-&gt;message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING)
+450   {
+451     group = xmlGetProp(conn-&gt;message-&gt;xml, "name");
+452     queue = g_hash_table_lookup(conn-&gt;group_queues, group);
+453     if(queue != NULL &amp;&amp; !g_queue_is_empty(queue))
+454     {
+455       xml = g_queue_pop_head(queue);
+456       fprintf(stderr, "[%s] Replay data (%s, %s)\n", conn-&gt;name, group, xml-&gt;name);
+457       inf_test_traffic_replay_connection_check_message(conn, xml);
+458       inf_test_traffic_replay_connection_fetch_next_message(conn);
+459       xmlFree(group);
+460       return;
+461     }
+462     xmlFree(group);
+463   }
+464   inf_test_traffic_replay_process_next_message(conn-&gt;replay);
+465 }
+466 static void
+467 inf_test_traffic_replay_process_next_message(InfTestTrafficReplay* replay)
+468 {
+469   GSList* item;
+470   InfTestTrafficReplayConnection* conn;
+471   InfTestTrafficReplayConnection* low;
+472   if(!inf_standalone_io_loop_running(replay-&gt;io))
+473     return;
+474   low = NULL;
+475   for(item = replay-&gt;conns; item != NULL; item = item-&gt;next)
+476   {
+477     conn = (InfTestTrafficReplayConnection*)item-&gt;data;
+478     if(low == NULL || conn-&gt;message-&gt;timestamp &lt; low-&gt;message-&gt;timestamp)
+479       low = conn;
+480     else if(conn-&gt;message-&gt;timestamp == low-&gt;message-&gt;timestamp)
+481     {
+482       if(conn-&gt;message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_OUTGOING &amp;&amp;
+483          low-&gt;message-&gt;type == INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING)
+484       {
+485         low = conn;
+486       }
+487     }
+488   }
+489   if(inf_test_traffic_replay_connection_process_next_message(low))
+490   {
+491     if(g_slist_find(replay-&gt;conns, low))
+492       inf_test_traffic_replay_connection_fetch_next_message(low);
+493     else
+494       inf_test_traffic_replay_process_next_message(replay);
+495   }
+496 }
+497 static void
+498 inf_test_traffic_replay_received_cb(InfXmppConnection* connection,
+499                                     xmlNodePtr xml,
+500                                     gpointer user_data)
+501 {
+502   InfTestTrafficReplayConnection* conn;
+503   xmlBufferPtr buffer;
+504   xmlSaveCtxtPtr ctx;
+505   xmlNodePtr child;
+506   GQueue* queue;
+507   xmlChar* received_group;
+508   xmlChar* expected_group;
+509   conn = (InfTestTrafficReplayConnection*)user_data;
+510   g_assert(strcmp(xml-&gt;name, "group") == 0);
+511   for(child = xml-&gt;children; child != NULL; child = child-&gt;next)
+512   {
+513     if(!inf_standalone_io_loop_running(conn-&gt;replay-&gt;io))
+514       break;
+515     if(!conn-&gt;message ||
+516        conn-&gt;message-&gt;type != INF_TEST_TRAFFIC_REPLAY_MESSAGE_INCOMING)
+517     {
+518       buffer = xmlBufferCreate();
+519       ctx = xmlSaveToBuffer(buffer, "UTF-8", 0);
+520       xmlSaveTree(ctx, child);
+521       xmlSaveClose(ctx);
+522       fprintf(
+523         stderr,
+524         "[ERROR] [%s] Received text \"%s\" without expecting any\n",
+525         conn-&gt;name,
+526         (const gchar*)xmlBufferContent(buffer)
+527       );
+528       xmlBufferFree(buffer);
+529       inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
+530       return;
+531     }
+532     received_group = xmlGetProp(xml, "name");
+533     expected_group = xmlGetProp(conn-&gt;message-&gt;xml, "name");
+534     fprintf(
+535       stderr,
+536       "[%s] Received data (%s, %s), expected %s\n",
+537       conn-&gt;name,
+538       received_group,
+539       child-&gt;name,
+540       expected_group
+541     );
+542     queue = g_hash_table_lookup(conn-&gt;group_queues, expected_group);
+543     g_assert(queue == NULL || g_queue_is_empty(queue));
+544     if(strcmp(received_group, expected_group) != 0)
+545     {
+546       queue = g_hash_table_lookup(conn-&gt;group_queues, received_group);
+547       if(!queue)
+548       {
+549         queue = g_queue_new();
+550         g_hash_table_insert(
+551           conn-&gt;group_queues,
+552           g_strdup(received_group),
+553           queue
+554         );
+555       }
+556       g_queue_push_tail(queue, xmlCopyNode(child, 1));
+557       xmlFree(received_group);
+558       xmlFree(expected_group);
+559     }
+560     else
+561     {
+562       xmlFree(received_group);
+563       xmlFree(expected_group);
+564       inf_test_traffic_replay_connection_check_message(conn, child);
+565       inf_test_traffic_replay_connection_fetch_next_message(conn);
+566     }
+567   }
+568 }
+569 static void
+570 inf_test_traffic_replay_notify_status_cb(GObject* object,
+571                                          GParamSpec* pspec,
+572                                          gpointer user_data)
+573 {
+574   InfTestTrafficReplayConnection* conn;
+575   InfXmlConnectionStatus status;
+576   conn = (InfTestTrafficReplayConnection*)user_data;
+577   g_object_get(object, "status", &amp;status, NULL);
+578   switch(status)
+579   {
+580   case INF_XML_CONNECTION_OPENING:
+581     break;
+582   case INF_XML_CONNECTION_OPEN:
+583     fprintf(stderr, "[%s] Connected\n", conn-&gt;name);
+584     inf_test_traffic_replay_connection_fetch_next_message(conn);
+585     break;
+586   case INF_XML_CONNECTION_CLOSING:
+587   case INF_XML_CONNECTION_CLOSED:
+588     fprintf(stderr, "[ERROR] [%s] Remote connection closed\n", conn-&gt;name);
+589     inf_standalone_io_loop_quit(conn-&gt;replay-&gt;io);
+590     break;
+591   }
+592 }
+593 static void
+594 inf_test_traffic_replay_new_connection_cb(InfdXmppServer* server,
+595                                           InfXmppConnection* xmpp,
+596                                           gpointer user_data)
+597 {
+598   InfTestTrafficReplayConnection* conn;
+599   InfTestTrafficReplay* replay;
+600   InfXmlConnectionStatus status;
+601   GError* error;
+602   conn = g_slice_new(InfTestTrafficReplayConnection);
+603   replay = (InfTestTrafficReplay*)user_data;
+604   conn-&gt;name = g_strdup("server");
+605   conn-&gt;replay = replay;
+606   conn-&gt;creds = NULL;
+607   conn-&gt;xmpp = xmpp;
+608   conn-&gt;group_queues = g_hash_table_new_full(
+609     g_str_hash,
+610     g_str_equal,
+611     g_free,
+612     (GDestroyNotify)inf_test_traffic_replay_queue_free
+613   );
+614   error = NULL;
+615   conn-&gt;message = inf_test_traffic_replay_get_next_message(conn, &amp;error);
+616   if(error != NULL)
+617   {
+618     fprintf(
+619       stderr,
+620       "Failed to read initial message for %s: %s\n",
+621       conn-&gt;name,
+622       error-&gt;message
+623     );
+624     inf_test_traffic_replay_connection_close(conn);
+625   }
+626   replay-&gt;conns = g_slist_prepend(replay-&gt;conns, conn);
+627   g_object_ref(xmpp);
+628   g_signal_connect(
+629     G_OBJECT(xmpp),
+630     "received",
+631     G_CALLBACK(inf_test_traffic_replay_received_cb),
+632     conn
+633   );
+634   g_signal_connect(
+635     G_OBJECT(conn-&gt;xmpp),
+636     "notify::status",
+637     G_CALLBACK(inf_test_traffic_replay_notify_status_cb),
+638     conn
+639   );
+640   conn-&gt;file = fopen(replay-&gt;filename, "r");
+641   if(!conn-&gt;file)
+642   {
+643     fprintf(
+644       stderr,
+645       "Failed to open %s: %s\n",
+646       replay-&gt;filename,
+647       strerror(errno)
+648     );
+649     inf_test_traffic_replay_connection_close(conn);
+650   }
+651   else
+652   {
+653     g_object_get(G_OBJECT(conn-&gt;xmpp), "status", &amp;status, NULL);
+654     if(status == INF_XML_CONNECTION_OPEN)
+655     {
+656       inf_test_traffic_replay_connection_fetch_next_message(conn);
+657     }
+658   }
+659 }
+660 static InfCertificateCredentials*
+661 inf_test_traffic_replay_load_server_credentials(GError** error)
+662 {
+663   GPtrArray* array;
+664   gnutls_x509_privkey_t key;
+665   InfCertificateCredentials* creds;
+666   gnutls_certificate_credentials_t gcreds;
+667   guint i;
+668   key = inf_cert_util_read_private_key(
+669     "/home/armin/kombia/kombia.cert",
+670     error
+671   );
+672   if(!key) return NULL;
+673   array = inf_cert_util_read_certificate(
+674     "/home/armin/kombia/kombia.cert",
+675     NULL,
+676     error
+677   );
+678   if(!array) return NULL;
+679   creds = inf_certificate_credentials_new();
+680   gcreds = inf_certificate_credentials_get(creds);
+681   gnutls_certificate_set_x509_key(
+682     gcreds,
+683     (gnutls_x509_crt_t*)array-&gt;pdata,
+684     array-&gt;len,
+685     key
+686   );
+687   gnutls_certificate_set_x509_trust(
+688     gcreds,
+689     (gnutls_x509_crt_t*)array-&gt;pdata,
+690     array-&gt;len
+691   );
+692   gnutls_x509_privkey_deinit(key);
+693   for(i = 0; i &lt; array-&gt;len; ++i)
+694     gnutls_x509_crt_deinit(array-&gt;pdata[i]);
+695   g_ptr_array_free(array, TRUE);
+696   return creds;
+697 }
+698 static InfCertificateCredentials*
+699 inf_test_traffic_replay_load_client_credentials(const gchar* path,
+700                                                 GError** error)
+701 {
+702   gchar* basename;
+703   gchar* dirname;
+704   gchar* full;
+705   GPtrArray* array;
+706   gnutls_x509_privkey_t key;
+707   InfCertificateCredentials* creds;
+708   gnutls_certificate_credentials_t gcreds;
+709   guint i;
+710   basename = g_path_get_basename(path);
+711   dirname = g_path_get_dirname(path);
+712   full = g_build_filename(dirname, "certs", basename, NULL);
+713   g_free(basename);
+714   g_free(dirname);
+715   key = inf_cert_util_read_private_key(full, error);
+716   if(!key) { g_free(full); return NULL; }
+717   array = inf_cert_util_read_certificate(full, NULL, error);
+718   if(!array) { g_free(full); return NULL; }
+719   g_free(full);
+720   creds = inf_certificate_credentials_new();
+721   gcreds = inf_certificate_credentials_get(creds);
+722   gnutls_certificate_set_x509_key(
+723     gcreds,
+724     (gnutls_x509_crt_t*)array-&gt;pdata,
+725     array-&gt;len,
+726     key
+727   );
+728   gnutls_certificate_set_x509_trust(
+729     gcreds,
+730     (gnutls_x509_crt_t*)&amp;array-&gt;pdata[array-&gt;len - 1],
+731     1
+732   );
+733   gnutls_x509_privkey_deinit(key);
+734   for(i = 0; i &lt; array-&gt;len; ++i)
+735     gnutls_x509_crt_deinit(array-&gt;pdata[i]);
+736   g_ptr_array_free(array, TRUE);
+737   return creds;
+738 }
+739 static void
+740 inf_test_traffic_replay_start_func(gpointer user_data)
+741 {
+742   inf_test_traffic_replay_process_next_message(user_data);
+743 }
+744 int main(int argc, char* argv[])
+745 {
+746   InfTestTrafficReplay replay;
+747   InfdTcpServer* server;
+748   InfCertificateCredentials* creds;
+749   GError* error;
+750   gboolean as_server;
+751   guint port;
+752   int i;
+753   FILE* f;
+754   InfTestTrafficReplayConnection* conn;
+755   as_server = FALSE;
+756   port = 6524;
+757   if(argc &lt; 2)
+758   {
+759     fprintf(stderr, "Usage: %s &lt;traffic-log&gt;\n", argv[0]);
+760     return -1;
+761   }
+762   error = NULL;
+763   if(!inf_init(&amp;error))
+764   {
+765     fprintf(stderr, "%s\n", error-&gt;message);
+766     g_error_free(error);
+767     return -1;
+768   }
+769   replay.io = inf_standalone_io_new();
+770   replay.port = port;
+771   replay.xmpp = NULL;
+772   replay.conns = NULL;
+773   if(as_server == TRUE)
+774   {
+775     replay.filename = argv[1];
+776     creds = inf_test_traffic_replay_load_server_credentials(&amp;error);
+777     if(!creds)
+778     {
+779       fprintf(stderr, "%s\n", error-&gt;message);
+780       g_error_free(error);
+781       return -1;
+782     }
+783     server = g_object_new(
+784       INFD_TYPE_TCP_SERVER,
+785       "io", replay.io,
+786       "local-address", NULL,
+787       "local-port", port,
+788       NULL
+789     );
+790     replay.xmpp = infd_xmpp_server_new(
+791       server,
+792       INF_XMPP_CONNECTION_SECURITY_ONLY_TLS,
+793       creds,
+794       NULL,
+795       NULL
+796     );
+797     inf_certificate_credentials_unref(creds);
+798     g_signal_connect(
+799       G_OBJECT(replay.xmpp),
+800       "new-connection",
+801       G_CALLBACK(inf_test_traffic_replay_new_connection_cb),
+802       &amp;replay
+803     );
+804     if(!infd_tcp_server_open(server, &amp;error))
+805     {
+806       fprintf(stderr, "%s\n", error-&gt;message);
+807       g_error_free(error);
+808       return 1;
+809     }
+810     g_object_unref(server);
+811   }
+812   else
+813   {
+814     replay.filename = NULL;
+815     for(i = 1; i &lt; argc; ++i)
+816     {
+817       f = fopen(argv[i], "r");
+818       if(!f)
+819       {
+820         fprintf(
+821           stderr,
+822           "Failed to open %s: %s\n",
+823           argv[i],
+824           strerror(errno)
+825         );
+826         return 1;
+827       }
+828       conn = g_slice_new(InfTestTrafficReplayConnection);
+829       conn-&gt;replay = &amp;replay;
+830       conn-&gt;name = g_strdup_printf("client %d (%s)", i, argv[i]);
+831       conn-&gt;xmpp = NULL;
+832       conn-&gt;file = f;
+833       conn-&gt;group_queues = g_hash_table_new_full(
+834         g_str_hash,
+835         g_str_equal,
+836         g_free,
+837         (GDestroyNotify)inf_test_traffic_replay_queue_free
+838       );
+839       conn-&gt;creds = inf_test_traffic_replay_load_client_credentials(argv[i], &amp;error);
+840       if(error != NULL)
+841       {
+842         if(error-&gt;domain == G_FILE_ERROR &amp;&amp; error-&gt;code == G_FILE_ERROR_NOENT)
+843         {
+844           printf("No client credentials for %s\n", conn-&gt;name);
+845           g_error_free(error);
+846           error = NULL;
+847         }
+848         else
+849         {
+850           fprintf(
+851             stderr,
+852             "Failed to load client credentials for %s: %s\n",
+853             conn-&gt;name,
+854             error-&gt;message
+855           );
+856           return 1;
+857         }
+858       }
+859       else
+860       {
+861         printf("Loaded client credentials for %s\n", conn-&gt;name);
+862       }
+863       replay.conns = g_slist_prepend(replay.conns, conn);
+864       conn-&gt;message = inf_test_traffic_replay_get_next_message(conn, &amp;error);
+865       if(error != NULL)
+866       {
+867         fprintf(
+868           stderr,
+869           "Failed to read initial message for %s: %s\n",
+870           conn-&gt;name,
+871           error-&gt;message
+872         );
+873         return 1;
+874       }
+875     }
+876     inf_io_add_dispatch(
+877       INF_IO(replay.io),
+878       inf_test_traffic_replay_start_func,
+879       &amp;replay,
+880       NULL
+881     );
+882   }
+883   inf_standalone_io_loop(replay.io);
+884   return 0;
+885 }
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -937,1945 +937,1945 @@ int main(int argc, char* argv[])
 </h3>
 <hr/>
 <pre>
-#include &lt;libinfgtk/inf-gtk-browser-store.h&gt;
-#include &lt;libinfgtk/inf-gtk-browser-model.h&gt;
-#include &lt;libinfinity/client/infc-browser.h&gt;
-#include &lt;libinfinity/inf-i18n.h&gt;
-#include &lt;libinfinity/inf-signals.h&gt;
-#include &lt;gtk/gtk.h&gt;
-typedef struct _InfGtkBrowserStoreItem InfGtkBrowserStoreItem;
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>struct _InfGtkBrowserStoreItem {
-  gchar* name;
-  InfDiscovery* discovery;
-  InfDiscoveryInfo* info;
-  InfBrowser* browser;
-  gpointer missing;
-  GSList* requests;
-  GHashTable* node_errors;
-  InfGtkBrowserModelStatus status;
-  GError* error;
-  InfGtkBrowserStoreItem* next;
-};
-typedef struct _InfGtkBrowserStoreRequestData InfGtkBrowserStoreRequestData;
-struct _InfGtkBrowserStoreRequestData {
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStoreItem* item;
-};
-typedef struct _InfGtkBrowserStorePrivate InfGtkBrowserStorePrivate;
-struct _InfGtkBrowserStorePrivate {
-  gint stamp;
-  InfIo* io;
-  InfCommunicationManager* communication_manager;
-  GSList* discoveries;
-  InfGtkBrowserStoreItem* first_item;
-  InfGtkBrowserStoreItem* last_item;
-};</b></font>
-enum {
-  PROP_0,
-  PROP_IO,
-  PROP_COMMUNICATION_MANAGER
-};
-#define INF_GTK_BROWSER_STORE_PRIVATE(obj) (G_TYPE_INSTANCE_GET_PRIVATE((obj), INF_GTK_TYPE_BROWSER_STORE, InfGtkBrowserStorePrivate))
-static void inf_gtk_browser_store_tree_model_iface_init(GtkTreeModelIface* iface);
-static void inf_gtk_browser_store_browser_model_iface_init(InfGtkBrowserModelInterface* iface);
-G_DEFINE_TYPE_WITH_CODE(InfGtkBrowserStore, inf_gtk_browser_store, G_TYPE_OBJECT,
-  G_ADD_PRIVATE(InfGtkBrowserStore)
-  G_IMPLEMENT_INTERFACE(GTK_TYPE_TREE_MODEL, inf_gtk_browser_store_tree_model_iface_init)
-  G_IMPLEMENT_INTERFACE(INF_GTK_TYPE_BROWSER_MODEL, inf_gtk_browser_store_browser_model_iface_init))
-static InfGtkBrowserStoreItem*
-inf_gtk_browser_store_find_item_by_connection(InfGtkBrowserStore* store,
-                                              InfXmlConnection* connection)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfcBrowser* browser;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  for(item = priv-&gt;first_item; item != NULL; item = item-&gt;next)
-  {
-    if(item-&gt;browser != NULL &amp;&amp; INFC_IS_BROWSER(item-&gt;browser))
-    {
-      browser = INFC_BROWSER(item-&gt;browser);
-      if(infc_browser_get_connection(browser) == connection)
-        return item;
-    }
-  }
-  return NULL;
-}
-static InfGtkBrowserStoreItem*
-inf_gtk_browser_store_find_item_by_browser(InfGtkBrowserStore* store,
-                                           InfBrowser* browser)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  for(item = priv-&gt;first_item; item != NULL; item = item-&gt;next)
-    if(item-&gt;browser != NULL)
-      if(item-&gt;browser == browser)
-        return item;
-  return NULL;
-}
-static InfGtkBrowserStoreItem*
-inf_gtk_browser_store_find_item_by_discovery_info(InfGtkBrowserStore* store,
-                                                  InfDiscoveryInfo* info)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  for(item = priv-&gt;first_item; item != NULL; item = item-&gt;next)
-    if(item-&gt;info != NULL)
-      if(item-&gt;info == info)
-        return item;
-  return NULL;
-}
-static void
-inf_gtk_browser_store_browser_notify_status_cb(GObject* object,
-                                               GParamSpec* pspec,
-                                               gpointer user_data);
-static void
-inf_gtk_browser_store_browser_error_cb(InfBrowser* browser,
-                                       const GError* error,
-                                       gpointer user_data);
-static void
-inf_gtk_browser_store_node_added_cb(InfBrowser* browser,
-                                    InfBrowserIter* iter,
-                                    InfRequest* request,
-                                    gpointer user_data);
-static void
-inf_gtk_browser_store_node_removed_cb(InfBrowser* browser,
-                                      InfBrowserIter* iter,
-                                      InfRequest* request,
-                                      gpointer user_data);
-static void
-inf_gtk_browser_store_begin_request_explore_node_cb(InfBrowser* browser,
-                                                    InfBrowserIter* iter,
-                                                    InfRequest* request,
-                                                    gpointer user_data);
-static void
-inf_gtk_browser_store_begin_request_subscribe_session_cb(InfBrowser* browser,
-                                                         InfBrowserIter* iter,
-                                                         InfRequest* request,
-                                                         gpointer user_data);
-static void
-inf_gtk_browser_store_request_finished_cb(InfRequest* request,
-                                          const InfRequestResult* result,
-                                          const GError* error,
-                                          gpointer user_data);
-static void
-inf_gtk_browser_store_request_unrefed_func(gpointer data,
-                                           GObject* where_the_object_was);
-static void
-inf_gtk_browser_store_request_data_free(gpointer data,
-                                        GClosure* closure)
-{
-  g_slice_free(InfGtkBrowserStoreRequestData, data);
-}
-static void
-inf_gtk_browser_store_item_request_remove(InfGtkBrowserStoreItem* item,
-                                          InfRequest* request)
-{
-  g_object_weak_unref(
-    G_OBJECT(request),
-    inf_gtk_browser_store_request_unrefed_func,
-    item
-  );
-  inf_signal_handlers_disconnect_by_func(
-    G_OBJECT(request),
-    G_CALLBACK(inf_gtk_browser_store_request_finished_cb),
-    item
-  );
-  item-&gt;requests = g_slist_remove(item-&gt;requests, request);
-}
-static void
-inf_gtk_browser_store_item_request_add(InfGtkBrowserStore* store,
-                                       InfGtkBrowserStoreItem* item,
-                                       InfRequest* request)
-{
-  InfGtkBrowserStoreRequestData* data;
-  g_assert(g_slist_find(item-&gt;requests, request) == NULL);
-  item-&gt;requests = g_slist_prepend(item-&gt;requests, request);
-  data = g_slice_new(InfGtkBrowserStoreRequestData);
-  data-&gt;store = store;
-  data-&gt;item = item;
-  g_signal_connect_data(
-    G_OBJECT(request),
-    "finished",
-    G_CALLBACK(inf_gtk_browser_store_request_finished_cb),
-    data,
-    inf_gtk_browser_store_request_data_free,
-    0
-  );
-  g_object_weak_ref(
-    G_OBJECT(request),
-    inf_gtk_browser_store_request_unrefed_func,
-    item
-  );
-}
-static void
-inf_gtk_browser_store_request_finished_cb(InfRequest* request,
-                                          const InfRequestResult* result,
-                                          const GError* error,
-                                          gpointer user_data)
-{
-  InfGtkBrowserStoreRequestData* data;
-  InfGtkBrowserStorePrivate* priv;
-  InfBrowserIter request_iter;
-  gboolean node_exists;
-  GtkTreeIter tree_iter;
-  GtkTreePath* path;
-  data = (InfGtkBrowserStoreRequestData*)user_data;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(data-&gt;store);
-  g_assert(g_slist_find(data-&gt;item-&gt;requests, request) != NULL);
-  g_assert(data-&gt;item-&gt;browser != NULL);
-  if(error != NULL)
-  {
-    node_exists = inf_browser_iter_from_request(
-      data-&gt;item-&gt;browser,
-      request,
-      &amp;request_iter
-    );
-    inf_gtk_browser_store_item_request_remove(data-&gt;item, request);
-    if(G_LIKELY(node_exists))
-    {
-      g_hash_table_insert(
-        data-&gt;item-&gt;node_errors,
-        GUINT_TO_POINTER(request_iter.node_id),
-        g_error_copy(error)
-      );
-      tree_iter.stamp = priv-&gt;stamp;
-      tree_iter.user_data = data-&gt;item;
-      tree_iter.user_data2 = GUINT_TO_POINTER(request_iter.node_id);
-      if(request_iter.node_id == 0)
-        tree_iter.user_data3 = NULL;
-      else
-        tree_iter.user_data3 = request_iter.node;
-      path = gtk_tree_model_get_path(GTK_TREE_MODEL(data-&gt;store), &amp;tree_iter);
-      gtk_tree_model_row_changed(GTK_TREE_MODEL(data-&gt;store), path, &amp;tree_iter);
-      gtk_tree_path_free(path);
-    }
-  }
-}
-static void
-inf_gtk_browser_store_request_unrefed_func(gpointer data,
-                                           GObject* where_the_object_was)
-{
-  InfGtkBrowserStoreItem* item;
-  item = (InfGtkBrowserStoreItem*)data;
-  item-&gt;requests = g_slist_remove(item-&gt;requests, where_the_object_was);
-}
-static void
-inf_gtk_browser_store_item_set_browser(InfGtkBrowserStore* store,
-                                       InfGtkBrowserStoreItem* item,
-                                       GtkTreePath* path,
-                                       InfBrowser* browser)
-{
-  GtkTreeIter tree_iter;
-  InfGtkBrowserStorePrivate* priv;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  tree_iter.stamp = priv-&gt;stamp;
-  tree_iter.user_data = item;
-  tree_iter.user_data2 = GUINT_TO_POINTER(0);
-  tree_iter.user_data3 = NULL;
-  inf_gtk_browser_model_set_browser(
-    INF_GTK_BROWSER_MODEL(store),
-    path,
-    &amp;tree_iter,
-    item-&gt;browser,
-    browser
-  );
-}
-static InfGtkBrowserStoreItem*
-inf_gtk_browser_store_add_item_by_browser(InfGtkBrowserStore* store,
-                                          InfDiscovery* discovery,
-                                          InfDiscoveryInfo* info,
-                                          InfBrowser* browser,
-                                          gchar* name)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfGtkBrowserStoreItem* cur;
-  GtkTreePath* path;
-  GtkTreeIter iter;
-  guint index;
-  g_assert(
-    browser == NULL ||
-    inf_gtk_browser_store_find_item_by_browser(store, browser) == NULL
-  );
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  item = g_slice_new(InfGtkBrowserStoreItem);
-  item-&gt;name = name;
-  item-&gt;discovery = discovery;
-  item-&gt;info = info;
-  item-&gt;status = INF_GTK_BROWSER_MODEL_DISCONNECTED;
-  if(discovery != NULL &amp;&amp; info != NULL)
-    item-&gt;status = INF_GTK_BROWSER_MODEL_DISCOVERED;
-  item-&gt;browser = NULL;
-  item-&gt;missing = NULL;
-  item-&gt;node_errors = g_hash_table_new_full(
-    NULL,
-    NULL,
-    NULL,
-    (GDestroyNotify)g_error_free
-  );
-  item-&gt;requests = NULL;
-  item-&gt;error = NULL;
-  item-&gt;next = NULL;
-  index = 0;
-  for(cur = priv-&gt;first_item; cur != NULL; cur = cur-&gt;next)
-    ++ index;
-  if(priv-&gt;first_item == NULL)
-  {
-    priv-&gt;first_item = item;
-    priv-&gt;last_item = item;
-  }
-  else
-  {
-    priv-&gt;last_item-&gt;next = item;
-    priv-&gt;last_item = item;
-  }
-  path = gtk_tree_path_new_from_indices(index, -1);
-  iter.stamp = priv-&gt;stamp;
-  iter.user_data = item;
-  iter.user_data2 = GUINT_TO_POINTER(0);
-  iter.user_data3 = NULL;
-  gtk_tree_model_row_inserted(GTK_TREE_MODEL(store), path, &amp;iter);
-  if(browser != NULL)
-    inf_gtk_browser_store_item_set_browser(store, item, path, browser);
-  gtk_tree_path_free(path);
-  return item;
-}
-static InfGtkBrowserStoreItem*
-inf_gtk_browser_store_add_item_by_connection(InfGtkBrowserStore* store,
-                                             InfDiscovery* discovery,
-                                             InfDiscoveryInfo* info,
-                                             InfXmlConnection* connection,
-                                             gchar* name)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfcBrowser* browser;
-  InfGtkBrowserStoreItem* item;
-  g_assert(
-    connection == NULL ||
-    inf_gtk_browser_store_find_item_by_connection(store, connection) == NULL
-  );
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  browser = NULL;
-  if(connection != NULL)
-  {
-    browser = infc_browser_new(
-      priv-&gt;io,
-      priv-&gt;communication_manager,
-      connection
-    );
-    if(infc_browser_get_connection(browser) == NULL)
-    {
-      g_object_unref(browser);
-      g_free(name);
-      return NULL;
-    }
-  }
-  item = inf_gtk_browser_store_add_item_by_browser(
-    store,
-    discovery,
-    info,
-    INF_BROWSER(browser),
-    name
-  );
-  if(browser != NULL)
-    g_object_unref(browser);
-  return item;
-}
-static void
-inf_gtk_browser_store_remove_item(InfGtkBrowserStore* store,
-                                  InfGtkBrowserStoreItem* item)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* prev;
-  InfGtkBrowserStoreItem* cur;
-  GtkTreePath* path;
-  guint index;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  prev = NULL;
-  index = 0;
-  for(cur = priv-&gt;first_item; cur != NULL; cur = cur-&gt;next)
-  {
-    if(cur == item)
-      break;
-    prev = cur;
-    ++ index;
-  }
-  g_assert(cur != NULL);
-  path = gtk_tree_path_new_from_indices(index, -1);
-  if(item-&gt;browser != NULL)
-  {
-    inf_gtk_browser_store_item_set_browser(store, item, path, NULL);
-    g_assert(item-&gt;browser == NULL);   }
-  if(prev == NULL)
-    priv-&gt;first_item = item-&gt;next;
-  else
-    prev-&gt;next = item-&gt;next;
-  if(item-&gt;next == NULL)
-    priv-&gt;last_item = prev;
-  g_assert(cur != NULL);
-  gtk_tree_model_row_deleted(GTK_TREE_MODEL(store), path);
-  gtk_tree_path_free(path);
-  if(item-&gt;error != NULL)
-    g_error_free(item-&gt;error);
-  g_hash_table_unref(item-&gt;node_errors);
-  g_free(item-&gt;name);
-  g_slice_free(InfGtkBrowserStoreItem, item);
-}
-static void
-inf_gtk_browser_store_discovered_cb(InfDiscovery* discovery,
-                                    InfDiscoveryInfo* info,
-                                    gpointer user_data)
-{
-  inf_gtk_browser_store_add_item_by_browser(
-    INF_GTK_BROWSER_STORE(user_data),
-    discovery,
-    info,
-    NULL,
-    inf_discovery_info_get_service_name(discovery, info)
-  );
-}
-static void
-inf_gtk_browser_store_undiscovered_cb(InfDiscovery* discovery,
-                                      InfDiscoveryInfo* info,
-                                      gpointer user_data)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStoreItem* item;
-  store = INF_GTK_BROWSER_STORE(user_data);
-  item = inf_gtk_browser_store_find_item_by_discovery_info(store, info);
-  if(item != NULL)
-  {
-    if(item-&gt;browser == NULL)
-    {
-      inf_gtk_browser_store_remove_item(store, item);
-    }
-    else
-    {
-      g_assert(item-&gt;status != INF_GTK_BROWSER_MODEL_DISCOVERED &amp;&amp;
-               item-&gt;status != INF_GTK_BROWSER_MODEL_RESOLVING);
-      item-&gt;discovery = NULL;
-      item-&gt;info = NULL;
-    }
-  }
-}
-static void
-inf_gtk_browser_store_browser_error_cb(InfBrowser* browser,
-                                       const GError* error,
-                                       gpointer user_data)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStoreItem* item;
-  InfGtkBrowserStorePrivate* priv;
-  GtkTreeIter iter;
-  GtkTreePath* path;
-  store = INF_GTK_BROWSER_STORE(user_data);
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  item = inf_gtk_browser_store_find_item_by_browser(store, browser);
-  g_assert(item != NULL);
-  if(item-&gt;error != NULL)
-    g_error_free(item-&gt;error);
-  item-&gt;error = g_error_copy(error);
-  iter.stamp = priv-&gt;stamp;
-  iter.user_data = item;
-  iter.user_data2 = GUINT_TO_POINTER(0);
-  iter.user_data3 = NULL;
-  path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;iter);
-  gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
-  gtk_tree_path_free(path);
-}
-static void
-inf_gtk_browser_store_browser_notify_status_cb(GObject* object,
-                                               GParamSpec* pspec,
-                                               gpointer user_data)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStorePrivate* priv;
-  InfBrowser* browser;
-  InfBrowserStatus status;
-  InfGtkBrowserStoreItem* item;
-  GtkTreeIter iter;
-  GtkTreePath* path;
-  store = INF_GTK_BROWSER_STORE(user_data);
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(user_data);  
-  browser = INF_BROWSER(object);
-  item = inf_gtk_browser_store_find_item_by_browser(store, browser);
-  g_assert(item != NULL);
-  iter.stamp = priv-&gt;stamp;
-  iter.user_data = item;
-  iter.user_data2 = GUINT_TO_POINTER(0);
-  iter.user_data3 = NULL;
-  path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;iter);
-  g_object_get(G_OBJECT(browser), "status", &amp;status, NULL);
-  switch(status)
-  {
-  case INF_BROWSER_CLOSED:
-    item-&gt;status = INF_GTK_BROWSER_MODEL_ERROR;
-    if(item-&gt;error == NULL)
-    {
-      item-&gt;error = g_error_new_literal(
-        g_quark_from_static_string("INF_GTK_BROWSER_STORE_ERROR"),
-        0,
-        _("Disconnected")
-      );
-    }
-    gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
-    break;
-  case INF_BROWSER_OPENING:
-    if(item-&gt;error != NULL) g_error_free(item-&gt;error);
-    item-&gt;error = NULL;
-    item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTING;
-    gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
-    break;
-  case INF_BROWSER_OPEN:
-    if(item-&gt;error != NULL) g_error_free(item-&gt;error);
-    item-&gt;error = NULL;
-    item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTED;
-    gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
-    break;
-  default:
-    g_assert_not_reached();
-    break;
-  }
-  gtk_tree_path_free(path);
-}
-static void
-inf_gtk_browser_store_node_added_cb(InfBrowser* browser,
-                                    InfBrowserIter* iter,
-                                    InfRequest* request,
-                                    gpointer user_data)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  GtkTreeIter tree_iter;
-  GtkTreePath* path;
-  InfBrowserIter test_iter;
-  gboolean test_result;
-  store = INF_GTK_BROWSER_STORE(user_data);
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  item = inf_gtk_browser_store_find_item_by_browser(store, browser);
-  tree_iter.stamp = priv-&gt;stamp;
-  tree_iter.user_data = item;
-  tree_iter.user_data2 = GUINT_TO_POINTER(iter-&gt;node_id);
-  tree_iter.user_data3 = iter-&gt;node;
-  if(iter-&gt;node_id != 0)
-  {
-    path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;tree_iter);
-    gtk_tree_model_row_inserted(GTK_TREE_MODEL(store), path, &amp;tree_iter);
-    test_iter = *iter;
-    test_result = inf_browser_get_parent(browser, &amp;test_iter);
-    g_assert(test_result == TRUE);
-    tree_iter.user_data2 = GUINT_TO_POINTER(test_iter.node_id);
-    gtk_tree_path_up(path);
-    if(test_iter.node_id == 0)
-      tree_iter.user_data3 = NULL;
-    else
-      tree_iter.user_data3 = test_iter.node;
-    test_result = inf_browser_get_child(browser, &amp;test_iter);
-    g_assert(test_result == TRUE);
-    if(inf_browser_get_next(browser, &amp;test_iter) == FALSE)
-    {
-      gtk_tree_model_row_has_child_toggled(
-        GTK_TREE_MODEL(store),
-        path,
-        &amp;tree_iter
-      );
-    }
-    gtk_tree_path_free(path);
-  }
-}
-static void
-inf_gtk_browser_store_node_removed_cb(InfBrowser* browser,
-                                      InfBrowserIter* iter,
-                                      InfRequest* request,
-                                      gpointer user_data)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  GtkTreeIter tree_iter;
-  GtkTreePath* path;
-  InfBrowserIter test_iter;
-  gboolean test_result;
-  store = INF_GTK_BROWSER_STORE(user_data);
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  item = inf_gtk_browser_store_find_item_by_browser(store, browser);
-  g_assert(item-&gt;missing == NULL);
-  tree_iter.stamp = priv-&gt;stamp;
-  tree_iter.user_data = item;
-  tree_iter.user_data2 = GUINT_TO_POINTER(iter-&gt;node_id);
-  tree_iter.user_data3 = iter-&gt;node;
-  path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;tree_iter);
-  item-&gt;missing = iter-&gt;node;
-  if(iter-&gt;node_id != 0)
-  {
-    gtk_tree_model_row_deleted(GTK_TREE_MODEL(store), path);
-    test_iter = *iter;
-    test_result = inf_browser_get_parent(browser, &amp;test_iter);
-    g_assert(test_result == TRUE);
-    tree_iter.user_data2 = GUINT_TO_POINTER(test_iter.node_id);
-    gtk_tree_path_up(path);
-    if(test_iter.node_id == 0)
-      tree_iter.user_data3 = NULL;
-    else
-      tree_iter.user_data3 = test_iter.node;
-    test_result = inf_browser_get_child(browser, &amp;test_iter);
-    g_assert(test_result == TRUE);
-    if(inf_browser_get_next(browser, &amp;test_iter) == FALSE)
-    {
-      gtk_tree_model_row_has_child_toggled(
-        GTK_TREE_MODEL(store),
-        path,
-        &amp;tree_iter
-      );
-    }
-  }
-  else
-  {
-    if(inf_browser_get_explored(browser, iter))
-    {
-      test_iter = *iter;
-      test_result = inf_browser_get_child(browser, &amp;test_iter);
-      gtk_tree_path_down(path);
-      do
-      {
-        gtk_tree_model_row_deleted(GTK_TREE_MODEL(store), path);
-      } while(inf_browser_get_next(browser, &amp;test_iter));
-      if(test_result == TRUE)
-      {
-        gtk_tree_path_up(path);
-        gtk_tree_model_row_has_child_toggled(
-          GTK_TREE_MODEL(store),
-          path,
-          &amp;tree_iter
-        );
-      }
-    }
-  }
-  item-&gt;missing = NULL;
-  gtk_tree_path_free(path);
-}
-static void
-inf_gtk_browser_store_begin_request_explore_node_cb(InfBrowser* browser,
-                                                    InfBrowserIter* iter,
-                                                    InfRequest* request,
-                                                    gpointer user_data)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStoreItem* item;
-  store = INF_GTK_BROWSER_STORE(user_data);
-  item = inf_gtk_browser_store_find_item_by_browser(store, browser);
-  inf_gtk_browser_store_item_request_add(store, item, request);
-}
-static void
-inf_gtk_browser_store_begin_request_subscribe_session_cb(InfBrowser* browser,
-                                                         InfBrowserIter* iter,
-                                                         InfRequest* request,
-                                                         gpointer user_data)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStoreItem* item;
-  g_assert(iter != NULL);
-  store = INF_GTK_BROWSER_STORE(user_data);
-  item = inf_gtk_browser_store_find_item_by_browser(store, browser);
-  inf_gtk_browser_store_item_request_add(store, item, request);
-}
-static void
-inf_gtk_browser_store_resolv_complete_func(InfDiscoveryInfo* info,
-                                           InfXmlConnection* connection,
-                                           const GError* error,
-                                           gpointer user_data)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* new_item;
-  InfGtkBrowserStoreItem* old_item;
-  GtkTreeIter tree_iter;
-  GtkTreePath* path;
-  InfcBrowser* browser;
-  InfGtkBrowserStoreItem* cur;
-  InfGtkBrowserStoreItem* prev;
-  InfGtkBrowserStoreItem* prev_new;
-  InfGtkBrowserStoreItem* prev_old;
-  gint* order;
-  guint count;
-  guint new_pos;
-  guint old_pos;
-  guint i;
-  store = INF_GTK_BROWSER_STORE(user_data);
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  new_item = inf_gtk_browser_store_find_item_by_discovery_info(store, info);
-  g_assert(new_item != NULL);
-  g_assert(new_item-&gt;status == INF_GTK_BROWSER_MODEL_RESOLVING);
-  tree_iter.stamp = priv-&gt;stamp;
-  tree_iter.user_data = new_item;
-  tree_iter.user_data2 = GUINT_TO_POINTER(0);
-  tree_iter.user_data3 = NULL;
-  if(error != NULL)
-  {
-    new_item-&gt;status = INF_GTK_BROWSER_MODEL_ERROR;
-    new_item-&gt;error = g_error_copy(error);
-    path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;tree_iter);
-    gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;tree_iter);
-    gtk_tree_path_free(path);
-  }
-  else
-  {
-    old_item =
-      inf_gtk_browser_store_find_item_by_connection(store, connection);
-    if(old_item != NULL)
-    {
-      g_assert(old_item != new_item);
-      count = 0;
-      prev = NULL;
-      for(cur = priv-&gt;first_item; cur != NULL; cur = cur-&gt;next)
-      {
-        if(cur == old_item) { old_pos = count; prev_old = prev; }
-        if(cur == new_item) { new_pos = count; prev_new = prev; }
-        ++ count;
-        prev = cur;
-      }
-      inf_gtk_browser_store_remove_item(store, new_item);
-      if(old_pos &gt; new_pos) -- old_pos;
-      else -- new_pos;
-      -- count;
-      if(new_pos != old_pos)
-      {
-        if(old_item-&gt;next == NULL)
-          priv-&gt;last_item = prev_old;
-        if(prev_old != NULL)
-          prev_old-&gt;next = old_item-&gt;next;
-        else
-          priv-&gt;first_item = old_item-&gt;next;
-        old_item-&gt;next = prev_new-&gt;next;
-        if(prev_new != NULL)
-          prev_new-&gt;next = old_item;
-        else
-          priv-&gt;first_item = old_item;
-        if(old_item-&gt;next == NULL)
-          priv-&gt;last_item = old_item;
-        order = g_malloc(sizeof(gint) * count);
-        if(new_pos &lt; old_pos)
-        {
-          for(i = 0; i &lt; new_pos; ++ i)
-            order[i] = i;
-          order[new_pos] = old_pos;
-          for(i = new_pos + 1; i &lt;= old_pos; ++ i)
-            order[i] = i - 1;
-          for(i = old_pos + 1; i &lt; count; ++ i)
-            order[i] = i;
-        }
-        else
-        {
-          for(i = 0; i &lt; old_pos; ++ i)
-            order[i] = i;
-          for(i = old_pos; i &lt; new_pos; ++ i)
-            order[i] = i + 1;
-          order[new_pos] = old_pos;
-          for(i = new_pos + 1; i &lt; count; ++ i)
-            order[i] = i;
-        }
-        path = gtk_tree_path_new();
-        gtk_tree_model_rows_reordered(
-          GTK_TREE_MODEL(store),
-          path,
-          NULL,
-          order
-        );
-        gtk_tree_path_free(path);
-        g_free(order);
-      }
-    }
-    else
-    {
-      path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;tree_iter);
-      browser = infc_browser_new(
-        priv-&gt;io,
-        priv-&gt;communication_manager,
-        connection
-      );
-      if(infc_browser_get_connection(browser) != NULL)
-      {
-        inf_gtk_browser_store_item_set_browser(
-          store,
-          new_item,
-          path,
-          INF_BROWSER(browser)
-        );
-      }
-      g_object_unref(G_OBJECT(browser));
-      gtk_tree_path_free(path);
-    }
-  }
-}
-static void
-inf_gtk_browser_store_init(InfGtkBrowserStore* store)
-{
-  InfGtkBrowserStorePrivate* priv;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  priv-&gt;stamp = g_random_int();
-  priv-&gt;io = NULL;
-  priv-&gt;communication_manager = NULL;
-  priv-&gt;discoveries = NULL;
-  priv-&gt;first_item = NULL;
-  priv-&gt;last_item = NULL;
-}
-static void
-inf_gtk_browser_store_dispose(GObject* object)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStorePrivate* priv;
-  GSList* item;
-  store = INF_GTK_BROWSER_STORE(object);
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  while(priv-&gt;first_item != NULL)
-    inf_gtk_browser_store_remove_item(store, priv-&gt;first_item);
-  g_assert(priv-&gt;last_item == NULL);
-  for(item = priv-&gt;discoveries; item != NULL; item = g_slist_next(item))
-  {
-    inf_signal_handlers_disconnect_by_func(
-      G_OBJECT(item-&gt;data),
-      G_CALLBACK(inf_gtk_browser_store_discovered_cb),
-      store
-    );
-    inf_signal_handlers_disconnect_by_func(
-      G_OBJECT(item-&gt;data),
-      G_CALLBACK(inf_gtk_browser_store_undiscovered_cb),
-      store
-    );
-    g_object_unref(G_OBJECT(item-&gt;data));
-  }
-  g_slist_free(priv-&gt;discoveries);
-  priv-&gt;discoveries = NULL;
-  if(priv-&gt;communication_manager != NULL)
-  {
-    g_object_unref(priv-&gt;communication_manager);
-    priv-&gt;communication_manager = NULL;
-  }
-  if(priv-&gt;io != NULL)
-  {
-    g_object_unref(G_OBJECT(priv-&gt;io));
-    priv-&gt;io = NULL;
-  }
-  G_OBJECT_CLASS(inf_gtk_browser_store_parent_class)-&gt;dispose(object);
-}
-static void
-inf_gtk_browser_store_set_property(GObject* object,
-                                   guint prop_id,
-                                   const GValue* value,
-                                   GParamSpec* pspec)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStorePrivate* priv;
-  store = INF_GTK_BROWSER_STORE(object);
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  switch(prop_id)
-  {
-  case PROP_IO:
-    g_assert(priv-&gt;io == NULL);     priv-&gt;io = INF_IO(g_value_dup_object(value));
-    break;
-  case PROP_COMMUNICATION_MANAGER: 
-    g_assert(priv-&gt;communication_manager == NULL);     priv-&gt;communication_manager =
-      INF_COMMUNICATION_MANAGER(g_value_dup_object(value));
-    break;
-  default:
-    G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
-    break;
-  }
-}
-static void
-inf_gtk_browser_store_get_property(GObject* object,
-                                   guint prop_id,
-                                   GValue* value,
-                                   GParamSpec* pspec)
-{
-  InfGtkBrowserStore* store;
-  InfGtkBrowserStorePrivate* priv;
-  store = INF_GTK_BROWSER_STORE(object);
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  switch(prop_id)
-  {
-  case PROP_IO:
-    g_value_set_object(value, priv-&gt;io);
-    break;
-  case PROP_COMMUNICATION_MANAGER:
-    g_value_set_object(value, priv-&gt;communication_manager);
-    break;
-  default:
-    G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
-    break;
-  }
-}
-static GtkTreeModelFlags
-inf_gtk_browser_store_tree_model_get_flags(GtkTreeModel* model)
-{
-  return GTK_TREE_MODEL_ITERS_PERSIST;
-}
-static gint
-inf_gtk_browser_store_tree_model_get_n_columns(GtkTreeModel* model)
-{
-  return INF_GTK_BROWSER_MODEL_NUM_COLS;
-}
-static GType
-inf_gtk_browser_store_tree_model_get_column_type(GtkTreeModel* model,
-                                                 gint index)
-{
-  switch(index)
-  {
-  case INF_GTK_BROWSER_MODEL_COL_DISCOVERY_INFO:
-    return G_TYPE_POINTER;
-  case INF_GTK_BROWSER_MODEL_COL_DISCOVERY:
-    return INF_TYPE_DISCOVERY;
-  case INF_GTK_BROWSER_MODEL_COL_BROWSER:
-    return INFC_TYPE_BROWSER;
-  case INF_GTK_BROWSER_MODEL_COL_STATUS:
-    return INF_GTK_TYPE_BROWSER_MODEL_STATUS;
-  case INF_GTK_BROWSER_MODEL_COL_NAME:
-    return G_TYPE_STRING;
-  case INF_GTK_BROWSER_MODEL_COL_ERROR:
-    return G_TYPE_POINTER;
-  case INF_GTK_BROWSER_MODEL_COL_NODE:
-    return INF_TYPE_BROWSER_ITER;
-  default:
-    g_assert_not_reached();
-    return G_TYPE_INVALID;
-  }
-}
-static gboolean
-inf_gtk_browser_store_tree_model_get_iter(GtkTreeModel* model,
-                                          GtkTreeIter* iter,
-                                          GtkTreePath* path)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfBrowserIter browser_iter;
-  gint* indices;
-  guint i;
-  guint n;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  if(gtk_tree_path_get_depth(path) == 0) return FALSE;
-  indices = gtk_tree_path_get_indices(path);
-  n = indices[0];
-  i = 0;
-  for(item = priv-&gt;first_item; item != NULL &amp;&amp; i &lt; n; item = item-&gt;next)
-    ++i;
-  if(item == NULL) return FALSE;
-  if(gtk_tree_path_get_depth(path) == 1)
-  {
-    iter-&gt;stamp = priv-&gt;stamp;
-    iter-&gt;user_data = item;
-    iter-&gt;user_data2 = GUINT_TO_POINTER(0);
-    iter-&gt;user_data3 = NULL;
-    return TRUE;
-  }
-  if(item-&gt;browser == NULL) return FALSE;
-  inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
-  for(n = 1; n &lt; (guint)gtk_tree_path_get_depth(path); ++ n)
-  {
-    if(inf_browser_get_explored(item-&gt;browser, &amp;browser_iter) == FALSE)
-      return FALSE;
-    if(inf_browser_get_child(item-&gt;browser, &amp;browser_iter) == FALSE)
-      return FALSE;
-    if(browser_iter.node == item-&gt;missing)
-      ++indices[n];
-    for(i = 0; i &lt; (guint)indices[n]; ++ i)
-    {
-      if(inf_browser_get_next(item-&gt;browser, &amp;browser_iter) == FALSE)
-        return FALSE;
-      if(browser_iter.node == item-&gt;missing)
-        ++indices[n];
-    }
-  }
-  iter-&gt;stamp = priv-&gt;stamp;
-  iter-&gt;user_data = item;
-  iter-&gt;user_data2 = GUINT_TO_POINTER(browser_iter.node_id);
-  iter-&gt;user_data3 = browser_iter.node;
-  return TRUE;
-}
-static void
-inf_gtk_browser_store_tree_model_get_path_impl(InfGtkBrowserStore* store,
-                                               InfGtkBrowserStoreItem* item,
-                                               InfBrowserIter* iter,
-                                               GtkTreePath* path)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfBrowserIter cur_iter;
-  InfGtkBrowserStoreItem* cur;
-  gboolean result;
-  guint n;
-  cur_iter = *iter;
-  if(inf_browser_get_parent(item-&gt;browser, &amp;cur_iter) == FALSE)
-  {
-    priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-    n = 0;
-    for(cur = priv-&gt;first_item; cur != item; cur = cur-&gt;next)
-      ++n;
-    gtk_tree_path_append_index(path, n);
-  }
-  else
-  {
-    inf_gtk_browser_store_tree_model_get_path_impl(
-      store,
-      item,
-      &amp;cur_iter,
-      path
-    );
-    result = inf_browser_get_child(item-&gt;browser, &amp;cur_iter);
-    g_assert(result == TRUE);
-    if(cur_iter.node == item-&gt;missing)
-    {
-      result = inf_browser_get_next(item-&gt;browser, &amp;cur_iter);
-      g_assert(result == TRUE);
-    }
-    n = 0;
-    while(cur_iter.node_id != iter-&gt;node_id)
-    {
-      result = inf_browser_get_next(item-&gt;browser, &amp;cur_iter);
-      g_assert(result == TRUE);
-      if(cur_iter.node == item-&gt;missing)
-      {
-        result = inf_browser_get_next(item-&gt;browser, &amp;cur_iter);
-        g_assert(result == TRUE);
-      }
-      ++n;
-    }
-    gtk_tree_path_append_index(path, n);
-  }
-}
-static GtkTreePath*
-inf_gtk_browser_store_tree_model_get_path(GtkTreeModel* model,
-                                          GtkTreeIter* iter)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfGtkBrowserStoreItem* cur;
-  GtkTreePath* path;
-  InfBrowserIter browser_iter;
-  guint n;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  g_assert(iter-&gt;stamp == priv-&gt;stamp);
-  g_assert(iter-&gt;user_data != NULL);
-  item = (InfGtkBrowserStoreItem*)iter-&gt;user_data;
-  path = gtk_tree_path_new();
-  browser_iter.node_id = GPOINTER_TO_UINT(iter-&gt;user_data2);
-  browser_iter.node = iter-&gt;user_data3;
-  if(browser_iter.node != NULL)
-  {
-    g_assert(item-&gt;browser != NULL);
-    inf_gtk_browser_store_tree_model_get_path_impl(
-      INF_GTK_BROWSER_STORE(model),
-      item,
-      &amp;browser_iter,
-      path
-    );
-  }
-  else
-  {
-    n = 0;
-    for(cur = priv-&gt;first_item; cur != item; cur = cur-&gt;next)
-      ++n;
-    gtk_tree_path_append_index(path, n);
-  }
-  return path;
-}
-static void
-inf_gtk_browser_store_tree_model_get_value(GtkTreeModel* model,
-                                           GtkTreeIter* iter,
-                                           gint column,
-                                           GValue* value)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfBrowserIter browser_iter;
-  InfBrowserStatus browser_status;
-  GError* error;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  g_assert(iter-&gt;stamp == priv-&gt;stamp);
-  item = (InfGtkBrowserStoreItem*)iter-&gt;user_data;
-  browser_iter.node_id = GPOINTER_TO_UINT(iter-&gt;user_data2);
-  browser_iter.node = iter-&gt;user_data3;
-  g_assert(
-    item-&gt;missing == NULL || browser_iter.node_id == 0 ||
-    browser_iter.node != item-&gt;missing
-  );
-  switch(column)
-  {
-  case INF_GTK_BROWSER_MODEL_COL_DISCOVERY_INFO:
-    g_value_init(value, G_TYPE_POINTER);
-    g_value_set_pointer(value, item-&gt;info);
-    break;
-  case INF_GTK_BROWSER_MODEL_COL_DISCOVERY:
-    g_value_init(value, G_TYPE_OBJECT);
-    g_value_set_object(value, item-&gt;discovery);
-    break;
-  case INF_GTK_BROWSER_MODEL_COL_BROWSER:
-    g_value_init(value, INF_TYPE_BROWSER);
-    g_value_set_object(value, G_OBJECT(item-&gt;browser));
-    break;
-  case INF_GTK_BROWSER_MODEL_COL_STATUS:
-    g_assert(browser_iter.node == NULL);     g_value_init(value, INF_GTK_TYPE_BROWSER_MODEL_STATUS);
-    g_value_set_enum(value, item-&gt;status);
-    break;
-  case INF_GTK_BROWSER_MODEL_COL_NAME:
-    g_value_init(value, G_TYPE_STRING);
-    if(browser_iter.node == NULL)
-    {
-      g_value_set_string(value, item-&gt;name);
-    }
-    else
-    {
-      g_value_set_string(
-        value,
-        inf_browser_get_node_name(INF_BROWSER(item-&gt;browser), &amp;browser_iter)
-      );
-    }
-    break;
-  case INF_GTK_BROWSER_MODEL_COL_ERROR:
-    if(browser_iter.node == NULL)
-    {
-      if(item-&gt;error != NULL)
-      {
-        error = item-&gt;error;
-      }
-      else if(item-&gt;browser != NULL)
-      {
-        g_object_get(
-          G_OBJECT(item-&gt;browser),
-          "status",
-          &amp;browser_status,
-          NULL
-        );
-        if(browser_status == INF_BROWSER_OPEN)
-        {
-          inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
-          error = g_hash_table_lookup(
-            item-&gt;node_errors,
-            GUINT_TO_POINTER(browser_iter.node_id)
-          );
-        }
-        else
-        {
-          error = NULL;
-        }
-      }
-      else
-      {
-        error = NULL;
-      }
-    }
-    else
-    {
-      g_assert(item-&gt;browser != NULL);
-      g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;browser_status, NULL);
-      g_assert(browser_status == INF_BROWSER_OPEN);
-      error = g_hash_table_lookup(
-        item-&gt;node_errors,
-        GUINT_TO_POINTER(browser_iter.node_id)
-      );
-    }
-    g_value_init(value, G_TYPE_POINTER);
-    g_value_set_pointer(value, error);
-    break;
-  case INF_GTK_BROWSER_MODEL_COL_NODE:
-    g_assert(item-&gt;browser != NULL);
-    g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;browser_status, NULL);
-    g_assert(browser_status == INF_BROWSER_OPEN);
-    if(browser_iter.node == NULL)
-      inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
-    g_value_init(value, INF_TYPE_BROWSER_ITER);
-    g_value_set_boxed(value, &amp;browser_iter);
-    break;
-  default:
-    g_assert_not_reached();
-    break;
-  }
-}
-static gboolean
-inf_gtk_browser_store_tree_model_iter_next(GtkTreeModel* model,
-                                           GtkTreeIter* iter)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfBrowserIter browser_iter;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  g_assert(iter-&gt;stamp == priv-&gt;stamp);
-  item = (InfGtkBrowserStoreItem*)iter-&gt;user_data;
-  browser_iter.node_id = GPOINTER_TO_UINT(iter-&gt;user_data2);
-  browser_iter.node = iter-&gt;user_data3;
-  if(browser_iter.node == NULL)
-  {
-    if(item-&gt;next == NULL)
-      return FALSE;
-    iter-&gt;user_data = item-&gt;next;
-    return TRUE;
-  }
-  else
-  {
-    g_assert(browser_iter.node != item-&gt;missing);
-    if(inf_browser_get_next(item-&gt;browser, &amp;browser_iter) == FALSE)
-      return FALSE;
-    if(browser_iter.node == item-&gt;missing)
-      if(inf_browser_get_next(item-&gt;browser, &amp;browser_iter) == FALSE)
-        return FALSE;
-    iter-&gt;user_data2 = GUINT_TO_POINTER(browser_iter.node_id);
-    iter-&gt;user_data3 = browser_iter.node;
-    return TRUE;
-  }
-}
-static gboolean
-inf_gtk_browser_store_tree_model_iter_children(GtkTreeModel* model,
-                                               GtkTreeIter* iter,
-                                               GtkTreeIter* parent)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfBrowserStatus browser_status;
-  InfBrowserIter browser_iter;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  if(parent == NULL)
-  {
-    if(priv-&gt;first_item == NULL)
-      return FALSE;
-    iter-&gt;stamp = priv-&gt;stamp;
-    iter-&gt;user_data = priv-&gt;first_item;
-    iter-&gt;user_data2 = GUINT_TO_POINTER(0);
-    iter-&gt;user_data3 = NULL;
-    return TRUE;
-  }
-  else
-  {
-    g_assert(parent-&gt;stamp == priv-&gt;stamp);
-    item = (InfGtkBrowserStoreItem*)parent-&gt;user_data;
-    if(item-&gt;browser == NULL)
-      return FALSE;
-    g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;browser_status, NULL);
-    if(browser_status != INF_BROWSER_OPEN)
-      return FALSE;
-    browser_iter.node_id = GPOINTER_TO_UINT(parent-&gt;user_data2);
-    if(browser_iter.node_id == 0)
-      inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
-    else
-      browser_iter.node = parent-&gt;user_data3;
-    g_assert(
-      item-&gt;missing == NULL || browser_iter.node_id == 0 ||
-      browser_iter.node != item-&gt;missing
-    );
-    if(item-&gt;missing != NULL &amp;&amp; browser_iter.node == item-&gt;missing)
-      return FALSE;
-    if(!inf_browser_is_subdirectory(item-&gt;browser, &amp;browser_iter))
-      return FALSE;
-    if(!inf_browser_get_explored(item-&gt;browser, &amp;browser_iter))
-      return FALSE;
-    if(!inf_browser_get_child(item-&gt;browser, &amp;browser_iter))
-      return FALSE;
-    if(browser_iter.node == item-&gt;missing)
-      if(!inf_browser_get_next(item-&gt;browser, &amp;browser_iter))
-        return FALSE;
-    iter-&gt;stamp = priv-&gt;stamp;
-    iter-&gt;user_data = item;
-    iter-&gt;user_data2 = GUINT_TO_POINTER(browser_iter.node_id);
-    iter-&gt;user_data3 = browser_iter.node;
-    return TRUE;
-  }
-}
-static gboolean
-inf_gtk_browser_store_tree_model_iter_has_child(GtkTreeModel* model,
-                                                GtkTreeIter* iter)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfBrowserStatus status;
-  InfBrowserIter browser_iter;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  g_assert(iter-&gt;stamp == priv-&gt;stamp);
-  item = (InfGtkBrowserStoreItem*)iter-&gt;user_data;
-  if(item-&gt;browser == NULL) return FALSE;
-  browser_iter.node_id = GPOINTER_TO_UINT(iter-&gt;user_data2);
-  browser_iter.node = iter-&gt;user_data3;
-  g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;status, NULL);
-  if(status != INF_BROWSER_OPEN)
-    return FALSE;
-  if(browser_iter.node == NULL)
-    inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
-  g_assert(
-    item-&gt;missing == NULL || browser_iter.node_id == 0 ||
-    browser_iter.node != item-&gt;missing
-  );
-  if(item-&gt;missing != NULL &amp;&amp; browser_iter.node == item-&gt;missing)
-    return FALSE;
-  if(inf_browser_is_subdirectory(item-&gt;browser, &amp;browser_iter) == FALSE)
-    return FALSE;
-  if(inf_browser_get_explored(item-&gt;browser, &amp;browser_iter) == FALSE)
-    return FALSE;
-  if(!inf_browser_get_child(item-&gt;browser, &amp;browser_iter))
-    return FALSE;
-  if(browser_iter.node == item-&gt;missing)
-    if(!inf_browser_get_next(item-&gt;browser, &amp;browser_iter))
-      return FALSE;
-  return TRUE;
-}
-static gint
-inf_gtk_browser_store_tree_model_iter_n_children(GtkTreeModel* model,
-                                                 GtkTreeIter* iter)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfGtkBrowserStoreItem* cur;
-  InfBrowserIter browser_iter;
-  gboolean result;
-  guint n;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  g_assert(iter == NULL || iter-&gt;stamp == priv-&gt;stamp);
-  if(iter == NULL)
-  {
-    n = 0;
-    for(cur = priv-&gt;first_item; cur != NULL; cur = cur-&gt;next)
-      ++n;
-    return n;
-  }
-  else
-  {
-    item = (InfGtkBrowserStoreItem*)iter-&gt;user_data;
-    browser_iter.node_id = GPOINTER_TO_UINT(iter-&gt;user_data2);
-    browser_iter.node = iter-&gt;user_data3;
-    if(browser_iter.node == NULL)
-      inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
-    g_assert(
-      item-&gt;missing == NULL || browser_iter.node_id == 0 ||
-      browser_iter.node != item-&gt;missing
-    );
-    if(item-&gt;missing != NULL &amp;&amp; browser_iter.node == item-&gt;missing)
-      return 0;
-    n = 0;
-    for(result = inf_browser_get_child(item-&gt;browser, &amp;browser_iter);
-        result == TRUE;
-        result = inf_browser_get_next(item-&gt;browser, &amp;browser_iter))
-    {
-      if(browser_iter.node != item-&gt;missing)
-        ++n;
-    }
-    return n;
-  }
-}
-static gboolean
-inf_gtk_browser_store_tree_model_iter_nth_child(GtkTreeModel* model,
-                                                GtkTreeIter* iter,
-                                                GtkTreeIter* parent,
-                                                gint n)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfGtkBrowserStoreItem* cur;
-  InfBrowserIter browser_iter;
-  guint i;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  if(parent == NULL)
-  {
-    cur = priv-&gt;first_item;
-    if(cur == NULL) return FALSE;
-    for(i = 0; i &lt; (guint)n; ++ i)
-    {
-      cur = cur-&gt;next;
-      if(cur == NULL) return FALSE;
-    }
-    iter-&gt;stamp = priv-&gt;stamp;
-    iter-&gt;user_data = cur;
-    iter-&gt;user_data2 = GUINT_TO_POINTER(0);
-    iter-&gt;user_data3 = NULL;
-    return TRUE;
-  }
-  else
-  {
-    g_assert(parent-&gt;stamp == priv-&gt;stamp);
-    item = (InfGtkBrowserStoreItem*)parent-&gt;user_data;
-    browser_iter.node_id = GPOINTER_TO_UINT(parent-&gt;user_data2);
-    if(browser_iter.node_id == 0)
-      inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
-    else
-      browser_iter.node = parent-&gt;user_data3;
-    g_assert(
-      item-&gt;missing == NULL || browser_iter.node_id == 0 ||
-      browser_iter.node != item-&gt;missing
-    );
-    if(item-&gt;missing != NULL &amp;&amp; browser_iter.node == item-&gt;missing)
-      return FALSE;
-    if(inf_browser_get_explored(item-&gt;browser, &amp;browser_iter) == FALSE)
-      return FALSE;
-    if(inf_browser_get_child(item-&gt;browser, &amp;browser_iter) == FALSE)
-      return FALSE;
-    if(browser_iter.node == item-&gt;missing)
-      ++n;
-    for(i = 0; i &lt; (guint)n; ++ i)
-    {
-      if(inf_browser_get_next(item-&gt;browser, &amp;browser_iter) == FALSE)
-        return FALSE;
-      if(browser_iter.node == item-&gt;missing)
-        ++n;
-    }
-    iter-&gt;stamp = priv-&gt;stamp;
-    iter-&gt;user_data = item;
-    iter-&gt;user_data2 = GUINT_TO_POINTER(browser_iter.node_id);
-    iter-&gt;user_data3 = browser_iter.node;
-    return TRUE;
-  }
-}
-static gboolean
-inf_gtk_browser_store_tree_model_iter_parent(GtkTreeModel* model,
-                                             GtkTreeIter* iter,
-                                             GtkTreeIter* child)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfBrowserIter browser_iter;
-  gboolean result;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  g_assert(child-&gt;stamp == priv-&gt;stamp);
-  item = (InfGtkBrowserStoreItem*)child-&gt;user_data;
-  browser_iter.node_id = GPOINTER_TO_UINT(child-&gt;user_data2);
-  browser_iter.node = child-&gt;user_data3;
-  if(browser_iter.node == NULL)
-    return FALSE;
-  g_assert(browser_iter.node != item-&gt;missing);
-  result = inf_browser_get_parent(item-&gt;browser, &amp;browser_iter);
-  g_assert(result == TRUE);
-  g_assert(browser_iter.node != item-&gt;missing);
-  iter-&gt;stamp = priv-&gt;stamp;
-  iter-&gt;user_data = item;
-  iter-&gt;user_data2 = GUINT_TO_POINTER(browser_iter.node_id);
-  iter-&gt;user_data3 = browser_iter.node;
-  if(browser_iter.node_id == 0)
-    iter-&gt;user_data3 = NULL;
-  return TRUE;
-}
-static void
-inf_gtk_browser_store_browser_model_set_browser(InfGtkBrowserModel* model,
-                                                GtkTreePath* path,
-                                                GtkTreeIter* tree_iter,
-                                                InfBrowser* old_browser,
-                                                InfBrowser* new_browser)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  InfBrowserIter iter;
-  guint n;
-  gboolean had_children;
-  InfBrowserStatus status;
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  had_children = FALSE;
-  item = (InfGtkBrowserStoreItem*)tree_iter-&gt;user_data;
-  g_assert(tree_iter-&gt;user_data3 == NULL);
-  if(item-&gt;browser != NULL)
-  {
-    g_assert(item-&gt;browser == old_browser);
-    g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;status, NULL);
-    if(status == INF_BROWSER_OPEN)
-    {
-      inf_browser_get_root(item-&gt;browser, &amp;iter);
-      if(inf_browser_get_explored(item-&gt;browser, &amp;iter) &amp;&amp;
-         inf_browser_get_child(item-&gt;browser, &amp;iter))
-      {
-        n = 1;
-        while(inf_browser_get_next(item-&gt;browser, &amp;iter))
-          ++ n;
-        gtk_tree_path_append_index(path, n);
-        for(; n &gt; 0; -- n)
-        {
-          had_children = TRUE;
-          gtk_tree_path_prev(path);
-          gtk_tree_model_row_deleted(GTK_TREE_MODEL(model), path);
-        }
-        gtk_tree_path_up(path);
-      }
-    }
-    while(item-&gt;requests != NULL)
-      inf_gtk_browser_store_item_request_remove(item, item-&gt;requests-&gt;data);
-    g_hash_table_remove_all(item-&gt;node_errors);
-    inf_signal_handlers_disconnect_by_func(
-      G_OBJECT(item-&gt;browser),
-      G_CALLBACK(inf_gtk_browser_store_browser_error_cb),
-      model
-    );
-    inf_signal_handlers_disconnect_by_func(
-      G_OBJECT(item-&gt;browser),
-      G_CALLBACK(inf_gtk_browser_store_browser_notify_status_cb),
-      model
-    );
-    inf_signal_handlers_disconnect_by_func(
-      G_OBJECT(item-&gt;browser),
-      G_CALLBACK(inf_gtk_browser_store_node_added_cb),
-      model
-    );
-    inf_signal_handlers_disconnect_by_func(
-      G_OBJECT(item-&gt;browser),
-      G_CALLBACK(inf_gtk_browser_store_node_removed_cb),
-      model
-    );
-    inf_signal_handlers_disconnect_by_func(
-      G_OBJECT(item-&gt;browser),
-      G_CALLBACK(inf_gtk_browser_store_begin_request_explore_node_cb),
-      model
-    );
-    inf_signal_handlers_disconnect_by_func(
-      G_OBJECT(item-&gt;browser),
-      G_CALLBACK(inf_gtk_browser_store_begin_request_subscribe_session_cb),
-      model
-    );
-    g_object_unref(G_OBJECT(item-&gt;browser));
-  }
-  item-&gt;browser = NULL;
-  if(had_children)
-  {
-    gtk_tree_model_row_has_child_toggled(
-      GTK_TREE_MODEL(model),
-      path,
-      tree_iter
-    );
-  }
-  item-&gt;browser = new_browser;
-  if(new_browser != NULL)
-  {
-    g_object_ref(new_browser);
-    g_signal_connect(
-      G_OBJECT(item-&gt;browser),
-      "error",
-      G_CALLBACK(inf_gtk_browser_store_browser_error_cb),
-      model
-    );
-    g_signal_connect(
-      G_OBJECT(item-&gt;browser),
-      "notify::status",
-      G_CALLBACK(inf_gtk_browser_store_browser_notify_status_cb),
-      model
-    );
-    g_signal_connect_after(
-      G_OBJECT(item-&gt;browser),
-      "node-added",
-      G_CALLBACK(inf_gtk_browser_store_node_added_cb),
-      model
-    );
-    g_signal_connect_after(
-      G_OBJECT(item-&gt;browser),
-      "node-removed",
-      G_CALLBACK(inf_gtk_browser_store_node_removed_cb),
-      model
-    );
-    g_signal_connect_after(
-      G_OBJECT(item-&gt;browser),
-      "begin-request::explore-node",
-      G_CALLBACK(inf_gtk_browser_store_begin_request_explore_node_cb),
-      model
-    );
-    g_signal_connect_after(
-      G_OBJECT(item-&gt;browser),
-      "begin-request::subscribe-session",
-      G_CALLBACK(inf_gtk_browser_store_begin_request_subscribe_session_cb),
-      model
-    );
-  }
-  if(item-&gt;browser == NULL &amp;&amp; item-&gt;info == NULL &amp;&amp;
-     (item-&gt;error == NULL || item-&gt;status != INF_GTK_BROWSER_MODEL_ERROR))
-  {
-    g_assert(item-&gt;status != INF_GTK_BROWSER_MODEL_ERROR);
-    if(item-&gt;error != NULL)
-    {
-      g_error_free(item-&gt;error);
-      item-&gt;error = NULL;
-    }
-    item-&gt;status = INF_GTK_BROWSER_MODEL_INVALID;
-  }
-  else if(item-&gt;status != INF_GTK_BROWSER_MODEL_ERROR)
-  {
-    if(item-&gt;browser != NULL)
-    {
-      g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;status, NULL);
-      switch(status)
-      {
-      case INF_BROWSER_CLOSED:
-        item-&gt;status = INF_GTK_BROWSER_MODEL_DISCONNECTED;
-        break;
-      case INF_BROWSER_OPENING:
-        item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTING;
-        break;
-      case INF_BROWSER_OPEN:
-        item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTED;
-        break;
-      default:
-        g_assert_not_reached();
-        break;
-      }
-    }
-    else
-    {
-      g_assert(item-&gt;info != NULL);
-      item-&gt;status = INF_GTK_BROWSER_MODEL_DISCOVERED;
-    }
-  }
-  else
-  {
-    g_assert(item-&gt;error != NULL);
-  }
-  gtk_tree_model_row_changed(GTK_TREE_MODEL(model), path, tree_iter);
-  if(item-&gt;browser != NULL &amp;&amp; item-&gt;status == INF_GTK_BROWSER_MODEL_CONNECTED)
-  {
-    inf_browser_get_root(item-&gt;browser, &amp;iter);
-    if(inf_browser_get_explored(item-&gt;browser, &amp;iter) &amp;&amp;
-       inf_browser_get_child(item-&gt;browser, &amp;iter))
-    {
-      gtk_tree_model_row_has_child_toggled(
-        GTK_TREE_MODEL(model),
-        path,
-        tree_iter
-      );
-    }
-  }
-}
-static void
-inf_gtk_browser_store_browser_model_resolve(InfGtkBrowserModel* model,
-                                            InfDiscovery* discovery,
-                                            InfDiscoveryInfo* info)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  GtkTreeIter tree_iter;
-  GtkTreePath* path;
-  g_assert(INF_GTK_IS_BROWSER_STORE(model));
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  item = inf_gtk_browser_store_find_item_by_discovery_info(
-    INF_GTK_BROWSER_STORE(model),
-    info
-  );
-  g_assert(item != NULL);
-  g_assert(
-    item-&gt;status == INF_GTK_BROWSER_MODEL_DISCOVERED ||
-    item-&gt;status == INF_GTK_BROWSER_MODEL_ERROR
-  );
-  if(item-&gt;status == INF_GTK_BROWSER_MODEL_ERROR)
-  {
-    g_assert(item-&gt;error != NULL);
-    g_error_free(item-&gt;error);
-    item-&gt;error = NULL;
-    item-&gt;status = INF_GTK_BROWSER_MODEL_RESOLVING;
-  }
-  else
-  {
-    item-&gt;status = INF_GTK_BROWSER_MODEL_RESOLVING;
-  }
-  tree_iter.stamp = priv-&gt;stamp;
-  tree_iter.user_data = item;
-  tree_iter.user_data2 = GUINT_TO_POINTER(0);
-  tree_iter.user_data3 = NULL;
-  path = gtk_tree_model_get_path(GTK_TREE_MODEL(model), &amp;tree_iter);
-  gtk_tree_model_row_changed(GTK_TREE_MODEL(model), path, &amp;tree_iter);
-  gtk_tree_path_free(path);
-  inf_discovery_resolve(
-    discovery,
-    info,
-    inf_gtk_browser_store_resolv_complete_func,
-    model
-  );
-}
-static gboolean
-inf_gtk_browser_store_browser_iter_to_tree_iter(InfGtkBrowserModel* model,
-                                                InfBrowser* browser,
-                                                const InfBrowserIter* iter,
-                                                GtkTreeIter* tree_iter)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  g_assert(INF_GTK_IS_BROWSER_STORE(model));
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
-  item = inf_gtk_browser_store_find_item_by_browser(
-    INF_GTK_BROWSER_STORE(model),
-    browser
-  );
-  if(item == NULL || (iter != NULL &amp;&amp; item-&gt;missing == iter-&gt;node))
-    return FALSE;
-  tree_iter-&gt;stamp = priv-&gt;stamp;
-  tree_iter-&gt;user_data = item;
-  if(iter != NULL &amp;&amp; iter-&gt;node_id != 0)
-  {
-    tree_iter-&gt;user_data2 = GUINT_TO_POINTER(iter-&gt;node_id);
-    tree_iter-&gt;user_data3 = iter-&gt;node;
-  }
-  else
-  {
-    tree_iter-&gt;user_data2 = 0;
-    tree_iter-&gt;user_data3 = NULL;
-  }
-  return TRUE;
-}
-static void
-inf_gtk_browser_store_class_init(InfGtkBrowserStoreClass* browser_store_class)
-{
-  GObjectClass* object_class;
-  object_class = G_OBJECT_CLASS(browser_store_class);
-  object_class-&gt;dispose = inf_gtk_browser_store_dispose;
-  object_class-&gt;set_property = inf_gtk_browser_store_set_property;
-  object_class-&gt;get_property = inf_gtk_browser_store_get_property;
-  g_object_class_install_property(
-    object_class,
-    PROP_IO,
-    g_param_spec_object(
-      "io",
-      "IO",
-      "The IO object used for the created browsers to schedule timeouts",
-      INF_TYPE_IO,
-      G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY
-    )
-  );
-  g_object_class_install_property(
-    object_class,
-    PROP_COMMUNICATION_MANAGER,
-    g_param_spec_object(
-      "communication-manager",
-      "Communication manager", 
-      "The communication manager used for browsing remote directories",
-      INF_COMMUNICATION_TYPE_MANAGER,
-      G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY
-    )
-  );
-}
-static void
-inf_gtk_browser_store_tree_model_iface_init(GtkTreeModelIface* iface)
-{
-  iface-&gt;get_flags = inf_gtk_browser_store_tree_model_get_flags;
-  iface-&gt;get_n_columns = inf_gtk_browser_store_tree_model_get_n_columns;
-  iface-&gt;get_column_type = inf_gtk_browser_store_tree_model_get_column_type;
-  iface-&gt;get_iter = inf_gtk_browser_store_tree_model_get_iter;
-  iface-&gt;get_path = inf_gtk_browser_store_tree_model_get_path;
-  iface-&gt;get_value = inf_gtk_browser_store_tree_model_get_value;
-  iface-&gt;iter_next = inf_gtk_browser_store_tree_model_iter_next;
-  iface-&gt;iter_children = inf_gtk_browser_store_tree_model_iter_children;
-  iface-&gt;iter_has_child = inf_gtk_browser_store_tree_model_iter_has_child;
-  iface-&gt;iter_n_children = inf_gtk_browser_store_tree_model_iter_n_children;
-  iface-&gt;iter_nth_child = inf_gtk_browser_store_tree_model_iter_nth_child;
-  iface-&gt;iter_parent = inf_gtk_browser_store_tree_model_iter_parent;
-}
-static void
-inf_gtk_browser_store_browser_model_iface_init(
-  InfGtkBrowserModelInterface* iface)
-{
-  iface-&gt;set_browser = inf_gtk_browser_store_browser_model_set_browser;
-  iface-&gt;resolve = inf_gtk_browser_store_browser_model_resolve;
-  iface-&gt;browser_iter_to_tree_iter =
-    inf_gtk_browser_store_browser_iter_to_tree_iter;
-}
-InfGtkBrowserStore*
-inf_gtk_browser_store_new(InfIo* io,
-                          InfCommunicationManager* comm_manager)
-{
-  GObject* object;
-  object = g_object_new(
-    INF_GTK_TYPE_BROWSER_STORE,
-    "io", io,
-    "communication-manager", comm_manager,
-    NULL
-  );
-  return INF_GTK_BROWSER_STORE(object);
-}
-void
-inf_gtk_browser_store_add_discovery(InfGtkBrowserStore* store,
-                                    InfDiscovery* discovery)
-{
-  InfGtkBrowserStorePrivate* priv;
-  GSList* discovered;
-  GSList* item;
-  InfDiscoveryInfo* info;
-  g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
-  g_return_if_fail(INF_IS_DISCOVERY(discovery));
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  g_return_if_fail(g_slist_find(priv-&gt;discoveries, discovery) == NULL);
-  g_object_ref(G_OBJECT(discovery));
-  priv-&gt;discoveries = g_slist_prepend(priv-&gt;discoveries, discovery);
-  g_signal_connect(
-    G_OBJECT(discovery),
-    "discovered",
-    G_CALLBACK(inf_gtk_browser_store_discovered_cb),
-    store
-  );
-  g_signal_connect(
-    G_OBJECT(discovery),
-    "undiscovered",
-    G_CALLBACK(inf_gtk_browser_store_undiscovered_cb),
-    store
-  );
-  discovered = inf_discovery_get_discovered(discovery, "_infinote._tcp");
-  for(item = discovered; item != NULL; item = g_slist_next(item))
-  {
-    info = (InfDiscoveryInfo*)item-&gt;data;
-    inf_gtk_browser_store_add_item_by_browser(
-      store,
-      discovery,
-      info,
-      NULL,
-      inf_discovery_info_get_service_name(discovery, info)
-    );
-  }
-  g_slist_free(discovered);
-  inf_discovery_discover(discovery, "_infinote._tcp");
-}
-InfBrowser*
-inf_gtk_browser_store_add_connection(InfGtkBrowserStore* store,
-                                     InfXmlConnection* connection,
-                                     const gchar* name)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  gchar* remote_id;
-  g_return_val_if_fail(INF_GTK_IS_BROWSER_STORE(store), NULL);
-  g_return_val_if_fail(INF_IS_XML_CONNECTION(connection), NULL);
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  item = inf_gtk_browser_store_find_item_by_connection(store, connection);
-  if(item == NULL)
-  {
-    if(name == NULL)
-    {
-      g_object_get(G_OBJECT(connection), "remote-id", &amp;remote_id, NULL);
-      item = inf_gtk_browser_store_add_item_by_connection(
-        store,
-        NULL,
-        NULL,
-        connection,
-        remote_id
-      );
-    }
-    else
-    {
-      item = inf_gtk_browser_store_add_item_by_connection(
-        store,
-        NULL,
-        NULL,
-        connection,
-        g_strdup(name)
-      );
-    }
-  }
-  return item-&gt;browser;
-}
-void
-inf_gtk_browser_store_add_browser(InfGtkBrowserStore* store,
-                                  InfBrowser* browser,
-                                  const gchar* name)
-{
-  InfGtkBrowserStorePrivate* priv;
-  InfGtkBrowserStoreItem* item;
-  g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
-  g_return_if_fail(INF_IS_BROWSER(browser));
-  g_return_if_fail(name != NULL);
-  priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
-  item = inf_gtk_browser_store_find_item_by_browser(store, browser);
-  if(item == NULL)
-  {
-    inf_gtk_browser_store_add_item_by_browser(
-      store,
-      NULL,
-      NULL,
-      browser,
-      g_strdup(name)
-    );
-  }
-}
-void
-inf_gtk_browser_store_remove_browser(InfGtkBrowserStore* store,
-                                     InfBrowser* browser)
-{
-  InfGtkBrowserStoreItem* item;
-  g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
-  g_return_if_fail(INF_IS_BROWSER(browser));
-  item = inf_gtk_browser_store_find_item_by_browser(store, browser);
-  g_return_if_fail(item != NULL);
-  inf_gtk_browser_store_remove_item (store, item);
-}
-void
-inf_gtk_browser_store_remove_connection(InfGtkBrowserStore* store,
-                                        InfXmlConnection* connection)
-{
-  InfGtkBrowserStoreItem* item;
-  g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
-  g_return_if_fail(INF_IS_XML_CONNECTION(connection));
-  item = inf_gtk_browser_store_find_item_by_connection(store, connection);
-  g_return_if_fail(item != NULL);
-  inf_gtk_browser_store_remove_item (store, item);
-}
-void
-inf_gtk_browser_store_clear_connection_error(InfGtkBrowserStore* store,
-                                             InfXmlConnection* connection)
-{
-  InfGtkBrowserStoreItem* item;
-  InfBrowserStatus status;
-  GtkTreeIter iter;
-  GtkTreePath* path;
-  g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
-  g_return_if_fail(INF_IS_XML_CONNECTION(connection));
-  item = inf_gtk_browser_store_find_item_by_connection(store, connection);
-  g_return_if_fail(item != NULL);
-  if(item-&gt;status == INF_GTK_BROWSER_MODEL_ERROR)
-  {
-    g_assert(item-&gt;error != NULL);
-    g_error_free(item-&gt;error);
-    item-&gt;error = NULL;
-    if(item-&gt;browser != NULL)
-    {
-      g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;status, NULL);
-      switch(status)
-      {
-      case INF_BROWSER_CLOSED:
-        item-&gt;status = INF_GTK_BROWSER_MODEL_DISCONNECTED;
-        break;
-      case INF_BROWSER_OPENING:
-        item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTING;
-        break;
-      case INF_BROWSER_OPEN:
-        item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTED;
-        break;
-      default:
-        g_assert_not_reached();
-        break;
-      }
-    }
-    else if(item-&gt;info != NULL)
-    {
-      item-&gt;status = INF_GTK_BROWSER_MODEL_DISCOVERED;
-    }
-    else
-    {
-      g_assert_not_reached();
-    }
-    iter.stamp = INF_GTK_BROWSER_STORE_PRIVATE(store)-&gt;stamp;
-    iter.user_data = item;
-    iter.user_data2 = GUINT_TO_POINTER(0);
-    iter.user_data3 = NULL;
-    path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;iter);
-    gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
-    gtk_tree_path_free (path);
-  }
-}
-void
-inf_gtk_browser_store_set_connection_name(InfGtkBrowserStore* store,
-                                          InfXmlConnection* connection,
-                                          const gchar* name)
-{
-  InfGtkBrowserStoreItem* item;
-  GtkTreeIter iter;
-  GtkTreePath* path;
-  g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
-  g_return_if_fail(INF_IS_XML_CONNECTION(connection));
-  g_return_if_fail(name != NULL);
-  item = inf_gtk_browser_store_find_item_by_connection(store, connection);
-  g_return_if_fail(item != NULL);
-  g_free (item-&gt;name);
-  item-&gt;name = g_strdup(name);
-  iter.stamp = INF_GTK_BROWSER_STORE_PRIVATE(store)-&gt;stamp;
-  iter.user_data = item;
-  iter.user_data2 = GUINT_TO_POINTER(0);
-  iter.user_data3 = NULL;
-  path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;iter);
-  gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
-  gtk_tree_path_free(path);
-}
+1 #include &lt;libinfgtk/inf-gtk-browser-store.h&gt;
+2 #include &lt;libinfgtk/inf-gtk-browser-model.h&gt;
+3 #include &lt;libinfinity/client/infc-browser.h&gt;
+4 #include &lt;libinfinity/inf-i18n.h&gt;
+5 #include &lt;libinfinity/inf-signals.h&gt;
+6 #include &lt;gtk/gtk.h&gt;
+7 typedef struct _InfGtkBrowserStoreItem InfGtkBrowserStoreItem;
+8 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>struct _InfGtkBrowserStoreItem {
+9   gchar* name;
+10   InfDiscovery* discovery;
+11   InfDiscoveryInfo* info;
+12   InfBrowser* browser;
+13   gpointer missing;
+14   GSList* requests;
+15   GHashTable* node_errors;
+16   InfGtkBrowserModelStatus status;
+17   GError* error;
+18   InfGtkBrowserStoreItem* next;
+19 };
+20 typedef struct _InfGtkBrowserStoreRequestData InfGtkBrowserStoreRequestData;
+21 struct _InfGtkBrowserStoreRequestData {
+22   InfGtkBrowserStore* store;
+23   InfGtkBrowserStoreItem* item;
+24 };
+25 typedef struct _InfGtkBrowserStorePrivate InfGtkBrowserStorePrivate;
+26 struct _InfGtkBrowserStorePrivate {
+27   gint stamp;
+28   InfIo* io;
+29   InfCommunicationManager* communication_manager;
+30   GSList* discoveries;
+31   InfGtkBrowserStoreItem* first_item;
+32   InfGtkBrowserStoreItem* last_item;
+33 };</b></font>
+34 enum {
+35   PROP_0,
+36   PROP_IO,
+37   PROP_COMMUNICATION_MANAGER
+38 };
+39 #define INF_GTK_BROWSER_STORE_PRIVATE(obj) (G_TYPE_INSTANCE_GET_PRIVATE((obj), INF_GTK_TYPE_BROWSER_STORE, InfGtkBrowserStorePrivate))
+40 static void inf_gtk_browser_store_tree_model_iface_init(GtkTreeModelIface* iface);
+41 static void inf_gtk_browser_store_browser_model_iface_init(InfGtkBrowserModelInterface* iface);
+42 G_DEFINE_TYPE_WITH_CODE(InfGtkBrowserStore, inf_gtk_browser_store, G_TYPE_OBJECT,
+43   G_ADD_PRIVATE(InfGtkBrowserStore)
+44   G_IMPLEMENT_INTERFACE(GTK_TYPE_TREE_MODEL, inf_gtk_browser_store_tree_model_iface_init)
+45   G_IMPLEMENT_INTERFACE(INF_GTK_TYPE_BROWSER_MODEL, inf_gtk_browser_store_browser_model_iface_init))
+46 static InfGtkBrowserStoreItem*
+47 inf_gtk_browser_store_find_item_by_connection(InfGtkBrowserStore* store,
+48                                               InfXmlConnection* connection)
+49 {
+50   InfGtkBrowserStorePrivate* priv;
+51   InfGtkBrowserStoreItem* item;
+52   InfcBrowser* browser;
+53   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+54   for(item = priv-&gt;first_item; item != NULL; item = item-&gt;next)
+55   {
+56     if(item-&gt;browser != NULL &amp;&amp; INFC_IS_BROWSER(item-&gt;browser))
+57     {
+58       browser = INFC_BROWSER(item-&gt;browser);
+59       if(infc_browser_get_connection(browser) == connection)
+60         return item;
+61     }
+62   }
+63   return NULL;
+64 }
+65 static InfGtkBrowserStoreItem*
+66 inf_gtk_browser_store_find_item_by_browser(InfGtkBrowserStore* store,
+67                                            InfBrowser* browser)
+68 {
+69   InfGtkBrowserStorePrivate* priv;
+70   InfGtkBrowserStoreItem* item;
+71   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+72   for(item = priv-&gt;first_item; item != NULL; item = item-&gt;next)
+73     if(item-&gt;browser != NULL)
+74       if(item-&gt;browser == browser)
+75         return item;
+76   return NULL;
+77 }
+78 static InfGtkBrowserStoreItem*
+79 inf_gtk_browser_store_find_item_by_discovery_info(InfGtkBrowserStore* store,
+80                                                   InfDiscoveryInfo* info)
+81 {
+82   InfGtkBrowserStorePrivate* priv;
+83   InfGtkBrowserStoreItem* item;
+84   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+85   for(item = priv-&gt;first_item; item != NULL; item = item-&gt;next)
+86     if(item-&gt;info != NULL)
+87       if(item-&gt;info == info)
+88         return item;
+89   return NULL;
+90 }
+91 static void
+92 inf_gtk_browser_store_browser_notify_status_cb(GObject* object,
+93                                                GParamSpec* pspec,
+94                                                gpointer user_data);
+95 static void
+96 inf_gtk_browser_store_browser_error_cb(InfBrowser* browser,
+97                                        const GError* error,
+98                                        gpointer user_data);
+99 static void
+100 inf_gtk_browser_store_node_added_cb(InfBrowser* browser,
+101                                     InfBrowserIter* iter,
+102                                     InfRequest* request,
+103                                     gpointer user_data);
+104 static void
+105 inf_gtk_browser_store_node_removed_cb(InfBrowser* browser,
+106                                       InfBrowserIter* iter,
+107                                       InfRequest* request,
+108                                       gpointer user_data);
+109 static void
+110 inf_gtk_browser_store_begin_request_explore_node_cb(InfBrowser* browser,
+111                                                     InfBrowserIter* iter,
+112                                                     InfRequest* request,
+113                                                     gpointer user_data);
+114 static void
+115 inf_gtk_browser_store_begin_request_subscribe_session_cb(InfBrowser* browser,
+116                                                          InfBrowserIter* iter,
+117                                                          InfRequest* request,
+118                                                          gpointer user_data);
+119 static void
+120 inf_gtk_browser_store_request_finished_cb(InfRequest* request,
+121                                           const InfRequestResult* result,
+122                                           const GError* error,
+123                                           gpointer user_data);
+124 static void
+125 inf_gtk_browser_store_request_unrefed_func(gpointer data,
+126                                            GObject* where_the_object_was);
+127 static void
+128 inf_gtk_browser_store_request_data_free(gpointer data,
+129                                         GClosure* closure)
+130 {
+131   g_slice_free(InfGtkBrowserStoreRequestData, data);
+132 }
+133 static void
+134 inf_gtk_browser_store_item_request_remove(InfGtkBrowserStoreItem* item,
+135                                           InfRequest* request)
+136 {
+137   g_object_weak_unref(
+138     G_OBJECT(request),
+139     inf_gtk_browser_store_request_unrefed_func,
+140     item
+141   );
+142   inf_signal_handlers_disconnect_by_func(
+143     G_OBJECT(request),
+144     G_CALLBACK(inf_gtk_browser_store_request_finished_cb),
+145     item
+146   );
+147   item-&gt;requests = g_slist_remove(item-&gt;requests, request);
+148 }
+149 static void
+150 inf_gtk_browser_store_item_request_add(InfGtkBrowserStore* store,
+151                                        InfGtkBrowserStoreItem* item,
+152                                        InfRequest* request)
+153 {
+154   InfGtkBrowserStoreRequestData* data;
+155   g_assert(g_slist_find(item-&gt;requests, request) == NULL);
+156   item-&gt;requests = g_slist_prepend(item-&gt;requests, request);
+157   data = g_slice_new(InfGtkBrowserStoreRequestData);
+158   data-&gt;store = store;
+159   data-&gt;item = item;
+160   g_signal_connect_data(
+161     G_OBJECT(request),
+162     "finished",
+163     G_CALLBACK(inf_gtk_browser_store_request_finished_cb),
+164     data,
+165     inf_gtk_browser_store_request_data_free,
+166     0
+167   );
+168   g_object_weak_ref(
+169     G_OBJECT(request),
+170     inf_gtk_browser_store_request_unrefed_func,
+171     item
+172   );
+173 }
+174 static void
+175 inf_gtk_browser_store_request_finished_cb(InfRequest* request,
+176                                           const InfRequestResult* result,
+177                                           const GError* error,
+178                                           gpointer user_data)
+179 {
+180   InfGtkBrowserStoreRequestData* data;
+181   InfGtkBrowserStorePrivate* priv;
+182   InfBrowserIter request_iter;
+183   gboolean node_exists;
+184   GtkTreeIter tree_iter;
+185   GtkTreePath* path;
+186   data = (InfGtkBrowserStoreRequestData*)user_data;
+187   priv = INF_GTK_BROWSER_STORE_PRIVATE(data-&gt;store);
+188   g_assert(g_slist_find(data-&gt;item-&gt;requests, request) != NULL);
+189   g_assert(data-&gt;item-&gt;browser != NULL);
+190   if(error != NULL)
+191   {
+192     node_exists = inf_browser_iter_from_request(
+193       data-&gt;item-&gt;browser,
+194       request,
+195       &amp;request_iter
+196     );
+197     inf_gtk_browser_store_item_request_remove(data-&gt;item, request);
+198     if(G_LIKELY(node_exists))
+199     {
+200       g_hash_table_insert(
+201         data-&gt;item-&gt;node_errors,
+202         GUINT_TO_POINTER(request_iter.node_id),
+203         g_error_copy(error)
+204       );
+205       tree_iter.stamp = priv-&gt;stamp;
+206       tree_iter.user_data = data-&gt;item;
+207       tree_iter.user_data2 = GUINT_TO_POINTER(request_iter.node_id);
+208       if(request_iter.node_id == 0)
+209         tree_iter.user_data3 = NULL;
+210       else
+211         tree_iter.user_data3 = request_iter.node;
+212       path = gtk_tree_model_get_path(GTK_TREE_MODEL(data-&gt;store), &amp;tree_iter);
+213       gtk_tree_model_row_changed(GTK_TREE_MODEL(data-&gt;store), path, &amp;tree_iter);
+214       gtk_tree_path_free(path);
+215     }
+216   }
+217 }
+218 static void
+219 inf_gtk_browser_store_request_unrefed_func(gpointer data,
+220                                            GObject* where_the_object_was)
+221 {
+222   InfGtkBrowserStoreItem* item;
+223   item = (InfGtkBrowserStoreItem*)data;
+224   item-&gt;requests = g_slist_remove(item-&gt;requests, where_the_object_was);
+225 }
+226 static void
+227 inf_gtk_browser_store_item_set_browser(InfGtkBrowserStore* store,
+228                                        InfGtkBrowserStoreItem* item,
+229                                        GtkTreePath* path,
+230                                        InfBrowser* browser)
+231 {
+232   GtkTreeIter tree_iter;
+233   InfGtkBrowserStorePrivate* priv;
+234   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+235   tree_iter.stamp = priv-&gt;stamp;
+236   tree_iter.user_data = item;
+237   tree_iter.user_data2 = GUINT_TO_POINTER(0);
+238   tree_iter.user_data3 = NULL;
+239   inf_gtk_browser_model_set_browser(
+240     INF_GTK_BROWSER_MODEL(store),
+241     path,
+242     &amp;tree_iter,
+243     item-&gt;browser,
+244     browser
+245   );
+246 }
+247 static InfGtkBrowserStoreItem*
+248 inf_gtk_browser_store_add_item_by_browser(InfGtkBrowserStore* store,
+249                                           InfDiscovery* discovery,
+250                                           InfDiscoveryInfo* info,
+251                                           InfBrowser* browser,
+252                                           gchar* name)
+253 {
+254   InfGtkBrowserStorePrivate* priv;
+255   InfGtkBrowserStoreItem* item;
+256   InfGtkBrowserStoreItem* cur;
+257   GtkTreePath* path;
+258   GtkTreeIter iter;
+259   guint index;
+260   g_assert(
+261     browser == NULL ||
+262     inf_gtk_browser_store_find_item_by_browser(store, browser) == NULL
+263   );
+264   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+265   item = g_slice_new(InfGtkBrowserStoreItem);
+266   item-&gt;name = name;
+267   item-&gt;discovery = discovery;
+268   item-&gt;info = info;
+269   item-&gt;status = INF_GTK_BROWSER_MODEL_DISCONNECTED;
+270   if(discovery != NULL &amp;&amp; info != NULL)
+271     item-&gt;status = INF_GTK_BROWSER_MODEL_DISCOVERED;
+272   item-&gt;browser = NULL;
+273   item-&gt;missing = NULL;
+274   item-&gt;node_errors = g_hash_table_new_full(
+275     NULL,
+276     NULL,
+277     NULL,
+278     (GDestroyNotify)g_error_free
+279   );
+280   item-&gt;requests = NULL;
+281   item-&gt;error = NULL;
+282   item-&gt;next = NULL;
+283   index = 0;
+284   for(cur = priv-&gt;first_item; cur != NULL; cur = cur-&gt;next)
+285     ++ index;
+286   if(priv-&gt;first_item == NULL)
+287   {
+288     priv-&gt;first_item = item;
+289     priv-&gt;last_item = item;
+290   }
+291   else
+292   {
+293     priv-&gt;last_item-&gt;next = item;
+294     priv-&gt;last_item = item;
+295   }
+296   path = gtk_tree_path_new_from_indices(index, -1);
+297   iter.stamp = priv-&gt;stamp;
+298   iter.user_data = item;
+299   iter.user_data2 = GUINT_TO_POINTER(0);
+300   iter.user_data3 = NULL;
+301   gtk_tree_model_row_inserted(GTK_TREE_MODEL(store), path, &amp;iter);
+302   if(browser != NULL)
+303     inf_gtk_browser_store_item_set_browser(store, item, path, browser);
+304   gtk_tree_path_free(path);
+305   return item;
+306 }
+307 static InfGtkBrowserStoreItem*
+308 inf_gtk_browser_store_add_item_by_connection(InfGtkBrowserStore* store,
+309                                              InfDiscovery* discovery,
+310                                              InfDiscoveryInfo* info,
+311                                              InfXmlConnection* connection,
+312                                              gchar* name)
+313 {
+314   InfGtkBrowserStorePrivate* priv;
+315   InfcBrowser* browser;
+316   InfGtkBrowserStoreItem* item;
+317   g_assert(
+318     connection == NULL ||
+319     inf_gtk_browser_store_find_item_by_connection(store, connection) == NULL
+320   );
+321   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+322   browser = NULL;
+323   if(connection != NULL)
+324   {
+325     browser = infc_browser_new(
+326       priv-&gt;io,
+327       priv-&gt;communication_manager,
+328       connection
+329     );
+330     if(infc_browser_get_connection(browser) == NULL)
+331     {
+332       g_object_unref(browser);
+333       g_free(name);
+334       return NULL;
+335     }
+336   }
+337   item = inf_gtk_browser_store_add_item_by_browser(
+338     store,
+339     discovery,
+340     info,
+341     INF_BROWSER(browser),
+342     name
+343   );
+344   if(browser != NULL)
+345     g_object_unref(browser);
+346   return item;
+347 }
+348 static void
+349 inf_gtk_browser_store_remove_item(InfGtkBrowserStore* store,
+350                                   InfGtkBrowserStoreItem* item)
+351 {
+352   InfGtkBrowserStorePrivate* priv;
+353   InfGtkBrowserStoreItem* prev;
+354   InfGtkBrowserStoreItem* cur;
+355   GtkTreePath* path;
+356   guint index;
+357   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+358   prev = NULL;
+359   index = 0;
+360   for(cur = priv-&gt;first_item; cur != NULL; cur = cur-&gt;next)
+361   {
+362     if(cur == item)
+363       break;
+364     prev = cur;
+365     ++ index;
+366   }
+367   g_assert(cur != NULL);
+368   path = gtk_tree_path_new_from_indices(index, -1);
+369   if(item-&gt;browser != NULL)
+370   {
+371     inf_gtk_browser_store_item_set_browser(store, item, path, NULL);
+372     g_assert(item-&gt;browser == NULL);   }
+373   if(prev == NULL)
+374     priv-&gt;first_item = item-&gt;next;
+375   else
+376     prev-&gt;next = item-&gt;next;
+377   if(item-&gt;next == NULL)
+378     priv-&gt;last_item = prev;
+379   g_assert(cur != NULL);
+380   gtk_tree_model_row_deleted(GTK_TREE_MODEL(store), path);
+381   gtk_tree_path_free(path);
+382   if(item-&gt;error != NULL)
+383     g_error_free(item-&gt;error);
+384   g_hash_table_unref(item-&gt;node_errors);
+385   g_free(item-&gt;name);
+386   g_slice_free(InfGtkBrowserStoreItem, item);
+387 }
+388 static void
+389 inf_gtk_browser_store_discovered_cb(InfDiscovery* discovery,
+390                                     InfDiscoveryInfo* info,
+391                                     gpointer user_data)
+392 {
+393   inf_gtk_browser_store_add_item_by_browser(
+394     INF_GTK_BROWSER_STORE(user_data),
+395     discovery,
+396     info,
+397     NULL,
+398     inf_discovery_info_get_service_name(discovery, info)
+399   );
+400 }
+401 static void
+402 inf_gtk_browser_store_undiscovered_cb(InfDiscovery* discovery,
+403                                       InfDiscoveryInfo* info,
+404                                       gpointer user_data)
+405 {
+406   InfGtkBrowserStore* store;
+407   InfGtkBrowserStoreItem* item;
+408   store = INF_GTK_BROWSER_STORE(user_data);
+409   item = inf_gtk_browser_store_find_item_by_discovery_info(store, info);
+410   if(item != NULL)
+411   {
+412     if(item-&gt;browser == NULL)
+413     {
+414       inf_gtk_browser_store_remove_item(store, item);
+415     }
+416     else
+417     {
+418       g_assert(item-&gt;status != INF_GTK_BROWSER_MODEL_DISCOVERED &amp;&amp;
+419                item-&gt;status != INF_GTK_BROWSER_MODEL_RESOLVING);
+420       item-&gt;discovery = NULL;
+421       item-&gt;info = NULL;
+422     }
+423   }
+424 }
+425 static void
+426 inf_gtk_browser_store_browser_error_cb(InfBrowser* browser,
+427                                        const GError* error,
+428                                        gpointer user_data)
+429 {
+430   InfGtkBrowserStore* store;
+431   InfGtkBrowserStoreItem* item;
+432   InfGtkBrowserStorePrivate* priv;
+433   GtkTreeIter iter;
+434   GtkTreePath* path;
+435   store = INF_GTK_BROWSER_STORE(user_data);
+436   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+437   item = inf_gtk_browser_store_find_item_by_browser(store, browser);
+438   g_assert(item != NULL);
+439   if(item-&gt;error != NULL)
+440     g_error_free(item-&gt;error);
+441   item-&gt;error = g_error_copy(error);
+442   iter.stamp = priv-&gt;stamp;
+443   iter.user_data = item;
+444   iter.user_data2 = GUINT_TO_POINTER(0);
+445   iter.user_data3 = NULL;
+446   path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;iter);
+447   gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
+448   gtk_tree_path_free(path);
+449 }
+450 static void
+451 inf_gtk_browser_store_browser_notify_status_cb(GObject* object,
+452                                                GParamSpec* pspec,
+453                                                gpointer user_data)
+454 {
+455   InfGtkBrowserStore* store;
+456   InfGtkBrowserStorePrivate* priv;
+457   InfBrowser* browser;
+458   InfBrowserStatus status;
+459   InfGtkBrowserStoreItem* item;
+460   GtkTreeIter iter;
+461   GtkTreePath* path;
+462   store = INF_GTK_BROWSER_STORE(user_data);
+463   priv = INF_GTK_BROWSER_STORE_PRIVATE(user_data);  
+464   browser = INF_BROWSER(object);
+465   item = inf_gtk_browser_store_find_item_by_browser(store, browser);
+466   g_assert(item != NULL);
+467   iter.stamp = priv-&gt;stamp;
+468   iter.user_data = item;
+469   iter.user_data2 = GUINT_TO_POINTER(0);
+470   iter.user_data3 = NULL;
+471   path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;iter);
+472   g_object_get(G_OBJECT(browser), "status", &amp;status, NULL);
+473   switch(status)
+474   {
+475   case INF_BROWSER_CLOSED:
+476     item-&gt;status = INF_GTK_BROWSER_MODEL_ERROR;
+477     if(item-&gt;error == NULL)
+478     {
+479       item-&gt;error = g_error_new_literal(
+480         g_quark_from_static_string("INF_GTK_BROWSER_STORE_ERROR"),
+481         0,
+482         _("Disconnected")
+483       );
+484     }
+485     gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
+486     break;
+487   case INF_BROWSER_OPENING:
+488     if(item-&gt;error != NULL) g_error_free(item-&gt;error);
+489     item-&gt;error = NULL;
+490     item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTING;
+491     gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
+492     break;
+493   case INF_BROWSER_OPEN:
+494     if(item-&gt;error != NULL) g_error_free(item-&gt;error);
+495     item-&gt;error = NULL;
+496     item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTED;
+497     gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
+498     break;
+499   default:
+500     g_assert_not_reached();
+501     break;
+502   }
+503   gtk_tree_path_free(path);
+504 }
+505 static void
+506 inf_gtk_browser_store_node_added_cb(InfBrowser* browser,
+507                                     InfBrowserIter* iter,
+508                                     InfRequest* request,
+509                                     gpointer user_data)
+510 {
+511   InfGtkBrowserStore* store;
+512   InfGtkBrowserStorePrivate* priv;
+513   InfGtkBrowserStoreItem* item;
+514   GtkTreeIter tree_iter;
+515   GtkTreePath* path;
+516   InfBrowserIter test_iter;
+517   gboolean test_result;
+518   store = INF_GTK_BROWSER_STORE(user_data);
+519   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+520   item = inf_gtk_browser_store_find_item_by_browser(store, browser);
+521   tree_iter.stamp = priv-&gt;stamp;
+522   tree_iter.user_data = item;
+523   tree_iter.user_data2 = GUINT_TO_POINTER(iter-&gt;node_id);
+524   tree_iter.user_data3 = iter-&gt;node;
+525   if(iter-&gt;node_id != 0)
+526   {
+527     path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;tree_iter);
+528     gtk_tree_model_row_inserted(GTK_TREE_MODEL(store), path, &amp;tree_iter);
+529     test_iter = *iter;
+530     test_result = inf_browser_get_parent(browser, &amp;test_iter);
+531     g_assert(test_result == TRUE);
+532     tree_iter.user_data2 = GUINT_TO_POINTER(test_iter.node_id);
+533     gtk_tree_path_up(path);
+534     if(test_iter.node_id == 0)
+535       tree_iter.user_data3 = NULL;
+536     else
+537       tree_iter.user_data3 = test_iter.node;
+538     test_result = inf_browser_get_child(browser, &amp;test_iter);
+539     g_assert(test_result == TRUE);
+540     if(inf_browser_get_next(browser, &amp;test_iter) == FALSE)
+541     {
+542       gtk_tree_model_row_has_child_toggled(
+543         GTK_TREE_MODEL(store),
+544         path,
+545         &amp;tree_iter
+546       );
+547     }
+548     gtk_tree_path_free(path);
+549   }
+550 }
+551 static void
+552 inf_gtk_browser_store_node_removed_cb(InfBrowser* browser,
+553                                       InfBrowserIter* iter,
+554                                       InfRequest* request,
+555                                       gpointer user_data)
+556 {
+557   InfGtkBrowserStore* store;
+558   InfGtkBrowserStorePrivate* priv;
+559   InfGtkBrowserStoreItem* item;
+560   GtkTreeIter tree_iter;
+561   GtkTreePath* path;
+562   InfBrowserIter test_iter;
+563   gboolean test_result;
+564   store = INF_GTK_BROWSER_STORE(user_data);
+565   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+566   item = inf_gtk_browser_store_find_item_by_browser(store, browser);
+567   g_assert(item-&gt;missing == NULL);
+568   tree_iter.stamp = priv-&gt;stamp;
+569   tree_iter.user_data = item;
+570   tree_iter.user_data2 = GUINT_TO_POINTER(iter-&gt;node_id);
+571   tree_iter.user_data3 = iter-&gt;node;
+572   path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;tree_iter);
+573   item-&gt;missing = iter-&gt;node;
+574   if(iter-&gt;node_id != 0)
+575   {
+576     gtk_tree_model_row_deleted(GTK_TREE_MODEL(store), path);
+577     test_iter = *iter;
+578     test_result = inf_browser_get_parent(browser, &amp;test_iter);
+579     g_assert(test_result == TRUE);
+580     tree_iter.user_data2 = GUINT_TO_POINTER(test_iter.node_id);
+581     gtk_tree_path_up(path);
+582     if(test_iter.node_id == 0)
+583       tree_iter.user_data3 = NULL;
+584     else
+585       tree_iter.user_data3 = test_iter.node;
+586     test_result = inf_browser_get_child(browser, &amp;test_iter);
+587     g_assert(test_result == TRUE);
+588     if(inf_browser_get_next(browser, &amp;test_iter) == FALSE)
+589     {
+590       gtk_tree_model_row_has_child_toggled(
+591         GTK_TREE_MODEL(store),
+592         path,
+593         &amp;tree_iter
+594       );
+595     }
+596   }
+597   else
+598   {
+599     if(inf_browser_get_explored(browser, iter))
+600     {
+601       test_iter = *iter;
+602       test_result = inf_browser_get_child(browser, &amp;test_iter);
+603       gtk_tree_path_down(path);
+604       do
+605       {
+606         gtk_tree_model_row_deleted(GTK_TREE_MODEL(store), path);
+607       } while(inf_browser_get_next(browser, &amp;test_iter));
+608       if(test_result == TRUE)
+609       {
+610         gtk_tree_path_up(path);
+611         gtk_tree_model_row_has_child_toggled(
+612           GTK_TREE_MODEL(store),
+613           path,
+614           &amp;tree_iter
+615         );
+616       }
+617     }
+618   }
+619   item-&gt;missing = NULL;
+620   gtk_tree_path_free(path);
+621 }
+622 static void
+623 inf_gtk_browser_store_begin_request_explore_node_cb(InfBrowser* browser,
+624                                                     InfBrowserIter* iter,
+625                                                     InfRequest* request,
+626                                                     gpointer user_data)
+627 {
+628   InfGtkBrowserStore* store;
+629   InfGtkBrowserStoreItem* item;
+630   store = INF_GTK_BROWSER_STORE(user_data);
+631   item = inf_gtk_browser_store_find_item_by_browser(store, browser);
+632   inf_gtk_browser_store_item_request_add(store, item, request);
+633 }
+634 static void
+635 inf_gtk_browser_store_begin_request_subscribe_session_cb(InfBrowser* browser,
+636                                                          InfBrowserIter* iter,
+637                                                          InfRequest* request,
+638                                                          gpointer user_data)
+639 {
+640   InfGtkBrowserStore* store;
+641   InfGtkBrowserStoreItem* item;
+642   g_assert(iter != NULL);
+643   store = INF_GTK_BROWSER_STORE(user_data);
+644   item = inf_gtk_browser_store_find_item_by_browser(store, browser);
+645   inf_gtk_browser_store_item_request_add(store, item, request);
+646 }
+647 static void
+648 inf_gtk_browser_store_resolv_complete_func(InfDiscoveryInfo* info,
+649                                            InfXmlConnection* connection,
+650                                            const GError* error,
+651                                            gpointer user_data)
+652 {
+653   InfGtkBrowserStore* store;
+654   InfGtkBrowserStorePrivate* priv;
+655   InfGtkBrowserStoreItem* new_item;
+656   InfGtkBrowserStoreItem* old_item;
+657   GtkTreeIter tree_iter;
+658   GtkTreePath* path;
+659   InfcBrowser* browser;
+660   InfGtkBrowserStoreItem* cur;
+661   InfGtkBrowserStoreItem* prev;
+662   InfGtkBrowserStoreItem* prev_new;
+663   InfGtkBrowserStoreItem* prev_old;
+664   gint* order;
+665   guint count;
+666   guint new_pos;
+667   guint old_pos;
+668   guint i;
+669   store = INF_GTK_BROWSER_STORE(user_data);
+670   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+671   new_item = inf_gtk_browser_store_find_item_by_discovery_info(store, info);
+672   g_assert(new_item != NULL);
+673   g_assert(new_item-&gt;status == INF_GTK_BROWSER_MODEL_RESOLVING);
+674   tree_iter.stamp = priv-&gt;stamp;
+675   tree_iter.user_data = new_item;
+676   tree_iter.user_data2 = GUINT_TO_POINTER(0);
+677   tree_iter.user_data3 = NULL;
+678   if(error != NULL)
+679   {
+680     new_item-&gt;status = INF_GTK_BROWSER_MODEL_ERROR;
+681     new_item-&gt;error = g_error_copy(error);
+682     path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;tree_iter);
+683     gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;tree_iter);
+684     gtk_tree_path_free(path);
+685   }
+686   else
+687   {
+688     old_item =
+689       inf_gtk_browser_store_find_item_by_connection(store, connection);
+690     if(old_item != NULL)
+691     {
+692       g_assert(old_item != new_item);
+693       count = 0;
+694       prev = NULL;
+695       for(cur = priv-&gt;first_item; cur != NULL; cur = cur-&gt;next)
+696       {
+697         if(cur == old_item) { old_pos = count; prev_old = prev; }
+698         if(cur == new_item) { new_pos = count; prev_new = prev; }
+699         ++ count;
+700         prev = cur;
+701       }
+702       inf_gtk_browser_store_remove_item(store, new_item);
+703       if(old_pos &gt; new_pos) -- old_pos;
+704       else -- new_pos;
+705       -- count;
+706       if(new_pos != old_pos)
+707       {
+708         if(old_item-&gt;next == NULL)
+709           priv-&gt;last_item = prev_old;
+710         if(prev_old != NULL)
+711           prev_old-&gt;next = old_item-&gt;next;
+712         else
+713           priv-&gt;first_item = old_item-&gt;next;
+714         old_item-&gt;next = prev_new-&gt;next;
+715         if(prev_new != NULL)
+716           prev_new-&gt;next = old_item;
+717         else
+718           priv-&gt;first_item = old_item;
+719         if(old_item-&gt;next == NULL)
+720           priv-&gt;last_item = old_item;
+721         order = g_malloc(sizeof(gint) * count);
+722         if(new_pos &lt; old_pos)
+723         {
+724           for(i = 0; i &lt; new_pos; ++ i)
+725             order[i] = i;
+726           order[new_pos] = old_pos;
+727           for(i = new_pos + 1; i &lt;= old_pos; ++ i)
+728             order[i] = i - 1;
+729           for(i = old_pos + 1; i &lt; count; ++ i)
+730             order[i] = i;
+731         }
+732         else
+733         {
+734           for(i = 0; i &lt; old_pos; ++ i)
+735             order[i] = i;
+736           for(i = old_pos; i &lt; new_pos; ++ i)
+737             order[i] = i + 1;
+738           order[new_pos] = old_pos;
+739           for(i = new_pos + 1; i &lt; count; ++ i)
+740             order[i] = i;
+741         }
+742         path = gtk_tree_path_new();
+743         gtk_tree_model_rows_reordered(
+744           GTK_TREE_MODEL(store),
+745           path,
+746           NULL,
+747           order
+748         );
+749         gtk_tree_path_free(path);
+750         g_free(order);
+751       }
+752     }
+753     else
+754     {
+755       path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;tree_iter);
+756       browser = infc_browser_new(
+757         priv-&gt;io,
+758         priv-&gt;communication_manager,
+759         connection
+760       );
+761       if(infc_browser_get_connection(browser) != NULL)
+762       {
+763         inf_gtk_browser_store_item_set_browser(
+764           store,
+765           new_item,
+766           path,
+767           INF_BROWSER(browser)
+768         );
+769       }
+770       g_object_unref(G_OBJECT(browser));
+771       gtk_tree_path_free(path);
+772     }
+773   }
+774 }
+775 static void
+776 inf_gtk_browser_store_init(InfGtkBrowserStore* store)
+777 {
+778   InfGtkBrowserStorePrivate* priv;
+779   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+780   priv-&gt;stamp = g_random_int();
+781   priv-&gt;io = NULL;
+782   priv-&gt;communication_manager = NULL;
+783   priv-&gt;discoveries = NULL;
+784   priv-&gt;first_item = NULL;
+785   priv-&gt;last_item = NULL;
+786 }
+787 static void
+788 inf_gtk_browser_store_dispose(GObject* object)
+789 {
+790   InfGtkBrowserStore* store;
+791   InfGtkBrowserStorePrivate* priv;
+792   GSList* item;
+793   store = INF_GTK_BROWSER_STORE(object);
+794   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+795   while(priv-&gt;first_item != NULL)
+796     inf_gtk_browser_store_remove_item(store, priv-&gt;first_item);
+797   g_assert(priv-&gt;last_item == NULL);
+798   for(item = priv-&gt;discoveries; item != NULL; item = g_slist_next(item))
+799   {
+800     inf_signal_handlers_disconnect_by_func(
+801       G_OBJECT(item-&gt;data),
+802       G_CALLBACK(inf_gtk_browser_store_discovered_cb),
+803       store
+804     );
+805     inf_signal_handlers_disconnect_by_func(
+806       G_OBJECT(item-&gt;data),
+807       G_CALLBACK(inf_gtk_browser_store_undiscovered_cb),
+808       store
+809     );
+810     g_object_unref(G_OBJECT(item-&gt;data));
+811   }
+812   g_slist_free(priv-&gt;discoveries);
+813   priv-&gt;discoveries = NULL;
+814   if(priv-&gt;communication_manager != NULL)
+815   {
+816     g_object_unref(priv-&gt;communication_manager);
+817     priv-&gt;communication_manager = NULL;
+818   }
+819   if(priv-&gt;io != NULL)
+820   {
+821     g_object_unref(G_OBJECT(priv-&gt;io));
+822     priv-&gt;io = NULL;
+823   }
+824   G_OBJECT_CLASS(inf_gtk_browser_store_parent_class)-&gt;dispose(object);
+825 }
+826 static void
+827 inf_gtk_browser_store_set_property(GObject* object,
+828                                    guint prop_id,
+829                                    const GValue* value,
+830                                    GParamSpec* pspec)
+831 {
+832   InfGtkBrowserStore* store;
+833   InfGtkBrowserStorePrivate* priv;
+834   store = INF_GTK_BROWSER_STORE(object);
+835   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+836   switch(prop_id)
+837   {
+838   case PROP_IO:
+839     g_assert(priv-&gt;io == NULL);     priv-&gt;io = INF_IO(g_value_dup_object(value));
+840     break;
+841   case PROP_COMMUNICATION_MANAGER: 
+842     g_assert(priv-&gt;communication_manager == NULL);     priv-&gt;communication_manager =
+843       INF_COMMUNICATION_MANAGER(g_value_dup_object(value));
+844     break;
+845   default:
+846     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+847     break;
+848   }
+849 }
+850 static void
+851 inf_gtk_browser_store_get_property(GObject* object,
+852                                    guint prop_id,
+853                                    GValue* value,
+854                                    GParamSpec* pspec)
+855 {
+856   InfGtkBrowserStore* store;
+857   InfGtkBrowserStorePrivate* priv;
+858   store = INF_GTK_BROWSER_STORE(object);
+859   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+860   switch(prop_id)
+861   {
+862   case PROP_IO:
+863     g_value_set_object(value, priv-&gt;io);
+864     break;
+865   case PROP_COMMUNICATION_MANAGER:
+866     g_value_set_object(value, priv-&gt;communication_manager);
+867     break;
+868   default:
+869     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+870     break;
+871   }
+872 }
+873 static GtkTreeModelFlags
+874 inf_gtk_browser_store_tree_model_get_flags(GtkTreeModel* model)
+875 {
+876   return GTK_TREE_MODEL_ITERS_PERSIST;
+877 }
+878 static gint
+879 inf_gtk_browser_store_tree_model_get_n_columns(GtkTreeModel* model)
+880 {
+881   return INF_GTK_BROWSER_MODEL_NUM_COLS;
+882 }
+883 static GType
+884 inf_gtk_browser_store_tree_model_get_column_type(GtkTreeModel* model,
+885                                                  gint index)
+886 {
+887   switch(index)
+888   {
+889   case INF_GTK_BROWSER_MODEL_COL_DISCOVERY_INFO:
+890     return G_TYPE_POINTER;
+891   case INF_GTK_BROWSER_MODEL_COL_DISCOVERY:
+892     return INF_TYPE_DISCOVERY;
+893   case INF_GTK_BROWSER_MODEL_COL_BROWSER:
+894     return INFC_TYPE_BROWSER;
+895   case INF_GTK_BROWSER_MODEL_COL_STATUS:
+896     return INF_GTK_TYPE_BROWSER_MODEL_STATUS;
+897   case INF_GTK_BROWSER_MODEL_COL_NAME:
+898     return G_TYPE_STRING;
+899   case INF_GTK_BROWSER_MODEL_COL_ERROR:
+900     return G_TYPE_POINTER;
+901   case INF_GTK_BROWSER_MODEL_COL_NODE:
+902     return INF_TYPE_BROWSER_ITER;
+903   default:
+904     g_assert_not_reached();
+905     return G_TYPE_INVALID;
+906   }
+907 }
+908 static gboolean
+909 inf_gtk_browser_store_tree_model_get_iter(GtkTreeModel* model,
+910                                           GtkTreeIter* iter,
+911                                           GtkTreePath* path)
+912 {
+913   InfGtkBrowserStorePrivate* priv;
+914   InfGtkBrowserStoreItem* item;
+915   InfBrowserIter browser_iter;
+916   gint* indices;
+917   guint i;
+918   guint n;
+919   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+920   if(gtk_tree_path_get_depth(path) == 0) return FALSE;
+921   indices = gtk_tree_path_get_indices(path);
+922   n = indices[0];
+923   i = 0;
+924   for(item = priv-&gt;first_item; item != NULL &amp;&amp; i &lt; n; item = item-&gt;next)
+925     ++i;
+926   if(item == NULL) return FALSE;
+927   if(gtk_tree_path_get_depth(path) == 1)
+928   {
+929     iter-&gt;stamp = priv-&gt;stamp;
+930     iter-&gt;user_data = item;
+931     iter-&gt;user_data2 = GUINT_TO_POINTER(0);
+932     iter-&gt;user_data3 = NULL;
+933     return TRUE;
+934   }
+935   if(item-&gt;browser == NULL) return FALSE;
+936   inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
+937   for(n = 1; n &lt; (guint)gtk_tree_path_get_depth(path); ++ n)
+938   {
+939     if(inf_browser_get_explored(item-&gt;browser, &amp;browser_iter) == FALSE)
+940       return FALSE;
+941     if(inf_browser_get_child(item-&gt;browser, &amp;browser_iter) == FALSE)
+942       return FALSE;
+943     if(browser_iter.node == item-&gt;missing)
+944       ++indices[n];
+945     for(i = 0; i &lt; (guint)indices[n]; ++ i)
+946     {
+947       if(inf_browser_get_next(item-&gt;browser, &amp;browser_iter) == FALSE)
+948         return FALSE;
+949       if(browser_iter.node == item-&gt;missing)
+950         ++indices[n];
+951     }
+952   }
+953   iter-&gt;stamp = priv-&gt;stamp;
+954   iter-&gt;user_data = item;
+955   iter-&gt;user_data2 = GUINT_TO_POINTER(browser_iter.node_id);
+956   iter-&gt;user_data3 = browser_iter.node;
+957   return TRUE;
+958 }
+959 static void
+960 inf_gtk_browser_store_tree_model_get_path_impl(InfGtkBrowserStore* store,
+961                                                InfGtkBrowserStoreItem* item,
+962                                                InfBrowserIter* iter,
+963                                                GtkTreePath* path)
+964 {
+965   InfGtkBrowserStorePrivate* priv;
+966   InfBrowserIter cur_iter;
+967   InfGtkBrowserStoreItem* cur;
+968   gboolean result;
+969   guint n;
+970   cur_iter = *iter;
+971   if(inf_browser_get_parent(item-&gt;browser, &amp;cur_iter) == FALSE)
+972   {
+973     priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+974     n = 0;
+975     for(cur = priv-&gt;first_item; cur != item; cur = cur-&gt;next)
+976       ++n;
+977     gtk_tree_path_append_index(path, n);
+978   }
+979   else
+980   {
+981     inf_gtk_browser_store_tree_model_get_path_impl(
+982       store,
+983       item,
+984       &amp;cur_iter,
+985       path
+986     );
+987     result = inf_browser_get_child(item-&gt;browser, &amp;cur_iter);
+988     g_assert(result == TRUE);
+989     if(cur_iter.node == item-&gt;missing)
+990     {
+991       result = inf_browser_get_next(item-&gt;browser, &amp;cur_iter);
+992       g_assert(result == TRUE);
+993     }
+994     n = 0;
+995     while(cur_iter.node_id != iter-&gt;node_id)
+996     {
+997       result = inf_browser_get_next(item-&gt;browser, &amp;cur_iter);
+998       g_assert(result == TRUE);
+999       if(cur_iter.node == item-&gt;missing)
+1000       {
+1001         result = inf_browser_get_next(item-&gt;browser, &amp;cur_iter);
+1002         g_assert(result == TRUE);
+1003       }
+1004       ++n;
+1005     }
+1006     gtk_tree_path_append_index(path, n);
+1007   }
+1008 }
+1009 static GtkTreePath*
+1010 inf_gtk_browser_store_tree_model_get_path(GtkTreeModel* model,
+1011                                           GtkTreeIter* iter)
+1012 {
+1013   InfGtkBrowserStorePrivate* priv;
+1014   InfGtkBrowserStoreItem* item;
+1015   InfGtkBrowserStoreItem* cur;
+1016   GtkTreePath* path;
+1017   InfBrowserIter browser_iter;
+1018   guint n;
+1019   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1020   g_assert(iter-&gt;stamp == priv-&gt;stamp);
+1021   g_assert(iter-&gt;user_data != NULL);
+1022   item = (InfGtkBrowserStoreItem*)iter-&gt;user_data;
+1023   path = gtk_tree_path_new();
+1024   browser_iter.node_id = GPOINTER_TO_UINT(iter-&gt;user_data2);
+1025   browser_iter.node = iter-&gt;user_data3;
+1026   if(browser_iter.node != NULL)
+1027   {
+1028     g_assert(item-&gt;browser != NULL);
+1029     inf_gtk_browser_store_tree_model_get_path_impl(
+1030       INF_GTK_BROWSER_STORE(model),
+1031       item,
+1032       &amp;browser_iter,
+1033       path
+1034     );
+1035   }
+1036   else
+1037   {
+1038     n = 0;
+1039     for(cur = priv-&gt;first_item; cur != item; cur = cur-&gt;next)
+1040       ++n;
+1041     gtk_tree_path_append_index(path, n);
+1042   }
+1043   return path;
+1044 }
+1045 static void
+1046 inf_gtk_browser_store_tree_model_get_value(GtkTreeModel* model,
+1047                                            GtkTreeIter* iter,
+1048                                            gint column,
+1049                                            GValue* value)
+1050 {
+1051   InfGtkBrowserStorePrivate* priv;
+1052   InfGtkBrowserStoreItem* item;
+1053   InfBrowserIter browser_iter;
+1054   InfBrowserStatus browser_status;
+1055   GError* error;
+1056   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1057   g_assert(iter-&gt;stamp == priv-&gt;stamp);
+1058   item = (InfGtkBrowserStoreItem*)iter-&gt;user_data;
+1059   browser_iter.node_id = GPOINTER_TO_UINT(iter-&gt;user_data2);
+1060   browser_iter.node = iter-&gt;user_data3;
+1061   g_assert(
+1062     item-&gt;missing == NULL || browser_iter.node_id == 0 ||
+1063     browser_iter.node != item-&gt;missing
+1064   );
+1065   switch(column)
+1066   {
+1067   case INF_GTK_BROWSER_MODEL_COL_DISCOVERY_INFO:
+1068     g_value_init(value, G_TYPE_POINTER);
+1069     g_value_set_pointer(value, item-&gt;info);
+1070     break;
+1071   case INF_GTK_BROWSER_MODEL_COL_DISCOVERY:
+1072     g_value_init(value, G_TYPE_OBJECT);
+1073     g_value_set_object(value, item-&gt;discovery);
+1074     break;
+1075   case INF_GTK_BROWSER_MODEL_COL_BROWSER:
+1076     g_value_init(value, INF_TYPE_BROWSER);
+1077     g_value_set_object(value, G_OBJECT(item-&gt;browser));
+1078     break;
+1079   case INF_GTK_BROWSER_MODEL_COL_STATUS:
+1080     g_assert(browser_iter.node == NULL);     g_value_init(value, INF_GTK_TYPE_BROWSER_MODEL_STATUS);
+1081     g_value_set_enum(value, item-&gt;status);
+1082     break;
+1083   case INF_GTK_BROWSER_MODEL_COL_NAME:
+1084     g_value_init(value, G_TYPE_STRING);
+1085     if(browser_iter.node == NULL)
+1086     {
+1087       g_value_set_string(value, item-&gt;name);
+1088     }
+1089     else
+1090     {
+1091       g_value_set_string(
+1092         value,
+1093         inf_browser_get_node_name(INF_BROWSER(item-&gt;browser), &amp;browser_iter)
+1094       );
+1095     }
+1096     break;
+1097   case INF_GTK_BROWSER_MODEL_COL_ERROR:
+1098     if(browser_iter.node == NULL)
+1099     {
+1100       if(item-&gt;error != NULL)
+1101       {
+1102         error = item-&gt;error;
+1103       }
+1104       else if(item-&gt;browser != NULL)
+1105       {
+1106         g_object_get(
+1107           G_OBJECT(item-&gt;browser),
+1108           "status",
+1109           &amp;browser_status,
+1110           NULL
+1111         );
+1112         if(browser_status == INF_BROWSER_OPEN)
+1113         {
+1114           inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
+1115           error = g_hash_table_lookup(
+1116             item-&gt;node_errors,
+1117             GUINT_TO_POINTER(browser_iter.node_id)
+1118           );
+1119         }
+1120         else
+1121         {
+1122           error = NULL;
+1123         }
+1124       }
+1125       else
+1126       {
+1127         error = NULL;
+1128       }
+1129     }
+1130     else
+1131     {
+1132       g_assert(item-&gt;browser != NULL);
+1133       g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;browser_status, NULL);
+1134       g_assert(browser_status == INF_BROWSER_OPEN);
+1135       error = g_hash_table_lookup(
+1136         item-&gt;node_errors,
+1137         GUINT_TO_POINTER(browser_iter.node_id)
+1138       );
+1139     }
+1140     g_value_init(value, G_TYPE_POINTER);
+1141     g_value_set_pointer(value, error);
+1142     break;
+1143   case INF_GTK_BROWSER_MODEL_COL_NODE:
+1144     g_assert(item-&gt;browser != NULL);
+1145     g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;browser_status, NULL);
+1146     g_assert(browser_status == INF_BROWSER_OPEN);
+1147     if(browser_iter.node == NULL)
+1148       inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
+1149     g_value_init(value, INF_TYPE_BROWSER_ITER);
+1150     g_value_set_boxed(value, &amp;browser_iter);
+1151     break;
+1152   default:
+1153     g_assert_not_reached();
+1154     break;
+1155   }
+1156 }
+1157 static gboolean
+1158 inf_gtk_browser_store_tree_model_iter_next(GtkTreeModel* model,
+1159                                            GtkTreeIter* iter)
+1160 {
+1161   InfGtkBrowserStorePrivate* priv;
+1162   InfGtkBrowserStoreItem* item;
+1163   InfBrowserIter browser_iter;
+1164   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1165   g_assert(iter-&gt;stamp == priv-&gt;stamp);
+1166   item = (InfGtkBrowserStoreItem*)iter-&gt;user_data;
+1167   browser_iter.node_id = GPOINTER_TO_UINT(iter-&gt;user_data2);
+1168   browser_iter.node = iter-&gt;user_data3;
+1169   if(browser_iter.node == NULL)
+1170   {
+1171     if(item-&gt;next == NULL)
+1172       return FALSE;
+1173     iter-&gt;user_data = item-&gt;next;
+1174     return TRUE;
+1175   }
+1176   else
+1177   {
+1178     g_assert(browser_iter.node != item-&gt;missing);
+1179     if(inf_browser_get_next(item-&gt;browser, &amp;browser_iter) == FALSE)
+1180       return FALSE;
+1181     if(browser_iter.node == item-&gt;missing)
+1182       if(inf_browser_get_next(item-&gt;browser, &amp;browser_iter) == FALSE)
+1183         return FALSE;
+1184     iter-&gt;user_data2 = GUINT_TO_POINTER(browser_iter.node_id);
+1185     iter-&gt;user_data3 = browser_iter.node;
+1186     return TRUE;
+1187   }
+1188 }
+1189 static gboolean
+1190 inf_gtk_browser_store_tree_model_iter_children(GtkTreeModel* model,
+1191                                                GtkTreeIter* iter,
+1192                                                GtkTreeIter* parent)
+1193 {
+1194   InfGtkBrowserStorePrivate* priv;
+1195   InfGtkBrowserStoreItem* item;
+1196   InfBrowserStatus browser_status;
+1197   InfBrowserIter browser_iter;
+1198   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1199   if(parent == NULL)
+1200   {
+1201     if(priv-&gt;first_item == NULL)
+1202       return FALSE;
+1203     iter-&gt;stamp = priv-&gt;stamp;
+1204     iter-&gt;user_data = priv-&gt;first_item;
+1205     iter-&gt;user_data2 = GUINT_TO_POINTER(0);
+1206     iter-&gt;user_data3 = NULL;
+1207     return TRUE;
+1208   }
+1209   else
+1210   {
+1211     g_assert(parent-&gt;stamp == priv-&gt;stamp);
+1212     item = (InfGtkBrowserStoreItem*)parent-&gt;user_data;
+1213     if(item-&gt;browser == NULL)
+1214       return FALSE;
+1215     g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;browser_status, NULL);
+1216     if(browser_status != INF_BROWSER_OPEN)
+1217       return FALSE;
+1218     browser_iter.node_id = GPOINTER_TO_UINT(parent-&gt;user_data2);
+1219     if(browser_iter.node_id == 0)
+1220       inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
+1221     else
+1222       browser_iter.node = parent-&gt;user_data3;
+1223     g_assert(
+1224       item-&gt;missing == NULL || browser_iter.node_id == 0 ||
+1225       browser_iter.node != item-&gt;missing
+1226     );
+1227     if(item-&gt;missing != NULL &amp;&amp; browser_iter.node == item-&gt;missing)
+1228       return FALSE;
+1229     if(!inf_browser_is_subdirectory(item-&gt;browser, &amp;browser_iter))
+1230       return FALSE;
+1231     if(!inf_browser_get_explored(item-&gt;browser, &amp;browser_iter))
+1232       return FALSE;
+1233     if(!inf_browser_get_child(item-&gt;browser, &amp;browser_iter))
+1234       return FALSE;
+1235     if(browser_iter.node == item-&gt;missing)
+1236       if(!inf_browser_get_next(item-&gt;browser, &amp;browser_iter))
+1237         return FALSE;
+1238     iter-&gt;stamp = priv-&gt;stamp;
+1239     iter-&gt;user_data = item;
+1240     iter-&gt;user_data2 = GUINT_TO_POINTER(browser_iter.node_id);
+1241     iter-&gt;user_data3 = browser_iter.node;
+1242     return TRUE;
+1243   }
+1244 }
+1245 static gboolean
+1246 inf_gtk_browser_store_tree_model_iter_has_child(GtkTreeModel* model,
+1247                                                 GtkTreeIter* iter)
+1248 {
+1249   InfGtkBrowserStorePrivate* priv;
+1250   InfGtkBrowserStoreItem* item;
+1251   InfBrowserStatus status;
+1252   InfBrowserIter browser_iter;
+1253   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1254   g_assert(iter-&gt;stamp == priv-&gt;stamp);
+1255   item = (InfGtkBrowserStoreItem*)iter-&gt;user_data;
+1256   if(item-&gt;browser == NULL) return FALSE;
+1257   browser_iter.node_id = GPOINTER_TO_UINT(iter-&gt;user_data2);
+1258   browser_iter.node = iter-&gt;user_data3;
+1259   g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;status, NULL);
+1260   if(status != INF_BROWSER_OPEN)
+1261     return FALSE;
+1262   if(browser_iter.node == NULL)
+1263     inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
+1264   g_assert(
+1265     item-&gt;missing == NULL || browser_iter.node_id == 0 ||
+1266     browser_iter.node != item-&gt;missing
+1267   );
+1268   if(item-&gt;missing != NULL &amp;&amp; browser_iter.node == item-&gt;missing)
+1269     return FALSE;
+1270   if(inf_browser_is_subdirectory(item-&gt;browser, &amp;browser_iter) == FALSE)
+1271     return FALSE;
+1272   if(inf_browser_get_explored(item-&gt;browser, &amp;browser_iter) == FALSE)
+1273     return FALSE;
+1274   if(!inf_browser_get_child(item-&gt;browser, &amp;browser_iter))
+1275     return FALSE;
+1276   if(browser_iter.node == item-&gt;missing)
+1277     if(!inf_browser_get_next(item-&gt;browser, &amp;browser_iter))
+1278       return FALSE;
+1279   return TRUE;
+1280 }
+1281 static gint
+1282 inf_gtk_browser_store_tree_model_iter_n_children(GtkTreeModel* model,
+1283                                                  GtkTreeIter* iter)
+1284 {
+1285   InfGtkBrowserStorePrivate* priv;
+1286   InfGtkBrowserStoreItem* item;
+1287   InfGtkBrowserStoreItem* cur;
+1288   InfBrowserIter browser_iter;
+1289   gboolean result;
+1290   guint n;
+1291   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1292   g_assert(iter == NULL || iter-&gt;stamp == priv-&gt;stamp);
+1293   if(iter == NULL)
+1294   {
+1295     n = 0;
+1296     for(cur = priv-&gt;first_item; cur != NULL; cur = cur-&gt;next)
+1297       ++n;
+1298     return n;
+1299   }
+1300   else
+1301   {
+1302     item = (InfGtkBrowserStoreItem*)iter-&gt;user_data;
+1303     browser_iter.node_id = GPOINTER_TO_UINT(iter-&gt;user_data2);
+1304     browser_iter.node = iter-&gt;user_data3;
+1305     if(browser_iter.node == NULL)
+1306       inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
+1307     g_assert(
+1308       item-&gt;missing == NULL || browser_iter.node_id == 0 ||
+1309       browser_iter.node != item-&gt;missing
+1310     );
+1311     if(item-&gt;missing != NULL &amp;&amp; browser_iter.node == item-&gt;missing)
+1312       return 0;
+1313     n = 0;
+1314     for(result = inf_browser_get_child(item-&gt;browser, &amp;browser_iter);
+1315         result == TRUE;
+1316         result = inf_browser_get_next(item-&gt;browser, &amp;browser_iter))
+1317     {
+1318       if(browser_iter.node != item-&gt;missing)
+1319         ++n;
+1320     }
+1321     return n;
+1322   }
+1323 }
+1324 static gboolean
+1325 inf_gtk_browser_store_tree_model_iter_nth_child(GtkTreeModel* model,
+1326                                                 GtkTreeIter* iter,
+1327                                                 GtkTreeIter* parent,
+1328                                                 gint n)
+1329 {
+1330   InfGtkBrowserStorePrivate* priv;
+1331   InfGtkBrowserStoreItem* item;
+1332   InfGtkBrowserStoreItem* cur;
+1333   InfBrowserIter browser_iter;
+1334   guint i;
+1335   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1336   if(parent == NULL)
+1337   {
+1338     cur = priv-&gt;first_item;
+1339     if(cur == NULL) return FALSE;
+1340     for(i = 0; i &lt; (guint)n; ++ i)
+1341     {
+1342       cur = cur-&gt;next;
+1343       if(cur == NULL) return FALSE;
+1344     }
+1345     iter-&gt;stamp = priv-&gt;stamp;
+1346     iter-&gt;user_data = cur;
+1347     iter-&gt;user_data2 = GUINT_TO_POINTER(0);
+1348     iter-&gt;user_data3 = NULL;
+1349     return TRUE;
+1350   }
+1351   else
+1352   {
+1353     g_assert(parent-&gt;stamp == priv-&gt;stamp);
+1354     item = (InfGtkBrowserStoreItem*)parent-&gt;user_data;
+1355     browser_iter.node_id = GPOINTER_TO_UINT(parent-&gt;user_data2);
+1356     if(browser_iter.node_id == 0)
+1357       inf_browser_get_root(item-&gt;browser, &amp;browser_iter);
+1358     else
+1359       browser_iter.node = parent-&gt;user_data3;
+1360     g_assert(
+1361       item-&gt;missing == NULL || browser_iter.node_id == 0 ||
+1362       browser_iter.node != item-&gt;missing
+1363     );
+1364     if(item-&gt;missing != NULL &amp;&amp; browser_iter.node == item-&gt;missing)
+1365       return FALSE;
+1366     if(inf_browser_get_explored(item-&gt;browser, &amp;browser_iter) == FALSE)
+1367       return FALSE;
+1368     if(inf_browser_get_child(item-&gt;browser, &amp;browser_iter) == FALSE)
+1369       return FALSE;
+1370     if(browser_iter.node == item-&gt;missing)
+1371       ++n;
+1372     for(i = 0; i &lt; (guint)n; ++ i)
+1373     {
+1374       if(inf_browser_get_next(item-&gt;browser, &amp;browser_iter) == FALSE)
+1375         return FALSE;
+1376       if(browser_iter.node == item-&gt;missing)
+1377         ++n;
+1378     }
+1379     iter-&gt;stamp = priv-&gt;stamp;
+1380     iter-&gt;user_data = item;
+1381     iter-&gt;user_data2 = GUINT_TO_POINTER(browser_iter.node_id);
+1382     iter-&gt;user_data3 = browser_iter.node;
+1383     return TRUE;
+1384   }
+1385 }
+1386 static gboolean
+1387 inf_gtk_browser_store_tree_model_iter_parent(GtkTreeModel* model,
+1388                                              GtkTreeIter* iter,
+1389                                              GtkTreeIter* child)
+1390 {
+1391   InfGtkBrowserStorePrivate* priv;
+1392   InfGtkBrowserStoreItem* item;
+1393   InfBrowserIter browser_iter;
+1394   gboolean result;
+1395   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1396   g_assert(child-&gt;stamp == priv-&gt;stamp);
+1397   item = (InfGtkBrowserStoreItem*)child-&gt;user_data;
+1398   browser_iter.node_id = GPOINTER_TO_UINT(child-&gt;user_data2);
+1399   browser_iter.node = child-&gt;user_data3;
+1400   if(browser_iter.node == NULL)
+1401     return FALSE;
+1402   g_assert(browser_iter.node != item-&gt;missing);
+1403   result = inf_browser_get_parent(item-&gt;browser, &amp;browser_iter);
+1404   g_assert(result == TRUE);
+1405   g_assert(browser_iter.node != item-&gt;missing);
+1406   iter-&gt;stamp = priv-&gt;stamp;
+1407   iter-&gt;user_data = item;
+1408   iter-&gt;user_data2 = GUINT_TO_POINTER(browser_iter.node_id);
+1409   iter-&gt;user_data3 = browser_iter.node;
+1410   if(browser_iter.node_id == 0)
+1411     iter-&gt;user_data3 = NULL;
+1412   return TRUE;
+1413 }
+1414 static void
+1415 inf_gtk_browser_store_browser_model_set_browser(InfGtkBrowserModel* model,
+1416                                                 GtkTreePath* path,
+1417                                                 GtkTreeIter* tree_iter,
+1418                                                 InfBrowser* old_browser,
+1419                                                 InfBrowser* new_browser)
+1420 {
+1421   InfGtkBrowserStorePrivate* priv;
+1422   InfGtkBrowserStoreItem* item;
+1423   InfBrowserIter iter;
+1424   guint n;
+1425   gboolean had_children;
+1426   InfBrowserStatus status;
+1427   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1428   had_children = FALSE;
+1429   item = (InfGtkBrowserStoreItem*)tree_iter-&gt;user_data;
+1430   g_assert(tree_iter-&gt;user_data3 == NULL);
+1431   if(item-&gt;browser != NULL)
+1432   {
+1433     g_assert(item-&gt;browser == old_browser);
+1434     g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;status, NULL);
+1435     if(status == INF_BROWSER_OPEN)
+1436     {
+1437       inf_browser_get_root(item-&gt;browser, &amp;iter);
+1438       if(inf_browser_get_explored(item-&gt;browser, &amp;iter) &amp;&amp;
+1439          inf_browser_get_child(item-&gt;browser, &amp;iter))
+1440       {
+1441         n = 1;
+1442         while(inf_browser_get_next(item-&gt;browser, &amp;iter))
+1443           ++ n;
+1444         gtk_tree_path_append_index(path, n);
+1445         for(; n &gt; 0; -- n)
+1446         {
+1447           had_children = TRUE;
+1448           gtk_tree_path_prev(path);
+1449           gtk_tree_model_row_deleted(GTK_TREE_MODEL(model), path);
+1450         }
+1451         gtk_tree_path_up(path);
+1452       }
+1453     }
+1454     while(item-&gt;requests != NULL)
+1455       inf_gtk_browser_store_item_request_remove(item, item-&gt;requests-&gt;data);
+1456     g_hash_table_remove_all(item-&gt;node_errors);
+1457     inf_signal_handlers_disconnect_by_func(
+1458       G_OBJECT(item-&gt;browser),
+1459       G_CALLBACK(inf_gtk_browser_store_browser_error_cb),
+1460       model
+1461     );
+1462     inf_signal_handlers_disconnect_by_func(
+1463       G_OBJECT(item-&gt;browser),
+1464       G_CALLBACK(inf_gtk_browser_store_browser_notify_status_cb),
+1465       model
+1466     );
+1467     inf_signal_handlers_disconnect_by_func(
+1468       G_OBJECT(item-&gt;browser),
+1469       G_CALLBACK(inf_gtk_browser_store_node_added_cb),
+1470       model
+1471     );
+1472     inf_signal_handlers_disconnect_by_func(
+1473       G_OBJECT(item-&gt;browser),
+1474       G_CALLBACK(inf_gtk_browser_store_node_removed_cb),
+1475       model
+1476     );
+1477     inf_signal_handlers_disconnect_by_func(
+1478       G_OBJECT(item-&gt;browser),
+1479       G_CALLBACK(inf_gtk_browser_store_begin_request_explore_node_cb),
+1480       model
+1481     );
+1482     inf_signal_handlers_disconnect_by_func(
+1483       G_OBJECT(item-&gt;browser),
+1484       G_CALLBACK(inf_gtk_browser_store_begin_request_subscribe_session_cb),
+1485       model
+1486     );
+1487     g_object_unref(G_OBJECT(item-&gt;browser));
+1488   }
+1489   item-&gt;browser = NULL;
+1490   if(had_children)
+1491   {
+1492     gtk_tree_model_row_has_child_toggled(
+1493       GTK_TREE_MODEL(model),
+1494       path,
+1495       tree_iter
+1496     );
+1497   }
+1498   item-&gt;browser = new_browser;
+1499   if(new_browser != NULL)
+1500   {
+1501     g_object_ref(new_browser);
+1502     g_signal_connect(
+1503       G_OBJECT(item-&gt;browser),
+1504       "error",
+1505       G_CALLBACK(inf_gtk_browser_store_browser_error_cb),
+1506       model
+1507     );
+1508     g_signal_connect(
+1509       G_OBJECT(item-&gt;browser),
+1510       "notify::status",
+1511       G_CALLBACK(inf_gtk_browser_store_browser_notify_status_cb),
+1512       model
+1513     );
+1514     g_signal_connect_after(
+1515       G_OBJECT(item-&gt;browser),
+1516       "node-added",
+1517       G_CALLBACK(inf_gtk_browser_store_node_added_cb),
+1518       model
+1519     );
+1520     g_signal_connect_after(
+1521       G_OBJECT(item-&gt;browser),
+1522       "node-removed",
+1523       G_CALLBACK(inf_gtk_browser_store_node_removed_cb),
+1524       model
+1525     );
+1526     g_signal_connect_after(
+1527       G_OBJECT(item-&gt;browser),
+1528       "begin-request::explore-node",
+1529       G_CALLBACK(inf_gtk_browser_store_begin_request_explore_node_cb),
+1530       model
+1531     );
+1532     g_signal_connect_after(
+1533       G_OBJECT(item-&gt;browser),
+1534       "begin-request::subscribe-session",
+1535       G_CALLBACK(inf_gtk_browser_store_begin_request_subscribe_session_cb),
+1536       model
+1537     );
+1538   }
+1539   if(item-&gt;browser == NULL &amp;&amp; item-&gt;info == NULL &amp;&amp;
+1540      (item-&gt;error == NULL || item-&gt;status != INF_GTK_BROWSER_MODEL_ERROR))
+1541   {
+1542     g_assert(item-&gt;status != INF_GTK_BROWSER_MODEL_ERROR);
+1543     if(item-&gt;error != NULL)
+1544     {
+1545       g_error_free(item-&gt;error);
+1546       item-&gt;error = NULL;
+1547     }
+1548     item-&gt;status = INF_GTK_BROWSER_MODEL_INVALID;
+1549   }
+1550   else if(item-&gt;status != INF_GTK_BROWSER_MODEL_ERROR)
+1551   {
+1552     if(item-&gt;browser != NULL)
+1553     {
+1554       g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;status, NULL);
+1555       switch(status)
+1556       {
+1557       case INF_BROWSER_CLOSED:
+1558         item-&gt;status = INF_GTK_BROWSER_MODEL_DISCONNECTED;
+1559         break;
+1560       case INF_BROWSER_OPENING:
+1561         item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTING;
+1562         break;
+1563       case INF_BROWSER_OPEN:
+1564         item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTED;
+1565         break;
+1566       default:
+1567         g_assert_not_reached();
+1568         break;
+1569       }
+1570     }
+1571     else
+1572     {
+1573       g_assert(item-&gt;info != NULL);
+1574       item-&gt;status = INF_GTK_BROWSER_MODEL_DISCOVERED;
+1575     }
+1576   }
+1577   else
+1578   {
+1579     g_assert(item-&gt;error != NULL);
+1580   }
+1581   gtk_tree_model_row_changed(GTK_TREE_MODEL(model), path, tree_iter);
+1582   if(item-&gt;browser != NULL &amp;&amp; item-&gt;status == INF_GTK_BROWSER_MODEL_CONNECTED)
+1583   {
+1584     inf_browser_get_root(item-&gt;browser, &amp;iter);
+1585     if(inf_browser_get_explored(item-&gt;browser, &amp;iter) &amp;&amp;
+1586        inf_browser_get_child(item-&gt;browser, &amp;iter))
+1587     {
+1588       gtk_tree_model_row_has_child_toggled(
+1589         GTK_TREE_MODEL(model),
+1590         path,
+1591         tree_iter
+1592       );
+1593     }
+1594   }
+1595 }
+1596 static void
+1597 inf_gtk_browser_store_browser_model_resolve(InfGtkBrowserModel* model,
+1598                                             InfDiscovery* discovery,
+1599                                             InfDiscoveryInfo* info)
+1600 {
+1601   InfGtkBrowserStorePrivate* priv;
+1602   InfGtkBrowserStoreItem* item;
+1603   GtkTreeIter tree_iter;
+1604   GtkTreePath* path;
+1605   g_assert(INF_GTK_IS_BROWSER_STORE(model));
+1606   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1607   item = inf_gtk_browser_store_find_item_by_discovery_info(
+1608     INF_GTK_BROWSER_STORE(model),
+1609     info
+1610   );
+1611   g_assert(item != NULL);
+1612   g_assert(
+1613     item-&gt;status == INF_GTK_BROWSER_MODEL_DISCOVERED ||
+1614     item-&gt;status == INF_GTK_BROWSER_MODEL_ERROR
+1615   );
+1616   if(item-&gt;status == INF_GTK_BROWSER_MODEL_ERROR)
+1617   {
+1618     g_assert(item-&gt;error != NULL);
+1619     g_error_free(item-&gt;error);
+1620     item-&gt;error = NULL;
+1621     item-&gt;status = INF_GTK_BROWSER_MODEL_RESOLVING;
+1622   }
+1623   else
+1624   {
+1625     item-&gt;status = INF_GTK_BROWSER_MODEL_RESOLVING;
+1626   }
+1627   tree_iter.stamp = priv-&gt;stamp;
+1628   tree_iter.user_data = item;
+1629   tree_iter.user_data2 = GUINT_TO_POINTER(0);
+1630   tree_iter.user_data3 = NULL;
+1631   path = gtk_tree_model_get_path(GTK_TREE_MODEL(model), &amp;tree_iter);
+1632   gtk_tree_model_row_changed(GTK_TREE_MODEL(model), path, &amp;tree_iter);
+1633   gtk_tree_path_free(path);
+1634   inf_discovery_resolve(
+1635     discovery,
+1636     info,
+1637     inf_gtk_browser_store_resolv_complete_func,
+1638     model
+1639   );
+1640 }
+1641 static gboolean
+1642 inf_gtk_browser_store_browser_iter_to_tree_iter(InfGtkBrowserModel* model,
+1643                                                 InfBrowser* browser,
+1644                                                 const InfBrowserIter* iter,
+1645                                                 GtkTreeIter* tree_iter)
+1646 {
+1647   InfGtkBrowserStorePrivate* priv;
+1648   InfGtkBrowserStoreItem* item;
+1649   g_assert(INF_GTK_IS_BROWSER_STORE(model));
+1650   priv = INF_GTK_BROWSER_STORE_PRIVATE(model);
+1651   item = inf_gtk_browser_store_find_item_by_browser(
+1652     INF_GTK_BROWSER_STORE(model),
+1653     browser
+1654   );
+1655   if(item == NULL || (iter != NULL &amp;&amp; item-&gt;missing == iter-&gt;node))
+1656     return FALSE;
+1657   tree_iter-&gt;stamp = priv-&gt;stamp;
+1658   tree_iter-&gt;user_data = item;
+1659   if(iter != NULL &amp;&amp; iter-&gt;node_id != 0)
+1660   {
+1661     tree_iter-&gt;user_data2 = GUINT_TO_POINTER(iter-&gt;node_id);
+1662     tree_iter-&gt;user_data3 = iter-&gt;node;
+1663   }
+1664   else
+1665   {
+1666     tree_iter-&gt;user_data2 = 0;
+1667     tree_iter-&gt;user_data3 = NULL;
+1668   }
+1669   return TRUE;
+1670 }
+1671 static void
+1672 inf_gtk_browser_store_class_init(InfGtkBrowserStoreClass* browser_store_class)
+1673 {
+1674   GObjectClass* object_class;
+1675   object_class = G_OBJECT_CLASS(browser_store_class);
+1676   object_class-&gt;dispose = inf_gtk_browser_store_dispose;
+1677   object_class-&gt;set_property = inf_gtk_browser_store_set_property;
+1678   object_class-&gt;get_property = inf_gtk_browser_store_get_property;
+1679   g_object_class_install_property(
+1680     object_class,
+1681     PROP_IO,
+1682     g_param_spec_object(
+1683       "io",
+1684       "IO",
+1685       "The IO object used for the created browsers to schedule timeouts",
+1686       INF_TYPE_IO,
+1687       G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY
+1688     )
+1689   );
+1690   g_object_class_install_property(
+1691     object_class,
+1692     PROP_COMMUNICATION_MANAGER,
+1693     g_param_spec_object(
+1694       "communication-manager",
+1695       "Communication manager", 
+1696       "The communication manager used for browsing remote directories",
+1697       INF_COMMUNICATION_TYPE_MANAGER,
+1698       G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY
+1699     )
+1700   );
+1701 }
+1702 static void
+1703 inf_gtk_browser_store_tree_model_iface_init(GtkTreeModelIface* iface)
+1704 {
+1705   iface-&gt;get_flags = inf_gtk_browser_store_tree_model_get_flags;
+1706   iface-&gt;get_n_columns = inf_gtk_browser_store_tree_model_get_n_columns;
+1707   iface-&gt;get_column_type = inf_gtk_browser_store_tree_model_get_column_type;
+1708   iface-&gt;get_iter = inf_gtk_browser_store_tree_model_get_iter;
+1709   iface-&gt;get_path = inf_gtk_browser_store_tree_model_get_path;
+1710   iface-&gt;get_value = inf_gtk_browser_store_tree_model_get_value;
+1711   iface-&gt;iter_next = inf_gtk_browser_store_tree_model_iter_next;
+1712   iface-&gt;iter_children = inf_gtk_browser_store_tree_model_iter_children;
+1713   iface-&gt;iter_has_child = inf_gtk_browser_store_tree_model_iter_has_child;
+1714   iface-&gt;iter_n_children = inf_gtk_browser_store_tree_model_iter_n_children;
+1715   iface-&gt;iter_nth_child = inf_gtk_browser_store_tree_model_iter_nth_child;
+1716   iface-&gt;iter_parent = inf_gtk_browser_store_tree_model_iter_parent;
+1717 }
+1718 static void
+1719 inf_gtk_browser_store_browser_model_iface_init(
+1720   InfGtkBrowserModelInterface* iface)
+1721 {
+1722   iface-&gt;set_browser = inf_gtk_browser_store_browser_model_set_browser;
+1723   iface-&gt;resolve = inf_gtk_browser_store_browser_model_resolve;
+1724   iface-&gt;browser_iter_to_tree_iter =
+1725     inf_gtk_browser_store_browser_iter_to_tree_iter;
+1726 }
+1727 InfGtkBrowserStore*
+1728 inf_gtk_browser_store_new(InfIo* io,
+1729                           InfCommunicationManager* comm_manager)
+1730 {
+1731   GObject* object;
+1732   object = g_object_new(
+1733     INF_GTK_TYPE_BROWSER_STORE,
+1734     "io", io,
+1735     "communication-manager", comm_manager,
+1736     NULL
+1737   );
+1738   return INF_GTK_BROWSER_STORE(object);
+1739 }
+1740 void
+1741 inf_gtk_browser_store_add_discovery(InfGtkBrowserStore* store,
+1742                                     InfDiscovery* discovery)
+1743 {
+1744   InfGtkBrowserStorePrivate* priv;
+1745   GSList* discovered;
+1746   GSList* item;
+1747   InfDiscoveryInfo* info;
+1748   g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
+1749   g_return_if_fail(INF_IS_DISCOVERY(discovery));
+1750   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+1751   g_return_if_fail(g_slist_find(priv-&gt;discoveries, discovery) == NULL);
+1752   g_object_ref(G_OBJECT(discovery));
+1753   priv-&gt;discoveries = g_slist_prepend(priv-&gt;discoveries, discovery);
+1754   g_signal_connect(
+1755     G_OBJECT(discovery),
+1756     "discovered",
+1757     G_CALLBACK(inf_gtk_browser_store_discovered_cb),
+1758     store
+1759   );
+1760   g_signal_connect(
+1761     G_OBJECT(discovery),
+1762     "undiscovered",
+1763     G_CALLBACK(inf_gtk_browser_store_undiscovered_cb),
+1764     store
+1765   );
+1766   discovered = inf_discovery_get_discovered(discovery, "_infinote._tcp");
+1767   for(item = discovered; item != NULL; item = g_slist_next(item))
+1768   {
+1769     info = (InfDiscoveryInfo*)item-&gt;data;
+1770     inf_gtk_browser_store_add_item_by_browser(
+1771       store,
+1772       discovery,
+1773       info,
+1774       NULL,
+1775       inf_discovery_info_get_service_name(discovery, info)
+1776     );
+1777   }
+1778   g_slist_free(discovered);
+1779   inf_discovery_discover(discovery, "_infinote._tcp");
+1780 }
+1781 InfBrowser*
+1782 inf_gtk_browser_store_add_connection(InfGtkBrowserStore* store,
+1783                                      InfXmlConnection* connection,
+1784                                      const gchar* name)
+1785 {
+1786   InfGtkBrowserStorePrivate* priv;
+1787   InfGtkBrowserStoreItem* item;
+1788   gchar* remote_id;
+1789   g_return_val_if_fail(INF_GTK_IS_BROWSER_STORE(store), NULL);
+1790   g_return_val_if_fail(INF_IS_XML_CONNECTION(connection), NULL);
+1791   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+1792   item = inf_gtk_browser_store_find_item_by_connection(store, connection);
+1793   if(item == NULL)
+1794   {
+1795     if(name == NULL)
+1796     {
+1797       g_object_get(G_OBJECT(connection), "remote-id", &amp;remote_id, NULL);
+1798       item = inf_gtk_browser_store_add_item_by_connection(
+1799         store,
+1800         NULL,
+1801         NULL,
+1802         connection,
+1803         remote_id
+1804       );
+1805     }
+1806     else
+1807     {
+1808       item = inf_gtk_browser_store_add_item_by_connection(
+1809         store,
+1810         NULL,
+1811         NULL,
+1812         connection,
+1813         g_strdup(name)
+1814       );
+1815     }
+1816   }
+1817   return item-&gt;browser;
+1818 }
+1819 void
+1820 inf_gtk_browser_store_add_browser(InfGtkBrowserStore* store,
+1821                                   InfBrowser* browser,
+1822                                   const gchar* name)
+1823 {
+1824   InfGtkBrowserStorePrivate* priv;
+1825   InfGtkBrowserStoreItem* item;
+1826   g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
+1827   g_return_if_fail(INF_IS_BROWSER(browser));
+1828   g_return_if_fail(name != NULL);
+1829   priv = INF_GTK_BROWSER_STORE_PRIVATE(store);
+1830   item = inf_gtk_browser_store_find_item_by_browser(store, browser);
+1831   if(item == NULL)
+1832   {
+1833     inf_gtk_browser_store_add_item_by_browser(
+1834       store,
+1835       NULL,
+1836       NULL,
+1837       browser,
+1838       g_strdup(name)
+1839     );
+1840   }
+1841 }
+1842 void
+1843 inf_gtk_browser_store_remove_browser(InfGtkBrowserStore* store,
+1844                                      InfBrowser* browser)
+1845 {
+1846   InfGtkBrowserStoreItem* item;
+1847   g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
+1848   g_return_if_fail(INF_IS_BROWSER(browser));
+1849   item = inf_gtk_browser_store_find_item_by_browser(store, browser);
+1850   g_return_if_fail(item != NULL);
+1851   inf_gtk_browser_store_remove_item (store, item);
+1852 }
+1853 void
+1854 inf_gtk_browser_store_remove_connection(InfGtkBrowserStore* store,
+1855                                         InfXmlConnection* connection)
+1856 {
+1857   InfGtkBrowserStoreItem* item;
+1858   g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
+1859   g_return_if_fail(INF_IS_XML_CONNECTION(connection));
+1860   item = inf_gtk_browser_store_find_item_by_connection(store, connection);
+1861   g_return_if_fail(item != NULL);
+1862   inf_gtk_browser_store_remove_item (store, item);
+1863 }
+1864 void
+1865 inf_gtk_browser_store_clear_connection_error(InfGtkBrowserStore* store,
+1866                                              InfXmlConnection* connection)
+1867 {
+1868   InfGtkBrowserStoreItem* item;
+1869   InfBrowserStatus status;
+1870   GtkTreeIter iter;
+1871   GtkTreePath* path;
+1872   g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
+1873   g_return_if_fail(INF_IS_XML_CONNECTION(connection));
+1874   item = inf_gtk_browser_store_find_item_by_connection(store, connection);
+1875   g_return_if_fail(item != NULL);
+1876   if(item-&gt;status == INF_GTK_BROWSER_MODEL_ERROR)
+1877   {
+1878     g_assert(item-&gt;error != NULL);
+1879     g_error_free(item-&gt;error);
+1880     item-&gt;error = NULL;
+1881     if(item-&gt;browser != NULL)
+1882     {
+1883       g_object_get(G_OBJECT(item-&gt;browser), "status", &amp;status, NULL);
+1884       switch(status)
+1885       {
+1886       case INF_BROWSER_CLOSED:
+1887         item-&gt;status = INF_GTK_BROWSER_MODEL_DISCONNECTED;
+1888         break;
+1889       case INF_BROWSER_OPENING:
+1890         item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTING;
+1891         break;
+1892       case INF_BROWSER_OPEN:
+1893         item-&gt;status = INF_GTK_BROWSER_MODEL_CONNECTED;
+1894         break;
+1895       default:
+1896         g_assert_not_reached();
+1897         break;
+1898       }
+1899     }
+1900     else if(item-&gt;info != NULL)
+1901     {
+1902       item-&gt;status = INF_GTK_BROWSER_MODEL_DISCOVERED;
+1903     }
+1904     else
+1905     {
+1906       g_assert_not_reached();
+1907     }
+1908     iter.stamp = INF_GTK_BROWSER_STORE_PRIVATE(store)-&gt;stamp;
+1909     iter.user_data = item;
+1910     iter.user_data2 = GUINT_TO_POINTER(0);
+1911     iter.user_data3 = NULL;
+1912     path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;iter);
+1913     gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
+1914     gtk_tree_path_free (path);
+1915   }
+1916 }
+1917 void
+1918 inf_gtk_browser_store_set_connection_name(InfGtkBrowserStore* store,
+1919                                           InfXmlConnection* connection,
+1920                                           const gchar* name)
+1921 {
+1922   InfGtkBrowserStoreItem* item;
+1923   GtkTreeIter iter;
+1924   GtkTreePath* path;
+1925   g_return_if_fail(INF_GTK_IS_BROWSER_STORE(store));
+1926   g_return_if_fail(INF_IS_XML_CONNECTION(connection));
+1927   g_return_if_fail(name != NULL);
+1928   item = inf_gtk_browser_store_find_item_by_connection(store, connection);
+1929   g_return_if_fail(item != NULL);
+1930   g_free (item-&gt;name);
+1931   item-&gt;name = g_strdup(name);
+1932   iter.stamp = INF_GTK_BROWSER_STORE_PRIVATE(store)-&gt;stamp;
+1933   iter.user_data = item;
+1934   iter.user_data2 = GUINT_TO_POINTER(0);
+1935   iter.user_data3 = NULL;
+1936   path = gtk_tree_model_get_path(GTK_TREE_MODEL(store), &amp;iter);
+1937   gtk_tree_model_row_changed(GTK_TREE_MODEL(store), path, &amp;iter);
+1938   gtk_tree_path_free(path);
+1939 }
 </pre>
 </div>
 </div>

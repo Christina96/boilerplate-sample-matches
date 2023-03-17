@@ -40,682 +40,682 @@ Matches for imdiag.c &amp; omfwd.c
 </h3>
 <hr/>
 <pre>
-#include "config.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;string.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;ctype.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;netinet/in.h&gt;
-#include &lt;netdb.h&gt;
-#include &lt;sys/types.h&gt;
-#include &lt;sys/socket.h&gt;
-#include &lt;pthread.h&gt;
-#include &lt;semaphore.h&gt;
-#if HAVE_FCNTL_H
-#include &lt;fcntl.h&gt;
-#endif
-#include "rsyslog.h"
-#include "dirty.h"
-#include "cfsysline.h"
-#include "module-template.h"
-#include "unicode-helper.h"
-#include "net.h"
-#include "netstrm.h"
-#include "errmsg.h"
-#include "tcpsrv.h"
-#include "srUtils.h"
-#include "msg.h"
-#include "datetime.h"
-#include "ratelimit.h"
-#include "queue.h"
-#include "lookup.h"
-#include "net.h" #include "statsobj.h"
-MODULE_TYPE_INPUT
-MODULE_TYPE_NOKEEP
-DEF_IMOD_STATIC_DATA
-DEFobjCurrIf(tcpsrv)
-DEFobjCurrIf(tcps_sess)
-DEFobjCurrIf(net)
-DEFobjCurrIf(netstrm)
-DEFobjCurrIf(datetime)
-DEFobjCurrIf(prop)
-DEFobjCurrIf(statsobj)
-static tcpsrv_t *pOurTcpsrv = NULL;  static permittedPeers_t *pPermPeersRoot = NULL;
-static prop_t *pInputName = NULL;
-static prop_t *pRcvDummy = NULL;
-static prop_t *pRcvIPDummy = NULL;
-static int max_empty_checks = 3; 
-statsobj_t *diagStats;
-STATSCOUNTER_DEF(potentialArtificialDelayMs, mutPotentialArtificialDelayMs)
-STATSCOUNTER_DEF(actualArtificialDelayMs, mutActualArtificialDelayMs)
-STATSCOUNTER_DEF(delayInvocationCount, mutDelayInvocationCount)
-static sem_t statsReportingBlocker;
-static long long statsReportingBlockStartTimeMs = 0;
-static int allowOnlyOnce = 0;
-DEF_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
-pthread_mutex_t mutStatsReporterWatch;
-pthread_cond_t statsReporterWatch;
-int statsReported = 0;
-static int abortTimeout = -1;		static pthread_t timeoutGuard_thrd;	
-struct modConfData_s {
-	EMPTY_STRUCT;
-};
-static flowControl_t injectmsgDelayMode = eFLOWCTL_NO_DELAY;
-static int iTCPSessMax = 20; static int iStrmDrvrMode = 0; static uchar *pszLstnPortFileName = NULL;
-static uchar *pszStrmDrvrAuthMode = NULL; static uchar *pszInputName = NULL; 
-static int
-isPermittedHost(struct sockaddr __attribute__((unused)) *addr, char __attribute__((unused)) *fromHostFQDN,
-		void __attribute__((unused)) *pUsrSrv, void __attribute__((unused)) *pUsrSess)
-{
-	return 1;	}
-static rsRetVal
-doOpenLstnSocks(tcpsrv_t *pSrv)
-{
-	ISOBJ_TYPE_assert(pSrv, tcpsrv);
-	dbgprintf("in imdiag doOpenLstnSocks\n");
-	return tcpsrv.create_tcp_socket(pSrv);
-}
-static rsRetVal
-doRcvData(tcps_sess_t *pSess, char *buf, size_t lenBuf, ssize_t *piLenRcvd, int *oserr)
-{
-	assert(pSess != NULL);
-	assert(piLenRcvd != NULL);
-	*piLenRcvd = lenBuf;
-	return netstrm.Rcv(pSess-&gt;pStrm, (uchar*) buf, piLenRcvd, oserr);
-}
-static rsRetVal
-onRegularClose(tcps_sess_t *pSess)
-{
-	DEFiRet;
-	assert(pSess != NULL);
-	tcps_sess.PrepareClose(pSess);
-	tcps_sess.Close(pSess);
-	RETiRet;
-}
-static rsRetVal
-onErrClose(tcps_sess_t *pSess)
-{
-	DEFiRet;
-	assert(pSess != NULL);
-	tcps_sess.Close(pSess);
-	RETiRet;
-}
-#define TO_LOWERCASE	1
-#define NO_MODIFY	0
-static void
-getFirstWord(uchar **ppszSrc, uchar *pszBuf, size_t lenBuf, int options)
-{
-	uchar c;
-	uchar *pszSrc = *ppszSrc;
-	while(*pszSrc &amp;&amp; *pszSrc == ' ')
-		++pszSrc; 
-	while(*pszSrc &amp;&amp; *pszSrc != ' ' &amp;&amp; lenBuf &gt; 1) {
-		c = *pszSrc++;
-		if(options &amp; TO_LOWERCASE)
-			c = tolower(c);
-		*pszBuf++ = c;
-		lenBuf--;
-	}
-	*pszBuf = '\0';
-	*ppszSrc = pszSrc;
-}
-static rsRetVal __attribute__((format(printf, 2, 3)))
-sendResponse(tcps_sess_t *pSess, const char *const __restrict__ fmt, ...)
-{
-	va_list ap;
-	ssize_t len;
-	uchar buf[1024];
-	DEFiRet;
-	va_start(ap, fmt);
-	len = vsnprintf((char*)buf, sizeof(buf), fmt, ap);
-	va_end(ap);
-	CHKiRet(netstrm.Send(pSess-&gt;pStrm, buf, &amp;len));
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-doInjectMsg(uchar *szMsg, ratelimit_t *ratelimiter)
-{
-	smsg_t *pMsg;
-	struct syslogTime stTime;
-	time_t ttGenTime;
-	DEFiRet;
-	datetime.getCurrTime(&amp;stTime, &amp;ttGenTime, TIME_IN_LOCALTIME);
-	CHKiRet(msgConstructWithTime(&amp;pMsg, &amp;stTime, ttGenTime));
-	MsgSetRawMsg(pMsg, (char*) szMsg, ustrlen(szMsg));
-	MsgSetInputName(pMsg, pInputName);
-	MsgSetFlowControlType(pMsg, injectmsgDelayMode);
-	pMsg-&gt;msgFlags  = NEEDS_PARSING | PARSE_HOSTNAME;
-	MsgSetRcvFrom(pMsg, pRcvDummy);
-	CHKiRet(MsgSetRcvFromIP(pMsg, pRcvIPDummy));
-	CHKiRet(ratelimitAddMsg(ratelimiter, NULL, pMsg));
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-doInjectNumericSuffixMsg(int iNum, ratelimit_t *ratelimiter)
-{
-	uchar szMsg[1024];
-	DEFiRet;
-	snprintf((char*)szMsg, sizeof(szMsg)/sizeof(uchar),
-		"&lt;167&gt;Mar  1 01:00:00 172.20.245.8 tag msgnum:%8.8d:", iNum);
-	iRet = doInjectMsg(szMsg, ratelimiter);
-	RETiRet;
-}
-static rsRetVal
-injectMsg(uchar *pszCmd, tcps_sess_t *pSess)
-{
-	uchar wordBuf[1024];
-	int iFrom, nMsgs;
-	uchar *literalMsg;
-	int i;
-	ratelimit_t *ratelimit = NULL;
-	DEFiRet;
-	literalMsg = NULL;
-	memset(wordBuf, 0, sizeof(wordBuf));
-	CHKiRet(ratelimitNew(&amp;ratelimit, "imdiag", "injectmsg"));
-	getFirstWord(&amp;pszCmd, wordBuf, sizeof(wordBuf), TO_LOWERCASE);
-	if (ustrcmp(UCHAR_CONSTANT("literal"), wordBuf) == 0) {
-		++pszCmd; 		CHKiRet(doInjectMsg(pszCmd, ratelimit));
-		nMsgs = 1;
-	} else { 		iFrom = atoi((char*)wordBuf);
-		getFirstWord(&amp;pszCmd, wordBuf, sizeof(wordBuf), TO_LOWERCASE);
-		nMsgs = atoi((char*)wordBuf);
-		for(i = 0 ; i &lt; nMsgs ; ++i) {
-			CHKiRet(doInjectNumericSuffixMsg(i + iFrom, ratelimit));
-		}
-	}
-	CHKiRet(sendResponse(pSess, "%d messages injected\n", nMsgs));
-	DBGPRINTF("imdiag: %d messages injected\n", nMsgs);
-finalize_it:
-	if(ratelimit != NULL)
-		ratelimitDestruct(ratelimit);
-	free(literalMsg);
-	RETiRet;
-}
-static rsRetVal
-waitMainQEmpty(tcps_sess_t *pSess)
-{
-	int iPrint = 0;
-	int iPrintVerbosity = 500; 	int nempty = 0;
-	static unsigned lastOverallQueueSize = 1;
-	DEFiRet;
-	while(1) {
-		processImInternal();
-		const unsigned OverallQueueSize = PREFER_FETCH_32BIT(iOverallQueueSize);
-		if(OverallQueueSize == 0) {
-			++nempty;
-		} else {
-			if(OverallQueueSize &gt; 500) {
-				srSleep(0, (OverallQueueSize &gt; 2000) ? 900000 : 100000);
-			}
-			nempty = 0;
-		}
-		if(dbgTimeoutToStderr) { 			if(OverallQueueSize != lastOverallQueueSize) {
-				fprintf(stderr, "imdiag: wait q_empty: qsize %d nempty %d\n",
-					OverallQueueSize, nempty);
-				lastOverallQueueSize = OverallQueueSize;
-			}
-		}
-		if(nempty &gt; max_empty_checks)
-			break;
-		if(iPrint++ % iPrintVerbosity == 0)
-			DBGPRINTF("imdiag sleeping, wait queues drain, "
-				"curr size %d, nempty %d\n",
-				OverallQueueSize, nempty);
-		srSleep(0,100000);	}
-	CHKiRet(sendResponse(pSess, "mainqueue empty\n"));
-	DBGPRINTF("imdiag: mainqueue empty\n");
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-awaitLookupTableReload(tcps_sess_t *pSess)
-{
-	DEFiRet;
-	while(1) {
-		if(lookupPendingReloadCount() == 0) {
-			break;
-		}
-		srSleep(0,500000);
-	}
-	CHKiRet(sendResponse(pSess, "no pending lookup-table reloads found\n"));
-	DBGPRINTF("imdiag: no pending lookup-table reloads found\n");
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-enableDebug(tcps_sess_t *pSess)
-{
-	DEFiRet;
-	Debug = DEBUG_FULL;
-	debugging_on = 1;
-	dbgprintf("Note: debug turned on via imdiag\n");
-	CHKiRet(sendResponse(pSess, "debug enabled\n"));
-finalize_it:
-	RETiRet;
-}
-static void
-imdiag_statsReadCallback(statsobj_t __attribute__((unused)) *const ignore_stats,
-	void __attribute__((unused)) *const ignore_ctx)
-{
-	long long waitStartTimeMs = currentTimeMills();
-	sem_wait(&amp;statsReportingBlocker);
-	long delta = currentTimeMills() - waitStartTimeMs;
-	if ((int)ATOMIC_DEC_AND_FETCH(&amp;allowOnlyOnce, &amp;mutAllowOnlyOnce) &lt; 0) {
-		sem_post(&amp;statsReportingBlocker);
-	} else {
-		LogError(0, RS_RET_OK, "imdiag(stats-read-callback): current stats-reporting "
-						"cycle will proceed now, next reporting cycle will again be blocked");
-	}
-	if (pthread_mutex_lock(&amp;mutStatsReporterWatch) == 0) {
-		statsReported = 1;
-		pthread_cond_signal(&amp;statsReporterWatch);
-		pthread_mutex_unlock(&amp;mutStatsReporterWatch);
-	}
-	if (delta &gt; 0) {
-		STATSCOUNTER_ADD(actualArtificialDelayMs, mutActualArtificialDelayMs, delta);
-	}
-}
-static rsRetVal
-blockStatsReporting(tcps_sess_t *pSess) {
-	DEFiRet;
-	sem_wait(&amp;statsReportingBlocker);
-	CHKiConcCtrl(pthread_mutex_lock(&amp;mutStatsReporterWatch));
-	statsReported = 0;
-	CHKiConcCtrl(pthread_mutex_unlock(&amp;mutStatsReporterWatch));
-	ATOMIC_STORE_0_TO_INT(&amp;allowOnlyOnce, &amp;mutAllowOnlyOnce);
-	statsReportingBlockStartTimeMs = currentTimeMills();
-	LogError(0, RS_RET_OK, "imdiag: blocked stats reporting");
-	CHKiRet(sendResponse(pSess, "next stats reporting call will be blocked\n"));
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		LogError(0, iRet, "imdiag: block-stats-reporting wasn't successful");
-		CHKiRet(sendResponse(pSess, "imdiag::error something went wrong\n"));
-	}
-	RETiRet;
-}
-static rsRetVal
-awaitStatsReport(uchar *pszCmd, tcps_sess_t *pSess) {
-	uchar subCmd[1024];
-	int blockAgain = 0;
-	DEFiRet;
-	memset(subCmd, 0, sizeof(subCmd));
-	getFirstWord(&amp;pszCmd, subCmd, sizeof(subCmd), TO_LOWERCASE);
-	blockAgain = (ustrcmp(UCHAR_CONSTANT("block_again"), subCmd) == 0);
-	if (statsReportingBlockStartTimeMs &gt; 0) {
-		long delta = currentTimeMills() - statsReportingBlockStartTimeMs;
-		if (blockAgain) {
-			ATOMIC_STORE_1_TO_INT(&amp;allowOnlyOnce, &amp;mutAllowOnlyOnce);
-			LogError(0, RS_RET_OK, "imdiag: un-blocking ONLY the next cycle of stats reporting");
-		} else {
-			statsReportingBlockStartTimeMs = 0;
-			LogError(0, RS_RET_OK, "imdiag: un-blocking stats reporting");
-		}
-		sem_post(&amp;statsReportingBlocker);
-		LogError(0, RS_RET_OK, "imdiag: stats reporting unblocked");
-		STATSCOUNTER_ADD(potentialArtificialDelayMs, mutPotentialArtificialDelayMs, delta);
-		STATSCOUNTER_INC(delayInvocationCount, mutDelayInvocationCount);
-		LogError(0, RS_RET_OK, "imdiag: will now await next reporting cycle");
-		CHKiConcCtrl(pthread_mutex_lock(&amp;mutStatsReporterWatch));
-		while (! statsReported) {
-			CHKiConcCtrl(pthread_cond_wait(&amp;statsReporterWatch, &amp;mutStatsReporterWatch));
-		}
-		statsReported = 0;
-		CHKiConcCtrl(pthread_mutex_unlock(&amp;mutStatsReporterWatch));
-		if (blockAgain) {
-			statsReportingBlockStartTimeMs = currentTimeMills();
-		}
-		LogError(0, RS_RET_OK, "imdiag: stats were reported, wait complete, returning");
-		CHKiRet(sendResponse(pSess, "stats reporting was unblocked\n"));
-	} else {
-		CHKiRet(sendResponse(pSess, "imdiag::error : stats reporting was not blocked, bug?\n"));
-	}
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		LogError(0, iRet, "imdiag: stats-reporting unblock + await-run wasn't successfully completed");
-		CHKiRet(sendResponse(pSess, "imdiag::error something went wrong\n"));
-	}
-	RETiRet;
-}
-static rsRetVal ATTR_NONNULL()
-OnMsgReceived(tcps_sess_t *const pSess, uchar *const pRcv, const int iLenMsg)
-{
-	uchar *pszMsg;
-	uchar *pToFree = NULL;
-	uchar cmdBuf[1024];
-	DEFiRet;
-	assert(pSess != NULL);
-	assert(pRcv != NULL);
-	CHKmalloc(pszMsg = calloc(1, iLenMsg + 1));
-	pToFree = pszMsg;
-	memcpy(pszMsg, pRcv, iLenMsg);
-	pszMsg[iLenMsg] = '\0';
-	memset(cmdBuf, 0, sizeof(cmdBuf)); 	getFirstWord(&amp;pszMsg, cmdBuf, sizeof(cmdBuf), TO_LOWERCASE);
-	dbgprintf("imdiag received command '%s'\n", cmdBuf);
-	if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("getmainmsgqueuesize"))) {
-		CHKiRet(sendResponse(pSess, "%d\n", iOverallQueueSize));
-		DBGPRINTF("imdiag: %d messages in main queue\n", iOverallQueueSize);
-	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("waitmainqueueempty"))) {
-		CHKiRet(waitMainQEmpty(pSess));
-	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("awaitlookuptablereload"))) {
-		CHKiRet(awaitLookupTableReload(pSess));
-	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("injectmsg"))) {
-		CHKiRet(injectMsg(pszMsg, pSess));
-	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("blockstatsreporting"))) {
-		CHKiRet(blockStatsReporting(pSess));
-	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("awaitstatsreport"))) {
-		CHKiRet(awaitStatsReport(pszMsg, pSess));
-	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("enabledebug"))) {
-		CHKiRet(enableDebug(pSess));
-	} else {
-		dbgprintf("imdiag unkown command '%s'\n", cmdBuf);
-		CHKiRet(sendResponse(pSess, "unkown command '%s'\n", cmdBuf));
-	}
-finalize_it:
-	free(pToFree);
-	RETiRet;
-}
-static rsRetVal
-setPermittedPeer(void __attribute__((unused)) *pVal, uchar *pszID)
-{
-	DEFiRet;
-	CHKiRet(net.AddPermittedPeer(&amp;pPermPeersRoot, pszID));
-	free(pszID); finalize_it:
-	RETiRet;
-}
-static rsRetVal
-setInjectDelayMode(void __attribute__((unused)) *pVal, uchar *const pszMode)
-{
-	DEFiRet;
-	if(!strcasecmp((char*)pszMode, "no")) {
-		injectmsgDelayMode = eFLOWCTL_NO_DELAY;
-	} else if(!strcasecmp((char*)pszMode, "light")) {
-		injectmsgDelayMode = eFLOWCTL_LIGHT_DELAY;
-	} else if(!strcasecmp((char*)pszMode, "full")) {
-		injectmsgDelayMode = eFLOWCTL_FULL_DELAY;
-	} else {
-		LogError(0, RS_RET_PARAM_ERROR,
-			"imdiag: invalid imdiagInjectDelayMode '%s' - ignored", pszMode);
-	}
-	free(pszMode);
-	RETiRet;
-}
-static rsRetVal
-addTCPListener(void __attribute__((unused)) *pVal, uchar *pNewVal)
-{
-	tcpLstnParams_t *cnf_params = NULL;
-	DEFiRet;
-	if(pOurTcpsrv != NULL) {
-		LogError(0, NO_ERRCODE, "imdiag: only a single listener is supported, "
-			"trying to add a second");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	CHKmalloc(cnf_params = (tcpLstnParams_t*) calloc(1, sizeof(tcpLstnParams_t)));
-	CHKiRet(tcpsrv.Construct(&amp;pOurTcpsrv));
-	CHKiRet(tcpsrv.SetSessMax(pOurTcpsrv, iTCPSessMax));
-	CHKiRet(tcpsrv.SetCBIsPermittedHost(pOurTcpsrv, isPermittedHost));
-	CHKiRet(tcpsrv.SetCBRcvData(pOurTcpsrv, doRcvData));
-	CHKiRet(tcpsrv.SetCBOpenLstnSocks(pOurTcpsrv, doOpenLstnSocks));
-	CHKiRet(tcpsrv.SetCBOnRegularClose(pOurTcpsrv, onRegularClose));
-	CHKiRet(tcpsrv.SetCBOnErrClose(pOurTcpsrv, onErrClose));
-	CHKiRet(tcpsrv.SetDrvrMode(pOurTcpsrv, iStrmDrvrMode));
-	CHKiRet(tcpsrv.SetOnMsgReceive(pOurTcpsrv, OnMsgReceived));
-	if(pszStrmDrvrAuthMode != NULL) {
-		CHKiRet(tcpsrv.SetDrvrAuthMode(pOurTcpsrv, pszStrmDrvrAuthMode));
-	}
-	if(pPermPeersRoot != NULL) {
-		CHKiRet(tcpsrv.SetDrvrPermPeers(pOurTcpsrv, pPermPeersRoot));
-	}
-	CHKiRet(tcpsrv.SetInputName(pOurTcpsrv, cnf_params, pszInputName == NULL ?
-						UCHAR_CONSTANT("imdiag") : pszInputName));
-	CHKiRet(tcpsrv.SetOrigin(pOurTcpsrv, (uchar*)"imdiag"));
-	cnf_params-&gt;pszPort = pNewVal;
-	cnf_params-&gt;bSuppOctetFram = 1;
-	CHKmalloc(cnf_params-&gt;pszLstnPortFileName = (const uchar*) strdup((const char*)pszLstnPortFileName));
-	tcpsrv.configureTCPListen(pOurTcpsrv, cnf_params);
-	cnf_params = NULL;
-finalize_it:
-	if(iRet != RS_RET_OK) {
-		LogError(0, NO_ERRCODE, "error %d trying to add listener", iRet);
-		if(pOurTcpsrv != NULL)
-			tcpsrv.Destruct(&amp;pOurTcpsrv);
-	}
-	free(cnf_params);
-	RETiRet;
-}
-static void *
-timeoutGuard(ATTR_UNUSED void *arg)
-{
-	assert(abortTimeout != -1);
-	sigset_t sigSet;
-	time_t strtTO;
-	time_t endTO;
-	sigfillset(&amp;sigSet);
-	sigdelset(&amp;sigSet, SIGSEGV);
-	pthread_sigmask(SIG_BLOCK, &amp;sigSet, NULL);
-	dbgprintf("timeoutGuard: timeout %d seconds, time %lld\n", abortTimeout, (long long) time(NULL));
-	time(&amp;strtTO);
-	endTO = strtTO + abortTimeout;
-	while(1) {
-		int to = endTO - time(NULL);
-		dbgprintf("timeoutGuard: sleep timeout %d seconds\n", to);
-		if(to &gt; 0) {
-			srSleep(to, 0);
-		}
-		if(time(NULL) &lt; endTO) {
-			dbgprintf("timeoutGuard: spurios wakeup, going back to sleep, time: %lld\n",
-				(long long) time(NULL));
-		} else {
-			break;
-		}
-	}
-	dbgprintf("timeoutGuard: sleep expired, aborting\n");
-	fprintf(stderr, "timeoutGuard: rsyslog still active after expiry of guard "
-		"period (strtTO %lld, endTO %lld, time now %lld, diff %lld), pid %d - initiating abort()\n",
-	(long long) strtTO, (long long) endTO, (long long) time(NULL), (long long) (time(NULL) - strtTO),
-	(int) glblGetOurPid());
-	fflush(stderr);
-	abort();
-}
-static rsRetVal
-setAbortTimeout(void __attribute__((unused)) *pVal, int timeout)
-{
-	DEFiRet;
-	if(abortTimeout != -1) {
-		LogError(0, NO_ERRCODE, "imdiag: abort timeout already set -"
-			"ignoring 2nd+ request");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	if(timeout &lt;= 0) {
-		LogError(0, NO_ERRCODE, "imdiag: $IMDiagAbortTimeout must be greater "
-			"than 0 - ignored");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	abortTimeout = timeout;
-	const int iState = pthread_create(&amp;timeoutGuard_thrd, NULL, timeoutGuard, NULL);
-	if(iState != 0) {
-		LogError(iState, NO_ERRCODE, "imdiag: error enabling timeoutGuard thread -"
-			"not guarding against system hang");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-finalize_it:
-	RETiRet;
-}
-#if 0 BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-ENDbeginCnfLoad
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-ENDendCnfLoad
-BEGINcheckCnf
-CODESTARTcheckCnf
-ENDcheckCnf
-BEGINactivateCnf
-CODESTARTactivateCnf
-ENDactivateCnf
-BEGINfreeCnf
-CODESTARTfreeCnf
-ENDfreeCnf
-#endif
-BEGINrunInput
-CODESTARTrunInput
-	CHKiRet(tcpsrv.ConstructFinalize(pOurTcpsrv));
-	iRet = tcpsrv.Run(pOurTcpsrv);
-finalize_it:
-ENDrunInput
-BEGINwillRun
-CODESTARTwillRun
-	if(pOurTcpsrv == NULL)
-		ABORT_FINALIZE(RS_RET_NO_RUN);
-	CHKiRet(prop.Construct(&amp;pInputName));
-	CHKiRet(prop.SetString(pInputName, UCHAR_CONSTANT("imdiag"), sizeof("imdiag") - 1));
-	CHKiRet(prop.ConstructFinalize(pInputName));
-	CHKiRet(prop.Construct(&amp;pRcvDummy));
-	CHKiRet(prop.SetString(pRcvDummy, UCHAR_CONSTANT("127.0.0.1"), sizeof("127.0.0.1") - 1));
-	CHKiRet(prop.ConstructFinalize(pRcvDummy));
-	CHKiRet(prop.Construct(&amp;pRcvIPDummy));
-	CHKiRet(prop.SetString(pRcvIPDummy, UCHAR_CONSTANT("127.0.0.1"), sizeof("127.0.0.1") - 1));
-	CHKiRet(prop.ConstructFinalize(pRcvIPDummy));
-finalize_it:
-ENDwillRun
-BEGINafterRun
-CODESTARTafterRun
-	if(pInputName != NULL)
-		prop.Destruct(&amp;pInputName);
-	if(pRcvDummy != NULL)
-		prop.Destruct(&amp;pRcvDummy);
-	if(pRcvIPDummy != NULL)
-		prop.Destruct(&amp;pRcvIPDummy);
-ENDafterRun
-BEGINmodExit
-CODESTARTmodExit
-	if(pOurTcpsrv != NULL)
-		iRet = tcpsrv.Destruct(&amp;pOurTcpsrv);
-	if(pPermPeersRoot != NULL) {
-		net.DestructPermittedPeers(&amp;pPermPeersRoot);
-	}
-	free(pszInputName);
-	free(pszLstnPortFileName);
-	free(pszStrmDrvrAuthMode);
-	statsobj.Destruct(&amp;diagStats);
-	sem_destroy(&amp;statsReportingBlocker);
-	DESTROY_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
-	pthread_cond_destroy(&amp;statsReporterWatch);
-	pthread_mutex_destroy(&amp;mutStatsReporterWatch);
-	objRelease(net, LM_NET_FILENAME);
-	objRelease(netstrm, LM_NETSTRMS_FILENAME);
-	objRelease(tcps_sess, LM_TCPSRV_FILENAME);
-	objRelease(tcpsrv, LM_TCPSRV_FILENAME);
-	objRelease(datetime, CORE_COMPONENT);
-	objRelease(prop, CORE_COMPONENT);
-	objRelease(statsobj, CORE_COMPONENT);
-	if(abortTimeout != -1) {
-		int r = pthread_cancel(timeoutGuard_thrd);
-		if(r == 0) {
-			void *dummy;
-			pthread_join(timeoutGuard_thrd, &amp;dummy);
-		}
-	}
-ENDmodExit
-static rsRetVal
-resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
-{
-	iTCPSessMax = 200;
-	iStrmDrvrMode = 0;
-	free(pszInputName);
-	free(pszLstnPortFileName);
-	pszLstnPortFileName = NULL;
-	if(pszStrmDrvrAuthMode != NULL) {
-		free(pszStrmDrvrAuthMode);
-		pszStrmDrvrAuthMode = NULL;
-	}
-	return RS_RET_OK;
-}
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURENonCancelInputTermination)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_IMOD_QUERIES
-CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
-ENDqueryEtryPt
-BEGINmodInit()
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
-	pOurTcpsrv = NULL;
-	CHKiRet(objUse(net, LM_NET_FILENAME));
-	CHKiRet(objUse(netstrm, LM_NETSTRMS_FILENAME));
-	CHKiRet(objUse(tcps_sess, LM_TCPSRV_FILENAME));
-	CHKiRet(objUse(tcpsrv, LM_TCPSRV_FILENAME));
-	CHKiRet(objUse(datetime, CORE_COMPONENT));
-	CHKiRet(objUse(prop, CORE_COMPONENT));
-	CHKiRet(objUse(statsobj, CORE_COMPONENT));
-	const char *ci_max_empty_checks = getenv("CI_SHUTDOWN_QUEUE_EMPTY_CHECKS");
-	if(ci_max_empty_checks != NULL) {
-		int n = atoi(ci_max_empty_checks);
-		if(n &gt; 200) {
-			LogError(0, RS_RET_PARAM_ERROR, "env var CI_SHUTDOWN_QUEUE_EMPTY_CHECKS has "
-				"value over 200, which is the maximum - capped to 200");
-			n = 200;
-		}
-		if(n &gt; 0) {
-			max_empty_checks = n;
-		} else {
-			LogError(0, RS_RET_PARAM_ERROR, "env var CI_SHUTDOWN_QUEUE_EMPTY_CHECKS has "
-				"value below 1, ignored; using default instead");
-		}
-		fprintf(stderr, "rsyslogd: info: imdiag does %d empty checks due to "
-			"CI_SHUTDOWN_QUEUE_EMPTY_CHECKS\n", max_empty_checks);
-	}
-<a name="0"></a>
-	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagaborttimeout"), 0, eCmdHdlrInt,
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>				   setAbortTimeout, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverrun"), 0, eCmdHdlrGetWord,
-				   addTCPListener, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiaginjectdelaymode"), 0, eCmdHdlrGetWord,
-				   setInjectDelayMode, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagmaxsessions"), 0, eCmdHdlrInt,
-				   NULL, &amp;iTCPSessMax, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverstreamdrivermode"), 0,
-				   eCmdHdlrInt, NULL, &amp;iStrmDrvrMode, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiaglistenportfilename"), 0,
-				   eCmdHdlrGetWord, NULL, &amp;pszLstnPortFileName, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverstreamdriverauthmode"), 0,
-				   eCmdHdlrGetWord, NULL, &amp;pszStrmDrvrAuthMode, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverstreamdriverpermittedpeer"), 0,
-				   eCmdHdlrGetWord, setPermittedPeer, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverinputname"), 0,
-				   eCmdHdlrGetWord, NULL, &amp;pszInputName, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("resetconfigvariables"), 1, eCmdHdlrCustomHandler,
-							   resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
-	sem_init(&amp;statsReportingBlocker, 0, 1);
-	INIT_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
-	CHKiConcCtrl(pthread_mutex_init(&amp;mutStatsReporterWatch, NULL));
-	CHKiConcCtrl(pthread_cond_init(&amp;statsReporterWatch, NULL));
-	CHKiRet(statsobj.Construct(&amp;diagStats));
-	CHKiRet(statsobj.SetName(diagStats, UCHAR_CONSTANT("imdiag-stats-reporting-controller")));
-	CHKiRet(statsobj.SetOrigin(diagStats, UCHAR_CONSTANT("imdiag")));
-	statsobj.SetStatsObjFlags(diagStats, STATSOBJ_FLAG_DO_PREPEND);
-	STATSCOUNTER_INIT(potentialArtificialDelayMs, mutPotentialArtificialDelayMs);
-	CHKiRet(statsobj.AddCounter(diagStats, UCHAR_CONSTANT("potentialTotalArtificialDelayInMs"),
-						ctrType_IntCtr, CTR_FLAG_NONE, &amp;potentialArtificialDelayMs));
-	STATSCOUNTER_INIT(actualArtificialDelayMs, mutActualArtificialDelayMs);
-	CHKiRet(statsobj.AddCounter(diagStats, UCHAR_CONSTANT("actualTotalArtificialDelayInMs"),
-							ctrType_IntCtr, CTR_FLAG_NONE, &amp;actualArtificialDelayMs));
-	STATSCOUNTER_INIT(delayInvocationCount, mutDelayInvocationCount);
-	CHKiRet(statsobj.AddCounter(diagStats, UCHAR_CONSTANT("delayInvocationCount"),
-			ctrType_IntCtr, CTR_FLAG_NONE, &amp;delayInvocationCount));
-	CHKiRet(statsobj.SetReadNotifier(diagStats, imdiag_statsReadCallback, NULL));</b></font>
-	CHKiRet(statsobj.ConstructFinalize(diagStats));
-ENDmodInit
+1 #include "config.h"
+2 #include &lt;stdio.h&gt;
+3 #include &lt;stdlib.h&gt;
+4 #include &lt;assert.h&gt;
+5 #include &lt;string.h&gt;
+6 #include &lt;errno.h&gt;
+7 #include &lt;unistd.h&gt;
+8 #include &lt;stdarg.h&gt;
+9 #include &lt;ctype.h&gt;
+10 #include &lt;signal.h&gt;
+11 #include &lt;netinet/in.h&gt;
+12 #include &lt;netdb.h&gt;
+13 #include &lt;sys/types.h&gt;
+14 #include &lt;sys/socket.h&gt;
+15 #include &lt;pthread.h&gt;
+16 #include &lt;semaphore.h&gt;
+17 #if HAVE_FCNTL_H
+18 #include &lt;fcntl.h&gt;
+19 #endif
+20 #include "rsyslog.h"
+21 #include "dirty.h"
+22 #include "cfsysline.h"
+23 #include "module-template.h"
+24 #include "unicode-helper.h"
+25 #include "net.h"
+26 #include "netstrm.h"
+27 #include "errmsg.h"
+28 #include "tcpsrv.h"
+29 #include "srUtils.h"
+30 #include "msg.h"
+31 #include "datetime.h"
+32 #include "ratelimit.h"
+33 #include "queue.h"
+34 #include "lookup.h"
+35 #include "net.h" #include "statsobj.h"
+36 MODULE_TYPE_INPUT
+37 MODULE_TYPE_NOKEEP
+38 DEF_IMOD_STATIC_DATA
+39 DEFobjCurrIf(tcpsrv)
+40 DEFobjCurrIf(tcps_sess)
+41 DEFobjCurrIf(net)
+42 DEFobjCurrIf(netstrm)
+43 DEFobjCurrIf(datetime)
+44 DEFobjCurrIf(prop)
+45 DEFobjCurrIf(statsobj)
+46 static tcpsrv_t *pOurTcpsrv = NULL;  static permittedPeers_t *pPermPeersRoot = NULL;
+47 static prop_t *pInputName = NULL;
+48 static prop_t *pRcvDummy = NULL;
+49 static prop_t *pRcvIPDummy = NULL;
+50 static int max_empty_checks = 3; 
+51 statsobj_t *diagStats;
+52 STATSCOUNTER_DEF(potentialArtificialDelayMs, mutPotentialArtificialDelayMs)
+53 STATSCOUNTER_DEF(actualArtificialDelayMs, mutActualArtificialDelayMs)
+54 STATSCOUNTER_DEF(delayInvocationCount, mutDelayInvocationCount)
+55 static sem_t statsReportingBlocker;
+56 static long long statsReportingBlockStartTimeMs = 0;
+57 static int allowOnlyOnce = 0;
+58 DEF_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
+59 pthread_mutex_t mutStatsReporterWatch;
+60 pthread_cond_t statsReporterWatch;
+61 int statsReported = 0;
+62 static int abortTimeout = -1;		static pthread_t timeoutGuard_thrd;	
+63 struct modConfData_s {
+64 	EMPTY_STRUCT;
+65 };
+66 static flowControl_t injectmsgDelayMode = eFLOWCTL_NO_DELAY;
+67 static int iTCPSessMax = 20; static int iStrmDrvrMode = 0; static uchar *pszLstnPortFileName = NULL;
+68 static uchar *pszStrmDrvrAuthMode = NULL; static uchar *pszInputName = NULL; 
+69 static int
+70 isPermittedHost(struct sockaddr __attribute__((unused)) *addr, char __attribute__((unused)) *fromHostFQDN,
+71 		void __attribute__((unused)) *pUsrSrv, void __attribute__((unused)) *pUsrSess)
+72 {
+73 	return 1;	}
+74 static rsRetVal
+75 doOpenLstnSocks(tcpsrv_t *pSrv)
+76 {
+77 	ISOBJ_TYPE_assert(pSrv, tcpsrv);
+78 	dbgprintf("in imdiag doOpenLstnSocks\n");
+79 	return tcpsrv.create_tcp_socket(pSrv);
+80 }
+81 static rsRetVal
+82 doRcvData(tcps_sess_t *pSess, char *buf, size_t lenBuf, ssize_t *piLenRcvd, int *oserr)
+83 {
+84 	assert(pSess != NULL);
+85 	assert(piLenRcvd != NULL);
+86 	*piLenRcvd = lenBuf;
+87 	return netstrm.Rcv(pSess-&gt;pStrm, (uchar*) buf, piLenRcvd, oserr);
+88 }
+89 static rsRetVal
+90 onRegularClose(tcps_sess_t *pSess)
+91 {
+92 	DEFiRet;
+93 	assert(pSess != NULL);
+94 	tcps_sess.PrepareClose(pSess);
+95 	tcps_sess.Close(pSess);
+96 	RETiRet;
+97 }
+98 static rsRetVal
+99 onErrClose(tcps_sess_t *pSess)
+100 {
+101 	DEFiRet;
+102 	assert(pSess != NULL);
+103 	tcps_sess.Close(pSess);
+104 	RETiRet;
+105 }
+106 #define TO_LOWERCASE	1
+107 #define NO_MODIFY	0
+108 static void
+109 getFirstWord(uchar **ppszSrc, uchar *pszBuf, size_t lenBuf, int options)
+110 {
+111 	uchar c;
+112 	uchar *pszSrc = *ppszSrc;
+113 	while(*pszSrc &amp;&amp; *pszSrc == ' ')
+114 		++pszSrc; 
+115 	while(*pszSrc &amp;&amp; *pszSrc != ' ' &amp;&amp; lenBuf &gt; 1) {
+116 		c = *pszSrc++;
+117 		if(options &amp; TO_LOWERCASE)
+118 			c = tolower(c);
+119 		*pszBuf++ = c;
+120 		lenBuf--;
+121 	}
+122 	*pszBuf = '\0';
+123 	*ppszSrc = pszSrc;
+124 }
+125 static rsRetVal __attribute__((format(printf, 2, 3)))
+126 sendResponse(tcps_sess_t *pSess, const char *const __restrict__ fmt, ...)
+127 {
+128 	va_list ap;
+129 	ssize_t len;
+130 	uchar buf[1024];
+131 	DEFiRet;
+132 	va_start(ap, fmt);
+133 	len = vsnprintf((char*)buf, sizeof(buf), fmt, ap);
+134 	va_end(ap);
+135 	CHKiRet(netstrm.Send(pSess-&gt;pStrm, buf, &amp;len));
+136 finalize_it:
+137 	RETiRet;
+138 }
+139 static rsRetVal
+140 doInjectMsg(uchar *szMsg, ratelimit_t *ratelimiter)
+141 {
+142 	smsg_t *pMsg;
+143 	struct syslogTime stTime;
+144 	time_t ttGenTime;
+145 	DEFiRet;
+146 	datetime.getCurrTime(&amp;stTime, &amp;ttGenTime, TIME_IN_LOCALTIME);
+147 	CHKiRet(msgConstructWithTime(&amp;pMsg, &amp;stTime, ttGenTime));
+148 	MsgSetRawMsg(pMsg, (char*) szMsg, ustrlen(szMsg));
+149 	MsgSetInputName(pMsg, pInputName);
+150 	MsgSetFlowControlType(pMsg, injectmsgDelayMode);
+151 	pMsg-&gt;msgFlags  = NEEDS_PARSING | PARSE_HOSTNAME;
+152 	MsgSetRcvFrom(pMsg, pRcvDummy);
+153 	CHKiRet(MsgSetRcvFromIP(pMsg, pRcvIPDummy));
+154 	CHKiRet(ratelimitAddMsg(ratelimiter, NULL, pMsg));
+155 finalize_it:
+156 	RETiRet;
+157 }
+158 static rsRetVal
+159 doInjectNumericSuffixMsg(int iNum, ratelimit_t *ratelimiter)
+160 {
+161 	uchar szMsg[1024];
+162 	DEFiRet;
+163 	snprintf((char*)szMsg, sizeof(szMsg)/sizeof(uchar),
+164 		"&lt;167&gt;Mar  1 01:00:00 172.20.245.8 tag msgnum:%8.8d:", iNum);
+165 	iRet = doInjectMsg(szMsg, ratelimiter);
+166 	RETiRet;
+167 }
+168 static rsRetVal
+169 injectMsg(uchar *pszCmd, tcps_sess_t *pSess)
+170 {
+171 	uchar wordBuf[1024];
+172 	int iFrom, nMsgs;
+173 	uchar *literalMsg;
+174 	int i;
+175 	ratelimit_t *ratelimit = NULL;
+176 	DEFiRet;
+177 	literalMsg = NULL;
+178 	memset(wordBuf, 0, sizeof(wordBuf));
+179 	CHKiRet(ratelimitNew(&amp;ratelimit, "imdiag", "injectmsg"));
+180 	getFirstWord(&amp;pszCmd, wordBuf, sizeof(wordBuf), TO_LOWERCASE);
+181 	if (ustrcmp(UCHAR_CONSTANT("literal"), wordBuf) == 0) {
+182 		++pszCmd; 		CHKiRet(doInjectMsg(pszCmd, ratelimit));
+183 		nMsgs = 1;
+184 	} else { 		iFrom = atoi((char*)wordBuf);
+185 		getFirstWord(&amp;pszCmd, wordBuf, sizeof(wordBuf), TO_LOWERCASE);
+186 		nMsgs = atoi((char*)wordBuf);
+187 		for(i = 0 ; i &lt; nMsgs ; ++i) {
+188 			CHKiRet(doInjectNumericSuffixMsg(i + iFrom, ratelimit));
+189 		}
+190 	}
+191 	CHKiRet(sendResponse(pSess, "%d messages injected\n", nMsgs));
+192 	DBGPRINTF("imdiag: %d messages injected\n", nMsgs);
+193 finalize_it:
+194 	if(ratelimit != NULL)
+195 		ratelimitDestruct(ratelimit);
+196 	free(literalMsg);
+197 	RETiRet;
+198 }
+199 static rsRetVal
+200 waitMainQEmpty(tcps_sess_t *pSess)
+201 {
+202 	int iPrint = 0;
+203 	int iPrintVerbosity = 500; 	int nempty = 0;
+204 	static unsigned lastOverallQueueSize = 1;
+205 	DEFiRet;
+206 	while(1) {
+207 		processImInternal();
+208 		const unsigned OverallQueueSize = PREFER_FETCH_32BIT(iOverallQueueSize);
+209 		if(OverallQueueSize == 0) {
+210 			++nempty;
+211 		} else {
+212 			if(OverallQueueSize &gt; 500) {
+213 				srSleep(0, (OverallQueueSize &gt; 2000) ? 900000 : 100000);
+214 			}
+215 			nempty = 0;
+216 		}
+217 		if(dbgTimeoutToStderr) { 			if(OverallQueueSize != lastOverallQueueSize) {
+218 				fprintf(stderr, "imdiag: wait q_empty: qsize %d nempty %d\n",
+219 					OverallQueueSize, nempty);
+220 				lastOverallQueueSize = OverallQueueSize;
+221 			}
+222 		}
+223 		if(nempty &gt; max_empty_checks)
+224 			break;
+225 		if(iPrint++ % iPrintVerbosity == 0)
+226 			DBGPRINTF("imdiag sleeping, wait queues drain, "
+227 				"curr size %d, nempty %d\n",
+228 				OverallQueueSize, nempty);
+229 		srSleep(0,100000);	}
+230 	CHKiRet(sendResponse(pSess, "mainqueue empty\n"));
+231 	DBGPRINTF("imdiag: mainqueue empty\n");
+232 finalize_it:
+233 	RETiRet;
+234 }
+235 static rsRetVal
+236 awaitLookupTableReload(tcps_sess_t *pSess)
+237 {
+238 	DEFiRet;
+239 	while(1) {
+240 		if(lookupPendingReloadCount() == 0) {
+241 			break;
+242 		}
+243 		srSleep(0,500000);
+244 	}
+245 	CHKiRet(sendResponse(pSess, "no pending lookup-table reloads found\n"));
+246 	DBGPRINTF("imdiag: no pending lookup-table reloads found\n");
+247 finalize_it:
+248 	RETiRet;
+249 }
+250 static rsRetVal
+251 enableDebug(tcps_sess_t *pSess)
+252 {
+253 	DEFiRet;
+254 	Debug = DEBUG_FULL;
+255 	debugging_on = 1;
+256 	dbgprintf("Note: debug turned on via imdiag\n");
+257 	CHKiRet(sendResponse(pSess, "debug enabled\n"));
+258 finalize_it:
+259 	RETiRet;
+260 }
+261 static void
+262 imdiag_statsReadCallback(statsobj_t __attribute__((unused)) *const ignore_stats,
+263 	void __attribute__((unused)) *const ignore_ctx)
+264 {
+265 	long long waitStartTimeMs = currentTimeMills();
+266 	sem_wait(&amp;statsReportingBlocker);
+267 	long delta = currentTimeMills() - waitStartTimeMs;
+268 	if ((int)ATOMIC_DEC_AND_FETCH(&amp;allowOnlyOnce, &amp;mutAllowOnlyOnce) &lt; 0) {
+269 		sem_post(&amp;statsReportingBlocker);
+270 	} else {
+271 		LogError(0, RS_RET_OK, "imdiag(stats-read-callback): current stats-reporting "
+272 						"cycle will proceed now, next reporting cycle will again be blocked");
+273 	}
+274 	if (pthread_mutex_lock(&amp;mutStatsReporterWatch) == 0) {
+275 		statsReported = 1;
+276 		pthread_cond_signal(&amp;statsReporterWatch);
+277 		pthread_mutex_unlock(&amp;mutStatsReporterWatch);
+278 	}
+279 	if (delta &gt; 0) {
+280 		STATSCOUNTER_ADD(actualArtificialDelayMs, mutActualArtificialDelayMs, delta);
+281 	}
+282 }
+283 static rsRetVal
+284 blockStatsReporting(tcps_sess_t *pSess) {
+285 	DEFiRet;
+286 	sem_wait(&amp;statsReportingBlocker);
+287 	CHKiConcCtrl(pthread_mutex_lock(&amp;mutStatsReporterWatch));
+288 	statsReported = 0;
+289 	CHKiConcCtrl(pthread_mutex_unlock(&amp;mutStatsReporterWatch));
+290 	ATOMIC_STORE_0_TO_INT(&amp;allowOnlyOnce, &amp;mutAllowOnlyOnce);
+291 	statsReportingBlockStartTimeMs = currentTimeMills();
+292 	LogError(0, RS_RET_OK, "imdiag: blocked stats reporting");
+293 	CHKiRet(sendResponse(pSess, "next stats reporting call will be blocked\n"));
+294 finalize_it:
+295 	if (iRet != RS_RET_OK) {
+296 		LogError(0, iRet, "imdiag: block-stats-reporting wasn't successful");
+297 		CHKiRet(sendResponse(pSess, "imdiag::error something went wrong\n"));
+298 	}
+299 	RETiRet;
+300 }
+301 static rsRetVal
+302 awaitStatsReport(uchar *pszCmd, tcps_sess_t *pSess) {
+303 	uchar subCmd[1024];
+304 	int blockAgain = 0;
+305 	DEFiRet;
+306 	memset(subCmd, 0, sizeof(subCmd));
+307 	getFirstWord(&amp;pszCmd, subCmd, sizeof(subCmd), TO_LOWERCASE);
+308 	blockAgain = (ustrcmp(UCHAR_CONSTANT("block_again"), subCmd) == 0);
+309 	if (statsReportingBlockStartTimeMs &gt; 0) {
+310 		long delta = currentTimeMills() - statsReportingBlockStartTimeMs;
+311 		if (blockAgain) {
+312 			ATOMIC_STORE_1_TO_INT(&amp;allowOnlyOnce, &amp;mutAllowOnlyOnce);
+313 			LogError(0, RS_RET_OK, "imdiag: un-blocking ONLY the next cycle of stats reporting");
+314 		} else {
+315 			statsReportingBlockStartTimeMs = 0;
+316 			LogError(0, RS_RET_OK, "imdiag: un-blocking stats reporting");
+317 		}
+318 		sem_post(&amp;statsReportingBlocker);
+319 		LogError(0, RS_RET_OK, "imdiag: stats reporting unblocked");
+320 		STATSCOUNTER_ADD(potentialArtificialDelayMs, mutPotentialArtificialDelayMs, delta);
+321 		STATSCOUNTER_INC(delayInvocationCount, mutDelayInvocationCount);
+322 		LogError(0, RS_RET_OK, "imdiag: will now await next reporting cycle");
+323 		CHKiConcCtrl(pthread_mutex_lock(&amp;mutStatsReporterWatch));
+324 		while (! statsReported) {
+325 			CHKiConcCtrl(pthread_cond_wait(&amp;statsReporterWatch, &amp;mutStatsReporterWatch));
+326 		}
+327 		statsReported = 0;
+328 		CHKiConcCtrl(pthread_mutex_unlock(&amp;mutStatsReporterWatch));
+329 		if (blockAgain) {
+330 			statsReportingBlockStartTimeMs = currentTimeMills();
+331 		}
+332 		LogError(0, RS_RET_OK, "imdiag: stats were reported, wait complete, returning");
+333 		CHKiRet(sendResponse(pSess, "stats reporting was unblocked\n"));
+334 	} else {
+335 		CHKiRet(sendResponse(pSess, "imdiag::error : stats reporting was not blocked, bug?\n"));
+336 	}
+337 finalize_it:
+338 	if (iRet != RS_RET_OK) {
+339 		LogError(0, iRet, "imdiag: stats-reporting unblock + await-run wasn't successfully completed");
+340 		CHKiRet(sendResponse(pSess, "imdiag::error something went wrong\n"));
+341 	}
+342 	RETiRet;
+343 }
+344 static rsRetVal ATTR_NONNULL()
+345 OnMsgReceived(tcps_sess_t *const pSess, uchar *const pRcv, const int iLenMsg)
+346 {
+347 	uchar *pszMsg;
+348 	uchar *pToFree = NULL;
+349 	uchar cmdBuf[1024];
+350 	DEFiRet;
+351 	assert(pSess != NULL);
+352 	assert(pRcv != NULL);
+353 	CHKmalloc(pszMsg = calloc(1, iLenMsg + 1));
+354 	pToFree = pszMsg;
+355 	memcpy(pszMsg, pRcv, iLenMsg);
+356 	pszMsg[iLenMsg] = '\0';
+357 	memset(cmdBuf, 0, sizeof(cmdBuf)); 	getFirstWord(&amp;pszMsg, cmdBuf, sizeof(cmdBuf), TO_LOWERCASE);
+358 	dbgprintf("imdiag received command '%s'\n", cmdBuf);
+359 	if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("getmainmsgqueuesize"))) {
+360 		CHKiRet(sendResponse(pSess, "%d\n", iOverallQueueSize));
+361 		DBGPRINTF("imdiag: %d messages in main queue\n", iOverallQueueSize);
+362 	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("waitmainqueueempty"))) {
+363 		CHKiRet(waitMainQEmpty(pSess));
+364 	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("awaitlookuptablereload"))) {
+365 		CHKiRet(awaitLookupTableReload(pSess));
+366 	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("injectmsg"))) {
+367 		CHKiRet(injectMsg(pszMsg, pSess));
+368 	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("blockstatsreporting"))) {
+369 		CHKiRet(blockStatsReporting(pSess));
+370 	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("awaitstatsreport"))) {
+371 		CHKiRet(awaitStatsReport(pszMsg, pSess));
+372 	} else if(!ustrcmp(cmdBuf, UCHAR_CONSTANT("enabledebug"))) {
+373 		CHKiRet(enableDebug(pSess));
+374 	} else {
+375 		dbgprintf("imdiag unkown command '%s'\n", cmdBuf);
+376 		CHKiRet(sendResponse(pSess, "unkown command '%s'\n", cmdBuf));
+377 	}
+378 finalize_it:
+379 	free(pToFree);
+380 	RETiRet;
+381 }
+382 static rsRetVal
+383 setPermittedPeer(void __attribute__((unused)) *pVal, uchar *pszID)
+384 {
+385 	DEFiRet;
+386 	CHKiRet(net.AddPermittedPeer(&amp;pPermPeersRoot, pszID));
+387 	free(pszID); finalize_it:
+388 	RETiRet;
+389 }
+390 static rsRetVal
+391 setInjectDelayMode(void __attribute__((unused)) *pVal, uchar *const pszMode)
+392 {
+393 	DEFiRet;
+394 	if(!strcasecmp((char*)pszMode, "no")) {
+395 		injectmsgDelayMode = eFLOWCTL_NO_DELAY;
+396 	} else if(!strcasecmp((char*)pszMode, "light")) {
+397 		injectmsgDelayMode = eFLOWCTL_LIGHT_DELAY;
+398 	} else if(!strcasecmp((char*)pszMode, "full")) {
+399 		injectmsgDelayMode = eFLOWCTL_FULL_DELAY;
+400 	} else {
+401 		LogError(0, RS_RET_PARAM_ERROR,
+402 			"imdiag: invalid imdiagInjectDelayMode '%s' - ignored", pszMode);
+403 	}
+404 	free(pszMode);
+405 	RETiRet;
+406 }
+407 static rsRetVal
+408 addTCPListener(void __attribute__((unused)) *pVal, uchar *pNewVal)
+409 {
+410 	tcpLstnParams_t *cnf_params = NULL;
+411 	DEFiRet;
+412 	if(pOurTcpsrv != NULL) {
+413 		LogError(0, NO_ERRCODE, "imdiag: only a single listener is supported, "
+414 			"trying to add a second");
+415 		ABORT_FINALIZE(RS_RET_ERR);
+416 	}
+417 	CHKmalloc(cnf_params = (tcpLstnParams_t*) calloc(1, sizeof(tcpLstnParams_t)));
+418 	CHKiRet(tcpsrv.Construct(&amp;pOurTcpsrv));
+419 	CHKiRet(tcpsrv.SetSessMax(pOurTcpsrv, iTCPSessMax));
+420 	CHKiRet(tcpsrv.SetCBIsPermittedHost(pOurTcpsrv, isPermittedHost));
+421 	CHKiRet(tcpsrv.SetCBRcvData(pOurTcpsrv, doRcvData));
+422 	CHKiRet(tcpsrv.SetCBOpenLstnSocks(pOurTcpsrv, doOpenLstnSocks));
+423 	CHKiRet(tcpsrv.SetCBOnRegularClose(pOurTcpsrv, onRegularClose));
+424 	CHKiRet(tcpsrv.SetCBOnErrClose(pOurTcpsrv, onErrClose));
+425 	CHKiRet(tcpsrv.SetDrvrMode(pOurTcpsrv, iStrmDrvrMode));
+426 	CHKiRet(tcpsrv.SetOnMsgReceive(pOurTcpsrv, OnMsgReceived));
+427 	if(pszStrmDrvrAuthMode != NULL) {
+428 		CHKiRet(tcpsrv.SetDrvrAuthMode(pOurTcpsrv, pszStrmDrvrAuthMode));
+429 	}
+430 	if(pPermPeersRoot != NULL) {
+431 		CHKiRet(tcpsrv.SetDrvrPermPeers(pOurTcpsrv, pPermPeersRoot));
+432 	}
+433 	CHKiRet(tcpsrv.SetInputName(pOurTcpsrv, cnf_params, pszInputName == NULL ?
+434 						UCHAR_CONSTANT("imdiag") : pszInputName));
+435 	CHKiRet(tcpsrv.SetOrigin(pOurTcpsrv, (uchar*)"imdiag"));
+436 	cnf_params-&gt;pszPort = pNewVal;
+437 	cnf_params-&gt;bSuppOctetFram = 1;
+438 	CHKmalloc(cnf_params-&gt;pszLstnPortFileName = (const uchar*) strdup((const char*)pszLstnPortFileName));
+439 	tcpsrv.configureTCPListen(pOurTcpsrv, cnf_params);
+440 	cnf_params = NULL;
+441 finalize_it:
+442 	if(iRet != RS_RET_OK) {
+443 		LogError(0, NO_ERRCODE, "error %d trying to add listener", iRet);
+444 		if(pOurTcpsrv != NULL)
+445 			tcpsrv.Destruct(&amp;pOurTcpsrv);
+446 	}
+447 	free(cnf_params);
+448 	RETiRet;
+449 }
+450 static void *
+451 timeoutGuard(ATTR_UNUSED void *arg)
+452 {
+453 	assert(abortTimeout != -1);
+454 	sigset_t sigSet;
+455 	time_t strtTO;
+456 	time_t endTO;
+457 	sigfillset(&amp;sigSet);
+458 	sigdelset(&amp;sigSet, SIGSEGV);
+459 	pthread_sigmask(SIG_BLOCK, &amp;sigSet, NULL);
+460 	dbgprintf("timeoutGuard: timeout %d seconds, time %lld\n", abortTimeout, (long long) time(NULL));
+461 	time(&amp;strtTO);
+462 	endTO = strtTO + abortTimeout;
+463 	while(1) {
+464 		int to = endTO - time(NULL);
+465 		dbgprintf("timeoutGuard: sleep timeout %d seconds\n", to);
+466 		if(to &gt; 0) {
+467 			srSleep(to, 0);
+468 		}
+469 		if(time(NULL) &lt; endTO) {
+470 			dbgprintf("timeoutGuard: spurios wakeup, going back to sleep, time: %lld\n",
+471 				(long long) time(NULL));
+472 		} else {
+473 			break;
+474 		}
+475 	}
+476 	dbgprintf("timeoutGuard: sleep expired, aborting\n");
+477 	fprintf(stderr, "timeoutGuard: rsyslog still active after expiry of guard "
+478 		"period (strtTO %lld, endTO %lld, time now %lld, diff %lld), pid %d - initiating abort()\n",
+479 	(long long) strtTO, (long long) endTO, (long long) time(NULL), (long long) (time(NULL) - strtTO),
+480 	(int) glblGetOurPid());
+481 	fflush(stderr);
+482 	abort();
+483 }
+484 static rsRetVal
+485 setAbortTimeout(void __attribute__((unused)) *pVal, int timeout)
+486 {
+487 	DEFiRet;
+488 	if(abortTimeout != -1) {
+489 		LogError(0, NO_ERRCODE, "imdiag: abort timeout already set -"
+490 			"ignoring 2nd+ request");
+491 		ABORT_FINALIZE(RS_RET_ERR);
+492 	}
+493 	if(timeout &lt;= 0) {
+494 		LogError(0, NO_ERRCODE, "imdiag: $IMDiagAbortTimeout must be greater "
+495 			"than 0 - ignored");
+496 		ABORT_FINALIZE(RS_RET_ERR);
+497 	}
+498 	abortTimeout = timeout;
+499 	const int iState = pthread_create(&amp;timeoutGuard_thrd, NULL, timeoutGuard, NULL);
+500 	if(iState != 0) {
+501 		LogError(iState, NO_ERRCODE, "imdiag: error enabling timeoutGuard thread -"
+502 			"not guarding against system hang");
+503 		ABORT_FINALIZE(RS_RET_ERR);
+504 	}
+505 finalize_it:
+506 	RETiRet;
+507 }
+508 #if 0 BEGINbeginCnfLoad
+509 CODESTARTbeginCnfLoad
+510 ENDbeginCnfLoad
+511 BEGINendCnfLoad
+512 CODESTARTendCnfLoad
+513 ENDendCnfLoad
+514 BEGINcheckCnf
+515 CODESTARTcheckCnf
+516 ENDcheckCnf
+517 BEGINactivateCnf
+518 CODESTARTactivateCnf
+519 ENDactivateCnf
+520 BEGINfreeCnf
+521 CODESTARTfreeCnf
+522 ENDfreeCnf
+523 #endif
+524 BEGINrunInput
+525 CODESTARTrunInput
+526 	CHKiRet(tcpsrv.ConstructFinalize(pOurTcpsrv));
+527 	iRet = tcpsrv.Run(pOurTcpsrv);
+528 finalize_it:
+529 ENDrunInput
+530 BEGINwillRun
+531 CODESTARTwillRun
+532 	if(pOurTcpsrv == NULL)
+533 		ABORT_FINALIZE(RS_RET_NO_RUN);
+534 	CHKiRet(prop.Construct(&amp;pInputName));
+535 	CHKiRet(prop.SetString(pInputName, UCHAR_CONSTANT("imdiag"), sizeof("imdiag") - 1));
+536 	CHKiRet(prop.ConstructFinalize(pInputName));
+537 	CHKiRet(prop.Construct(&amp;pRcvDummy));
+538 	CHKiRet(prop.SetString(pRcvDummy, UCHAR_CONSTANT("127.0.0.1"), sizeof("127.0.0.1") - 1));
+539 	CHKiRet(prop.ConstructFinalize(pRcvDummy));
+540 	CHKiRet(prop.Construct(&amp;pRcvIPDummy));
+541 	CHKiRet(prop.SetString(pRcvIPDummy, UCHAR_CONSTANT("127.0.0.1"), sizeof("127.0.0.1") - 1));
+542 	CHKiRet(prop.ConstructFinalize(pRcvIPDummy));
+543 finalize_it:
+544 ENDwillRun
+545 BEGINafterRun
+546 CODESTARTafterRun
+547 	if(pInputName != NULL)
+548 		prop.Destruct(&amp;pInputName);
+549 	if(pRcvDummy != NULL)
+550 		prop.Destruct(&amp;pRcvDummy);
+551 	if(pRcvIPDummy != NULL)
+552 		prop.Destruct(&amp;pRcvIPDummy);
+553 ENDafterRun
+554 BEGINmodExit
+555 CODESTARTmodExit
+556 	if(pOurTcpsrv != NULL)
+557 		iRet = tcpsrv.Destruct(&amp;pOurTcpsrv);
+558 	if(pPermPeersRoot != NULL) {
+559 		net.DestructPermittedPeers(&amp;pPermPeersRoot);
+560 	}
+561 	free(pszInputName);
+562 	free(pszLstnPortFileName);
+563 	free(pszStrmDrvrAuthMode);
+564 	statsobj.Destruct(&amp;diagStats);
+565 	sem_destroy(&amp;statsReportingBlocker);
+566 	DESTROY_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
+567 	pthread_cond_destroy(&amp;statsReporterWatch);
+568 	pthread_mutex_destroy(&amp;mutStatsReporterWatch);
+569 	objRelease(net, LM_NET_FILENAME);
+570 	objRelease(netstrm, LM_NETSTRMS_FILENAME);
+571 	objRelease(tcps_sess, LM_TCPSRV_FILENAME);
+572 	objRelease(tcpsrv, LM_TCPSRV_FILENAME);
+573 	objRelease(datetime, CORE_COMPONENT);
+574 	objRelease(prop, CORE_COMPONENT);
+575 	objRelease(statsobj, CORE_COMPONENT);
+576 	if(abortTimeout != -1) {
+577 		int r = pthread_cancel(timeoutGuard_thrd);
+578 		if(r == 0) {
+579 			void *dummy;
+580 			pthread_join(timeoutGuard_thrd, &amp;dummy);
+581 		}
+582 	}
+583 ENDmodExit
+584 static rsRetVal
+585 resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
+586 {
+587 	iTCPSessMax = 200;
+588 	iStrmDrvrMode = 0;
+589 	free(pszInputName);
+590 	free(pszLstnPortFileName);
+591 	pszLstnPortFileName = NULL;
+592 	if(pszStrmDrvrAuthMode != NULL) {
+593 		free(pszStrmDrvrAuthMode);
+594 		pszStrmDrvrAuthMode = NULL;
+595 	}
+596 	return RS_RET_OK;
+597 }
+598 BEGINisCompatibleWithFeature
+599 CODESTARTisCompatibleWithFeature
+600 	if(eFeat == sFEATURENonCancelInputTermination)
+601 		iRet = RS_RET_OK;
+602 ENDisCompatibleWithFeature
+603 BEGINqueryEtryPt
+604 CODESTARTqueryEtryPt
+605 CODEqueryEtryPt_STD_IMOD_QUERIES
+606 CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
+607 ENDqueryEtryPt
+608 BEGINmodInit()
+609 CODESTARTmodInit
+610 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+611 	pOurTcpsrv = NULL;
+612 	CHKiRet(objUse(net, LM_NET_FILENAME));
+613 	CHKiRet(objUse(netstrm, LM_NETSTRMS_FILENAME));
+614 	CHKiRet(objUse(tcps_sess, LM_TCPSRV_FILENAME));
+615 	CHKiRet(objUse(tcpsrv, LM_TCPSRV_FILENAME));
+616 	CHKiRet(objUse(datetime, CORE_COMPONENT));
+617 	CHKiRet(objUse(prop, CORE_COMPONENT));
+618 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
+619 	const char *ci_max_empty_checks = getenv("CI_SHUTDOWN_QUEUE_EMPTY_CHECKS");
+620 	if(ci_max_empty_checks != NULL) {
+621 		int n = atoi(ci_max_empty_checks);
+622 		if(n &gt; 200) {
+623 			LogError(0, RS_RET_PARAM_ERROR, "env var CI_SHUTDOWN_QUEUE_EMPTY_CHECKS has "
+624 				"value over 200, which is the maximum - capped to 200");
+625 			n = 200;
+626 		}
+627 		if(n &gt; 0) {
+628 			max_empty_checks = n;
+629 		} else {
+630 			LogError(0, RS_RET_PARAM_ERROR, "env var CI_SHUTDOWN_QUEUE_EMPTY_CHECKS has "
+631 				"value below 1, ignored; using default instead");
+632 		}
+633 		fprintf(stderr, "rsyslogd: info: imdiag does %d empty checks due to "
+634 			"CI_SHUTDOWN_QUEUE_EMPTY_CHECKS\n", max_empty_checks);
+635 	}
+636 <a name="0"></a>
+637 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagaborttimeout"), 0, eCmdHdlrInt,
+638 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>				   setAbortTimeout, NULL, STD_LOADABLE_MODULE_ID));
+639 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverrun"), 0, eCmdHdlrGetWord,
+640 				   addTCPListener, NULL, STD_LOADABLE_MODULE_ID));
+641 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiaginjectdelaymode"), 0, eCmdHdlrGetWord,
+642 				   setInjectDelayMode, NULL, STD_LOADABLE_MODULE_ID));
+643 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagmaxsessions"), 0, eCmdHdlrInt,
+644 				   NULL, &amp;iTCPSessMax, STD_LOADABLE_MODULE_ID));
+645 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverstreamdrivermode"), 0,
+646 				   eCmdHdlrInt, NULL, &amp;iStrmDrvrMode, STD_LOADABLE_MODULE_ID));
+647 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiaglistenportfilename"), 0,
+648 				   eCmdHdlrGetWord, NULL, &amp;pszLstnPortFileName, STD_LOADABLE_MODULE_ID));
+649 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverstreamdriverauthmode"), 0,
+650 				   eCmdHdlrGetWord, NULL, &amp;pszStrmDrvrAuthMode, STD_LOADABLE_MODULE_ID));
+651 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverstreamdriverpermittedpeer"), 0,
+652 				   eCmdHdlrGetWord, setPermittedPeer, NULL, STD_LOADABLE_MODULE_ID));
+653 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("imdiagserverinputname"), 0,
+654 				   eCmdHdlrGetWord, NULL, &amp;pszInputName, STD_LOADABLE_MODULE_ID));
+655 	CHKiRet(omsdRegCFSLineHdlr(UCHAR_CONSTANT("resetconfigvariables"), 1, eCmdHdlrCustomHandler,
+656 							   resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+657 	sem_init(&amp;statsReportingBlocker, 0, 1);
+658 	INIT_ATOMIC_HELPER_MUT(mutAllowOnlyOnce);
+659 	CHKiConcCtrl(pthread_mutex_init(&amp;mutStatsReporterWatch, NULL));
+660 	CHKiConcCtrl(pthread_cond_init(&amp;statsReporterWatch, NULL));
+661 	CHKiRet(statsobj.Construct(&amp;diagStats));
+662 	CHKiRet(statsobj.SetName(diagStats, UCHAR_CONSTANT("imdiag-stats-reporting-controller")));
+663 	CHKiRet(statsobj.SetOrigin(diagStats, UCHAR_CONSTANT("imdiag")));
+664 	statsobj.SetStatsObjFlags(diagStats, STATSOBJ_FLAG_DO_PREPEND);
+665 	STATSCOUNTER_INIT(potentialArtificialDelayMs, mutPotentialArtificialDelayMs);
+666 	CHKiRet(statsobj.AddCounter(diagStats, UCHAR_CONSTANT("potentialTotalArtificialDelayInMs"),
+667 						ctrType_IntCtr, CTR_FLAG_NONE, &amp;potentialArtificialDelayMs));
+668 	STATSCOUNTER_INIT(actualArtificialDelayMs, mutActualArtificialDelayMs);
+669 	CHKiRet(statsobj.AddCounter(diagStats, UCHAR_CONSTANT("actualTotalArtificialDelayInMs"),
+670 							ctrType_IntCtr, CTR_FLAG_NONE, &amp;actualArtificialDelayMs));
+671 	STATSCOUNTER_INIT(delayInvocationCount, mutDelayInvocationCount);
+672 	CHKiRet(statsobj.AddCounter(diagStats, UCHAR_CONSTANT("delayInvocationCount"),
+673 			ctrType_IntCtr, CTR_FLAG_NONE, &amp;delayInvocationCount));
+674 	CHKiRet(statsobj.SetReadNotifier(diagStats, imdiag_statsReadCallback, NULL));</b></font>
+675 	CHKiRet(statsobj.ConstructFinalize(diagStats));
+676 ENDmodInit
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -728,1303 +728,1303 @@ ENDmodInit
 </h3>
 <hr/>
 <pre>
-#include "config.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;time.h&gt;
-#include &lt;netinet/in.h&gt;
-#include &lt;netdb.h&gt;
-#include &lt;fnmatch.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;ctype.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;stdint.h&gt;
-#include &lt;fcntl.h&gt;
-#include &lt;zlib.h&gt;
-#include &lt;pthread.h&gt;
-#include "rsyslog.h"
-#include "syslogd.h"
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "net.h"
-#include "netstrms.h"
-#include "netstrm.h"
-#include "omfwd.h"
-#include "template.h"
-#include "msg.h"
-#include "tcpclt.h"
-#include "cfsysline.h"
-#include "module-template.h"
-#include "glbl.h"
-#include "errmsg.h"
-#include "unicode-helper.h"
-#include "parserif.h"
-#include "ratelimit.h"
-#include "statsobj.h"
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("omfwd")
-DEF_OMOD_STATIC_DATA
-DEFobjCurrIf(glbl)
-DEFobjCurrIf(net)
-DEFobjCurrIf(netstrms)
-DEFobjCurrIf(netstrm)
-DEFobjCurrIf(tcpclt)
-DEFobjCurrIf(statsobj)
-#define IS_FLUSH 1
-#define NO_FLUSH 0
-typedef struct _instanceData {
-	uchar 	*tplName;		uchar *pszStrmDrvr;
-	uchar *pszStrmDrvrAuthMode;
-	uchar *pszStrmDrvrPermitExpiredCerts;
-	permittedPeers_t *pPermPeers;
-	int iStrmDrvrMode;
-	const uchar *pszStrmDrvrCAFile;
-	const uchar *pszStrmDrvrKeyFile;
-	const uchar *pszStrmDrvrCertFile;
-	char	*target;
-	char	*address;
-	char	*device;
-	int compressionLevel;		char *port;
-	int protocol;
-	char *networkNamespace;
-	int originalNamespace;
-	int iRebindInterval;		sbool bKeepAlive;
-	int iKeepAliveIntvl;
-	int iKeepAliveProbes;
-	int iKeepAliveTime;
-	int iConErrSkip;    	uchar *gnutlsPriorityString;
-	int ipfreebind;
-#	define	FORW_UDP 0
-#	define	FORW_TCP 1
-	int bSendToAll;
-	int iUDPSendDelay;
-	int UDPSendBuf;
-	TCPFRAMINGMODE tcp_framing;
-	uchar tcp_framingDelimiter;
-	int bResendLastOnRecon; #	define COMPRESS_NEVER 0
-#	define COMPRESS_SINGLE_MSG 1	#	define COMPRESS_STREAM_ALWAYS 2
-	uint8_t compressionMode;
-	int errsToReport;		sbool strmCompFlushOnTxEnd; 	unsigned int ratelimitInterval;
-	unsigned int ratelimitBurst;
-	ratelimit_t *ratelimiter;
-	statsobj_t *stats;			intctr_t sentBytes;
-	DEF_ATOMIC_HELPER_MUT64(mut_sentBytes)
-} instanceData;
-typedef struct wrkrInstanceData {
-	instanceData *pData;
-	netstrms_t *pNS; 	netstrm_t *pNetstrm; 	struct addrinfo *f_addr;
-	int *pSockArray;		int bIsConnected;  	int nXmit;			tcpclt_t *pTCPClt;		sbool bzInitDone; 	z_stream zstrm;		uchar sndBuf[16*1024];		unsigned offsSndBuf;		int errsToReport;	} wrkrInstanceData_t;
-typedef struct configSettings_s {
-	uchar *pszTplName; 	uchar *pszStrmDrvr; 	int iStrmDrvrMode; 	int bResendLastOnRecon; 	uchar *pszStrmDrvrAuthMode;			uchar *pszStrmDrvrPermitExpiredCerts;		int iTCPRebindInterval;		int iUDPRebindInterval;		int bKeepAlive;
-	int iKeepAliveIntvl;
-	int iKeepAliveProbes;
-	int iKeepAliveTime;
-	int iConErrSkip;
-	uchar *gnutlsPriorityString;
-	permittedPeers_t *pPermPeers;
-} configSettings_t;
-static configSettings_t cs;
-static struct cnfparamdescr modpdescr[] = {
-	{ "template", eCmdHdlrGetWord, 0 },
-};
-static struct cnfparamblk modpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
-	  modpdescr
-	};
-static struct cnfparamdescr actpdescr[] = {
-	{ "target", eCmdHdlrGetWord, 0 },
-	{ "address", eCmdHdlrGetWord, 0 },
-	{ "device", eCmdHdlrGetWord, 0 },
-	{ "port", eCmdHdlrGetWord, 0 },
-	{ "protocol", eCmdHdlrGetWord, 0 },
-	{ "networknamespace", eCmdHdlrGetWord, 0 },
-	{ "tcp_framing", eCmdHdlrGetWord, 0 },
-	{ "tcp_framedelimiter", eCmdHdlrInt, 0 },
-	{ "ziplevel", eCmdHdlrInt, 0 },
-	{ "compression.mode", eCmdHdlrGetWord, 0 },
-	{ "compression.stream.flushontxend", eCmdHdlrBinary, 0 },
-	{ "ipfreebind", eCmdHdlrInt, 0 },
-	{ "maxerrormessages", eCmdHdlrInt, CNFPARAM_DEPRECATED },
-	{ "rebindinterval", eCmdHdlrInt, 0 },
-	{ "keepalive", eCmdHdlrBinary, 0 },
-	{ "keepalive.probes", eCmdHdlrNonNegInt, 0 },
-	{ "keepalive.time", eCmdHdlrNonNegInt, 0 },
-	{ "keepalive.interval", eCmdHdlrNonNegInt, 0 },
-	{ "conerrskip", eCmdHdlrNonNegInt, 0 },
-	{ "gnutlsprioritystring", eCmdHdlrString, 0 },
-	{ "streamdriver", eCmdHdlrGetWord, 0 },
-	{ "streamdrivermode", eCmdHdlrInt, 0 },
-	{ "streamdriverauthmode", eCmdHdlrGetWord, 0 },
-	{ "streamdriverpermittedpeers", eCmdHdlrGetWord, 0 },
-	{ "streamdriver.permitexpiredcerts", eCmdHdlrGetWord, 0 },
-	{ "streamdriver.CheckExtendedKeyPurpose", eCmdHdlrBinary, 0 },
-	{ "streamdriver.PrioritizeSAN", eCmdHdlrBinary, 0 },
-	{ "streamdriver.TlsVerifyDepth", eCmdHdlrPositiveInt, 0 },
-	{ "streamdriver.cafile", eCmdHdlrString, 0 },
-	{ "streamdriver.keyfile", eCmdHdlrString, 0 },
-	{ "streamdriver.certfile", eCmdHdlrString, 0 },
-	{ "resendlastmsgonreconnect", eCmdHdlrBinary, 0 },
-	{ "udp.sendtoall", eCmdHdlrBinary, 0 },
-	{ "udp.senddelay", eCmdHdlrInt, 0 },
-	{ "udp.sendbuf", eCmdHdlrSize, 0 },
-	{ "template", eCmdHdlrGetWord, 0 },
-	{ "ratelimit.interval", eCmdHdlrInt, 0 },
-	{ "ratelimit.burst", eCmdHdlrInt, 0 }
-};
-static struct cnfparamblk actpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	  actpdescr
-	};
-struct modConfData_s {
-	rsconf_t *pConf;		uchar 	*tplName;	};
-static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;
-static rsRetVal initTCP(wrkrInstanceData_t *pWrkrData);
-BEGINinitConfVars		CODESTARTinitConfVars
-	cs.pszTplName = NULL; 	cs.pszStrmDrvr = NULL; 	cs.iStrmDrvrMode = 0; 	cs.bResendLastOnRecon = 0; 	cs.pszStrmDrvrAuthMode = NULL; 	cs.iUDPRebindInterval = 0;		cs.iTCPRebindInterval = 0;		cs.pPermPeers = NULL;
-ENDinitConfVars
-static rsRetVal doTryResume(wrkrInstanceData_t *);
-static rsRetVal doZipFinish(wrkrInstanceData_t *);
-static uchar*
-getDfltTpl(void)
-{
-	if(loadModConf != NULL &amp;&amp; loadModConf-&gt;tplName != NULL)
-		return loadModConf-&gt;tplName;
-	else if(cs.pszTplName == NULL)
-		return (uchar*)"RSYSLOG_TraditionalForwardFormat";
-	else
-		return cs.pszTplName;
-}
-static rsRetVal
-setLegacyDfltTpl(void __attribute__((unused)) *pVal, uchar* newVal)
-{
-	DEFiRet;
-	if(loadModConf != NULL &amp;&amp; loadModConf-&gt;tplName != NULL) {
-		free(newVal);
-		LogError(0, RS_RET_ERR, "omfwd default template already set via module "
-			"global parameter - can no longer be changed");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	free(cs.pszTplName);
-	cs.pszTplName = newVal;
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-closeUDPSockets(wrkrInstanceData_t *pWrkrData)
-{
-	DEFiRet;
-	if(pWrkrData-&gt;pSockArray != NULL) {
-		net.closeUDPListenSockets(pWrkrData-&gt;pSockArray);
-		pWrkrData-&gt;pSockArray = NULL;
-		freeaddrinfo(pWrkrData-&gt;f_addr);
-		pWrkrData-&gt;f_addr = NULL;
-	}
-pWrkrData-&gt;bIsConnected = 0; 	RETiRet;
-}
-static void
-DestructTCPInstanceData(wrkrInstanceData_t *pWrkrData)
-{
-	doZipFinish(pWrkrData);
-	if(pWrkrData-&gt;pNetstrm != NULL)
-		netstrm.Destruct(&amp;pWrkrData-&gt;pNetstrm);
-	if(pWrkrData-&gt;pNS != NULL)
-		netstrms.Destruct(&amp;pWrkrData-&gt;pNS);
-}
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	loadModConf = pModConf;
-	pModConf-&gt;pConf = pConf;
-	pModConf-&gt;tplName = NULL;
-ENDbeginCnfLoad
-BEGINsetModCnf
-	int i;
-CODESTARTsetModCnf
-	const struct cnfparamvals *const __restrict__ pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
-	if(pvals == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-	if(Debug) {
-		dbgprintf("module (global) param blk for omfwd:\n");
-		cnfparamsPrint(&amp;modpblk, pvals);
-	}
-	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(modpblk.descr[i].name, "template")) {
-			loadModConf-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			if(cs.pszTplName != NULL) {
-				LogError(0, RS_RET_DUP_PARAM, "omfwd: warning: default template "
-						"was already set via legacy directive - may lead to inconsistent "
-						"results.");
-			}
-		} else {
-			dbgprintf("omfwd: program error, non-handled "
-			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
-		}
-	}
-finalize_it:
-	if(pvals != NULL)
-		cnfparamvalsDestruct(pvals, &amp;modpblk);
-ENDsetModCnf
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-	loadModConf = NULL; 	free(cs.pszTplName);
-	cs.pszTplName = NULL;
-ENDendCnfLoad
-BEGINcheckCnf
-CODESTARTcheckCnf
-ENDcheckCnf
-BEGINactivateCnf
-CODESTARTactivateCnf
-	runModConf = pModConf;
-ENDactivateCnf
-BEGINfreeCnf
-CODESTARTfreeCnf
-	free(pModConf-&gt;tplName);
-ENDfreeCnf
-BEGINcreateInstance
-CODESTARTcreateInstance
-	if(cs.pszStrmDrvr != NULL)
-		CHKmalloc(pData-&gt;pszStrmDrvr = (uchar*)strdup((char*)cs.pszStrmDrvr));
-	if(cs.pszStrmDrvrAuthMode != NULL)
-		CHKmalloc(pData-&gt;pszStrmDrvrAuthMode =
-				     (uchar*)strdup((char*)cs.pszStrmDrvrAuthMode));
-finalize_it:
-ENDcreateInstance
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-	dbgprintf("DDDD: createWrkrInstance: pWrkrData %p\n", pWrkrData);
-	pWrkrData-&gt;offsSndBuf = 0;
-	iRet = initTCP(pWrkrData);
-ENDcreateWrkrInstance
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURERepeatedMsgReduction)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-BEGINfreeInstance
-CODESTARTfreeInstance
-	if(pData-&gt;stats != NULL)
-		statsobj.Destruct(&amp;(pData-&gt;stats));
-	free(pData-&gt;pszStrmDrvr);
-	free(pData-&gt;pszStrmDrvrAuthMode);
-	free(pData-&gt;pszStrmDrvrPermitExpiredCerts);
-	free(pData-&gt;gnutlsPriorityString);
-	free(pData-&gt;port);
-	free(pData-&gt;networkNamespace);
-	free(pData-&gt;target);
-	free(pData-&gt;address);
-	free(pData-&gt;device);
-	free((void*)pData-&gt;pszStrmDrvrCAFile);
-	free((void*)pData-&gt;pszStrmDrvrKeyFile);
-	free((void*)pData-&gt;pszStrmDrvrCertFile);
-	net.DestructPermittedPeers(&amp;pData-&gt;pPermPeers);
-	if (pData-&gt;ratelimiter != NULL){
-		ratelimitDestruct(pData-&gt;ratelimiter);
-		pData-&gt;ratelimiter = NULL;
-	}
-ENDfreeInstance
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-	DestructTCPInstanceData(pWrkrData);
-	closeUDPSockets(pWrkrData);
-	if(pWrkrData-&gt;pData-&gt;protocol == FORW_TCP) {
-		tcpclt.Destruct(&amp;pWrkrData-&gt;pTCPClt);
-	}
-ENDfreeWrkrInstance
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-	dbgprintf("omfwd\n");
-	dbgprintf("\ttarget='%s'\n", pData-&gt;target);
-	dbgprintf("\tratelimit.interval='%u'\n", pData-&gt;ratelimitInterval);
-	dbgprintf("\tratelimit.burst='%u'\n", pData-&gt;ratelimitBurst);
-ENDdbgPrintInstInfo
-#define UDP_MAX_MSGSIZE 65507 static rsRetVal UDPSend(wrkrInstanceData_t *__restrict__ const pWrkrData,
-	uchar *__restrict__ const msg,
-	size_t len)
-{
-	DEFiRet;
-	struct addrinfo *r;
-	int i;
-	ssize_t lsent = 0;
-	sbool bSendSuccess;
-	sbool reInit = RSFALSE;
-	int lasterrno = ENOENT;
-	int lasterr_sock = -1;
-	if(pWrkrData-&gt;pData-&gt;iRebindInterval &amp;&amp; (pWrkrData-&gt;nXmit++ % pWrkrData-&gt;pData-&gt;iRebindInterval == 0)) {
-		dbgprintf("omfwd dropping UDP 'connection' (as configured)\n");
-		pWrkrData-&gt;nXmit = 1;			CHKiRet(closeUDPSockets(pWrkrData));
-	}
-	if(pWrkrData-&gt;pSockArray == NULL) {
-		CHKiRet(doTryResume(pWrkrData));
-	}
-	if(pWrkrData-&gt;pSockArray == NULL) {
-		FINALIZE;
-	}
-	if(len &gt; UDP_MAX_MSGSIZE) {
-		LogError(0, RS_RET_UDP_MSGSIZE_TOO_LARGE, "omfwd/udp: message is %u "
-			"bytes long, but UDP can send at most %d bytes (by RFC limit) "
-			"- truncating message", (unsigned) len, UDP_MAX_MSGSIZE);
-		len = UDP_MAX_MSGSIZE;
-	}
-	bSendSuccess = RSFALSE;
-	for (r = pWrkrData-&gt;f_addr; r; r = r-&gt;ai_next) {
-		int runSockArrayLoop = 1;
-		for (i = 0; runSockArrayLoop &amp;&amp; (i &lt; *pWrkrData-&gt;pSockArray) ; i++) {
-			int try_send = 1;
-			size_t lenThisTry = len;
-			while(try_send) {
-				lsent = sendto(pWrkrData-&gt;pSockArray[i+1], msg, lenThisTry, 0,
-						r-&gt;ai_addr, r-&gt;ai_addrlen);
-				if (lsent == (ssize_t) lenThisTry) {
-					bSendSuccess = RSTRUE;
-					ATOMIC_ADD_uint64(&amp;pWrkrData-&gt;pData-&gt;sentBytes,
-						&amp;pWrkrData-&gt;pData-&gt;mut_sentBytes, lenThisTry);
-					try_send = 0;
-					runSockArrayLoop = 0;
-				} else if(errno == EMSGSIZE) {
-					const size_t newlen = (lenThisTry &gt; 1024) ? lenThisTry - 1024 : 512;
-					LogError(0, RS_RET_UDP_MSGSIZE_TOO_LARGE,
-						"omfwd/udp: send failed due to message being too "
-						"large for this system. Message size was %u bytes. "
-						"Truncating to %u bytes and retrying.",
-						(unsigned) lenThisTry, (unsigned) newlen);
-					lenThisTry = newlen;
-				} else {
-					reInit = RSTRUE;
-					lasterrno = errno;
-					lasterr_sock = pWrkrData-&gt;pSockArray[i+1];
-					LogError(lasterrno, RS_RET_ERR_UDPSEND,
-						"omfwd/udp: socket %d: sendto() error",
-						lasterr_sock);
-					try_send = 0;
-				}
-			}
-		}
-		if (lsent == (ssize_t) len &amp;&amp; !pWrkrData-&gt;pData-&gt;bSendToAll)
-		       break;
-	}
-	if (reInit == RSTRUE) {
-		CHKiRet(closeUDPSockets(pWrkrData));
-	}
-	if(bSendSuccess == RSTRUE) {
-		if(pWrkrData-&gt;pData-&gt;iUDPSendDelay &gt; 0) {
-			srSleep(pWrkrData-&gt;pData-&gt;iUDPSendDelay / 1000000,
-				pWrkrData-&gt;pData-&gt;iUDPSendDelay % 1000000);
-		}
-	} else {
-		LogError(lasterrno, RS_RET_ERR_UDPSEND,
-			"omfwd: socket %d: error %d sending via udp", lasterr_sock, lasterrno);
-		iRet = RS_RET_SUSPENDED;
-	}
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-setPermittedPeer(void __attribute__((unused)) *pVal, uchar *pszID)
-{
-	DEFiRet;
-	CHKiRet(net.AddPermittedPeer(&amp;cs.pPermPeers, pszID));
-	free(pszID); finalize_it:
-	RETiRet;
-}
-static rsRetVal
-TCPSendBufUncompressed(wrkrInstanceData_t *pWrkrData, uchar *const buf, const unsigned len)
-{
-	DEFiRet;
-	unsigned alreadySent;
-	ssize_t lenSend;
-	alreadySent = 0;
-	CHKiRet(netstrm.CheckConnection(pWrkrData-&gt;pNetstrm));
-	while(alreadySent != len) {
-		lenSend = len - alreadySent;
-		CHKiRet(netstrm.Send(pWrkrData-&gt;pNetstrm, buf+alreadySent, &amp;lenSend));
-		DBGPRINTF("omfwd: TCP sent %ld bytes, requested %u\n", (long) lenSend, len - alreadySent);
-		alreadySent += lenSend;
-	}
-	ATOMIC_ADD_uint64(&amp;pWrkrData-&gt;pData-&gt;sentBytes, &amp;pWrkrData-&gt;pData-&gt;mut_sentBytes, len);
-finalize_it:
-	if(iRet != RS_RET_OK) {
-		if(iRet == RS_RET_IO_ERROR) {
-			static unsigned int conErrCnt = 0;
-			const int skipFactor = pWrkrData-&gt;pData-&gt;iConErrSkip;
-			if (skipFactor &lt;= 1)  {
-				LogError(0, iRet, "omfwd: remote server at %s:%s seems to have closed connection. "
-					"This often happens when the remote peer (or an interim system like a load "
-					"balancer or firewall) shuts down or aborts a connection. Rsyslog will "
-					"re-open the connection if configured to do so (we saw a generic IO Error, "
-					"which usually goes along with that behaviour).",
-					pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port);
-			} else if ((conErrCnt++ % skipFactor) == 0) {
-				LogError(0, iRet, "omfwd: remote server at %s:%s seems to have closed connection. "
-					"This often happens when the remote peer (or an interim system like a load "
-					"balancer or firewall) shuts down or aborts a connection. Rsyslog will "
-					"re-open the connection if configured to do so (we saw a generic IO Error, "
-					"which usually goes along with that behaviour). Note that the next %d "
-					"connection error messages will be skipped.",
-					pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port, skipFactor-1);
-			}
-		} else {
-			LogError(0, iRet, "omfwd: TCPSendBuf error %d, destruct TCP Connection to %s:%s",
-				iRet, pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port);
-		}
-		DestructTCPInstanceData(pWrkrData);
-		iRet = RS_RET_SUSPENDED;
-	}
-	RETiRet;
-}
-static rsRetVal
-TCPSendBufCompressed(wrkrInstanceData_t *pWrkrData, uchar *buf, unsigned len, sbool bIsFlush)
-{
-	int zRet;		unsigned outavail;
-	uchar zipBuf[32*1024];
-	int op;
-	DEFiRet;
-	if(!pWrkrData-&gt;bzInitDone) {
-		pWrkrData-&gt;zstrm.zalloc = Z_NULL;
-		pWrkrData-&gt;zstrm.zfree = Z_NULL;
-		pWrkrData-&gt;zstrm.opaque = Z_NULL;
-		zRet = deflateInit(&amp;pWrkrData-&gt;zstrm, pWrkrData-&gt;pData-&gt;compressionLevel);
-		if(zRet != Z_OK) {
-			DBGPRINTF("error %d returned from zlib/deflateInit()\n", zRet);
-			ABORT_FINALIZE(RS_RET_ZLIB_ERR);
-		}
-		pWrkrData-&gt;bzInitDone = RSTRUE;
-	}
-	pWrkrData-&gt;zstrm.next_in = (Bytef*) buf;
-	pWrkrData-&gt;zstrm.avail_in = len;
-	if(pWrkrData-&gt;pData-&gt;strmCompFlushOnTxEnd &amp;&amp; bIsFlush)
-		op = Z_SYNC_FLUSH;
-	else
-		op = Z_NO_FLUSH;
-	do {
-		DBGPRINTF("omfwd: in deflate() loop, avail_in %d, total_in %ld, isFlush %d\n",
-			pWrkrData-&gt;zstrm.avail_in, pWrkrData-&gt;zstrm.total_in, bIsFlush);
-		pWrkrData-&gt;zstrm.avail_out = sizeof(zipBuf);
-		pWrkrData-&gt;zstrm.next_out = zipBuf;
-		zRet = deflate(&amp;pWrkrData-&gt;zstrm, op);    		DBGPRINTF("after deflate, ret %d, avail_out %d\n", zRet, pWrkrData-&gt;zstrm.avail_out);
-		outavail = sizeof(zipBuf) - pWrkrData-&gt;zstrm.avail_out;
-		if(outavail != 0) {
-			CHKiRet(TCPSendBufUncompressed(pWrkrData, zipBuf, outavail));
-		}
-	} while (pWrkrData-&gt;zstrm.avail_out == 0);
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-TCPSendBuf(wrkrInstanceData_t *pWrkrData, uchar *buf, unsigned len, sbool bIsFlush)
-{
-	DEFiRet;
-	if(pWrkrData-&gt;pData-&gt;compressionMode &gt;= COMPRESS_STREAM_ALWAYS)
-		iRet = TCPSendBufCompressed(pWrkrData, buf, len, bIsFlush);
-	else
-		iRet = TCPSendBufUncompressed(pWrkrData, buf, len);
-	RETiRet;
-}
-static rsRetVal
-doZipFinish(wrkrInstanceData_t *pWrkrData)
-{
-	int zRet;		DEFiRet;
-	unsigned outavail;
-	uchar zipBuf[32*1024];
-	if(!pWrkrData-&gt;bzInitDone)
-		goto done;
-	pWrkrData-&gt;zstrm.avail_in = 0;
-	do {
-		DBGPRINTF("in deflate() loop, avail_in %d, total_in %ld\n", pWrkrData-&gt;zstrm.avail_in,
-			pWrkrData-&gt;zstrm.total_in);
-		pWrkrData-&gt;zstrm.avail_out = sizeof(zipBuf);
-		pWrkrData-&gt;zstrm.next_out = zipBuf;
-		zRet = deflate(&amp;pWrkrData-&gt;zstrm, Z_FINISH);    		DBGPRINTF("after deflate, ret %d, avail_out %d\n", zRet, pWrkrData-&gt;zstrm.avail_out);
-		outavail = sizeof(zipBuf) - pWrkrData-&gt;zstrm.avail_out;
-		if(outavail != 0) {
-			CHKiRet(TCPSendBufUncompressed(pWrkrData, zipBuf, outavail));
-		}
-	} while (pWrkrData-&gt;zstrm.avail_out == 0);
-finalize_it:
-	zRet = deflateEnd(&amp;pWrkrData-&gt;zstrm);
-	if(zRet != Z_OK) {
-		DBGPRINTF("error %d returned from zlib/deflateEnd()\n", zRet);
-	}
-	pWrkrData-&gt;bzInitDone = 0;
-done:	RETiRet;
-}
-static rsRetVal TCPSendFrame(void *pvData, char *msg, size_t len)
-{
-	DEFiRet;
-	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t *) pvData;
-	DBGPRINTF("omfwd: add %u bytes to send buffer (curr offs %u)\n",
-		(unsigned) len, pWrkrData-&gt;offsSndBuf);
-	if(pWrkrData-&gt;offsSndBuf != 0 &amp;&amp; pWrkrData-&gt;offsSndBuf + len &gt;= sizeof(pWrkrData-&gt;sndBuf)) {
-		DBGPRINTF("omfwd: we need to do a tcp send due to buffer "
-			  "out of space. If the transaction fails, this will "
-			  "lead to duplication of messages");
-		CHKiRet(TCPSendBuf(pWrkrData, pWrkrData-&gt;sndBuf, pWrkrData-&gt;offsSndBuf, NO_FLUSH));
-		pWrkrData-&gt;offsSndBuf = 0;
-	}
-	if(len &gt; sizeof(pWrkrData-&gt;sndBuf)) {
-		CHKiRet(TCPSendBuf(pWrkrData, (uchar*)msg, len, NO_FLUSH));
-		ABORT_FINALIZE(RS_RET_OK);		}
-	memcpy(pWrkrData-&gt;sndBuf + pWrkrData-&gt;offsSndBuf, msg, len);
-	pWrkrData-&gt;offsSndBuf += len;
-	iRet = RS_RET_DEFER_COMMIT;
-finalize_it:
-	RETiRet;
-}
-static rsRetVal TCPSendPrepRetry(void *pvData)
-{
-	DEFiRet;
-	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t *) pvData;
-	assert(pWrkrData != NULL);
-	DestructTCPInstanceData(pWrkrData);
-	RETiRet;
-}
-static rsRetVal TCPSendInit(void *pvData)
-{
-	DEFiRet;
-	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t *) pvData;
-	instanceData *pData;
-	assert(pWrkrData != NULL);
-	pData = pWrkrData-&gt;pData;
-	if(pWrkrData-&gt;pNetstrm == NULL) {
-		dbgprintf("TCPSendInit CREATE\n");
-		CHKiRet(netstrms.Construct(&amp;pWrkrData-&gt;pNS));
-		CHKiRet(netstrms.SetDrvrName(pWrkrData-&gt;pNS, pData-&gt;pszStrmDrvr));
-		CHKiRet(netstrms.ConstructFinalize(pWrkrData-&gt;pNS));
-		CHKiRet(netstrms.CreateStrm(pWrkrData-&gt;pNS, &amp;pWrkrData-&gt;pNetstrm));
-		CHKiRet(netstrm.ConstructFinalize(pWrkrData-&gt;pNetstrm));
-		CHKiRet(netstrm.SetDrvrMode(pWrkrData-&gt;pNetstrm, pData-&gt;iStrmDrvrMode));
-		CHKiRet(netstrm.SetDrvrCheckExtendedKeyUsage(pWrkrData-&gt;pNetstrm, pData-&gt;iStrmDrvrExtendedCertCheck));
-		CHKiRet(netstrm.SetDrvrPrioritizeSAN(pWrkrData-&gt;pNetstrm, pData-&gt;iStrmDrvrSANPreference));
-		CHKiRet(netstrm.SetDrvrTlsVerifyDepth(pWrkrData-&gt;pNetstrm, pData-&gt;iStrmTlsVerifyDepth));
-		if(pData-&gt;pszStrmDrvrAuthMode != NULL) {
-			CHKiRet(netstrm.SetDrvrAuthMode(pWrkrData-&gt;pNetstrm, pData-&gt;pszStrmDrvrAuthMode));
-		}
-		CHKiRet(netstrm.SetDrvrPermitExpiredCerts(pWrkrData-&gt;pNetstrm,
-			pData-&gt;pszStrmDrvrPermitExpiredCerts));
-		CHKiRet(netstrm.SetDrvrTlsCAFile(pWrkrData-&gt;pNetstrm, pData-&gt;pszStrmDrvrCAFile));
-		CHKiRet(netstrm.SetDrvrTlsKeyFile(pWrkrData-&gt;pNetstrm, pData-&gt;pszStrmDrvrKeyFile));
-		CHKiRet(netstrm.SetDrvrTlsCertFile(pWrkrData-&gt;pNetstrm, pData-&gt;pszStrmDrvrCertFile));
-		if(pData-&gt;pPermPeers != NULL) {
-			CHKiRet(netstrm.SetDrvrPermPeers(pWrkrData-&gt;pNetstrm, pData-&gt;pPermPeers));
-		}
-		if(pData-&gt;gnutlsPriorityString != NULL) {
-			CHKiRet(netstrm.SetGnutlsPriorityString(pWrkrData-&gt;pNetstrm, pData-&gt;gnutlsPriorityString));
-		}
-		CHKiRet(netstrm.Connect(pWrkrData-&gt;pNetstrm, glbl.GetDefPFFamily(runModConf-&gt;pConf),
-			(uchar*)pData-&gt;port, (uchar*)pData-&gt;target, pData-&gt;device));
-		if(pData-&gt;bKeepAlive) {
-			CHKiRet(netstrm.SetKeepAliveProbes(pWrkrData-&gt;pNetstrm, pData-&gt;iKeepAliveProbes));
-			CHKiRet(netstrm.SetKeepAliveIntvl(pWrkrData-&gt;pNetstrm, pData-&gt;iKeepAliveIntvl));
-			CHKiRet(netstrm.SetKeepAliveTime(pWrkrData-&gt;pNetstrm, pData-&gt;iKeepAliveTime));
-			CHKiRet(netstrm.EnableKeepAlive(pWrkrData-&gt;pNetstrm));
-		}
-	}
-finalize_it:
-	if(iRet != RS_RET_OK) {
-		dbgprintf("TCPSendInit FAILED with %d.\n", iRet);
-		DestructTCPInstanceData(pWrkrData);
-	}
-	RETiRet;
-}
-static rsRetVal changeToNs(instanceData *const pData __attribute__((unused)))
-{
-	DEFiRet;
-#ifdef HAVE_SETNS
-	int iErr;
-	int destinationNs = -1;
-	char *nsPath = NULL;
-	if(pData-&gt;networkNamespace) {
-		pData-&gt;originalNamespace = open("/proc/self/ns/net", O_RDONLY);
-		if (pData-&gt;originalNamespace &lt; 0) {
-			LogError(0, RS_RET_IO_ERROR, "omfwd: could not read /proc/self/ns/net");
-			ABORT_FINALIZE(RS_RET_IO_ERROR);
-		}
-		if (asprintf(&amp;nsPath, "/var/run/netns/%s", pData-&gt;networkNamespace) == -1) {
-			LogError(0, RS_RET_OUT_OF_MEMORY, "omfwd: asprintf failed");
-			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-		}
-		destinationNs = open(nsPath, 0);
-		if (destinationNs &lt; 0) {
-			LogError(0, RS_RET_IO_ERROR, "omfwd: could not change to namespace '%s'",
-					pData-&gt;networkNamespace);
-			ABORT_FINALIZE(RS_RET_IO_ERROR);
-		}
-		if((iErr = (setns(destinationNs, CLONE_NEWNET))) != 0) {
-			LogError(0, RS_RET_IO_ERROR, "could not change to namespace '%s': %s",
-				  pData-&gt;networkNamespace, gai_strerror(iErr));
-			ABORT_FINALIZE(RS_RET_IO_ERROR);
-		}
-		dbgprintf("omfwd: changed to network namespace '%s'\n", pData-&gt;networkNamespace);
-	}
-finalize_it:
-	free(nsPath);
-	if(destinationNs &gt;= 0) {
-		close(destinationNs);
-	}
-#else 		dbgprintf("omfwd: OS does not support network namespaces\n");
-#endif 	RETiRet;
-}
-static rsRetVal returnToOriginalNs(instanceData *const pData __attribute__((unused)))
-{
-	DEFiRet;
-#ifdef HAVE_SETNS
-	int iErr;
-	if(pData-&gt;networkNamespace &amp;&amp; pData-&gt;originalNamespace &gt;= 0) {
-		if((iErr = (setns(pData-&gt;originalNamespace, CLONE_NEWNET))) != 0) {
-			LogError(0, RS_RET_IO_ERROR, "could not return to original namespace: %s",
-				  gai_strerror(iErr));
-			ABORT_FINALIZE(RS_RET_IO_ERROR);
-		}
-		close(pData-&gt;originalNamespace);
-		dbgprintf("omfwd: returned to original network namespace\n");
-	}
-finalize_it:
-#endif 	RETiRet;
-}
-static rsRetVal doTryResume(wrkrInstanceData_t *pWrkrData)
-{
-	int iErr;
-	struct addrinfo *res = NULL;
-	struct addrinfo hints;
-	instanceData *pData;
-	int bBindRequired = 0;
-	const char *address;
-	DEFiRet;
-	if(pWrkrData-&gt;bIsConnected)
-		FINALIZE;
-	pData = pWrkrData-&gt;pData;
-	if(pData-&gt;protocol == FORW_UDP) {
-		memset(&amp;hints, 0, sizeof(hints));
-		hints.ai_flags = AI_NUMERICSERV;
-		hints.ai_family = glbl.GetDefPFFamily(runModConf-&gt;pConf);
-		hints.ai_socktype = SOCK_DGRAM;
-		if((iErr = (getaddrinfo(pData-&gt;target, pData-&gt;port, &amp;hints, &amp;res))) != 0) {
-			LogError(0, RS_RET_SUSPENDED,
-				"omfwd: could not get addrinfo for hostname '%s':'%s': %s",
-				pData-&gt;target, pData-&gt;port, gai_strerror(iErr));
-			ABORT_FINALIZE(RS_RET_SUSPENDED);
-		}
-		address = pData-&gt;target;
-		if(pData-&gt;address) {
-			struct addrinfo *addr;
-			hints.ai_family = res-&gt;ai_family;
-			hints.ai_flags |= AI_PASSIVE;
-			iErr = getaddrinfo(pData-&gt;address, pData-&gt;port, &amp;hints, &amp;addr);
-			freeaddrinfo(addr);
-			if(iErr != 0) {
-				LogError(0, RS_RET_SUSPENDED,
-					 "omfwd: cannot use bind address '%s' for host '%s': %s",
-					 pData-&gt;address, pData-&gt;target, gai_strerror(iErr));
-				ABORT_FINALIZE(RS_RET_SUSPENDED);
-			}
-			bBindRequired = 1;
-			address = pData-&gt;address;
-		}
-		DBGPRINTF("%s found, resuming.\n", pData-&gt;target);
-		pWrkrData-&gt;f_addr = res;
-		res = NULL;
-		if(pWrkrData-&gt;pSockArray == NULL) {
-			CHKiRet(changeToNs(pData));
-			pWrkrData-&gt;pSockArray = net.create_udp_socket((uchar*)address,
-				NULL, bBindRequired, 0, pData-&gt;UDPSendBuf, pData-&gt;ipfreebind, pData-&gt;device);
-			CHKiRet(returnToOriginalNs(pData));
-		}
-		if(pWrkrData-&gt;pSockArray != NULL) {
-			pWrkrData-&gt;bIsConnected = 1;
-		}
-	} else {
-		CHKiRet(changeToNs(pData));
-		CHKiRet(TCPSendInit((void*)pWrkrData));
-		CHKiRet(returnToOriginalNs(pData));
-	}
-finalize_it:
-	DBGPRINTF("omfwd: doTryResume %s iRet %d\n", pWrkrData-&gt;pData-&gt;target, iRet);
-	if(res != NULL) {
-		freeaddrinfo(res);
-	}
-	if(iRet != RS_RET_OK) {
-		returnToOriginalNs(pData);
-		if(pWrkrData-&gt;f_addr != NULL) {
-			freeaddrinfo(pWrkrData-&gt;f_addr);
-			pWrkrData-&gt;f_addr = NULL;
-		}
-		iRet = RS_RET_SUSPENDED;
-	}
-	RETiRet;
-}
-BEGINtryResume
-CODESTARTtryResume
-	dbgprintf("omfwd: tryResume: pWrkrData %p\n", pWrkrData);
-	iRet = doTryResume(pWrkrData);
-ENDtryResume
-BEGINbeginTransaction
-CODESTARTbeginTransaction
-	dbgprintf("omfwd: beginTransaction\n");
-	iRet = doTryResume(pWrkrData);
-ENDbeginTransaction
-static rsRetVal
-processMsg(wrkrInstanceData_t *__restrict__ const pWrkrData,
-	actWrkrIParams_t *__restrict__ const iparam)
-{
-	uchar *psz; 	register unsigned l;
-	int iMaxLine;
-	Bytef *out = NULL; 	instanceData *__restrict__ const pData = pWrkrData-&gt;pData;
-	DEFiRet;
-	iMaxLine = glbl.GetMaxLine(runModConf-&gt;pConf);
-	psz = iparam-&gt;param;
-	l = iparam-&gt;lenStr;
-	if((int) l &gt; iMaxLine)
-		l = iMaxLine;
-	if(pData-&gt;compressionMode == COMPRESS_SINGLE_MSG &amp;&amp; (l &gt; CONF_MIN_SIZE_FOR_COMPRESS)) {
-		uLongf destLen = iMaxLine + iMaxLine/100 +12; 		uLong srcLen = l;
-		int ret;
-		CHKmalloc(out = (Bytef*) malloc(destLen));
-		out[0] = 'z';
-		out[1] = '\0';
-		ret = compress2((Bytef*) out+1, &amp;destLen, (Bytef*) psz,
-				srcLen, pData-&gt;compressionLevel);
-		dbgprintf("Compressing message, length was %d now %d, return state  %d.\n",
-			l, (int) destLen, ret);
-		if(ret != Z_OK) {
-			dbgprintf("Compression failed, sending uncompressed message\n");
-		} else if(destLen+1 &lt; l) {
-			dbgprintf("there is gain in compression, so we do it\n");
-			psz = out;
-			l = destLen + 1; 		}
-		++destLen;
-	}
-	if(pData-&gt;protocol == FORW_UDP) {
-		CHKiRet(UDPSend(pWrkrData, psz, l));
-	} else {
-		iRet = tcpclt.Send(pWrkrData-&gt;pTCPClt, pWrkrData, (char *)psz, l);
-		if(iRet != RS_RET_OK &amp;&amp; iRet != RS_RET_DEFER_COMMIT &amp;&amp; iRet != RS_RET_PREVIOUS_COMMITTED) {
-			LogError(0, iRet, "omfwd: error forwarding via tcp to %s:%s, suspending action",
-				pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port);
-			DestructTCPInstanceData(pWrkrData);
-			iRet = RS_RET_SUSPENDED;
-		}
-	}
-finalize_it:
-	free(out); 	RETiRet;
-}
-BEGINcommitTransaction
-	unsigned i;
-	char namebuf[264]; CODESTARTcommitTransaction
-	CHKiRet(doTryResume(pWrkrData));
-	DBGPRINTF(" %s:%s/%s\n", pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port,
-		 pWrkrData-&gt;pData-&gt;protocol == FORW_UDP ? "udp" : "tcp");
-	if(pWrkrData-&gt;pData-&gt;ratelimiter) {
-		snprintf(namebuf, sizeof namebuf, "%s:[%s]:%s",
-			pWrkrData-&gt;pData-&gt;protocol == FORW_UDP ? "udp" : "tcp",
-			pWrkrData-&gt;pData-&gt;target,
-			pWrkrData-&gt;pData-&gt;port);
-	}
-	for(i = 0 ; i &lt; nParams ; ++i) {
-		if(pWrkrData-&gt;pData-&gt;ratelimiter) {
-			iRet = ratelimitMsgCount(pWrkrData-&gt;pData-&gt;ratelimiter, 0, namebuf);
-			if (iRet == RS_RET_DISCARDMSG) {
-				iRet = RS_RET_OK;
-				continue;
-			} else if (iRet != RS_RET_OK) {
-				LogError(0, RS_RET_ERR, "omfwd: error during rate limit : %d.\n",iRet);
-			}
-		}
-		iRet = processMsg(pWrkrData, &amp;actParam(pParams, 1, i, 0));
-		if(iRet != RS_RET_OK &amp;&amp; iRet != RS_RET_DEFER_COMMIT &amp;&amp; iRet != RS_RET_PREVIOUS_COMMITTED)
-			FINALIZE;
-	}
-	if(pWrkrData-&gt;offsSndBuf != 0) {
-		iRet = TCPSendBuf(pWrkrData, pWrkrData-&gt;sndBuf, pWrkrData-&gt;offsSndBuf, IS_FLUSH);
-		pWrkrData-&gt;offsSndBuf = 0;
-	}
-finalize_it:
-ENDcommitTransaction
-static rsRetVal
-loadTCPSupport(void)
-{
-	DEFiRet;
-	CHKiRet(objUse(netstrms, LM_NETSTRMS_FILENAME));
-	CHKiRet(objUse(netstrm, LM_NETSTRMS_FILENAME));
-	CHKiRet(objUse(tcpclt, LM_TCPCLT_FILENAME));
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-initTCP(wrkrInstanceData_t *pWrkrData)
-{
-	instanceData *pData;
-	DEFiRet;
-	pData = pWrkrData-&gt;pData;
-	if(pData-&gt;protocol == FORW_TCP) {
-		CHKiRet(tcpclt.Construct(&amp;pWrkrData-&gt;pTCPClt));
-		CHKiRet(tcpclt.SetResendLastOnRecon(pWrkrData-&gt;pTCPClt, pData-&gt;bResendLastOnRecon));
-		CHKiRet(tcpclt.SetSendInit(pWrkrData-&gt;pTCPClt, TCPSendInit));
-		CHKiRet(tcpclt.SetSendFrame(pWrkrData-&gt;pTCPClt, TCPSendFrame));
-		CHKiRet(tcpclt.SetSendPrepRetry(pWrkrData-&gt;pTCPClt, TCPSendPrepRetry));
-		CHKiRet(tcpclt.SetFraming(pWrkrData-&gt;pTCPClt, pData-&gt;tcp_framing));
-		CHKiRet(tcpclt.SetFramingDelimiter(pWrkrData-&gt;pTCPClt, pData-&gt;tcp_framingDelimiter));
-		CHKiRet(tcpclt.SetRebindInterval(pWrkrData-&gt;pTCPClt, pData-&gt;iRebindInterval));
-	}
-finalize_it:
-	RETiRet;
-}
-static void
-setInstParamDefaults(instanceData *pData)
-{
-	pData-&gt;tplName = NULL;
-	pData-&gt;protocol = FORW_UDP;
-	pData-&gt;networkNamespace = NULL;
-	pData-&gt;originalNamespace = -1;
-	pData-&gt;tcp_framing = TCP_FRAMING_OCTET_STUFFING;
-	pData-&gt;tcp_framingDelimiter = '\n';
-	pData-&gt;pszStrmDrvr = NULL;
-	pData-&gt;pszStrmDrvrAuthMode = NULL;
-	pData-&gt;pszStrmDrvrPermitExpiredCerts = NULL;
-	pData-&gt;iStrmDrvrMode = 0;
-	pData-&gt;iStrmDrvrExtendedCertCheck = 0;
-	pData-&gt;iStrmDrvrSANPreference = 0;
-	pData-&gt;iStrmTlsVerifyDepth = 0;
-	pData-&gt;pszStrmDrvrCAFile = NULL;
-	pData-&gt;pszStrmDrvrKeyFile = NULL;
-	pData-&gt;pszStrmDrvrCertFile = NULL;
-	pData-&gt;iRebindInterval = 0;
-	pData-&gt;bKeepAlive = 0;
-	pData-&gt;iKeepAliveProbes = 0;
-	pData-&gt;iKeepAliveIntvl = 0;
-	pData-&gt;iKeepAliveTime = 0;
-	pData-&gt;iConErrSkip = 0;
-	pData-&gt;gnutlsPriorityString = NULL;
-	pData-&gt;bResendLastOnRecon = 0;
-	pData-&gt;bSendToAll = -1;  	pData-&gt;iUDPSendDelay = 0;
-	pData-&gt;UDPSendBuf = 0;
-	pData-&gt;pPermPeers = NULL;
-	pData-&gt;compressionLevel = 9;
-	pData-&gt;strmCompFlushOnTxEnd = 1;
-	pData-&gt;compressionMode = COMPRESS_NEVER;
-	pData-&gt;ipfreebind = IPFREEBIND_ENABLED_WITH_LOG;
-	pData-&gt;ratelimiter = NULL;
-	pData-&gt;ratelimitInterval = 0;
-	pData-&gt;ratelimitBurst = 200;
-}
-static rsRetVal
-setupInstStatsCtrs(instanceData *__restrict__ const pData)
-{
-	uchar ctrName[512];
-	DEFiRet;
-	snprintf((char*)ctrName, sizeof(ctrName), "%s-%s-%s",
-		(pData-&gt;protocol == FORW_TCP) ? "TCP" : "UDP",
-		pData-&gt;target, pData-&gt;port);
-	ctrName[sizeof(ctrName)-1] = '\0'; 	CHKiRet(statsobj.Construct(&amp;(pData-&gt;stats)));
-	CHKiRet(statsobj.SetName(pData-&gt;stats, ctrName));
-	CHKiRet(statsobj.SetOrigin(pData-&gt;stats, (uchar*)"omfwd"));
-	pData-&gt;sentBytes = 0;
-	INIT_ATOMIC_HELPER_MUT64(pData-&gt;mut_sentBytes);
-	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("bytes.sent"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;sentBytes)));
-	CHKiRet(statsobj.ConstructFinalize(pData-&gt;stats));
-finalize_it:
-	RETiRet;
-}
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	uchar *tplToUse;
-	char *cstr;
-	int i;
-	rsRetVal localRet;
-	int complevel = -1;
-CODESTARTnewActInst
-	DBGPRINTF("newActInst (omfwd)\n");
-	pvals = nvlstGetParams(lst, &amp;actpblk, NULL);
-	if(pvals == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-	if(Debug) {
-		dbgprintf("action param blk in omfwd:\n");
-		cnfparamsPrint(&amp;actpblk, pvals);
-	}
-	CHKiRet(createInstance(&amp;pData));
-	setInstParamDefaults(pData);
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(actpblk.descr[i].name, "target")) {
-			pData-&gt;target = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "address")) {
-			pData-&gt;address = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "device")) {
-			pData-&gt;device = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "port")) {
-			pData-&gt;port = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "protocol")) {
-			if(!es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"udp", 3)) {
-				pData-&gt;protocol = FORW_UDP;
-			} else if(!es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"tcp", 3)) {
-				localRet = loadTCPSupport();
-				if(localRet != RS_RET_OK) {
-					LogError(0, localRet, "could not activate network stream modules for TCP "
-							"(internal error %d) - are modules missing?", localRet);
-					ABORT_FINALIZE(localRet);
-				}
-				pData-&gt;protocol = FORW_TCP;
-			} else {
-				uchar *str;
-				str = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-				LogError(0, RS_RET_INVLD_PROTOCOL,
-						"omfwd: invalid protocol \"%s\"", str);
-				free(str);
-				ABORT_FINALIZE(RS_RET_INVLD_PROTOCOL);
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "networknamespace")) {
-			pData-&gt;networkNamespace = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "tcp_framing")) {
-			if(!es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"traditional", 11)) {
-				pData-&gt;tcp_framing = TCP_FRAMING_OCTET_STUFFING;
-			} else if(!es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"octet-counted", 13)) {
-				pData-&gt;tcp_framing = TCP_FRAMING_OCTET_COUNTING;
-			} else {
-				uchar *str;
-				str = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-				LogError(0, RS_RET_CNF_INVLD_FRAMING,
-						"omfwd: invalid framing \"%s\"", str);
-				free(str);
-				ABORT_FINALIZE(RS_RET_CNF_INVLD_FRAMING );
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "rebindinterval")) {
-			pData-&gt;iRebindInterval = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "keepalive")) {
-			pData-&gt;bKeepAlive = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "keepalive.probes")) {
-			pData-&gt;iKeepAliveProbes = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "keepalive.interval")) {
-			pData-&gt;iKeepAliveIntvl = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "keepalive.time")) {
-			pData-&gt;iKeepAliveTime = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "conerrskip")) {
-			pData-&gt;iConErrSkip = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "gnutlsprioritystring")) {
-			pData-&gt;gnutlsPriorityString = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "streamdriver")) {
-			pData-&gt;pszStrmDrvr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "streamdrivermode")) {
-			pData-&gt;iStrmDrvrMode = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.CheckExtendedKeyPurpose")) {
-			pData-&gt;iStrmDrvrExtendedCertCheck = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.PrioritizeSAN")) {
-			pData-&gt;iStrmDrvrSANPreference = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.TlsVerifyDepth")) {
-			if (pvals[i].val.d.n &gt;= 2) {
-				pData-&gt;iStrmTlsVerifyDepth = pvals[i].val.d.n;
-			} else {
-				parser_errmsg("streamdriver.TlsVerifyDepth must be 2 or higher but is %d",
-									(int) pvals[i].val.d.n);
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "streamdriverauthmode")) {
-			pData-&gt;pszStrmDrvrAuthMode = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.permitexpiredcerts")) {
-			uchar *val = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			if(   es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"off", 3)
-			   &amp;&amp; es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"on", 2)
-			   &amp;&amp; es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"warn", 4)
-			  ) {
-				parser_errmsg("streamdriver.permitExpiredCerts must be 'warn', 'off' or 'on' "
-					"but is '%s' - ignoring parameter, using 'off' instead.", val);
-				free(val);
-			} else {
-				pData-&gt;pszStrmDrvrPermitExpiredCerts = val;
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.cafile")) {
-			pData-&gt;pszStrmDrvrCAFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.keyfile")) {
-			pData-&gt;pszStrmDrvrKeyFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.certfile")) {
-			pData-&gt;pszStrmDrvrCertFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "streamdriverpermittedpeers")) {
-			uchar *start, *str;
-			uchar *p;
-			int lenStr;
-			str = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			start = str;
-			lenStr = ustrlen(start); 			while(lenStr &gt; 0) {
-				p = start;
-				while(*p &amp;&amp; *p != ',' &amp;&amp; lenStr--)
-					p++;
-				if(*p == ',') {
-					*p = '\0';
-				}
-				if(*start == '\0') {
-					DBGPRINTF("omfwd: ignoring empty permitted peer\n");
-				} else {
-					dbgprintf("omfwd: adding permitted peer: '%s'\n", start);
-					CHKiRet(net.AddPermittedPeer(&amp;(pData-&gt;pPermPeers), start));
-				}
-				start = p+1;
-				if(lenStr)
-					--lenStr;
-			}
-			free(str);
-		} else if(!strcmp(actpblk.descr[i].name, "ziplevel")) {
-			complevel = pvals[i].val.d.n;
-			if(complevel &gt;= 0 &amp;&amp; complevel &lt;= 10) {
-				pData-&gt;compressionLevel = complevel;
-				pData-&gt;compressionMode = COMPRESS_SINGLE_MSG;
-			} else {
-				LogError(0, NO_ERRCODE, "Invalid ziplevel %d specified in "
-					 "forwarding action - NOT turning on compression.",
-					 complevel);
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "tcp_framedelimiter")) {
-			if(pvals[i].val.d.n &gt; 255) {
-				parser_errmsg("tcp_frameDelimiter must be below 255 but is %d",
-					(int) pvals[i].val.d.n);
-				ABORT_FINALIZE(RS_RET_PARAM_ERROR);
-			}
-			pData-&gt;tcp_framingDelimiter = (uchar) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "resendlastmsgonreconnect")) {
-			pData-&gt;bResendLastOnRecon = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "udp.sendtoall")) {
-			pData-&gt;bSendToAll = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "udp.senddelay")) {
-			pData-&gt;iUDPSendDelay = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "udp.sendbuf")) {
-			pData-&gt;UDPSendBuf = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "template")) {
-			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "compression.stream.flushontxend")) {
-			pData-&gt;strmCompFlushOnTxEnd = (sbool) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "compression.mode")) {
-			cstr = es_str2cstr(pvals[i].val.d.estr, NULL);
-			if(!strcasecmp(cstr, "stream:always")) {
-				pData-&gt;compressionMode = COMPRESS_STREAM_ALWAYS;
-			} else if(!strcasecmp(cstr, "none")) {
-				pData-&gt;compressionMode = COMPRESS_NEVER;
-			} else if(!strcasecmp(cstr, "single")) {
-				pData-&gt;compressionMode = COMPRESS_SINGLE_MSG;
-			} else {
-				LogError(0, RS_RET_PARAM_ERROR, "omfwd: invalid value for 'compression.mode' "
-					 "parameter (given is '%s')", cstr);
-				free(cstr);
-				ABORT_FINALIZE(RS_RET_PARAM_ERROR);
-			}
-			free(cstr);
-		} else if(!strcmp(actpblk.descr[i].name, "ipfreebind")) {
-			pData-&gt;ipfreebind = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "ratelimit.burst")) {
-			pData-&gt;ratelimitBurst = (unsigned int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "ratelimit.interval")) {
-			pData-&gt;ratelimitInterval = (unsigned int) pvals[i].val.d.n;
-		} else {
-			LogError(0, RS_RET_INTERNAL_ERROR,
-				"omfwd: program error, non-handled parameter '%s'",
-				actpblk.descr[i].name);
-		}
-	}
-	if(pData-&gt;port == NULL) {
-		CHKmalloc(pData-&gt;port = strdup("514"));
-	}
-	if(complevel != -1) {
-		pData-&gt;compressionLevel = complevel;
-		if(pData-&gt;compressionMode == COMPRESS_NEVER) {
-			pData-&gt;compressionMode = COMPRESS_SINGLE_MSG;
-		}
-	}
-	CODE_STD_STRING_REQUESTnewActInst(1)
-	tplToUse = ustrdup((pData-&gt;tplName == NULL) ? getDfltTpl() : pData-&gt;tplName);
-	CHKiRet(OMSRsetEntry(*ppOMSR, 0, tplToUse, OMSR_NO_RQD_TPL_OPTS));
-	if(pData-&gt;bSendToAll == -1) {
-		pData-&gt;bSendToAll = send_to_all;
-	} else {
-		if(pData-&gt;protocol == FORW_TCP) {
-			LogError(0, RS_RET_PARAM_ERROR, "omfwd: parameter udp.sendToAll "
-					"cannot be used with tcp transport -- ignored");
-		}
-	}
-	if(pData-&gt;address &amp;&amp; (pData-&gt;protocol == FORW_TCP)) {
-		LogError(0, RS_RET_PARAM_ERROR,
-			 "omfwd: parameter \"address\" not supported for tcp -- ignored");
-	}
-	if( pData-&gt;ratelimitInterval &gt; 0) {
-		CHKiRet(ratelimitNew(&amp;pData-&gt;ratelimiter, "omfwd", NULL));
-		ratelimitSetLinuxLike(pData-&gt;ratelimiter, pData-&gt;ratelimitInterval, pData-&gt;ratelimitBurst);
-		ratelimitSetNoTimeCache(pData-&gt;ratelimiter);
-	}
-	setupInstStatsCtrs(pData);
-CODE_STD_FINALIZERnewActInst
-	cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-BEGINparseSelectorAct
-	uchar *q;
-	int i;
-	rsRetVal localRet;
-	struct addrinfo;
-	TCPFRAMINGMODE tcp_framing = TCP_FRAMING_OCTET_STUFFING;
-CODESTARTparseSelectorAct
-CODE_STD_STRING_REQUESTparseSelectorAct(1)
-	if(*p != '@')
-		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
-	CHKiRet(createInstance(&amp;pData));
-	pData-&gt;tcp_framingDelimiter = '\n';
-	++p; 	if(*p == '@') { 		localRet = loadTCPSupport();
-		if(localRet != RS_RET_OK) {
-			LogError(0, localRet, "could not activate network stream modules for TCP "
-					"(internal error %d) - are modules missing?", localRet);
-			ABORT_FINALIZE(localRet);
-		}
-		pData-&gt;protocol = FORW_TCP;
-		++p; 	} else {
-		pData-&gt;protocol = FORW_UDP;
-	}
-	if(*p == '(') {
-		do {
-			++p; 			if(*p == 'z') { 				++p; 				if(isdigit((int) *p)) {
-					int iLevel;
-					iLevel = *p - '0';
-					++p; 					pData-&gt;compressionLevel = iLevel;
-					pData-&gt;compressionMode = COMPRESS_SINGLE_MSG;
-				} else {
-					LogError(0, NO_ERRCODE, "Invalid compression level '%c' specified in "
-						 "forwarding action - NOT turning on compression.",
-						 *p);
-				}
-			} else if(*p == 'o') { 				++p; 				tcp_framing = TCP_FRAMING_OCTET_COUNTING;
-			} else { 				LogError(0, NO_ERRCODE, "Invalid option %c in forwarding action - ignoring.", *p);
-				++p; 			}
-			while(*p &amp;&amp; *p != ')' &amp;&amp; *p != ',')
-				++p;			} while(*p &amp;&amp; *p == ','); 		if(*p == ')')
-			++p; 		else
-			LogError(0, NO_ERRCODE, "Option block not terminated in forwarding action.");
-	}
-	if(*p == '[') { 		++p; 		for(q = p ; *p &amp;&amp; *p != ']' ; ++p)
-		if(*p == ']') {
-			*p = '\0'; 			++p; 		}
-	} else { 		for(q = p ; *p &amp;&amp; *p != ';' &amp;&amp; *p != ':' &amp;&amp; *p != '#' ; ++p)
-	}
-	pData-&gt;tcp_framing = tcp_framing;
-	pData-&gt;port = NULL;
-	pData-&gt;networkNamespace = NULL;
-	if(*p == ':') { 		uchar * tmp;
-		*p = '\0'; 		tmp = ++p;
-		for(i=0 ; *p &amp;&amp; isdigit((int) *p) ; ++p, ++i)
-		pData-&gt;port = malloc(i + 1);
-		if(pData-&gt;port == NULL) {
-			LogError(0, NO_ERRCODE, "Could not get memory to store syslog forwarding port, "
-				 "using default port, results may not be what you intend");
-		} else {
-			memcpy(pData-&gt;port, tmp, i);
-			*(pData-&gt;port + i) = '\0';
-		}
-	}
-	if(pData-&gt;port == NULL) {
-		CHKmalloc(pData-&gt;port = strdup("514"));
-	}
-	while(*p &amp;&amp; *p != ';'  &amp;&amp; *p != '#' &amp;&amp; !isspace((int) *p))
-	if(*p == ';' || *p == '#' || isspace(*p)) {
-		uchar cTmp = *p;
-		*p = '\0'; 		CHKmalloc(pData-&gt;target = strdup((char*) q));
-		*p = cTmp;
-	} else {
-		CHKmalloc(pData-&gt;target = strdup((char*) q));
-	}
-	pData-&gt;iRebindInterval = (pData-&gt;protocol == FORW_TCP) ?
-				 cs.iTCPRebindInterval : cs.iUDPRebindInterval;
-	pData-&gt;bKeepAlive = cs.bKeepAlive;
-	pData-&gt;iKeepAliveProbes = cs.iKeepAliveProbes;
-	pData-&gt;iKeepAliveIntvl = cs.iKeepAliveIntvl;
-	pData-&gt;iKeepAliveTime = cs.iKeepAliveTime;
-	pData-&gt;iConErrSkip = cs.iConErrSkip;
-	CHKiRet(cflineParseTemplateName(&amp;p, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS, getDfltTpl()));
-	if(pData-&gt;protocol == FORW_TCP) {
-		pData-&gt;bResendLastOnRecon = cs.bResendLastOnRecon;
-		pData-&gt;iStrmDrvrMode = cs.iStrmDrvrMode;
-		if(cs.pPermPeers != NULL) {
-			pData-&gt;pPermPeers = cs.pPermPeers;
-			cs.pPermPeers = NULL;
-		}
-	}
-CODE_STD_FINALIZERparseSelectorAct
-ENDparseSelectorAct
-static void
-freeConfigVars(void)
-{
-	free(cs.pszStrmDrvr);
-	cs.pszStrmDrvr = NULL;
-	free(cs.pszStrmDrvrAuthMode);
-	cs.pszStrmDrvrAuthMode = NULL;
-	free(cs.pPermPeers);
-	cs.pPermPeers = NULL; }
-BEGINmodExit
-CODESTARTmodExit
-	objRelease(glbl, CORE_COMPONENT);
-	objRelease(net, LM_NET_FILENAME);
-	objRelease(netstrm, LM_NETSTRMS_FILENAME);
-	objRelease(netstrms, LM_NETSTRMS_FILENAME);
-	objRelease(tcpclt, LM_TCPCLT_FILENAME);
-	objRelease(statsobj, CORE_COMPONENT);
-	freeConfigVars();
-ENDmodExit
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_OMODTX_QUERIES
-CODEqueryEtryPt_STD_OMOD8_QUERIES
-CODEqueryEtryPt_STD_CONF2_QUERIES
-CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
-CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-ENDqueryEtryPt
-static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
-{
-	freeConfigVars();
-	cs.iStrmDrvrMode = 0;
-	cs.bResendLastOnRecon = 0;
-	cs.iUDPRebindInterval = 0;
-	cs.iTCPRebindInterval = 0;
-	cs.bKeepAlive = 0;
-	cs.iKeepAliveProbes = 0;
-	cs.iKeepAliveIntvl = 0;
-	cs.iKeepAliveTime = 0;
-	cs.iConErrSkip = 0;
-	return RS_RET_OK;
-}
-BEGINmodInit(Fwd)
-CODESTARTmodInit
-INITLegCnfVars
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-	CHKiRet(objUse(net,LM_NET_FILENAME));
-<a name="0"></a>	CHKiRet(objUse(statsobj, CORE_COMPONENT));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionforwarddefaulttemplate", 0, eCmdHdlrGetWord,
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		setLegacyDfltTpl, NULL, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcprebindinterval", 0, eCmdHdlrInt,
-		NULL, &amp;cs.iTCPRebindInterval, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendudprebindinterval", 0, eCmdHdlrInt,
-		NULL, &amp;cs.iUDPRebindInterval, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcpkeepalive", 0, eCmdHdlrBinary,
-		NULL, &amp;cs.bKeepAlive, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcpkeepalive_probes", 0, eCmdHdlrInt,
-		NULL, &amp;cs.iKeepAliveProbes, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcpkeepalive_intvl", 0, eCmdHdlrInt,
-		NULL, &amp;cs.iKeepAliveIntvl, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcpkeepalive_time", 0, eCmdHdlrInt,
-		NULL, &amp;cs.iKeepAliveTime, NULL));</b></font>
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdriver", 0, eCmdHdlrGetWord,
-		NULL, &amp;cs.pszStrmDrvr, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdrivermode", 0, eCmdHdlrInt,
-		NULL, &amp;cs.iStrmDrvrMode, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdriverauthmode", 0, eCmdHdlrGetWord,
-		NULL, &amp;cs.pszStrmDrvrAuthMode, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdriverpermittedpeer", 0, eCmdHdlrGetWord,
-		setPermittedPeer, NULL, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendresendlastmsgonreconnect", 0, eCmdHdlrBinary,
-		NULL, &amp;cs.bResendLastOnRecon, NULL));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler,
-		resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
-ENDmodInit
+1 #include "config.h"
+2 #include &lt;stdio.h&gt;
+3 #include &lt;stdarg.h&gt;
+4 #include &lt;stdlib.h&gt;
+5 #include &lt;string.h&gt;
+6 #include &lt;time.h&gt;
+7 #include &lt;netinet/in.h&gt;
+8 #include &lt;netdb.h&gt;
+9 #include &lt;fnmatch.h&gt;
+10 #include &lt;assert.h&gt;
+11 #include &lt;errno.h&gt;
+12 #include &lt;ctype.h&gt;
+13 #include &lt;unistd.h&gt;
+14 #include &lt;stdint.h&gt;
+15 #include &lt;fcntl.h&gt;
+16 #include &lt;zlib.h&gt;
+17 #include &lt;pthread.h&gt;
+18 #include "rsyslog.h"
+19 #include "syslogd.h"
+20 #include "conf.h"
+21 #include "syslogd-types.h"
+22 #include "srUtils.h"
+23 #include "net.h"
+24 #include "netstrms.h"
+25 #include "netstrm.h"
+26 #include "omfwd.h"
+27 #include "template.h"
+28 #include "msg.h"
+29 #include "tcpclt.h"
+30 #include "cfsysline.h"
+31 #include "module-template.h"
+32 #include "glbl.h"
+33 #include "errmsg.h"
+34 #include "unicode-helper.h"
+35 #include "parserif.h"
+36 #include "ratelimit.h"
+37 #include "statsobj.h"
+38 MODULE_TYPE_OUTPUT
+39 MODULE_TYPE_NOKEEP
+40 MODULE_CNFNAME("omfwd")
+41 DEF_OMOD_STATIC_DATA
+42 DEFobjCurrIf(glbl)
+43 DEFobjCurrIf(net)
+44 DEFobjCurrIf(netstrms)
+45 DEFobjCurrIf(netstrm)
+46 DEFobjCurrIf(tcpclt)
+47 DEFobjCurrIf(statsobj)
+48 #define IS_FLUSH 1
+49 #define NO_FLUSH 0
+50 typedef struct _instanceData {
+51 	uchar 	*tplName;		uchar *pszStrmDrvr;
+52 	uchar *pszStrmDrvrAuthMode;
+53 	uchar *pszStrmDrvrPermitExpiredCerts;
+54 	permittedPeers_t *pPermPeers;
+55 	int iStrmDrvrMode;
+56 	const uchar *pszStrmDrvrCAFile;
+57 	const uchar *pszStrmDrvrKeyFile;
+58 	const uchar *pszStrmDrvrCertFile;
+59 	char	*target;
+60 	char	*address;
+61 	char	*device;
+62 	int compressionLevel;		char *port;
+63 	int protocol;
+64 	char *networkNamespace;
+65 	int originalNamespace;
+66 	int iRebindInterval;		sbool bKeepAlive;
+67 	int iKeepAliveIntvl;
+68 	int iKeepAliveProbes;
+69 	int iKeepAliveTime;
+70 	int iConErrSkip;    	uchar *gnutlsPriorityString;
+71 	int ipfreebind;
+72 #	define	FORW_UDP 0
+73 #	define	FORW_TCP 1
+74 	int bSendToAll;
+75 	int iUDPSendDelay;
+76 	int UDPSendBuf;
+77 	TCPFRAMINGMODE tcp_framing;
+78 	uchar tcp_framingDelimiter;
+79 	int bResendLastOnRecon; #	define COMPRESS_NEVER 0
+80 #	define COMPRESS_SINGLE_MSG 1	#	define COMPRESS_STREAM_ALWAYS 2
+81 	uint8_t compressionMode;
+82 	int errsToReport;		sbool strmCompFlushOnTxEnd; 	unsigned int ratelimitInterval;
+83 	unsigned int ratelimitBurst;
+84 	ratelimit_t *ratelimiter;
+85 	statsobj_t *stats;			intctr_t sentBytes;
+86 	DEF_ATOMIC_HELPER_MUT64(mut_sentBytes)
+87 } instanceData;
+88 typedef struct wrkrInstanceData {
+89 	instanceData *pData;
+90 	netstrms_t *pNS; 	netstrm_t *pNetstrm; 	struct addrinfo *f_addr;
+91 	int *pSockArray;		int bIsConnected;  	int nXmit;			tcpclt_t *pTCPClt;		sbool bzInitDone; 	z_stream zstrm;		uchar sndBuf[16*1024];		unsigned offsSndBuf;		int errsToReport;	} wrkrInstanceData_t;
+92 typedef struct configSettings_s {
+93 	uchar *pszTplName; 	uchar *pszStrmDrvr; 	int iStrmDrvrMode; 	int bResendLastOnRecon; 	uchar *pszStrmDrvrAuthMode;			uchar *pszStrmDrvrPermitExpiredCerts;		int iTCPRebindInterval;		int iUDPRebindInterval;		int bKeepAlive;
+94 	int iKeepAliveIntvl;
+95 	int iKeepAliveProbes;
+96 	int iKeepAliveTime;
+97 	int iConErrSkip;
+98 	uchar *gnutlsPriorityString;
+99 	permittedPeers_t *pPermPeers;
+100 } configSettings_t;
+101 static configSettings_t cs;
+102 static struct cnfparamdescr modpdescr[] = {
+103 	{ "template", eCmdHdlrGetWord, 0 },
+104 };
+105 static struct cnfparamblk modpblk =
+106 	{ CNFPARAMBLK_VERSION,
+107 	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+108 	  modpdescr
+109 	};
+110 static struct cnfparamdescr actpdescr[] = {
+111 	{ "target", eCmdHdlrGetWord, 0 },
+112 	{ "address", eCmdHdlrGetWord, 0 },
+113 	{ "device", eCmdHdlrGetWord, 0 },
+114 	{ "port", eCmdHdlrGetWord, 0 },
+115 	{ "protocol", eCmdHdlrGetWord, 0 },
+116 	{ "networknamespace", eCmdHdlrGetWord, 0 },
+117 	{ "tcp_framing", eCmdHdlrGetWord, 0 },
+118 	{ "tcp_framedelimiter", eCmdHdlrInt, 0 },
+119 	{ "ziplevel", eCmdHdlrInt, 0 },
+120 	{ "compression.mode", eCmdHdlrGetWord, 0 },
+121 	{ "compression.stream.flushontxend", eCmdHdlrBinary, 0 },
+122 	{ "ipfreebind", eCmdHdlrInt, 0 },
+123 	{ "maxerrormessages", eCmdHdlrInt, CNFPARAM_DEPRECATED },
+124 	{ "rebindinterval", eCmdHdlrInt, 0 },
+125 	{ "keepalive", eCmdHdlrBinary, 0 },
+126 	{ "keepalive.probes", eCmdHdlrNonNegInt, 0 },
+127 	{ "keepalive.time", eCmdHdlrNonNegInt, 0 },
+128 	{ "keepalive.interval", eCmdHdlrNonNegInt, 0 },
+129 	{ "conerrskip", eCmdHdlrNonNegInt, 0 },
+130 	{ "gnutlsprioritystring", eCmdHdlrString, 0 },
+131 	{ "streamdriver", eCmdHdlrGetWord, 0 },
+132 	{ "streamdrivermode", eCmdHdlrInt, 0 },
+133 	{ "streamdriverauthmode", eCmdHdlrGetWord, 0 },
+134 	{ "streamdriverpermittedpeers", eCmdHdlrGetWord, 0 },
+135 	{ "streamdriver.permitexpiredcerts", eCmdHdlrGetWord, 0 },
+136 	{ "streamdriver.CheckExtendedKeyPurpose", eCmdHdlrBinary, 0 },
+137 	{ "streamdriver.PrioritizeSAN", eCmdHdlrBinary, 0 },
+138 	{ "streamdriver.TlsVerifyDepth", eCmdHdlrPositiveInt, 0 },
+139 	{ "streamdriver.cafile", eCmdHdlrString, 0 },
+140 	{ "streamdriver.keyfile", eCmdHdlrString, 0 },
+141 	{ "streamdriver.certfile", eCmdHdlrString, 0 },
+142 	{ "resendlastmsgonreconnect", eCmdHdlrBinary, 0 },
+143 	{ "udp.sendtoall", eCmdHdlrBinary, 0 },
+144 	{ "udp.senddelay", eCmdHdlrInt, 0 },
+145 	{ "udp.sendbuf", eCmdHdlrSize, 0 },
+146 	{ "template", eCmdHdlrGetWord, 0 },
+147 	{ "ratelimit.interval", eCmdHdlrInt, 0 },
+148 	{ "ratelimit.burst", eCmdHdlrInt, 0 }
+149 };
+150 static struct cnfparamblk actpblk =
+151 	{ CNFPARAMBLK_VERSION,
+152 	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+153 	  actpdescr
+154 	};
+155 struct modConfData_s {
+156 	rsconf_t *pConf;		uchar 	*tplName;	};
+157 static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;
+158 static rsRetVal initTCP(wrkrInstanceData_t *pWrkrData);
+159 BEGINinitConfVars		CODESTARTinitConfVars
+160 	cs.pszTplName = NULL; 	cs.pszStrmDrvr = NULL; 	cs.iStrmDrvrMode = 0; 	cs.bResendLastOnRecon = 0; 	cs.pszStrmDrvrAuthMode = NULL; 	cs.iUDPRebindInterval = 0;		cs.iTCPRebindInterval = 0;		cs.pPermPeers = NULL;
+161 ENDinitConfVars
+162 static rsRetVal doTryResume(wrkrInstanceData_t *);
+163 static rsRetVal doZipFinish(wrkrInstanceData_t *);
+164 static uchar*
+165 getDfltTpl(void)
+166 {
+167 	if(loadModConf != NULL &amp;&amp; loadModConf-&gt;tplName != NULL)
+168 		return loadModConf-&gt;tplName;
+169 	else if(cs.pszTplName == NULL)
+170 		return (uchar*)"RSYSLOG_TraditionalForwardFormat";
+171 	else
+172 		return cs.pszTplName;
+173 }
+174 static rsRetVal
+175 setLegacyDfltTpl(void __attribute__((unused)) *pVal, uchar* newVal)
+176 {
+177 	DEFiRet;
+178 	if(loadModConf != NULL &amp;&amp; loadModConf-&gt;tplName != NULL) {
+179 		free(newVal);
+180 		LogError(0, RS_RET_ERR, "omfwd default template already set via module "
+181 			"global parameter - can no longer be changed");
+182 		ABORT_FINALIZE(RS_RET_ERR);
+183 	}
+184 	free(cs.pszTplName);
+185 	cs.pszTplName = newVal;
+186 finalize_it:
+187 	RETiRet;
+188 }
+189 static rsRetVal
+190 closeUDPSockets(wrkrInstanceData_t *pWrkrData)
+191 {
+192 	DEFiRet;
+193 	if(pWrkrData-&gt;pSockArray != NULL) {
+194 		net.closeUDPListenSockets(pWrkrData-&gt;pSockArray);
+195 		pWrkrData-&gt;pSockArray = NULL;
+196 		freeaddrinfo(pWrkrData-&gt;f_addr);
+197 		pWrkrData-&gt;f_addr = NULL;
+198 	}
+199 pWrkrData-&gt;bIsConnected = 0; 	RETiRet;
+200 }
+201 static void
+202 DestructTCPInstanceData(wrkrInstanceData_t *pWrkrData)
+203 {
+204 	doZipFinish(pWrkrData);
+205 	if(pWrkrData-&gt;pNetstrm != NULL)
+206 		netstrm.Destruct(&amp;pWrkrData-&gt;pNetstrm);
+207 	if(pWrkrData-&gt;pNS != NULL)
+208 		netstrms.Destruct(&amp;pWrkrData-&gt;pNS);
+209 }
+210 BEGINbeginCnfLoad
+211 CODESTARTbeginCnfLoad
+212 	loadModConf = pModConf;
+213 	pModConf-&gt;pConf = pConf;
+214 	pModConf-&gt;tplName = NULL;
+215 ENDbeginCnfLoad
+216 BEGINsetModCnf
+217 	int i;
+218 CODESTARTsetModCnf
+219 	const struct cnfparamvals *const __restrict__ pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
+220 	if(pvals == NULL) {
+221 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+222 	}
+223 	if(Debug) {
+224 		dbgprintf("module (global) param blk for omfwd:\n");
+225 		cnfparamsPrint(&amp;modpblk, pvals);
+226 	}
+227 	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
+228 		if(!pvals[i].bUsed)
+229 			continue;
+230 		if(!strcmp(modpblk.descr[i].name, "template")) {
+231 			loadModConf-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+232 			if(cs.pszTplName != NULL) {
+233 				LogError(0, RS_RET_DUP_PARAM, "omfwd: warning: default template "
+234 						"was already set via legacy directive - may lead to inconsistent "
+235 						"results.");
+236 			}
+237 		} else {
+238 			dbgprintf("omfwd: program error, non-handled "
+239 			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
+240 		}
+241 	}
+242 finalize_it:
+243 	if(pvals != NULL)
+244 		cnfparamvalsDestruct(pvals, &amp;modpblk);
+245 ENDsetModCnf
+246 BEGINendCnfLoad
+247 CODESTARTendCnfLoad
+248 	loadModConf = NULL; 	free(cs.pszTplName);
+249 	cs.pszTplName = NULL;
+250 ENDendCnfLoad
+251 BEGINcheckCnf
+252 CODESTARTcheckCnf
+253 ENDcheckCnf
+254 BEGINactivateCnf
+255 CODESTARTactivateCnf
+256 	runModConf = pModConf;
+257 ENDactivateCnf
+258 BEGINfreeCnf
+259 CODESTARTfreeCnf
+260 	free(pModConf-&gt;tplName);
+261 ENDfreeCnf
+262 BEGINcreateInstance
+263 CODESTARTcreateInstance
+264 	if(cs.pszStrmDrvr != NULL)
+265 		CHKmalloc(pData-&gt;pszStrmDrvr = (uchar*)strdup((char*)cs.pszStrmDrvr));
+266 	if(cs.pszStrmDrvrAuthMode != NULL)
+267 		CHKmalloc(pData-&gt;pszStrmDrvrAuthMode =
+268 				     (uchar*)strdup((char*)cs.pszStrmDrvrAuthMode));
+269 finalize_it:
+270 ENDcreateInstance
+271 BEGINcreateWrkrInstance
+272 CODESTARTcreateWrkrInstance
+273 	dbgprintf("DDDD: createWrkrInstance: pWrkrData %p\n", pWrkrData);
+274 	pWrkrData-&gt;offsSndBuf = 0;
+275 	iRet = initTCP(pWrkrData);
+276 ENDcreateWrkrInstance
+277 BEGINisCompatibleWithFeature
+278 CODESTARTisCompatibleWithFeature
+279 	if(eFeat == sFEATURERepeatedMsgReduction)
+280 		iRet = RS_RET_OK;
+281 ENDisCompatibleWithFeature
+282 BEGINfreeInstance
+283 CODESTARTfreeInstance
+284 	if(pData-&gt;stats != NULL)
+285 		statsobj.Destruct(&amp;(pData-&gt;stats));
+286 	free(pData-&gt;pszStrmDrvr);
+287 	free(pData-&gt;pszStrmDrvrAuthMode);
+288 	free(pData-&gt;pszStrmDrvrPermitExpiredCerts);
+289 	free(pData-&gt;gnutlsPriorityString);
+290 	free(pData-&gt;port);
+291 	free(pData-&gt;networkNamespace);
+292 	free(pData-&gt;target);
+293 	free(pData-&gt;address);
+294 	free(pData-&gt;device);
+295 	free((void*)pData-&gt;pszStrmDrvrCAFile);
+296 	free((void*)pData-&gt;pszStrmDrvrKeyFile);
+297 	free((void*)pData-&gt;pszStrmDrvrCertFile);
+298 	net.DestructPermittedPeers(&amp;pData-&gt;pPermPeers);
+299 	if (pData-&gt;ratelimiter != NULL){
+300 		ratelimitDestruct(pData-&gt;ratelimiter);
+301 		pData-&gt;ratelimiter = NULL;
+302 	}
+303 ENDfreeInstance
+304 BEGINfreeWrkrInstance
+305 CODESTARTfreeWrkrInstance
+306 	DestructTCPInstanceData(pWrkrData);
+307 	closeUDPSockets(pWrkrData);
+308 	if(pWrkrData-&gt;pData-&gt;protocol == FORW_TCP) {
+309 		tcpclt.Destruct(&amp;pWrkrData-&gt;pTCPClt);
+310 	}
+311 ENDfreeWrkrInstance
+312 BEGINdbgPrintInstInfo
+313 CODESTARTdbgPrintInstInfo
+314 	dbgprintf("omfwd\n");
+315 	dbgprintf("\ttarget='%s'\n", pData-&gt;target);
+316 	dbgprintf("\tratelimit.interval='%u'\n", pData-&gt;ratelimitInterval);
+317 	dbgprintf("\tratelimit.burst='%u'\n", pData-&gt;ratelimitBurst);
+318 ENDdbgPrintInstInfo
+319 #define UDP_MAX_MSGSIZE 65507 static rsRetVal UDPSend(wrkrInstanceData_t *__restrict__ const pWrkrData,
+320 	uchar *__restrict__ const msg,
+321 	size_t len)
+322 {
+323 	DEFiRet;
+324 	struct addrinfo *r;
+325 	int i;
+326 	ssize_t lsent = 0;
+327 	sbool bSendSuccess;
+328 	sbool reInit = RSFALSE;
+329 	int lasterrno = ENOENT;
+330 	int lasterr_sock = -1;
+331 	if(pWrkrData-&gt;pData-&gt;iRebindInterval &amp;&amp; (pWrkrData-&gt;nXmit++ % pWrkrData-&gt;pData-&gt;iRebindInterval == 0)) {
+332 		dbgprintf("omfwd dropping UDP 'connection' (as configured)\n");
+333 		pWrkrData-&gt;nXmit = 1;			CHKiRet(closeUDPSockets(pWrkrData));
+334 	}
+335 	if(pWrkrData-&gt;pSockArray == NULL) {
+336 		CHKiRet(doTryResume(pWrkrData));
+337 	}
+338 	if(pWrkrData-&gt;pSockArray == NULL) {
+339 		FINALIZE;
+340 	}
+341 	if(len &gt; UDP_MAX_MSGSIZE) {
+342 		LogError(0, RS_RET_UDP_MSGSIZE_TOO_LARGE, "omfwd/udp: message is %u "
+343 			"bytes long, but UDP can send at most %d bytes (by RFC limit) "
+344 			"- truncating message", (unsigned) len, UDP_MAX_MSGSIZE);
+345 		len = UDP_MAX_MSGSIZE;
+346 	}
+347 	bSendSuccess = RSFALSE;
+348 	for (r = pWrkrData-&gt;f_addr; r; r = r-&gt;ai_next) {
+349 		int runSockArrayLoop = 1;
+350 		for (i = 0; runSockArrayLoop &amp;&amp; (i &lt; *pWrkrData-&gt;pSockArray) ; i++) {
+351 			int try_send = 1;
+352 			size_t lenThisTry = len;
+353 			while(try_send) {
+354 				lsent = sendto(pWrkrData-&gt;pSockArray[i+1], msg, lenThisTry, 0,
+355 						r-&gt;ai_addr, r-&gt;ai_addrlen);
+356 				if (lsent == (ssize_t) lenThisTry) {
+357 					bSendSuccess = RSTRUE;
+358 					ATOMIC_ADD_uint64(&amp;pWrkrData-&gt;pData-&gt;sentBytes,
+359 						&amp;pWrkrData-&gt;pData-&gt;mut_sentBytes, lenThisTry);
+360 					try_send = 0;
+361 					runSockArrayLoop = 0;
+362 				} else if(errno == EMSGSIZE) {
+363 					const size_t newlen = (lenThisTry &gt; 1024) ? lenThisTry - 1024 : 512;
+364 					LogError(0, RS_RET_UDP_MSGSIZE_TOO_LARGE,
+365 						"omfwd/udp: send failed due to message being too "
+366 						"large for this system. Message size was %u bytes. "
+367 						"Truncating to %u bytes and retrying.",
+368 						(unsigned) lenThisTry, (unsigned) newlen);
+369 					lenThisTry = newlen;
+370 				} else {
+371 					reInit = RSTRUE;
+372 					lasterrno = errno;
+373 					lasterr_sock = pWrkrData-&gt;pSockArray[i+1];
+374 					LogError(lasterrno, RS_RET_ERR_UDPSEND,
+375 						"omfwd/udp: socket %d: sendto() error",
+376 						lasterr_sock);
+377 					try_send = 0;
+378 				}
+379 			}
+380 		}
+381 		if (lsent == (ssize_t) len &amp;&amp; !pWrkrData-&gt;pData-&gt;bSendToAll)
+382 		       break;
+383 	}
+384 	if (reInit == RSTRUE) {
+385 		CHKiRet(closeUDPSockets(pWrkrData));
+386 	}
+387 	if(bSendSuccess == RSTRUE) {
+388 		if(pWrkrData-&gt;pData-&gt;iUDPSendDelay &gt; 0) {
+389 			srSleep(pWrkrData-&gt;pData-&gt;iUDPSendDelay / 1000000,
+390 				pWrkrData-&gt;pData-&gt;iUDPSendDelay % 1000000);
+391 		}
+392 	} else {
+393 		LogError(lasterrno, RS_RET_ERR_UDPSEND,
+394 			"omfwd: socket %d: error %d sending via udp", lasterr_sock, lasterrno);
+395 		iRet = RS_RET_SUSPENDED;
+396 	}
+397 finalize_it:
+398 	RETiRet;
+399 }
+400 static rsRetVal
+401 setPermittedPeer(void __attribute__((unused)) *pVal, uchar *pszID)
+402 {
+403 	DEFiRet;
+404 	CHKiRet(net.AddPermittedPeer(&amp;cs.pPermPeers, pszID));
+405 	free(pszID); finalize_it:
+406 	RETiRet;
+407 }
+408 static rsRetVal
+409 TCPSendBufUncompressed(wrkrInstanceData_t *pWrkrData, uchar *const buf, const unsigned len)
+410 {
+411 	DEFiRet;
+412 	unsigned alreadySent;
+413 	ssize_t lenSend;
+414 	alreadySent = 0;
+415 	CHKiRet(netstrm.CheckConnection(pWrkrData-&gt;pNetstrm));
+416 	while(alreadySent != len) {
+417 		lenSend = len - alreadySent;
+418 		CHKiRet(netstrm.Send(pWrkrData-&gt;pNetstrm, buf+alreadySent, &amp;lenSend));
+419 		DBGPRINTF("omfwd: TCP sent %ld bytes, requested %u\n", (long) lenSend, len - alreadySent);
+420 		alreadySent += lenSend;
+421 	}
+422 	ATOMIC_ADD_uint64(&amp;pWrkrData-&gt;pData-&gt;sentBytes, &amp;pWrkrData-&gt;pData-&gt;mut_sentBytes, len);
+423 finalize_it:
+424 	if(iRet != RS_RET_OK) {
+425 		if(iRet == RS_RET_IO_ERROR) {
+426 			static unsigned int conErrCnt = 0;
+427 			const int skipFactor = pWrkrData-&gt;pData-&gt;iConErrSkip;
+428 			if (skipFactor &lt;= 1)  {
+429 				LogError(0, iRet, "omfwd: remote server at %s:%s seems to have closed connection. "
+430 					"This often happens when the remote peer (or an interim system like a load "
+431 					"balancer or firewall) shuts down or aborts a connection. Rsyslog will "
+432 					"re-open the connection if configured to do so (we saw a generic IO Error, "
+433 					"which usually goes along with that behaviour).",
+434 					pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port);
+435 			} else if ((conErrCnt++ % skipFactor) == 0) {
+436 				LogError(0, iRet, "omfwd: remote server at %s:%s seems to have closed connection. "
+437 					"This often happens when the remote peer (or an interim system like a load "
+438 					"balancer or firewall) shuts down or aborts a connection. Rsyslog will "
+439 					"re-open the connection if configured to do so (we saw a generic IO Error, "
+440 					"which usually goes along with that behaviour). Note that the next %d "
+441 					"connection error messages will be skipped.",
+442 					pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port, skipFactor-1);
+443 			}
+444 		} else {
+445 			LogError(0, iRet, "omfwd: TCPSendBuf error %d, destruct TCP Connection to %s:%s",
+446 				iRet, pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port);
+447 		}
+448 		DestructTCPInstanceData(pWrkrData);
+449 		iRet = RS_RET_SUSPENDED;
+450 	}
+451 	RETiRet;
+452 }
+453 static rsRetVal
+454 TCPSendBufCompressed(wrkrInstanceData_t *pWrkrData, uchar *buf, unsigned len, sbool bIsFlush)
+455 {
+456 	int zRet;		unsigned outavail;
+457 	uchar zipBuf[32*1024];
+458 	int op;
+459 	DEFiRet;
+460 	if(!pWrkrData-&gt;bzInitDone) {
+461 		pWrkrData-&gt;zstrm.zalloc = Z_NULL;
+462 		pWrkrData-&gt;zstrm.zfree = Z_NULL;
+463 		pWrkrData-&gt;zstrm.opaque = Z_NULL;
+464 		zRet = deflateInit(&amp;pWrkrData-&gt;zstrm, pWrkrData-&gt;pData-&gt;compressionLevel);
+465 		if(zRet != Z_OK) {
+466 			DBGPRINTF("error %d returned from zlib/deflateInit()\n", zRet);
+467 			ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+468 		}
+469 		pWrkrData-&gt;bzInitDone = RSTRUE;
+470 	}
+471 	pWrkrData-&gt;zstrm.next_in = (Bytef*) buf;
+472 	pWrkrData-&gt;zstrm.avail_in = len;
+473 	if(pWrkrData-&gt;pData-&gt;strmCompFlushOnTxEnd &amp;&amp; bIsFlush)
+474 		op = Z_SYNC_FLUSH;
+475 	else
+476 		op = Z_NO_FLUSH;
+477 	do {
+478 		DBGPRINTF("omfwd: in deflate() loop, avail_in %d, total_in %ld, isFlush %d\n",
+479 			pWrkrData-&gt;zstrm.avail_in, pWrkrData-&gt;zstrm.total_in, bIsFlush);
+480 		pWrkrData-&gt;zstrm.avail_out = sizeof(zipBuf);
+481 		pWrkrData-&gt;zstrm.next_out = zipBuf;
+482 		zRet = deflate(&amp;pWrkrData-&gt;zstrm, op);    		DBGPRINTF("after deflate, ret %d, avail_out %d\n", zRet, pWrkrData-&gt;zstrm.avail_out);
+483 		outavail = sizeof(zipBuf) - pWrkrData-&gt;zstrm.avail_out;
+484 		if(outavail != 0) {
+485 			CHKiRet(TCPSendBufUncompressed(pWrkrData, zipBuf, outavail));
+486 		}
+487 	} while (pWrkrData-&gt;zstrm.avail_out == 0);
+488 finalize_it:
+489 	RETiRet;
+490 }
+491 static rsRetVal
+492 TCPSendBuf(wrkrInstanceData_t *pWrkrData, uchar *buf, unsigned len, sbool bIsFlush)
+493 {
+494 	DEFiRet;
+495 	if(pWrkrData-&gt;pData-&gt;compressionMode &gt;= COMPRESS_STREAM_ALWAYS)
+496 		iRet = TCPSendBufCompressed(pWrkrData, buf, len, bIsFlush);
+497 	else
+498 		iRet = TCPSendBufUncompressed(pWrkrData, buf, len);
+499 	RETiRet;
+500 }
+501 static rsRetVal
+502 doZipFinish(wrkrInstanceData_t *pWrkrData)
+503 {
+504 	int zRet;		DEFiRet;
+505 	unsigned outavail;
+506 	uchar zipBuf[32*1024];
+507 	if(!pWrkrData-&gt;bzInitDone)
+508 		goto done;
+509 	pWrkrData-&gt;zstrm.avail_in = 0;
+510 	do {
+511 		DBGPRINTF("in deflate() loop, avail_in %d, total_in %ld\n", pWrkrData-&gt;zstrm.avail_in,
+512 			pWrkrData-&gt;zstrm.total_in);
+513 		pWrkrData-&gt;zstrm.avail_out = sizeof(zipBuf);
+514 		pWrkrData-&gt;zstrm.next_out = zipBuf;
+515 		zRet = deflate(&amp;pWrkrData-&gt;zstrm, Z_FINISH);    		DBGPRINTF("after deflate, ret %d, avail_out %d\n", zRet, pWrkrData-&gt;zstrm.avail_out);
+516 		outavail = sizeof(zipBuf) - pWrkrData-&gt;zstrm.avail_out;
+517 		if(outavail != 0) {
+518 			CHKiRet(TCPSendBufUncompressed(pWrkrData, zipBuf, outavail));
+519 		}
+520 	} while (pWrkrData-&gt;zstrm.avail_out == 0);
+521 finalize_it:
+522 	zRet = deflateEnd(&amp;pWrkrData-&gt;zstrm);
+523 	if(zRet != Z_OK) {
+524 		DBGPRINTF("error %d returned from zlib/deflateEnd()\n", zRet);
+525 	}
+526 	pWrkrData-&gt;bzInitDone = 0;
+527 done:	RETiRet;
+528 }
+529 static rsRetVal TCPSendFrame(void *pvData, char *msg, size_t len)
+530 {
+531 	DEFiRet;
+532 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t *) pvData;
+533 	DBGPRINTF("omfwd: add %u bytes to send buffer (curr offs %u)\n",
+534 		(unsigned) len, pWrkrData-&gt;offsSndBuf);
+535 	if(pWrkrData-&gt;offsSndBuf != 0 &amp;&amp; pWrkrData-&gt;offsSndBuf + len &gt;= sizeof(pWrkrData-&gt;sndBuf)) {
+536 		DBGPRINTF("omfwd: we need to do a tcp send due to buffer "
+537 			  "out of space. If the transaction fails, this will "
+538 			  "lead to duplication of messages");
+539 		CHKiRet(TCPSendBuf(pWrkrData, pWrkrData-&gt;sndBuf, pWrkrData-&gt;offsSndBuf, NO_FLUSH));
+540 		pWrkrData-&gt;offsSndBuf = 0;
+541 	}
+542 	if(len &gt; sizeof(pWrkrData-&gt;sndBuf)) {
+543 		CHKiRet(TCPSendBuf(pWrkrData, (uchar*)msg, len, NO_FLUSH));
+544 		ABORT_FINALIZE(RS_RET_OK);		}
+545 	memcpy(pWrkrData-&gt;sndBuf + pWrkrData-&gt;offsSndBuf, msg, len);
+546 	pWrkrData-&gt;offsSndBuf += len;
+547 	iRet = RS_RET_DEFER_COMMIT;
+548 finalize_it:
+549 	RETiRet;
+550 }
+551 static rsRetVal TCPSendPrepRetry(void *pvData)
+552 {
+553 	DEFiRet;
+554 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t *) pvData;
+555 	assert(pWrkrData != NULL);
+556 	DestructTCPInstanceData(pWrkrData);
+557 	RETiRet;
+558 }
+559 static rsRetVal TCPSendInit(void *pvData)
+560 {
+561 	DEFiRet;
+562 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t *) pvData;
+563 	instanceData *pData;
+564 	assert(pWrkrData != NULL);
+565 	pData = pWrkrData-&gt;pData;
+566 	if(pWrkrData-&gt;pNetstrm == NULL) {
+567 		dbgprintf("TCPSendInit CREATE\n");
+568 		CHKiRet(netstrms.Construct(&amp;pWrkrData-&gt;pNS));
+569 		CHKiRet(netstrms.SetDrvrName(pWrkrData-&gt;pNS, pData-&gt;pszStrmDrvr));
+570 		CHKiRet(netstrms.ConstructFinalize(pWrkrData-&gt;pNS));
+571 		CHKiRet(netstrms.CreateStrm(pWrkrData-&gt;pNS, &amp;pWrkrData-&gt;pNetstrm));
+572 		CHKiRet(netstrm.ConstructFinalize(pWrkrData-&gt;pNetstrm));
+573 		CHKiRet(netstrm.SetDrvrMode(pWrkrData-&gt;pNetstrm, pData-&gt;iStrmDrvrMode));
+574 		CHKiRet(netstrm.SetDrvrCheckExtendedKeyUsage(pWrkrData-&gt;pNetstrm, pData-&gt;iStrmDrvrExtendedCertCheck));
+575 		CHKiRet(netstrm.SetDrvrPrioritizeSAN(pWrkrData-&gt;pNetstrm, pData-&gt;iStrmDrvrSANPreference));
+576 		CHKiRet(netstrm.SetDrvrTlsVerifyDepth(pWrkrData-&gt;pNetstrm, pData-&gt;iStrmTlsVerifyDepth));
+577 		if(pData-&gt;pszStrmDrvrAuthMode != NULL) {
+578 			CHKiRet(netstrm.SetDrvrAuthMode(pWrkrData-&gt;pNetstrm, pData-&gt;pszStrmDrvrAuthMode));
+579 		}
+580 		CHKiRet(netstrm.SetDrvrPermitExpiredCerts(pWrkrData-&gt;pNetstrm,
+581 			pData-&gt;pszStrmDrvrPermitExpiredCerts));
+582 		CHKiRet(netstrm.SetDrvrTlsCAFile(pWrkrData-&gt;pNetstrm, pData-&gt;pszStrmDrvrCAFile));
+583 		CHKiRet(netstrm.SetDrvrTlsKeyFile(pWrkrData-&gt;pNetstrm, pData-&gt;pszStrmDrvrKeyFile));
+584 		CHKiRet(netstrm.SetDrvrTlsCertFile(pWrkrData-&gt;pNetstrm, pData-&gt;pszStrmDrvrCertFile));
+585 		if(pData-&gt;pPermPeers != NULL) {
+586 			CHKiRet(netstrm.SetDrvrPermPeers(pWrkrData-&gt;pNetstrm, pData-&gt;pPermPeers));
+587 		}
+588 		if(pData-&gt;gnutlsPriorityString != NULL) {
+589 			CHKiRet(netstrm.SetGnutlsPriorityString(pWrkrData-&gt;pNetstrm, pData-&gt;gnutlsPriorityString));
+590 		}
+591 		CHKiRet(netstrm.Connect(pWrkrData-&gt;pNetstrm, glbl.GetDefPFFamily(runModConf-&gt;pConf),
+592 			(uchar*)pData-&gt;port, (uchar*)pData-&gt;target, pData-&gt;device));
+593 		if(pData-&gt;bKeepAlive) {
+594 			CHKiRet(netstrm.SetKeepAliveProbes(pWrkrData-&gt;pNetstrm, pData-&gt;iKeepAliveProbes));
+595 			CHKiRet(netstrm.SetKeepAliveIntvl(pWrkrData-&gt;pNetstrm, pData-&gt;iKeepAliveIntvl));
+596 			CHKiRet(netstrm.SetKeepAliveTime(pWrkrData-&gt;pNetstrm, pData-&gt;iKeepAliveTime));
+597 			CHKiRet(netstrm.EnableKeepAlive(pWrkrData-&gt;pNetstrm));
+598 		}
+599 	}
+600 finalize_it:
+601 	if(iRet != RS_RET_OK) {
+602 		dbgprintf("TCPSendInit FAILED with %d.\n", iRet);
+603 		DestructTCPInstanceData(pWrkrData);
+604 	}
+605 	RETiRet;
+606 }
+607 static rsRetVal changeToNs(instanceData *const pData __attribute__((unused)))
+608 {
+609 	DEFiRet;
+610 #ifdef HAVE_SETNS
+611 	int iErr;
+612 	int destinationNs = -1;
+613 	char *nsPath = NULL;
+614 	if(pData-&gt;networkNamespace) {
+615 		pData-&gt;originalNamespace = open("/proc/self/ns/net", O_RDONLY);
+616 		if (pData-&gt;originalNamespace &lt; 0) {
+617 			LogError(0, RS_RET_IO_ERROR, "omfwd: could not read /proc/self/ns/net");
+618 			ABORT_FINALIZE(RS_RET_IO_ERROR);
+619 		}
+620 		if (asprintf(&amp;nsPath, "/var/run/netns/%s", pData-&gt;networkNamespace) == -1) {
+621 			LogError(0, RS_RET_OUT_OF_MEMORY, "omfwd: asprintf failed");
+622 			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+623 		}
+624 		destinationNs = open(nsPath, 0);
+625 		if (destinationNs &lt; 0) {
+626 			LogError(0, RS_RET_IO_ERROR, "omfwd: could not change to namespace '%s'",
+627 					pData-&gt;networkNamespace);
+628 			ABORT_FINALIZE(RS_RET_IO_ERROR);
+629 		}
+630 		if((iErr = (setns(destinationNs, CLONE_NEWNET))) != 0) {
+631 			LogError(0, RS_RET_IO_ERROR, "could not change to namespace '%s': %s",
+632 				  pData-&gt;networkNamespace, gai_strerror(iErr));
+633 			ABORT_FINALIZE(RS_RET_IO_ERROR);
+634 		}
+635 		dbgprintf("omfwd: changed to network namespace '%s'\n", pData-&gt;networkNamespace);
+636 	}
+637 finalize_it:
+638 	free(nsPath);
+639 	if(destinationNs &gt;= 0) {
+640 		close(destinationNs);
+641 	}
+642 #else 		dbgprintf("omfwd: OS does not support network namespaces\n");
+643 #endif 	RETiRet;
+644 }
+645 static rsRetVal returnToOriginalNs(instanceData *const pData __attribute__((unused)))
+646 {
+647 	DEFiRet;
+648 #ifdef HAVE_SETNS
+649 	int iErr;
+650 	if(pData-&gt;networkNamespace &amp;&amp; pData-&gt;originalNamespace &gt;= 0) {
+651 		if((iErr = (setns(pData-&gt;originalNamespace, CLONE_NEWNET))) != 0) {
+652 			LogError(0, RS_RET_IO_ERROR, "could not return to original namespace: %s",
+653 				  gai_strerror(iErr));
+654 			ABORT_FINALIZE(RS_RET_IO_ERROR);
+655 		}
+656 		close(pData-&gt;originalNamespace);
+657 		dbgprintf("omfwd: returned to original network namespace\n");
+658 	}
+659 finalize_it:
+660 #endif 	RETiRet;
+661 }
+662 static rsRetVal doTryResume(wrkrInstanceData_t *pWrkrData)
+663 {
+664 	int iErr;
+665 	struct addrinfo *res = NULL;
+666 	struct addrinfo hints;
+667 	instanceData *pData;
+668 	int bBindRequired = 0;
+669 	const char *address;
+670 	DEFiRet;
+671 	if(pWrkrData-&gt;bIsConnected)
+672 		FINALIZE;
+673 	pData = pWrkrData-&gt;pData;
+674 	if(pData-&gt;protocol == FORW_UDP) {
+675 		memset(&amp;hints, 0, sizeof(hints));
+676 		hints.ai_flags = AI_NUMERICSERV;
+677 		hints.ai_family = glbl.GetDefPFFamily(runModConf-&gt;pConf);
+678 		hints.ai_socktype = SOCK_DGRAM;
+679 		if((iErr = (getaddrinfo(pData-&gt;target, pData-&gt;port, &amp;hints, &amp;res))) != 0) {
+680 			LogError(0, RS_RET_SUSPENDED,
+681 				"omfwd: could not get addrinfo for hostname '%s':'%s': %s",
+682 				pData-&gt;target, pData-&gt;port, gai_strerror(iErr));
+683 			ABORT_FINALIZE(RS_RET_SUSPENDED);
+684 		}
+685 		address = pData-&gt;target;
+686 		if(pData-&gt;address) {
+687 			struct addrinfo *addr;
+688 			hints.ai_family = res-&gt;ai_family;
+689 			hints.ai_flags |= AI_PASSIVE;
+690 			iErr = getaddrinfo(pData-&gt;address, pData-&gt;port, &amp;hints, &amp;addr);
+691 			freeaddrinfo(addr);
+692 			if(iErr != 0) {
+693 				LogError(0, RS_RET_SUSPENDED,
+694 					 "omfwd: cannot use bind address '%s' for host '%s': %s",
+695 					 pData-&gt;address, pData-&gt;target, gai_strerror(iErr));
+696 				ABORT_FINALIZE(RS_RET_SUSPENDED);
+697 			}
+698 			bBindRequired = 1;
+699 			address = pData-&gt;address;
+700 		}
+701 		DBGPRINTF("%s found, resuming.\n", pData-&gt;target);
+702 		pWrkrData-&gt;f_addr = res;
+703 		res = NULL;
+704 		if(pWrkrData-&gt;pSockArray == NULL) {
+705 			CHKiRet(changeToNs(pData));
+706 			pWrkrData-&gt;pSockArray = net.create_udp_socket((uchar*)address,
+707 				NULL, bBindRequired, 0, pData-&gt;UDPSendBuf, pData-&gt;ipfreebind, pData-&gt;device);
+708 			CHKiRet(returnToOriginalNs(pData));
+709 		}
+710 		if(pWrkrData-&gt;pSockArray != NULL) {
+711 			pWrkrData-&gt;bIsConnected = 1;
+712 		}
+713 	} else {
+714 		CHKiRet(changeToNs(pData));
+715 		CHKiRet(TCPSendInit((void*)pWrkrData));
+716 		CHKiRet(returnToOriginalNs(pData));
+717 	}
+718 finalize_it:
+719 	DBGPRINTF("omfwd: doTryResume %s iRet %d\n", pWrkrData-&gt;pData-&gt;target, iRet);
+720 	if(res != NULL) {
+721 		freeaddrinfo(res);
+722 	}
+723 	if(iRet != RS_RET_OK) {
+724 		returnToOriginalNs(pData);
+725 		if(pWrkrData-&gt;f_addr != NULL) {
+726 			freeaddrinfo(pWrkrData-&gt;f_addr);
+727 			pWrkrData-&gt;f_addr = NULL;
+728 		}
+729 		iRet = RS_RET_SUSPENDED;
+730 	}
+731 	RETiRet;
+732 }
+733 BEGINtryResume
+734 CODESTARTtryResume
+735 	dbgprintf("omfwd: tryResume: pWrkrData %p\n", pWrkrData);
+736 	iRet = doTryResume(pWrkrData);
+737 ENDtryResume
+738 BEGINbeginTransaction
+739 CODESTARTbeginTransaction
+740 	dbgprintf("omfwd: beginTransaction\n");
+741 	iRet = doTryResume(pWrkrData);
+742 ENDbeginTransaction
+743 static rsRetVal
+744 processMsg(wrkrInstanceData_t *__restrict__ const pWrkrData,
+745 	actWrkrIParams_t *__restrict__ const iparam)
+746 {
+747 	uchar *psz; 	register unsigned l;
+748 	int iMaxLine;
+749 	Bytef *out = NULL; 	instanceData *__restrict__ const pData = pWrkrData-&gt;pData;
+750 	DEFiRet;
+751 	iMaxLine = glbl.GetMaxLine(runModConf-&gt;pConf);
+752 	psz = iparam-&gt;param;
+753 	l = iparam-&gt;lenStr;
+754 	if((int) l &gt; iMaxLine)
+755 		l = iMaxLine;
+756 	if(pData-&gt;compressionMode == COMPRESS_SINGLE_MSG &amp;&amp; (l &gt; CONF_MIN_SIZE_FOR_COMPRESS)) {
+757 		uLongf destLen = iMaxLine + iMaxLine/100 +12; 		uLong srcLen = l;
+758 		int ret;
+759 		CHKmalloc(out = (Bytef*) malloc(destLen));
+760 		out[0] = 'z';
+761 		out[1] = '\0';
+762 		ret = compress2((Bytef*) out+1, &amp;destLen, (Bytef*) psz,
+763 				srcLen, pData-&gt;compressionLevel);
+764 		dbgprintf("Compressing message, length was %d now %d, return state  %d.\n",
+765 			l, (int) destLen, ret);
+766 		if(ret != Z_OK) {
+767 			dbgprintf("Compression failed, sending uncompressed message\n");
+768 		} else if(destLen+1 &lt; l) {
+769 			dbgprintf("there is gain in compression, so we do it\n");
+770 			psz = out;
+771 			l = destLen + 1; 		}
+772 		++destLen;
+773 	}
+774 	if(pData-&gt;protocol == FORW_UDP) {
+775 		CHKiRet(UDPSend(pWrkrData, psz, l));
+776 	} else {
+777 		iRet = tcpclt.Send(pWrkrData-&gt;pTCPClt, pWrkrData, (char *)psz, l);
+778 		if(iRet != RS_RET_OK &amp;&amp; iRet != RS_RET_DEFER_COMMIT &amp;&amp; iRet != RS_RET_PREVIOUS_COMMITTED) {
+779 			LogError(0, iRet, "omfwd: error forwarding via tcp to %s:%s, suspending action",
+780 				pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port);
+781 			DestructTCPInstanceData(pWrkrData);
+782 			iRet = RS_RET_SUSPENDED;
+783 		}
+784 	}
+785 finalize_it:
+786 	free(out); 	RETiRet;
+787 }
+788 BEGINcommitTransaction
+789 	unsigned i;
+790 	char namebuf[264]; CODESTARTcommitTransaction
+791 	CHKiRet(doTryResume(pWrkrData));
+792 	DBGPRINTF(" %s:%s/%s\n", pWrkrData-&gt;pData-&gt;target, pWrkrData-&gt;pData-&gt;port,
+793 		 pWrkrData-&gt;pData-&gt;protocol == FORW_UDP ? "udp" : "tcp");
+794 	if(pWrkrData-&gt;pData-&gt;ratelimiter) {
+795 		snprintf(namebuf, sizeof namebuf, "%s:[%s]:%s",
+796 			pWrkrData-&gt;pData-&gt;protocol == FORW_UDP ? "udp" : "tcp",
+797 			pWrkrData-&gt;pData-&gt;target,
+798 			pWrkrData-&gt;pData-&gt;port);
+799 	}
+800 	for(i = 0 ; i &lt; nParams ; ++i) {
+801 		if(pWrkrData-&gt;pData-&gt;ratelimiter) {
+802 			iRet = ratelimitMsgCount(pWrkrData-&gt;pData-&gt;ratelimiter, 0, namebuf);
+803 			if (iRet == RS_RET_DISCARDMSG) {
+804 				iRet = RS_RET_OK;
+805 				continue;
+806 			} else if (iRet != RS_RET_OK) {
+807 				LogError(0, RS_RET_ERR, "omfwd: error during rate limit : %d.\n",iRet);
+808 			}
+809 		}
+810 		iRet = processMsg(pWrkrData, &amp;actParam(pParams, 1, i, 0));
+811 		if(iRet != RS_RET_OK &amp;&amp; iRet != RS_RET_DEFER_COMMIT &amp;&amp; iRet != RS_RET_PREVIOUS_COMMITTED)
+812 			FINALIZE;
+813 	}
+814 	if(pWrkrData-&gt;offsSndBuf != 0) {
+815 		iRet = TCPSendBuf(pWrkrData, pWrkrData-&gt;sndBuf, pWrkrData-&gt;offsSndBuf, IS_FLUSH);
+816 		pWrkrData-&gt;offsSndBuf = 0;
+817 	}
+818 finalize_it:
+819 ENDcommitTransaction
+820 static rsRetVal
+821 loadTCPSupport(void)
+822 {
+823 	DEFiRet;
+824 	CHKiRet(objUse(netstrms, LM_NETSTRMS_FILENAME));
+825 	CHKiRet(objUse(netstrm, LM_NETSTRMS_FILENAME));
+826 	CHKiRet(objUse(tcpclt, LM_TCPCLT_FILENAME));
+827 finalize_it:
+828 	RETiRet;
+829 }
+830 static rsRetVal
+831 initTCP(wrkrInstanceData_t *pWrkrData)
+832 {
+833 	instanceData *pData;
+834 	DEFiRet;
+835 	pData = pWrkrData-&gt;pData;
+836 	if(pData-&gt;protocol == FORW_TCP) {
+837 		CHKiRet(tcpclt.Construct(&amp;pWrkrData-&gt;pTCPClt));
+838 		CHKiRet(tcpclt.SetResendLastOnRecon(pWrkrData-&gt;pTCPClt, pData-&gt;bResendLastOnRecon));
+839 		CHKiRet(tcpclt.SetSendInit(pWrkrData-&gt;pTCPClt, TCPSendInit));
+840 		CHKiRet(tcpclt.SetSendFrame(pWrkrData-&gt;pTCPClt, TCPSendFrame));
+841 		CHKiRet(tcpclt.SetSendPrepRetry(pWrkrData-&gt;pTCPClt, TCPSendPrepRetry));
+842 		CHKiRet(tcpclt.SetFraming(pWrkrData-&gt;pTCPClt, pData-&gt;tcp_framing));
+843 		CHKiRet(tcpclt.SetFramingDelimiter(pWrkrData-&gt;pTCPClt, pData-&gt;tcp_framingDelimiter));
+844 		CHKiRet(tcpclt.SetRebindInterval(pWrkrData-&gt;pTCPClt, pData-&gt;iRebindInterval));
+845 	}
+846 finalize_it:
+847 	RETiRet;
+848 }
+849 static void
+850 setInstParamDefaults(instanceData *pData)
+851 {
+852 	pData-&gt;tplName = NULL;
+853 	pData-&gt;protocol = FORW_UDP;
+854 	pData-&gt;networkNamespace = NULL;
+855 	pData-&gt;originalNamespace = -1;
+856 	pData-&gt;tcp_framing = TCP_FRAMING_OCTET_STUFFING;
+857 	pData-&gt;tcp_framingDelimiter = '\n';
+858 	pData-&gt;pszStrmDrvr = NULL;
+859 	pData-&gt;pszStrmDrvrAuthMode = NULL;
+860 	pData-&gt;pszStrmDrvrPermitExpiredCerts = NULL;
+861 	pData-&gt;iStrmDrvrMode = 0;
+862 	pData-&gt;iStrmDrvrExtendedCertCheck = 0;
+863 	pData-&gt;iStrmDrvrSANPreference = 0;
+864 	pData-&gt;iStrmTlsVerifyDepth = 0;
+865 	pData-&gt;pszStrmDrvrCAFile = NULL;
+866 	pData-&gt;pszStrmDrvrKeyFile = NULL;
+867 	pData-&gt;pszStrmDrvrCertFile = NULL;
+868 	pData-&gt;iRebindInterval = 0;
+869 	pData-&gt;bKeepAlive = 0;
+870 	pData-&gt;iKeepAliveProbes = 0;
+871 	pData-&gt;iKeepAliveIntvl = 0;
+872 	pData-&gt;iKeepAliveTime = 0;
+873 	pData-&gt;iConErrSkip = 0;
+874 	pData-&gt;gnutlsPriorityString = NULL;
+875 	pData-&gt;bResendLastOnRecon = 0;
+876 	pData-&gt;bSendToAll = -1;  	pData-&gt;iUDPSendDelay = 0;
+877 	pData-&gt;UDPSendBuf = 0;
+878 	pData-&gt;pPermPeers = NULL;
+879 	pData-&gt;compressionLevel = 9;
+880 	pData-&gt;strmCompFlushOnTxEnd = 1;
+881 	pData-&gt;compressionMode = COMPRESS_NEVER;
+882 	pData-&gt;ipfreebind = IPFREEBIND_ENABLED_WITH_LOG;
+883 	pData-&gt;ratelimiter = NULL;
+884 	pData-&gt;ratelimitInterval = 0;
+885 	pData-&gt;ratelimitBurst = 200;
+886 }
+887 static rsRetVal
+888 setupInstStatsCtrs(instanceData *__restrict__ const pData)
+889 {
+890 	uchar ctrName[512];
+891 	DEFiRet;
+892 	snprintf((char*)ctrName, sizeof(ctrName), "%s-%s-%s",
+893 		(pData-&gt;protocol == FORW_TCP) ? "TCP" : "UDP",
+894 		pData-&gt;target, pData-&gt;port);
+895 	ctrName[sizeof(ctrName)-1] = '\0'; 	CHKiRet(statsobj.Construct(&amp;(pData-&gt;stats)));
+896 	CHKiRet(statsobj.SetName(pData-&gt;stats, ctrName));
+897 	CHKiRet(statsobj.SetOrigin(pData-&gt;stats, (uchar*)"omfwd"));
+898 	pData-&gt;sentBytes = 0;
+899 	INIT_ATOMIC_HELPER_MUT64(pData-&gt;mut_sentBytes);
+900 	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("bytes.sent"),
+901 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;sentBytes)));
+902 	CHKiRet(statsobj.ConstructFinalize(pData-&gt;stats));
+903 finalize_it:
+904 	RETiRet;
+905 }
+906 BEGINnewActInst
+907 	struct cnfparamvals *pvals;
+908 	uchar *tplToUse;
+909 	char *cstr;
+910 	int i;
+911 	rsRetVal localRet;
+912 	int complevel = -1;
+913 CODESTARTnewActInst
+914 	DBGPRINTF("newActInst (omfwd)\n");
+915 	pvals = nvlstGetParams(lst, &amp;actpblk, NULL);
+916 	if(pvals == NULL) {
+917 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+918 	}
+919 	if(Debug) {
+920 		dbgprintf("action param blk in omfwd:\n");
+921 		cnfparamsPrint(&amp;actpblk, pvals);
+922 	}
+923 	CHKiRet(createInstance(&amp;pData));
+924 	setInstParamDefaults(pData);
+925 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+926 		if(!pvals[i].bUsed)
+927 			continue;
+928 		if(!strcmp(actpblk.descr[i].name, "target")) {
+929 			pData-&gt;target = es_str2cstr(pvals[i].val.d.estr, NULL);
+930 		} else if(!strcmp(actpblk.descr[i].name, "address")) {
+931 			pData-&gt;address = es_str2cstr(pvals[i].val.d.estr, NULL);
+932 		} else if(!strcmp(actpblk.descr[i].name, "device")) {
+933 			pData-&gt;device = es_str2cstr(pvals[i].val.d.estr, NULL);
+934 		} else if(!strcmp(actpblk.descr[i].name, "port")) {
+935 			pData-&gt;port = es_str2cstr(pvals[i].val.d.estr, NULL);
+936 		} else if(!strcmp(actpblk.descr[i].name, "protocol")) {
+937 			if(!es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"udp", 3)) {
+938 				pData-&gt;protocol = FORW_UDP;
+939 			} else if(!es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"tcp", 3)) {
+940 				localRet = loadTCPSupport();
+941 				if(localRet != RS_RET_OK) {
+942 					LogError(0, localRet, "could not activate network stream modules for TCP "
+943 							"(internal error %d) - are modules missing?", localRet);
+944 					ABORT_FINALIZE(localRet);
+945 				}
+946 				pData-&gt;protocol = FORW_TCP;
+947 			} else {
+948 				uchar *str;
+949 				str = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+950 				LogError(0, RS_RET_INVLD_PROTOCOL,
+951 						"omfwd: invalid protocol \"%s\"", str);
+952 				free(str);
+953 				ABORT_FINALIZE(RS_RET_INVLD_PROTOCOL);
+954 			}
+955 		} else if(!strcmp(actpblk.descr[i].name, "networknamespace")) {
+956 			pData-&gt;networkNamespace = es_str2cstr(pvals[i].val.d.estr, NULL);
+957 		} else if(!strcmp(actpblk.descr[i].name, "tcp_framing")) {
+958 			if(!es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"traditional", 11)) {
+959 				pData-&gt;tcp_framing = TCP_FRAMING_OCTET_STUFFING;
+960 			} else if(!es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"octet-counted", 13)) {
+961 				pData-&gt;tcp_framing = TCP_FRAMING_OCTET_COUNTING;
+962 			} else {
+963 				uchar *str;
+964 				str = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+965 				LogError(0, RS_RET_CNF_INVLD_FRAMING,
+966 						"omfwd: invalid framing \"%s\"", str);
+967 				free(str);
+968 				ABORT_FINALIZE(RS_RET_CNF_INVLD_FRAMING );
+969 			}
+970 		} else if(!strcmp(actpblk.descr[i].name, "rebindinterval")) {
+971 			pData-&gt;iRebindInterval = (int) pvals[i].val.d.n;
+972 		} else if(!strcmp(actpblk.descr[i].name, "keepalive")) {
+973 			pData-&gt;bKeepAlive = (int) pvals[i].val.d.n;
+974 		} else if(!strcmp(actpblk.descr[i].name, "keepalive.probes")) {
+975 			pData-&gt;iKeepAliveProbes = (int) pvals[i].val.d.n;
+976 		} else if(!strcmp(actpblk.descr[i].name, "keepalive.interval")) {
+977 			pData-&gt;iKeepAliveIntvl = (int) pvals[i].val.d.n;
+978 		} else if(!strcmp(actpblk.descr[i].name, "keepalive.time")) {
+979 			pData-&gt;iKeepAliveTime = (int) pvals[i].val.d.n;
+980 		} else if(!strcmp(actpblk.descr[i].name, "conerrskip")) {
+981 			pData-&gt;iConErrSkip = (int) pvals[i].val.d.n;
+982 		} else if(!strcmp(actpblk.descr[i].name, "gnutlsprioritystring")) {
+983 			pData-&gt;gnutlsPriorityString = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+984 		} else if(!strcmp(actpblk.descr[i].name, "streamdriver")) {
+985 			pData-&gt;pszStrmDrvr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+986 		} else if(!strcmp(actpblk.descr[i].name, "streamdrivermode")) {
+987 			pData-&gt;iStrmDrvrMode = pvals[i].val.d.n;
+988 		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.CheckExtendedKeyPurpose")) {
+989 			pData-&gt;iStrmDrvrExtendedCertCheck = pvals[i].val.d.n;
+990 		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.PrioritizeSAN")) {
+991 			pData-&gt;iStrmDrvrSANPreference = pvals[i].val.d.n;
+992 		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.TlsVerifyDepth")) {
+993 			if (pvals[i].val.d.n &gt;= 2) {
+994 				pData-&gt;iStrmTlsVerifyDepth = pvals[i].val.d.n;
+995 			} else {
+996 				parser_errmsg("streamdriver.TlsVerifyDepth must be 2 or higher but is %d",
+997 									(int) pvals[i].val.d.n);
+998 			}
+999 		} else if(!strcmp(actpblk.descr[i].name, "streamdriverauthmode")) {
+1000 			pData-&gt;pszStrmDrvrAuthMode = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+1001 		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.permitexpiredcerts")) {
+1002 			uchar *val = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+1003 			if(   es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"off", 3)
+1004 			   &amp;&amp; es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"on", 2)
+1005 			   &amp;&amp; es_strcasebufcmp(pvals[i].val.d.estr, (uchar*)"warn", 4)
+1006 			  ) {
+1007 				parser_errmsg("streamdriver.permitExpiredCerts must be 'warn', 'off' or 'on' "
+1008 					"but is '%s' - ignoring parameter, using 'off' instead.", val);
+1009 				free(val);
+1010 			} else {
+1011 				pData-&gt;pszStrmDrvrPermitExpiredCerts = val;
+1012 			}
+1013 		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.cafile")) {
+1014 			pData-&gt;pszStrmDrvrCAFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+1015 		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.keyfile")) {
+1016 			pData-&gt;pszStrmDrvrKeyFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+1017 		} else if(!strcmp(actpblk.descr[i].name, "streamdriver.certfile")) {
+1018 			pData-&gt;pszStrmDrvrCertFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+1019 		} else if(!strcmp(actpblk.descr[i].name, "streamdriverpermittedpeers")) {
+1020 			uchar *start, *str;
+1021 			uchar *p;
+1022 			int lenStr;
+1023 			str = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+1024 			start = str;
+1025 			lenStr = ustrlen(start); 			while(lenStr &gt; 0) {
+1026 				p = start;
+1027 				while(*p &amp;&amp; *p != ',' &amp;&amp; lenStr--)
+1028 					p++;
+1029 				if(*p == ',') {
+1030 					*p = '\0';
+1031 				}
+1032 				if(*start == '\0') {
+1033 					DBGPRINTF("omfwd: ignoring empty permitted peer\n");
+1034 				} else {
+1035 					dbgprintf("omfwd: adding permitted peer: '%s'\n", start);
+1036 					CHKiRet(net.AddPermittedPeer(&amp;(pData-&gt;pPermPeers), start));
+1037 				}
+1038 				start = p+1;
+1039 				if(lenStr)
+1040 					--lenStr;
+1041 			}
+1042 			free(str);
+1043 		} else if(!strcmp(actpblk.descr[i].name, "ziplevel")) {
+1044 			complevel = pvals[i].val.d.n;
+1045 			if(complevel &gt;= 0 &amp;&amp; complevel &lt;= 10) {
+1046 				pData-&gt;compressionLevel = complevel;
+1047 				pData-&gt;compressionMode = COMPRESS_SINGLE_MSG;
+1048 			} else {
+1049 				LogError(0, NO_ERRCODE, "Invalid ziplevel %d specified in "
+1050 					 "forwarding action - NOT turning on compression.",
+1051 					 complevel);
+1052 			}
+1053 		} else if(!strcmp(actpblk.descr[i].name, "tcp_framedelimiter")) {
+1054 			if(pvals[i].val.d.n &gt; 255) {
+1055 				parser_errmsg("tcp_frameDelimiter must be below 255 but is %d",
+1056 					(int) pvals[i].val.d.n);
+1057 				ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+1058 			}
+1059 			pData-&gt;tcp_framingDelimiter = (uchar) pvals[i].val.d.n;
+1060 		} else if(!strcmp(actpblk.descr[i].name, "resendlastmsgonreconnect")) {
+1061 			pData-&gt;bResendLastOnRecon = (int) pvals[i].val.d.n;
+1062 		} else if(!strcmp(actpblk.descr[i].name, "udp.sendtoall")) {
+1063 			pData-&gt;bSendToAll = (int) pvals[i].val.d.n;
+1064 		} else if(!strcmp(actpblk.descr[i].name, "udp.senddelay")) {
+1065 			pData-&gt;iUDPSendDelay = (int) pvals[i].val.d.n;
+1066 		} else if(!strcmp(actpblk.descr[i].name, "udp.sendbuf")) {
+1067 			pData-&gt;UDPSendBuf = (int) pvals[i].val.d.n;
+1068 		} else if(!strcmp(actpblk.descr[i].name, "template")) {
+1069 			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+1070 		} else if(!strcmp(actpblk.descr[i].name, "compression.stream.flushontxend")) {
+1071 			pData-&gt;strmCompFlushOnTxEnd = (sbool) pvals[i].val.d.n;
+1072 		} else if(!strcmp(actpblk.descr[i].name, "compression.mode")) {
+1073 			cstr = es_str2cstr(pvals[i].val.d.estr, NULL);
+1074 			if(!strcasecmp(cstr, "stream:always")) {
+1075 				pData-&gt;compressionMode = COMPRESS_STREAM_ALWAYS;
+1076 			} else if(!strcasecmp(cstr, "none")) {
+1077 				pData-&gt;compressionMode = COMPRESS_NEVER;
+1078 			} else if(!strcasecmp(cstr, "single")) {
+1079 				pData-&gt;compressionMode = COMPRESS_SINGLE_MSG;
+1080 			} else {
+1081 				LogError(0, RS_RET_PARAM_ERROR, "omfwd: invalid value for 'compression.mode' "
+1082 					 "parameter (given is '%s')", cstr);
+1083 				free(cstr);
+1084 				ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+1085 			}
+1086 			free(cstr);
+1087 		} else if(!strcmp(actpblk.descr[i].name, "ipfreebind")) {
+1088 			pData-&gt;ipfreebind = (int) pvals[i].val.d.n;
+1089 		} else if(!strcmp(actpblk.descr[i].name, "ratelimit.burst")) {
+1090 			pData-&gt;ratelimitBurst = (unsigned int) pvals[i].val.d.n;
+1091 		} else if(!strcmp(actpblk.descr[i].name, "ratelimit.interval")) {
+1092 			pData-&gt;ratelimitInterval = (unsigned int) pvals[i].val.d.n;
+1093 		} else {
+1094 			LogError(0, RS_RET_INTERNAL_ERROR,
+1095 				"omfwd: program error, non-handled parameter '%s'",
+1096 				actpblk.descr[i].name);
+1097 		}
+1098 	}
+1099 	if(pData-&gt;port == NULL) {
+1100 		CHKmalloc(pData-&gt;port = strdup("514"));
+1101 	}
+1102 	if(complevel != -1) {
+1103 		pData-&gt;compressionLevel = complevel;
+1104 		if(pData-&gt;compressionMode == COMPRESS_NEVER) {
+1105 			pData-&gt;compressionMode = COMPRESS_SINGLE_MSG;
+1106 		}
+1107 	}
+1108 	CODE_STD_STRING_REQUESTnewActInst(1)
+1109 	tplToUse = ustrdup((pData-&gt;tplName == NULL) ? getDfltTpl() : pData-&gt;tplName);
+1110 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, tplToUse, OMSR_NO_RQD_TPL_OPTS));
+1111 	if(pData-&gt;bSendToAll == -1) {
+1112 		pData-&gt;bSendToAll = send_to_all;
+1113 	} else {
+1114 		if(pData-&gt;protocol == FORW_TCP) {
+1115 			LogError(0, RS_RET_PARAM_ERROR, "omfwd: parameter udp.sendToAll "
+1116 					"cannot be used with tcp transport -- ignored");
+1117 		}
+1118 	}
+1119 	if(pData-&gt;address &amp;&amp; (pData-&gt;protocol == FORW_TCP)) {
+1120 		LogError(0, RS_RET_PARAM_ERROR,
+1121 			 "omfwd: parameter \"address\" not supported for tcp -- ignored");
+1122 	}
+1123 	if( pData-&gt;ratelimitInterval &gt; 0) {
+1124 		CHKiRet(ratelimitNew(&amp;pData-&gt;ratelimiter, "omfwd", NULL));
+1125 		ratelimitSetLinuxLike(pData-&gt;ratelimiter, pData-&gt;ratelimitInterval, pData-&gt;ratelimitBurst);
+1126 		ratelimitSetNoTimeCache(pData-&gt;ratelimiter);
+1127 	}
+1128 	setupInstStatsCtrs(pData);
+1129 CODE_STD_FINALIZERnewActInst
+1130 	cnfparamvalsDestruct(pvals, &amp;actpblk);
+1131 ENDnewActInst
+1132 BEGINparseSelectorAct
+1133 	uchar *q;
+1134 	int i;
+1135 	rsRetVal localRet;
+1136 	struct addrinfo;
+1137 	TCPFRAMINGMODE tcp_framing = TCP_FRAMING_OCTET_STUFFING;
+1138 CODESTARTparseSelectorAct
+1139 CODE_STD_STRING_REQUESTparseSelectorAct(1)
+1140 	if(*p != '@')
+1141 		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
+1142 	CHKiRet(createInstance(&amp;pData));
+1143 	pData-&gt;tcp_framingDelimiter = '\n';
+1144 	++p; 	if(*p == '@') { 		localRet = loadTCPSupport();
+1145 		if(localRet != RS_RET_OK) {
+1146 			LogError(0, localRet, "could not activate network stream modules for TCP "
+1147 					"(internal error %d) - are modules missing?", localRet);
+1148 			ABORT_FINALIZE(localRet);
+1149 		}
+1150 		pData-&gt;protocol = FORW_TCP;
+1151 		++p; 	} else {
+1152 		pData-&gt;protocol = FORW_UDP;
+1153 	}
+1154 	if(*p == '(') {
+1155 		do {
+1156 			++p; 			if(*p == 'z') { 				++p; 				if(isdigit((int) *p)) {
+1157 					int iLevel;
+1158 					iLevel = *p - '0';
+1159 					++p; 					pData-&gt;compressionLevel = iLevel;
+1160 					pData-&gt;compressionMode = COMPRESS_SINGLE_MSG;
+1161 				} else {
+1162 					LogError(0, NO_ERRCODE, "Invalid compression level '%c' specified in "
+1163 						 "forwarding action - NOT turning on compression.",
+1164 						 *p);
+1165 				}
+1166 			} else if(*p == 'o') { 				++p; 				tcp_framing = TCP_FRAMING_OCTET_COUNTING;
+1167 			} else { 				LogError(0, NO_ERRCODE, "Invalid option %c in forwarding action - ignoring.", *p);
+1168 				++p; 			}
+1169 			while(*p &amp;&amp; *p != ')' &amp;&amp; *p != ',')
+1170 				++p;			} while(*p &amp;&amp; *p == ','); 		if(*p == ')')
+1171 			++p; 		else
+1172 			LogError(0, NO_ERRCODE, "Option block not terminated in forwarding action.");
+1173 	}
+1174 	if(*p == '[') { 		++p; 		for(q = p ; *p &amp;&amp; *p != ']' ; ++p)
+1175 		if(*p == ']') {
+1176 			*p = '\0'; 			++p; 		}
+1177 	} else { 		for(q = p ; *p &amp;&amp; *p != ';' &amp;&amp; *p != ':' &amp;&amp; *p != '#' ; ++p)
+1178 	}
+1179 	pData-&gt;tcp_framing = tcp_framing;
+1180 	pData-&gt;port = NULL;
+1181 	pData-&gt;networkNamespace = NULL;
+1182 	if(*p == ':') { 		uchar * tmp;
+1183 		*p = '\0'; 		tmp = ++p;
+1184 		for(i=0 ; *p &amp;&amp; isdigit((int) *p) ; ++p, ++i)
+1185 		pData-&gt;port = malloc(i + 1);
+1186 		if(pData-&gt;port == NULL) {
+1187 			LogError(0, NO_ERRCODE, "Could not get memory to store syslog forwarding port, "
+1188 				 "using default port, results may not be what you intend");
+1189 		} else {
+1190 			memcpy(pData-&gt;port, tmp, i);
+1191 			*(pData-&gt;port + i) = '\0';
+1192 		}
+1193 	}
+1194 	if(pData-&gt;port == NULL) {
+1195 		CHKmalloc(pData-&gt;port = strdup("514"));
+1196 	}
+1197 	while(*p &amp;&amp; *p != ';'  &amp;&amp; *p != '#' &amp;&amp; !isspace((int) *p))
+1198 	if(*p == ';' || *p == '#' || isspace(*p)) {
+1199 		uchar cTmp = *p;
+1200 		*p = '\0'; 		CHKmalloc(pData-&gt;target = strdup((char*) q));
+1201 		*p = cTmp;
+1202 	} else {
+1203 		CHKmalloc(pData-&gt;target = strdup((char*) q));
+1204 	}
+1205 	pData-&gt;iRebindInterval = (pData-&gt;protocol == FORW_TCP) ?
+1206 				 cs.iTCPRebindInterval : cs.iUDPRebindInterval;
+1207 	pData-&gt;bKeepAlive = cs.bKeepAlive;
+1208 	pData-&gt;iKeepAliveProbes = cs.iKeepAliveProbes;
+1209 	pData-&gt;iKeepAliveIntvl = cs.iKeepAliveIntvl;
+1210 	pData-&gt;iKeepAliveTime = cs.iKeepAliveTime;
+1211 	pData-&gt;iConErrSkip = cs.iConErrSkip;
+1212 	CHKiRet(cflineParseTemplateName(&amp;p, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS, getDfltTpl()));
+1213 	if(pData-&gt;protocol == FORW_TCP) {
+1214 		pData-&gt;bResendLastOnRecon = cs.bResendLastOnRecon;
+1215 		pData-&gt;iStrmDrvrMode = cs.iStrmDrvrMode;
+1216 		if(cs.pPermPeers != NULL) {
+1217 			pData-&gt;pPermPeers = cs.pPermPeers;
+1218 			cs.pPermPeers = NULL;
+1219 		}
+1220 	}
+1221 CODE_STD_FINALIZERparseSelectorAct
+1222 ENDparseSelectorAct
+1223 static void
+1224 freeConfigVars(void)
+1225 {
+1226 	free(cs.pszStrmDrvr);
+1227 	cs.pszStrmDrvr = NULL;
+1228 	free(cs.pszStrmDrvrAuthMode);
+1229 	cs.pszStrmDrvrAuthMode = NULL;
+1230 	free(cs.pPermPeers);
+1231 	cs.pPermPeers = NULL; }
+1232 BEGINmodExit
+1233 CODESTARTmodExit
+1234 	objRelease(glbl, CORE_COMPONENT);
+1235 	objRelease(net, LM_NET_FILENAME);
+1236 	objRelease(netstrm, LM_NETSTRMS_FILENAME);
+1237 	objRelease(netstrms, LM_NETSTRMS_FILENAME);
+1238 	objRelease(tcpclt, LM_TCPCLT_FILENAME);
+1239 	objRelease(statsobj, CORE_COMPONENT);
+1240 	freeConfigVars();
+1241 ENDmodExit
+1242 BEGINqueryEtryPt
+1243 CODESTARTqueryEtryPt
+1244 CODEqueryEtryPt_STD_OMODTX_QUERIES
+1245 CODEqueryEtryPt_STD_OMOD8_QUERIES
+1246 CODEqueryEtryPt_STD_CONF2_QUERIES
+1247 CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+1248 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+1249 ENDqueryEtryPt
+1250 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
+1251 {
+1252 	freeConfigVars();
+1253 	cs.iStrmDrvrMode = 0;
+1254 	cs.bResendLastOnRecon = 0;
+1255 	cs.iUDPRebindInterval = 0;
+1256 	cs.iTCPRebindInterval = 0;
+1257 	cs.bKeepAlive = 0;
+1258 	cs.iKeepAliveProbes = 0;
+1259 	cs.iKeepAliveIntvl = 0;
+1260 	cs.iKeepAliveTime = 0;
+1261 	cs.iConErrSkip = 0;
+1262 	return RS_RET_OK;
+1263 }
+1264 BEGINmodInit(Fwd)
+1265 CODESTARTmodInit
+1266 INITLegCnfVars
+1267 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+1268 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+1269 	CHKiRet(objUse(net,LM_NET_FILENAME));
+1270 <a name="0"></a>	CHKiRet(objUse(statsobj, CORE_COMPONENT));
+1271 	CHKiRet(regCfSysLineHdlr((uchar *)"actionforwarddefaulttemplate", 0, eCmdHdlrGetWord,
+1272 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		setLegacyDfltTpl, NULL, NULL));
+1273 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcprebindinterval", 0, eCmdHdlrInt,
+1274 		NULL, &amp;cs.iTCPRebindInterval, NULL));
+1275 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendudprebindinterval", 0, eCmdHdlrInt,
+1276 		NULL, &amp;cs.iUDPRebindInterval, NULL));
+1277 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcpkeepalive", 0, eCmdHdlrBinary,
+1278 		NULL, &amp;cs.bKeepAlive, NULL));
+1279 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcpkeepalive_probes", 0, eCmdHdlrInt,
+1280 		NULL, &amp;cs.iKeepAliveProbes, NULL));
+1281 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcpkeepalive_intvl", 0, eCmdHdlrInt,
+1282 		NULL, &amp;cs.iKeepAliveIntvl, NULL));
+1283 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendtcpkeepalive_time", 0, eCmdHdlrInt,
+1284 		NULL, &amp;cs.iKeepAliveTime, NULL));</b></font>
+1285 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdriver", 0, eCmdHdlrGetWord,
+1286 		NULL, &amp;cs.pszStrmDrvr, NULL));
+1287 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdrivermode", 0, eCmdHdlrInt,
+1288 		NULL, &amp;cs.iStrmDrvrMode, NULL));
+1289 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdriverauthmode", 0, eCmdHdlrGetWord,
+1290 		NULL, &amp;cs.pszStrmDrvrAuthMode, NULL));
+1291 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendstreamdriverpermittedpeer", 0, eCmdHdlrGetWord,
+1292 		setPermittedPeer, NULL, NULL));
+1293 	CHKiRet(regCfSysLineHdlr((uchar *)"actionsendresendlastmsgonreconnect", 0, eCmdHdlrBinary,
+1294 		NULL, &amp;cs.bResendLastOnRecon, NULL));
+1295 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler,
+1296 		resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+1297 ENDmodInit
 </pre>
 </div>
 </div>

@@ -44,1401 +44,1401 @@ Matches for imdocker.c &amp; omprog.c
 </h3>
 <hr/>
 <pre>
-#ifdef __sun
-#define _XPG4_2
-#endif
-#include "config.h"
-#include "rsyslog.h"
-#include &lt;stdlib.h&gt;
-#include &lt;stdio.h&gt;
-#include &lt;ctype.h&gt;
-#include &lt;string.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;curl/curl.h&gt;
-#include &lt;json.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;stdbool.h&gt;
-#include "cfsysline.h"  #include "unicode-helper.h"
-#include "module-template.h"
-#include "srUtils.h"    #include "errmsg.h"
-#include "net.h"
-#include "glbl.h"
-#include "msg.h"
-#include "parser.h"
-#include "prop.h"
-#include "debug.h"
-#include "statsobj.h"
-#include "datetime.h"
-#include "ratelimit.h"
-#include "hashtable.h"
-#include "hashtable_itr.h"
-#if !defined(_AIX)
-#pragma GCC diagnostic ignored "-Wswitch-enum"
-#endif
-MODULE_TYPE_INPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("imdocker")
-extern int Debug;
-#define USE_MULTI_LINE
-#undef ENABLE_DEBUG_BYTE_BUFFER
-#define DOCKER_TAG_NAME                     "docker:"
-#define DOCKER_CONTAINER_ID_PARSE_NAME      "Id"
-#define DOCKER_CONTAINER_NAMES_PARSE_NAME   "Names"
-#define DOCKER_CONTAINER_IMAGEID_PARSE_NAME "ImageID"
-#define DOCKER_CONTAINER_CREATED_PARSE_NAME "Created"
-#define DOCKER_CONTAINER_LABELS_PARSE_NAME  "Labels"
-#define DOCKER_CONTAINER_LABEL_KEY_STARTREGEX "imdocker.startregex"
-#define DFLT_pollingInterval   60      #define DFLT_retrieveNewLogsFromStart 1#define DFLT_containersLimit   25      #define DFLT_trimLineOverBytes 4194304 #define DFLT_bEscapeLF         1       
-#define DFLT_SEVERITY pri2sev(LOG_INFO)
-#define DFLT_FACILITY pri2fac(LOG_USER)
-enum {
-	dst_invalid = -1,
-	dst_stdin,
-	dst_stdout,
-	dst_stderr,
-	dst_stream_type_count
-} docker_stream_type_t;
-typedef struct imdocker_buf_s {
-	uchar  *data;
-	size_t len;
-	size_t data_size;
-} imdocker_buf_t;
-typedef struct docker_cont_logs_buf_s {
-	imdocker_buf_t *buf;
-	int8_t         stream_type;
-	size_t         bytes_remaining;
-} docker_cont_logs_buf_t;
-struct docker_cont_logs_inst_s;
-typedef rsRetVal (*submitmsg_funcptr) (struct docker_cont_logs_inst_s *pInst, docker_cont_logs_buf_t *pBufdata,
-		const uchar* pszTag);
-typedef submitmsg_funcptr SubmitMsgFuncPtr;
-typedef struct docker_cont_logs_req_s {
-	CURL     *curl;
-	docker_cont_logs_buf_t* data_bufs[dst_stream_type_count];
-	SubmitMsgFuncPtr submitMsg;
-} docker_cont_logs_req_t;
-typedef struct imdocker_req_s {
-	CURL           *curl;
-	imdocker_buf_t *buf;
-} imdocker_req_t;
-typedef struct docker_container_info_s {
-	uchar *name;
-	uchar *image_id;
-	uint64_t created;
-	uchar *json_str_labels;
-} docker_container_info_t;
-typedef struct docker_cont_logs_inst_s {
-	char *id;
-	char short_id[12];
-	docker_container_info_t *container_info;
-	docker_cont_logs_req_t  *logsReq;
-	uchar *start_regex;
-	regex_t start_preg;  	uint32_t prevSegEnd;
-} docker_cont_logs_inst_t;
-typedef struct docker_cont_log_instances_s {
-	struct hashtable* ht_container_log_insts;
-	pthread_mutex_t mut;
-	CURLM         *curlm;
-	uint64_t last_container_created;
-	uchar   *last_container_id;
-	time_t  time_started;
-} docker_cont_log_instances_t;
-static rsRetVal imdockerBufNew(imdocker_buf_t **ppThis);
-static void imdockerBufDestruct(imdocker_buf_t *pThis);
-static rsRetVal dockerContLogsBufNew(docker_cont_logs_buf_t **ppThis);
-static void dockerContLogsBufDestruct(docker_cont_logs_buf_t *pThis);
-static rsRetVal dockerContLogsBufWrite(docker_cont_logs_buf_t *pThis, const uchar *pdata,
-		size_t write_size);
-static rsRetVal imdockerReqNew(imdocker_req_t **ppThis);
-static void imdockerReqDestruct(imdocker_req_t *pThis);
-static rsRetVal dockerContLogsReqNew(docker_cont_logs_req_t **ppThis, SubmitMsgFuncPtr submitMsg);
-static void dockerContLogsReqDestruct(docker_cont_logs_req_t *pThis);
-static rsRetVal
-dockerContLogsInstNew(docker_cont_logs_inst_t **ppThis, const char* id,
-		docker_container_info_t *container_info, SubmitMsgFuncPtr submitMsg);
-static void dockerContLogsInstDestruct(docker_cont_logs_inst_t *pThis);
-static rsRetVal dockerContLogsInstSetUrlById (sbool isInit, docker_cont_logs_inst_t *pThis,
-		CURLM *curlm, const char* containerId);
-static rsRetVal dockerContLogReqsNew(docker_cont_log_instances_t **ppThis);
-static rsRetVal dockerContLogReqsDestruct(docker_cont_log_instances_t *pThis);
-static rsRetVal dockerContLogReqsGet(docker_cont_log_instances_t *pThis,
-		docker_cont_logs_inst_t** ppContLogsInst, const char *id);
-static rsRetVal dockerContLogReqsPrint(docker_cont_log_instances_t *pThis);
-static rsRetVal dockerContLogReqsAdd(docker_cont_log_instances_t *pThis,
-		docker_cont_logs_inst_t *pContLogsReqInst);
-static rsRetVal dockerContLogReqsRemove(docker_cont_log_instances_t *pThis, const char *id);
-static rsRetVal dockerContainerInfoNew(docker_container_info_t **pThis);
-static void dockerContainerInfoDestruct(docker_container_info_t *pThis);
-static CURLcode docker_get(imdocker_req_t *req, const char* url);
-static char* dupDockerContainerName(const char* pname);
-static rsRetVal SubmitMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData,
-		const uchar* pszTag);
-static rsRetVal
-SubmitMsg2(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag);
-static size_t imdocker_container_list_curlCB(void *data, size_t size, size_t nmemb, void *buffer);
-static size_t imdocker_container_logs_curlCB(void *data, size_t size, size_t nmemb, void *buffer);
-static sbool get_stream_info(const uchar* data, size_t size, int8_t *stream_type, size_t *payload_size);
-static int8_t is_valid_stream_type(int8_t stream_type);
-DEF_IMOD_STATIC_DATA
-DEFobjCurrIf(glbl)
-DEFobjCurrIf(prop)
-DEFobjCurrIf(parser)
-DEFobjCurrIf(datetime)
-DEFobjCurrIf(statsobj)
-statsobj_t *modStats;
-STATSCOUNTER_DEF(ctrSubmit, mutCtrSubmit)
-STATSCOUNTER_DEF(ctrLostRatelimit, mutCtrLostRatelimit)
-STATSCOUNTER_DEF(ctrCurlError, mutCtrCurlError)
-const char* DFLT_dockerAPIUnixSockAddr  = "/var/run/docker.sock";
-const char* DFLT_dockerAPIAdd           = "http://localhost:2375";
-const char* DFLT_apiVersionStr          = "v1.27";
-const char* DFLT_listContainersOptions  = "";
-const char* DFLT_getContainerLogOptions = "timestamps=0&amp;follow=1&amp;stdout=1&amp;stderr=1&amp;tail=1";
-const char* DFLT_getContainerLogOptionsWithoutTail = "timestamps=0&amp;follow=1&amp;stdout=1&amp;stderr=1";
-struct modConfData_s {
-	rsconf_t *pConf;  	uchar    *apiVersionStr;
-	uchar    *listContainersOptions;
-	uchar    *getContainerLogOptions;
-	uchar    *getContainerLogOptionsWithoutTail;
-	int      iPollInterval;  	uchar    *dockerApiUnixSockAddr;
-	uchar    *dockerApiAddr;
-	sbool    retrieveNewLogsFromStart;
-	int      containersLimit;
-	int      trimLineOverBytes;
-	int      iDfltSeverity;
-	int      iDfltFacility;
-	sbool    bEscapeLf;
-};
-static modConfData_t *loadModConf = NULL;
-static modConfData_t *runModConf = NULL;
-static prop_t *pInputName = NULL;   static prop_t *pLocalHostIP = NULL; 
-static ratelimit_t *ratelimiter = NULL;
-<a name="0"></a>
-static struct cnfparamdescr modpdescr[] = {
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "apiversionstr", eCmdHdlrString, 0 },
-	{ "dockerapiunixsockaddr", eCmdHdlrString, 0 },
-	{ "dockerapiaddr", eCmdHdlrString, 0 },
-	{ "listcontainersoptions", eCmdHdlrString, 0 },
-	{ "getcontainerlogoptions", eCmdHdlrString, 0 },
-	{ "pollinginterval", eCmdHdlrPositiveInt, 0 },
-	{ "retrievenewlogsfromstart", eCmdHdlrBinary, 0 },
-	{ "trimlineoverbytes", eCmdHdlrPositiveInt, 0 },
-	{ "defaultseverity", eCmdHdlrSeverity, 0 },
-	{ "defaultfacility", eCmdHdlrFacility, 0 },
-	{ "escapelf", eCmdHdlrBinary, 0 },
-};
-static struct cnfparamblk modpblk =
-	{ CNFPARAMBLK_VERSION,
-		sizeof(modpdescr)/sizeof(struct cnfparamdescr),
-		modpdescr
-	};
-static int bLegacyCnfModGlobalsPermitted; 
-static rsRetVal
-imdockerBufNew(imdocker_buf_t **ppThis) {
-	DEFiRet;
-	imdocker_buf_t *pThis = (imdocker_buf_t*) calloc(1, sizeof(imdocker_buf_t));
-	if (!pThis) { return RS_RET_OUT_OF_MEMORY; }
-	*ppThis = pThis;
-	RETiRet;
-}
-static void
-imdockerBufDestruct(imdocker_buf_t *pThis) {
-	if (pThis) {
-		if (pThis-&gt;data) {
-			free(pThis-&gt;data);
-			pThis-&gt;data = NULL;
-		}
-		free(pThis);
-	}
-}
-static rsRetVal
-dockerContLogsBufNew(docker_cont_logs_buf_t **ppThis) {
-	DEFiRet;
-	docker_cont_logs_buf_t *pThis = (docker_cont_logs_buf_t*) calloc(1, sizeof(docker_cont_logs_buf_t));
-	if (pThis &amp;&amp; (iRet = imdockerBufNew(&amp;pThis-&gt;buf)) == RS_RET_OK) {
-		pThis-&gt;stream_type = dst_invalid;
-		pThis-&gt;bytes_remaining = 0;
-		*ppThis = pThis;
-	} else {
-		dockerContLogsBufDestruct(pThis);
-	}
-	RETiRet;
-}
-static void
-dockerContLogsBufDestruct(docker_cont_logs_buf_t *pThis) {
-	if (pThis) {
-		if (pThis-&gt;buf) {
-			imdockerBufDestruct(pThis-&gt;buf);
-		}
-		free(pThis);
-	}
-}
-static rsRetVal
-dockerContLogsBufWrite(docker_cont_logs_buf_t *const pThis, const uchar *const pdata, const size_t write_size) {
-	DEFiRet;
-	imdocker_buf_t *const mem = pThis-&gt;buf;
-	if (mem-&gt;len + write_size + 1 &gt; mem-&gt;data_size) {
-		uchar *const pbuf = realloc(mem-&gt;data, mem-&gt;len + write_size + 1);
-		if(pbuf == NULL) {
-			LogError(errno, RS_RET_ERR, "%s() - realloc failed!\n", __FUNCTION__);
-			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-		}
-		mem-&gt;data = pbuf;
-		mem-&gt;data_size = mem-&gt;len+ write_size + 1;
-	}
-	memcpy(&amp;(mem-&gt;data[mem-&gt;len]), pdata, write_size);
-	mem-&gt;len += write_size;
-	mem-&gt;data[mem-&gt;len] = '\0';
-	if (write_size &gt; pThis-&gt;bytes_remaining) {
-		pThis-&gt;bytes_remaining = 0;
-	} else {
-		pThis-&gt;bytes_remaining -= write_size;
-	}
-finalize_it:
-	RETiRet;
-}
-rsRetVal imdockerReqNew(imdocker_req_t **ppThis) {
-	DEFiRet;
-	imdocker_req_t *pThis = (imdocker_req_t*) calloc(1, sizeof(imdocker_req_t));
-	CHKmalloc(pThis);
-	pThis-&gt;curl = curl_easy_init();
-	if (!pThis-&gt;curl) {
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	CHKiRet(imdockerBufNew(&amp;(pThis-&gt;buf)));
-	*ppThis = pThis;
-finalize_it:
-	if (iRet != RS_RET_OK &amp;&amp; pThis) {
-		imdockerReqDestruct(pThis);
-	}
-	RETiRet;
-}
-void imdockerReqDestruct(imdocker_req_t *pThis) {
-	if (pThis) {
-		if (pThis-&gt;buf) {
-			imdockerBufDestruct(pThis-&gt;buf);
-		}
-		if (pThis-&gt;curl) {
-			curl_easy_cleanup(pThis-&gt;curl);
-			pThis-&gt;curl = NULL;
-		}
-		free(pThis);
-	}
-}
-static rsRetVal
-dockerContLogsReqNew(docker_cont_logs_req_t **ppThis, SubmitMsgFuncPtr submitMsg) {
-	DEFiRet;
-	docker_cont_logs_req_t *pThis = (docker_cont_logs_req_t*) calloc(1, sizeof(docker_cont_logs_req_t));
-	CHKmalloc(pThis);
-	pThis-&gt;submitMsg = submitMsg;
-	pThis-&gt;curl = curl_easy_init();
-	if (!pThis-&gt;curl) {
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	for (int i = 0; i &lt; dst_stream_type_count; i ++) {
-		CHKiRet(dockerContLogsBufNew(&amp;pThis-&gt;data_bufs[i]));
-	}
-	*ppThis = pThis;
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		if (pThis) {
-			dockerContLogsReqDestruct(pThis);
-		}
-	}
-	RETiRet;
-}
-static void
-dockerContLogsReqDestruct(docker_cont_logs_req_t *pThis) {
-	if (pThis) {
-		for (int i = 0; i &lt; dst_stream_type_count; i++) {
-			dockerContLogsBufDestruct(pThis-&gt;data_bufs[i]);
-		}
-		if (pThis-&gt;curl) {
-			curl_easy_cleanup(pThis-&gt;curl);
-			pThis-&gt;curl=NULL;
-		}
-		free(pThis);
-	}
-}
-static rsRetVal
-dockerContLogsInstPrint(docker_cont_logs_inst_t * pThis) {
-	DEFiRet;
-	DBGPRINTF("\t container id: %s\n", pThis-&gt;id);
-	char* pUrl = NULL;
-	curl_easy_getinfo(pThis-&gt;logsReq-&gt;curl, CURLINFO_EFFECTIVE_URL, &amp;pUrl);
-	DBGPRINTF("\t container url: %s\n", pUrl);
-	RETiRet;
-}
-static void
-dockerContLogsInstDestruct(docker_cont_logs_inst_t *pThis) {
-	if (pThis) {
-		if (pThis-&gt;id) {
-			free((void*)pThis-&gt;id);
-		}
-		if (pThis-&gt;container_info) {
-			dockerContainerInfoDestruct(pThis-&gt;container_info);
-		}
-		if (pThis-&gt;logsReq) {
-			dockerContLogsReqDestruct(pThis-&gt;logsReq);
-		}
-		if (pThis-&gt;start_regex) {
-			free(pThis-&gt;start_regex);
-			regfree(&amp;pThis-&gt;start_preg);
-		}
-		free(pThis);
-	}
-}
-static rsRetVal
-parseLabels(docker_cont_logs_inst_t *inst, const uchar* json) {
-	DEFiRet;
-	DBGPRINTF("%s() - parsing json=%s\n", __FUNCTION__, json);
-	struct fjson_object *json_obj = fjson_tokener_parse((const char*)json);
-	struct fjson_object_iterator it = fjson_object_iter_begin(json_obj);
-	struct fjson_object_iterator itEnd = fjson_object_iter_end(json_obj);
-	while (!fjson_object_iter_equal(&amp;it, &amp;itEnd)) {
-		if (Debug) {
-			DBGPRINTF("%s - \t%s: '%s'\n",
-					__FUNCTION__,
-					fjson_object_iter_peek_name(&amp;it),
-					fjson_object_get_string(fjson_object_iter_peek_value(&amp;it)));
-		}
-		if (strcmp(fjson_object_iter_peek_name(&amp;it), DOCKER_CONTAINER_LABEL_KEY_STARTREGEX) == 0) {
-			inst-&gt;start_regex = (uchar*)strdup(fjson_object_get_string(fjson_object_iter_peek_value(&amp;it)));
-			int err = regcomp(&amp;inst-&gt;start_preg, fjson_object_get_string(fjson_object_iter_peek_value(&amp;it)),
-					REG_EXTENDED);
-			if (err != 0) {
-				char errbuf[512];
-				regerror(err, &amp;inst-&gt;start_preg, errbuf, sizeof(errbuf));
-				LogError(0, err, "%s() - error in startregex compile: %s", __FUNCTION__, errbuf);
-				ABORT_FINALIZE(RS_RET_ERR);
-			}
-		}
-		fjson_object_iter_next(&amp;it);
-	}
-finalize_it:
-	if (json_obj) {
-		json_object_put(json_obj);
-	}
-	RETiRet;
-}
-static rsRetVal
-dockerContLogsInstNew(docker_cont_logs_inst_t **ppThis, const char* id,
-		docker_container_info_t *container_info, SubmitMsgFuncPtr submitMsg) {
-	DEFiRet;
-	docker_cont_logs_inst_t *pThis = NULL;
-	CHKmalloc(pThis = calloc(1, sizeof(docker_cont_logs_inst_t)));
-	pThis-&gt;id = strdup((char*)id);
-	strncpy((char*) pThis-&gt;short_id, id, sizeof(pThis-&gt;short_id)-1);
-	CHKiRet(dockerContLogsReqNew(&amp;pThis-&gt;logsReq, submitMsg));
-	if (container_info) {
-		CHKiRet(dockerContainerInfoNew(&amp;pThis-&gt;container_info));
-		if (container_info-&gt;image_id) {
-			pThis-&gt;container_info-&gt;image_id = (uchar*)strdup((char*)container_info-&gt;image_id);
-		}
-		if (container_info-&gt;name) {
-			const char *pname = (const char*)container_info-&gt;name;
-			pThis-&gt;container_info-&gt;name = (uchar*)dupDockerContainerName(pname);
-		}
-		if (container_info-&gt;json_str_labels) {
-			pThis-&gt;container_info-&gt;json_str_labels =
-				(uchar*)strdup((char*)container_info-&gt;json_str_labels);
-		}
-		pThis-&gt;container_info-&gt;created = container_info-&gt;created;
-	}
-	pThis-&gt;start_regex = NULL;
-	pThis-&gt;prevSegEnd = 0;
-	if (pThis-&gt;container_info &amp;&amp; pThis-&gt;container_info-&gt;json_str_labels) {
-		parseLabels(pThis, pThis-&gt;container_info-&gt;json_str_labels);
-	}
-	*ppThis = pThis;
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		if (pThis) {
-			dockerContLogsInstDestruct(pThis);
-		}
-	}
-	RETiRet;
-}
-static rsRetVal
-dockerContLogsInstSetUrl(docker_cont_logs_inst_t *pThis, CURLM *curlm, const char* pUrl) {
-	DEFiRet;
-	CURLcode ccode = CURLE_OK;
-	CURLMcode mcode = CURLM_OK;
-	if (curlm) {
-		docker_cont_logs_req_t *req = pThis-&gt;logsReq;
-		if (!runModConf-&gt;dockerApiAddr) {
-			ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_UNIX_SOCKET_PATH,
-					runModConf-&gt;dockerApiUnixSockAddr);
-			if (ccode != CURLE_OK) {
-				LogError(0, RS_RET_ERR,
-						"imdocker: curl_easy_setopt(CURLOPT_UNIX_SOCKET_PATH) error - %d:%s\n",
-						ccode, curl_easy_strerror(ccode));
-				ABORT_FINALIZE(RS_RET_ERR);
-			}
-		}
-		ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_WRITEFUNCTION, imdocker_container_logs_curlCB);
-		if (ccode != CURLE_OK) {
-				LogError(0, RS_RET_ERR,
-						"imdocker: curl_easy_setopt(CURLOPT_WRITEFUNCTION) error - %d:%s\n",
-						ccode, curl_easy_strerror(ccode));
-				ABORT_FINALIZE(RS_RET_ERR);
-		}
-		ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_WRITEDATA, pThis);
-		if (ccode != CURLE_OK) {
-				LogError(0, RS_RET_ERR, "imdocker: curl_easy_setopt(CURLOPT_WRITEDATA) error - %d:%s\n",
-						ccode, curl_easy_strerror(ccode));
-				ABORT_FINALIZE(RS_RET_ERR);
-		}
-		ccode = curl_easy_setopt(pThis-&gt;logsReq-&gt;curl, CURLOPT_URL, pUrl);
-		if (ccode != CURLE_OK) {
-			LogError(0, RS_RET_ERR, "imdocker: could not set url - %d:%s\n",
-					ccode, curl_easy_strerror(ccode));
-			ABORT_FINALIZE(RS_RET_ERR);
-		}
-		ccode = curl_easy_setopt(pThis-&gt;logsReq-&gt;curl, CURLOPT_PRIVATE, pThis-&gt;id);
-		if (ccode != CURLE_OK) {
-			LogError(0, RS_RET_ERR, "imdocker: could not set private data - %d:%s\n",
-					ccode, curl_easy_strerror(ccode));
-			ABORT_FINALIZE(RS_RET_ERR);
-		}
-		mcode = curl_multi_add_handle(curlm, pThis-&gt;logsReq-&gt;curl);
-		if (mcode != CURLM_OK) {
-			LogError(0, RS_RET_ERR, "imdocker: error curl_multi_add_handle ret- %d:%s\n",
-					mcode, curl_multi_strerror(mcode));
-			ABORT_FINALIZE(RS_RET_ERR);
-		}
-	}
-finalize_it:
-	if (ccode != CURLE_OK) {
-		STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
-	}
-	RETiRet;
-}
-static rsRetVal
-dockerContLogsInstSetUrlById (sbool isInit, docker_cont_logs_inst_t *pThis, CURLM *curlm,
-		const char* containerId) {
-	char url[256];
-	const uchar* container_log_options = runModConf-&gt;getContainerLogOptionsWithoutTail;
-	if (isInit || !runModConf-&gt;retrieveNewLogsFromStart) {
-		container_log_options = runModConf-&gt;getContainerLogOptions;
-	}
-	const uchar* pApiAddr = (uchar*)"http:";
-	if (runModConf-&gt;dockerApiAddr) {
-		pApiAddr = runModConf-&gt;dockerApiAddr;
-	}
-	snprintf(url, sizeof(url), "%s/%s/containers/%s/logs?%s",
-			pApiAddr, runModConf-&gt;apiVersionStr, containerId, container_log_options);
-	DBGPRINTF("%s() - url: %s\n", __FUNCTION__, url);
-	return dockerContLogsInstSetUrl(pThis, curlm, url);
-}
-static void
-dockerContLogReqsDestructForHashtable(void *pData) {
-	docker_cont_logs_inst_t *pThis = (docker_cont_logs_inst_t *) pData;
-	dockerContLogsInstDestruct(pThis);
-}
-static rsRetVal
-dockerContLogReqsNew(docker_cont_log_instances_t **ppThis) {
-	DEFiRet;
-	docker_cont_log_instances_t *pThis = calloc(1, sizeof(docker_cont_log_instances_t));
-	CHKmalloc(pThis);
-	CHKmalloc(pThis-&gt;ht_container_log_insts =
-			create_hashtable(7, hash_from_string, key_equals_string,
-				dockerContLogReqsDestructForHashtable));
-	CHKiConcCtrl(pthread_mutex_init(&amp;pThis-&gt;mut, NULL));
-	pThis-&gt;curlm = curl_multi_init();
-	if (!pThis-&gt;curlm) {
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	*ppThis = pThis;
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		if (pThis) {
-			dockerContLogReqsDestruct(pThis);
-		}
-	}
-	RETiRet;
-}
-static rsRetVal
-dockerContLogReqsDestruct(docker_cont_log_instances_t *pThis) {
-	DEFiRet;
-	if (pThis) {
-		if (pThis-&gt;ht_container_log_insts) {
-			pthread_mutex_lock(&amp;pThis-&gt;mut);
-			hashtable_destroy(pThis-&gt;ht_container_log_insts, 1);
-			pthread_mutex_unlock(&amp;pThis-&gt;mut);
-		}
-		if (pThis-&gt;last_container_id) {
-			free(pThis-&gt;last_container_id);
-		}
-		curl_multi_cleanup(pThis-&gt;curlm);
-		pthread_mutex_destroy(&amp;pThis-&gt;mut);
-		free(pThis);
-	}
-	RETiRet;
-}
-static rsRetVal
-dockerContLogReqsGet(docker_cont_log_instances_t *pThis,
-		docker_cont_logs_inst_t** ppContLogsInst, const char *id) {
-	DEFiRet;
-	if (ppContLogsInst &amp;&amp; id) {
-		docker_cont_logs_inst_t *pSearchObj = hashtable_search(pThis-&gt;ht_container_log_insts, (void*)id);
-		if (!pSearchObj) {
-			return RS_RET_NOT_FOUND;
-		}
-		*ppContLogsInst = pSearchObj;
-	}
-	RETiRet;
-}
-static rsRetVal
-dockerContLogReqsPrint(docker_cont_log_instances_t *pThis) {
-	DEFiRet;
-	int count = 0;
-	count = hashtable_count(pThis-&gt;ht_container_log_insts);
-	if (count) {
-		int ret = 0;
-		struct hashtable_itr *itr = hashtable_iterator(pThis-&gt;ht_container_log_insts);
-		DBGPRINTF("%s() - All container instances, count=%d...\n", __FUNCTION__, count);
-		do {
-			docker_cont_logs_inst_t *pObj = hashtable_iterator_value(itr);
-			dockerContLogsInstPrint(pObj);
-			ret = hashtable_iterator_advance(itr);
-		} while (ret);
-		free (itr);
-		DBGPRINTF("End of container instances.\n");
-	}
-	RETiRet;
-}
-static rsRetVal
-dockerContLogReqsAdd(docker_cont_log_instances_t *pThis,
-		docker_cont_logs_inst_t *pContLogsReqInst)
-{
-	DEFiRet;
-	if (!pContLogsReqInst) {
-		return RS_RET_ERR;
-	}
-	uchar *keyName = (uchar*)strdup((char*)pContLogsReqInst-&gt;id);
-	if (keyName) {
-		docker_cont_logs_inst_t *pFind;
-		if (RS_RET_NOT_FOUND == dockerContLogReqsGet(pThis, &amp;pFind, (void*)keyName)) {
-			if (!hashtable_insert(pThis-&gt;ht_container_log_insts, keyName, pContLogsReqInst)) {
-				ABORT_FINALIZE(RS_RET_ERR);
-			}
-			keyName = NULL;
-		}
-	}
-finalize_it:
-	free(keyName);
-	RETiRet;
-}
-static rsRetVal
-dockerContLogReqsRemove(docker_cont_log_instances_t *pThis, const char *id) {
-	DEFiRet;
-	if (pThis &amp;&amp; id) {
-		CHKiConcCtrl(pthread_mutex_lock(&amp;pThis-&gt;mut));
-		docker_cont_logs_inst_t *pRemoved =
-			hashtable_remove(pThis-&gt;ht_container_log_insts, (void*)id);
-		pthread_mutex_unlock(&amp;pThis-&gt;mut);
-		if (pRemoved) {
-			dockerContLogsInstDestruct(pRemoved);
-		} else {
-			iRet = RS_RET_NOT_FOUND;
-		}
-	}
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-dockerContainerInfoNew(docker_container_info_t **ppThis) {
-	DEFiRet;
-	docker_container_info_t* pThis = calloc(1, sizeof(docker_container_info_t));
-	CHKmalloc(pThis);
-	*ppThis = pThis;
-finalize_it:
-	RETiRet;
-}
-static void
-dockerContainerInfoDestruct(docker_container_info_t *pThis) {
-	if (pThis) {
-		if (pThis-&gt;image_id) { free(pThis-&gt;image_id); }
-		if (pThis-&gt;name) { free(pThis-&gt;name); }
-		if (pThis-&gt;json_str_labels) { free(pThis-&gt;json_str_labels); }
-		free(pThis);
-	}
-}
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	dbgprintf("imdocker: beginCnfLoad\n");
-	loadModConf = pModConf;
-	pModConf-&gt;pConf = pConf;
-	loadModConf-&gt;iPollInterval     = DFLT_pollingInterval; 	loadModConf-&gt;retrieveNewLogsFromStart  = DFLT_retrieveNewLogsFromStart;
-	loadModConf-&gt;containersLimit   = DFLT_containersLimit;
-	loadModConf-&gt;trimLineOverBytes = DFLT_trimLineOverBytes;
-	loadModConf-&gt;bEscapeLf         = DFLT_bEscapeLF;
-	loadModConf-&gt;apiVersionStr          = NULL;
-	loadModConf-&gt;dockerApiUnixSockAddr  = NULL;
-	loadModConf-&gt;dockerApiAddr          = NULL;
-	loadModConf-&gt;listContainersOptions  = NULL;
-	loadModConf-&gt;getContainerLogOptions = NULL;
-	loadModConf-&gt;getContainerLogOptionsWithoutTail = NULL;
-	loadModConf-&gt;iDfltFacility = DFLT_FACILITY;
-	loadModConf-&gt;iDfltSeverity = DFLT_SEVERITY;
-ENDbeginCnfLoad
-BEGINsetModCnf
-	struct cnfparamvals *pvals = NULL;
-	int i;
-CODESTARTsetModCnf
-	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
-	if(pvals == NULL) {
-		LogError(0, RS_RET_MISSING_CNFPARAMS, "error processing module "
-				"config parameters [module(...)]");
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-	if (Debug) {
-		dbgprintf("module (global) param blk for imdocker:\n");
-		cnfparamsPrint(&amp;modpblk, pvals);
-	}
-	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
-		dbgprintf("%s() - iteration %d\n", __FUNCTION__,i);
-		dbgprintf("%s() - modpblk descr: %s\n", __FUNCTION__, modpblk.descr[i].name);
-		if(!pvals[i].bUsed)
-<a name="1"></a>			continue;
-		if(!strcmp(modpblk.descr[i].name, "pollinginterval")) {
-			loadModConf-&gt;iPollInterval = (int) pvals[i].val.d.n;
-<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		} else if(!strcmp(modpblk.descr[i].name, "containterlimit")) {
-			loadModConf-&gt;containersLimit = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "trimlineoverbytes")) {
-			loadModConf-&gt;trimLineOverBytes = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "listcontainersoptions")) {
-			loadModConf-&gt;listContainersOptions = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(modpblk.descr[i].name, "getcontainerlogoptions")) {
-			loadModConf-&gt;getContainerLogOptions = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
-			size_t offset = 0;
-			char buf[256];
-			size_t buf_size = sizeof(buf);
-			strncpy(buf, (char*)loadModConf-&gt;getContainerLogOptions, buf_size-1);
-			size_t option_str_len = strlen((char*)loadModConf-&gt;getContainerLogOptions);
-			uchar *option_str = calloc(1, option_str_len);
-			CHKmalloc(option_str);
-			const char *search_str = "tail=";
-			size_t search_str_len = strlen(search_str);
-			char *token = strtok(buf, "&amp;");
-			while (token != NULL) {
-				if (strncmp(token, search_str, search_str_len) == 0) {
-					token = strtok(NULL, "&amp;");
-					continue;
-				}
-				int len = strlen(token);
-				if (offset + len + 1 &gt;= option_str_len) {
-					break;
-				}
-				int bytes = snprintf((char*)option_str + offset,
-						(option_str_len - offset), "%s&amp;", token);
-				if (bytes &lt;= 0) {
-					break;
-				}
-				offset += bytes;
-				token = strtok(NULL, "&amp;");
-			}
-			loadModConf-&gt;getContainerLogOptionsWithoutTail = option_str;
-		} else if(!strcmp(modpblk.descr[i].name, "dockerapiunixsockaddr")) {
-			loadModConf-&gt;dockerApiUnixSockAddr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(modpblk.descr[i].name, "dockerapiaddr")) {
-			loadModConf-&gt;dockerApiAddr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(modpblk.descr[i].name, "apiversionstr")) {
-<a name="3"></a>			loadModConf-&gt;apiVersionStr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(modpblk.descr[i].name, "retrievenewlogsfromstart")) {
-			loadModConf-&gt;retrieveNewLogsFromStart = (sbool) pvals[i].val.d.n;
-<font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		} else if (!strcmp(modpblk.descr[i].name, "defaultseverity")) {
-			loadModConf-&gt;iDfltSeverity = (int) pvals[i].val.d.n;
-		} else if (!strcmp(modpblk.descr[i].name, "defaultfacility")) {
-			loadModConf-&gt;iDfltFacility = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "escapelf")) {
-			loadModConf-&gt;bEscapeLf = (sbool) pvals[i].val.d.n;</b></font>
-		} else {
-			LogError(0, RS_RET_INVALID_PARAMS,
-					"imdocker: program error, non-handled "
-					"param '%s' in setModCnf\n", modpblk.descr[i].name);
-		}
-	}
-	bLegacyCnfModGlobalsPermitted = 0;
-finalize_it:
-	if(pvals != NULL)
-		cnfparamvalsDestruct(pvals, &amp;modpblk);
-ENDsetModCnf
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-ENDendCnfLoad
-BEGINcheckCnf
-CODESTARTcheckCnf
-ENDcheckCnf
-BEGINactivateCnf
-CODESTARTactivateCnf
-	if (!loadModConf-&gt;dockerApiUnixSockAddr) {
-		loadModConf-&gt;dockerApiUnixSockAddr = (uchar*) strdup(DFLT_dockerAPIUnixSockAddr);
-	}
-	if (!loadModConf-&gt;apiVersionStr) {
-		loadModConf-&gt;apiVersionStr = (uchar*) strdup(DFLT_apiVersionStr);
-	}
-	if (!loadModConf-&gt;listContainersOptions) {
-		loadModConf-&gt;listContainersOptions = (uchar*) strdup(DFLT_listContainersOptions);
-	}
-	if (!loadModConf-&gt;getContainerLogOptions) {
-		loadModConf-&gt;getContainerLogOptions = (uchar*) strdup(DFLT_getContainerLogOptions);
-	}
-if (!loadModConf-&gt;getContainerLogOptionsWithoutTail) {
-		loadModConf-&gt;getContainerLogOptionsWithoutTail =
-			(uchar*) strdup(DFLT_getContainerLogOptionsWithoutTail);
-	}
-	runModConf = loadModConf;
-	CHKiRet(statsobj.Construct(&amp;modStats));
-	CHKiRet(statsobj.SetName(modStats, UCHAR_CONSTANT("imdocker")));
-	CHKiRet(statsobj.SetOrigin(modStats, UCHAR_CONSTANT("imdocker")));
-	STATSCOUNTER_INIT(ctrSubmit, mutCtrSubmit);
-	CHKiRet(statsobj.AddCounter(modStats, UCHAR_CONSTANT("submitted"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;ctrSubmit));
-	STATSCOUNTER_INIT(ctrLostRatelimit, mutCtrLostRatelimit);
-	CHKiRet(statsobj.AddCounter(modStats, UCHAR_CONSTANT("ratelimit.discarded"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;ctrLostRatelimit));
-	STATSCOUNTER_INIT(ctrCurlError, mutCtrCurlError);
-	CHKiRet(statsobj.AddCounter(modStats, UCHAR_CONSTANT("curl.errors"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;ctrCurlError));
-	CHKiRet(statsobj.ConstructFinalize(modStats));
-finalize_it:
-ENDactivateCnf
-<a name="2"></a>
-BEGINfreeCnf
-CODESTARTfreeCnf
-<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if (loadModConf-&gt;dockerApiUnixSockAddr) {
-		free(loadModConf-&gt;dockerApiUnixSockAddr);
-	}
-	if (loadModConf-&gt;dockerApiAddr) {
-		free(loadModConf-&gt;dockerApiAddr);
-	}
-	if (loadModConf-&gt;apiVersionStr) {
-		free(loadModConf-&gt;apiVersionStr);
-	}
-	if (loadModConf-&gt;getContainerLogOptions) {
-		free(loadModConf-&gt;getContainerLogOptions);
-	}
-	if (loadModConf-&gt;getContainerLogOptionsWithoutTail) {
-		free(loadModConf-&gt;getContainerLogOptionsWithoutTail);
-	}
-	if (loadModConf-&gt;listContainersOptions) {
-		free(loadModConf-&gt;listContainersOptions);
-	}</b></font>
-	statsobj.Destruct(&amp;modStats);
-ENDfreeCnf
-static rsRetVal
-addDockerMetaData(const uchar* container_id, docker_container_info_t* pinfo, smsg_t *pMsg) {
-	const uchar *names[4] = {
-		(const uchar*) DOCKER_CONTAINER_ID_PARSE_NAME,
-		(const uchar*) DOCKER_CONTAINER_NAMES_PARSE_NAME,
-		(const uchar*) DOCKER_CONTAINER_IMAGEID_PARSE_NAME,
-		(const uchar*) DOCKER_CONTAINER_LABELS_PARSE_NAME
-	};
-	const uchar * empty_str= (const uchar*) "";
-	const uchar *id = container_id ? container_id : empty_str;
-	const uchar *name = pinfo-&gt;name ? pinfo-&gt;name : empty_str;
-	const uchar *image_id = pinfo-&gt;image_id ? pinfo-&gt;image_id : empty_str;
-	const uchar *json_str_labels = pinfo-&gt;json_str_labels ? pinfo-&gt;json_str_labels : empty_str;
-	const uchar *values[4] = {
-		id,
-		name,
-		image_id,
-		json_str_labels
-	};
-	return msgAddMultiMetadata(pMsg, names, values, 4);
-}
-static rsRetVal
-enqMsg(docker_cont_logs_inst_t *pInst, uchar *msg, size_t len, const uchar *pszTag,
-		int facility, int severity, struct timeval *tp)
-{
-	struct syslogTime st;
-	smsg_t *pMsg;
-	DEFiRet;
-	if (!msg) {
-		return RS_RET_ERR;
-	}
-	if (tp == NULL) {
-		CHKiRet(msgConstruct(&amp;pMsg));
-	} else {
-		datetime.timeval2syslogTime(tp, &amp;st, TIME_IN_LOCALTIME);
-		CHKiRet(msgConstructWithTime(&amp;pMsg, &amp;st, tp-&gt;tv_sec));
-	}
-	MsgSetFlowControlType(pMsg, eFLOWCTL_LIGHT_DELAY);
-	MsgSetInputName(pMsg, pInputName);
-	MsgSetRawMsg(pMsg, (char*)msg, len);
-	if (loadModConf-&gt;bEscapeLf) {
-		parser.SanitizeMsg(pMsg);
-	} else {
-		size_t lenMsg = pMsg-&gt;iLenRawMsg;
-		uchar *pszMsg = pMsg-&gt;pszRawMsg;
-		if(pszMsg[lenMsg-1] == '\0') {
-			DBGPRINTF("dropped NULL at very end of message\n");
-			lenMsg--;
-		}
-		if(glbl.GetParserDropTrailingLFOnReception(loadModConf-&gt;pConf)
-				&amp;&amp; lenMsg &gt; 0 &amp;&amp; pszMsg[lenMsg-1] == '\n') {
-			DBGPRINTF("dropped LF at very end of message (DropTrailingLF is set)\n");
-			lenMsg--;
-			pszMsg[lenMsg] = '\0';
-		}
-		pMsg-&gt;iLenRawMsg = lenMsg;
-	}
-	MsgSetMSGoffs(pMsg, 0);  	MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
-	if (pLocalHostIP) { MsgSetRcvFromIP(pMsg, pLocalHostIP); }
-	MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
-	MsgSetTAG(pMsg, pszTag, ustrlen(pszTag));
-	pMsg-&gt;iFacility = facility;
-	pMsg-&gt;iSeverity = severity;
-	addDockerMetaData((const uchar*)pInst-&gt;short_id, pInst-&gt;container_info, pMsg);
-	const char *name = (const char*)pInst-&gt;container_info-&gt;name;
-	DBGPRINTF("imdocker: %s - %s:%s\n", __FUNCTION__, name, msg);
-	CHKiRet(ratelimitAddMsg(ratelimiter, NULL, pMsg));
-	STATSCOUNTER_INC(ctrSubmit, mutCtrSubmit);
-finalize_it:
-	if (iRet == RS_RET_DISCARDMSG)
-		STATSCOUNTER_INC(ctrLostRatelimit, mutCtrLostRatelimit)
-	RETiRet;
-}
-static int8_t
-is_valid_stream_type(int8_t stream_type) {
-	return (dst_invalid &lt; stream_type &amp;&amp; stream_type &lt; dst_stream_type_count);
-}
-static sbool
-get_stream_info(const uchar* data, size_t size, int8_t *stream_type, size_t *payload_size) {
-	if (size &lt; 8 || !data || !stream_type || !payload_size) {
-		return 0;
-	}
-	const uchar* pdata = data;
-	*stream_type = pdata[0];
-	pdata += 4;
-	uint32_t len = 0;
-	memcpy(&amp;len, pdata, sizeof(len));
-	*payload_size = ntohl(len);
-	return 1;
-}
-#ifdef ENABLE_DEBUG_BYTE_BUFFER
-static void debug_byte_buffer(const uchar* data, size_t size) {
-	if (Debug) {
-		DBGPRINTF("%s() - ENTER, size=%lu\n", __FUNCTION__, size);
-		for (size_t i = 0; i &lt; size; i++) {
-			DBGPRINTF("0x%02x,", data[i]);
-		}
-		DBGPRINTF("\n");
-	}
-}
-#endif
-static size_t
-imdocker_container_list_curlCB(void *data, size_t size, size_t nmemb, void *buffer) {
-	DEFiRet;
-	size_t realsize = size*nmemb;
-	uchar		*pbuf=NULL;
-	imdocker_buf_t *mem = (imdocker_buf_t*)buffer;
-	if ((pbuf = realloc(mem-&gt;data, mem-&gt;len + realsize + 1)) == NULL) {
-		LogError(errno, RS_RET_ERR, "%s() - realloc failed!\n", __FUNCTION__);
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	mem-&gt;data = pbuf;
-	mem-&gt;data_size = mem-&gt;len + realsize + 1;
-	memcpy(&amp;(mem-&gt;data[mem-&gt;len]), data, realsize);
-	mem-&gt;len += realsize;
-	mem-&gt;data[mem-&gt;len] = 0;
-#ifdef ENABLE_DEBUG_BYTE_BUFFER
-	debug_byte_buffer((const uchar*) data, realsize);
-#endif
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		return 0;
-	}
-	return realsize;
-}
-static rsRetVal
-SubmitMultiLineMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData,
-		const uchar* pszTag, size_t len) {
-	DEFiRet;
-	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData-&gt;buf;
-	DBGPRINTF("%s() {type=%d, len=%u} %s\n",
-			__FUNCTION__, pBufData-&gt;stream_type, (unsigned int)mem-&gt;len, mem-&gt;data);
-	uchar* message = (uchar*)mem-&gt;data;
-	int facility = loadModConf-&gt;iDfltFacility;
-	int severity = pBufData-&gt;stream_type == dst_stderr ? LOG_ERR : loadModConf-&gt;iDfltSeverity;
-	enqMsg(pInst, message, len, (const uchar*)pszTag, facility, severity, NULL);
-	size_t size = mem-&gt;len - pInst-&gt;prevSegEnd;
-	memmove(mem-&gt;data, mem-&gt;data+pInst-&gt;prevSegEnd, size);
-	mem-&gt;data[len] = '\0';
-	mem-&gt;len = size;
-	pBufData-&gt;bytes_remaining = 0;
-	RETiRet;
-}
-static rsRetVal
-SubmitMsgWithStartRegex(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
-	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData-&gt;buf;
-	assert(mem-&gt;data[mem-&gt;len] == 0 || mem-&gt;data[mem-&gt;len] == '\0');
-	const char* thisLine = (const char*) mem-&gt;data;
-	if (pInst-&gt;prevSegEnd) {
-		thisLine = (const char*) mem-&gt;data+pInst-&gt;prevSegEnd;
-	}
-	DBGPRINTF("prevSeg: %d, thisLine: '%s'\n", pInst-&gt;prevSegEnd, thisLine);
-	DBGPRINTF("line(s) so far: '%s'\n", mem-&gt;data);
-	regex_t *start_preg = (pInst-&gt;start_regex == NULL) ? NULL : &amp;pInst-&gt;start_preg;
-	const int isStartMatch = start_preg ?
-		!regexec(start_preg, (char*)thisLine, 0, NULL, 0) : 0;
-	if (isStartMatch &amp;&amp; pInst-&gt;prevSegEnd != 0) {
-		SubmitMultiLineMsg(pInst, pBufData, pszTag, pInst-&gt;prevSegEnd);
-		pInst-&gt;prevSegEnd = 0;
-		FINALIZE;
-	} else {
-		pInst-&gt;prevSegEnd = mem-&gt;len;
-	}
-finalize_it:
-	return RS_RET_OK;
-}
-static rsRetVal
-SubmitMsg2(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
-	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData-&gt;buf;
-	DBGPRINTF("%s() - {type=%d, len=%u} %s\n",
-			__FUNCTION__, pBufData-&gt;stream_type, (unsigned int)mem-&gt;len, mem-&gt;data);
-	if (pInst-&gt;start_regex) {
-		SubmitMsgWithStartRegex(pInst, pBufData, pszTag);
-	} else {
-		SubmitMsg(pInst, pBufData, pszTag);
-	}
-	return RS_RET_OK;
-}
-static rsRetVal
-SubmitMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
-	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData-&gt;buf;
-	DBGPRINTF("%s() - {type=%d, len=%u} %s\n",
-			__FUNCTION__, pBufData-&gt;stream_type, (unsigned int)mem-&gt;len, mem-&gt;data);
-	uchar* message = mem-&gt;data;
-	int facility = loadModConf-&gt;iDfltFacility;
-	int severity = pBufData-&gt;stream_type == dst_stderr ? LOG_ERR : loadModConf-&gt;iDfltSeverity;
-	enqMsg(pInst, message, mem-&gt;len, (const uchar*)pszTag, facility, severity, NULL);
-	mem-&gt;len = 0;
-	memset(mem-&gt;data, 0, mem-&gt;data_size);
-	pBufData-&gt;bytes_remaining = 0;
-	return RS_RET_OK;
-}
-static size_t
-imdocker_container_logs_curlCB(void *data, size_t size, size_t nmemb, void *buffer) {
-	DEFiRet;
-	const uint8_t frame_size = 8;
-	const char imdocker_eol_char = '\n';
-	int8_t stream_type = dst_invalid;
-	docker_cont_logs_inst_t* pInst = (docker_cont_logs_inst_t*) buffer;
-	docker_cont_logs_req_t* req = pInst-&gt;logsReq;
-	size_t realsize = size*nmemb;
-	const uchar* pdata = data;
-	size_t write_size = 0;
-#ifdef ENABLE_DEBUG_BYTE_BUFFER
-	debug_byte_buffer((const uchar*) data, realsize);
-#endif
-	if (req-&gt;data_bufs[dst_stdout]-&gt;bytes_remaining || req-&gt;data_bufs[dst_stderr]-&gt;bytes_remaining) {
-		if (req-&gt;data_bufs[dst_stdout]-&gt;bytes_remaining) {
-			if (req-&gt;data_bufs[dst_stderr]-&gt;bytes_remaining != 0) {
-				ABORT_FINALIZE(RS_RET_ERR);
-			}
-		} else if (req-&gt;data_bufs[dst_stderr]-&gt;bytes_remaining) {
-			if (req-&gt;data_bufs[dst_stdout]-&gt;bytes_remaining != 0) {
-				ABORT_FINALIZE(RS_RET_ERR);
-			}
-		}
-		stream_type = req-&gt;data_bufs[dst_stdout]-&gt;bytes_remaining ? dst_stdout : dst_stderr;
-		docker_cont_logs_buf_t *pDataBuf = req-&gt;data_bufs[stream_type];
-		DBGPRINTF("Chunk continuation, remaining bytes: type: %d, "
-				"bytes remaining: %u, realsize: %u, data pos: %u\n",
-				stream_type, (unsigned int)pDataBuf-&gt;bytes_remaining,
-				(unsigned int)realsize, (unsigned int)pDataBuf-&gt;buf-&gt;len);
-		write_size = MIN(pDataBuf-&gt;bytes_remaining, realsize);
-		CHKiRet(dockerContLogsBufWrite(pDataBuf, pdata, write_size));
-		if (pDataBuf-&gt;bytes_remaining == 0) {
-			imdocker_buf_t *mem = pDataBuf-&gt;buf;
-			if (mem-&gt;data[mem-&gt;len-1] == imdocker_eol_char) {
-				const char* szContainerId = NULL;
-				CURLcode ccode;
-				if(CURLE_OK != (ccode = curl_easy_getinfo(req-&gt;curl,
-								CURLINFO_PRIVATE,
-								&amp;szContainerId))) {
-					LogError(0, RS_RET_ERR,
-							"imdocker: could not get private data req[%p] - %d:%s\n",
-							req-&gt;curl, ccode, curl_easy_strerror(ccode));
-					ABORT_FINALIZE(RS_RET_ERR);
-				}
-				req-&gt;submitMsg(pInst, pDataBuf, (const uchar*)DOCKER_TAG_NAME);
-			}
-		}
-		pdata += write_size;
-	}
-	if ((size_t)(pdata - (const uchar*)data) &gt;= realsize) {
-		return (pdata - (const uchar*)data);
-	}
-	size_t payload_size = 0;
-	const uchar* pread = pdata + frame_size;
-	docker_cont_logs_buf_t* pDataBuf = NULL;
-	if (get_stream_info(pdata, realsize, &amp;stream_type, &amp;payload_size)
-				&amp;&amp; is_valid_stream_type(stream_type)) {
-		pDataBuf = req-&gt;data_bufs[stream_type];
-		pDataBuf-&gt;stream_type = stream_type;
-		pDataBuf-&gt;bytes_remaining = payload_size;
-		write_size = MIN(payload_size, realsize - frame_size);
-	} else {
-		stream_type = req-&gt;data_bufs[dst_stderr]-&gt;bytes_remaining ? dst_stderr : dst_stdout;
-		pDataBuf = req-&gt;data_bufs[stream_type];
-		pDataBuf-&gt;stream_type = stream_type;
-		pDataBuf-&gt;bytes_remaining = 0;
-		write_size = realsize;
-		pread = pdata;
-	}
-	CHKiRet(dockerContLogsBufWrite(pDataBuf, pread, write_size));
-	if (pDataBuf-&gt;bytes_remaining == 0) {
-		DBGPRINTF("%s() - write size is same as payload_size\n", __FUNCTION__);
-		req-&gt;submitMsg(pInst, pDataBuf, (const uchar*)DOCKER_TAG_NAME);
-	}
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		return 0;
-	}
-	return realsize;
-}
-CURLcode docker_get(imdocker_req_t *req, const char* url) {
-	CURLcode ccode;
-	if (!runModConf-&gt;dockerApiAddr) {
-		if ((ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_UNIX_SOCKET_PATH, runModConf-&gt;dockerApiUnixSockAddr))
-				!= CURLE_OK) {
-			STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
-			LogError(0, RS_RET_ERR, "imdocker: curl_easy_setopt(CURLOPT_UNIX_SOCKET_PATH) error - %d:%s\n",
-					ccode, curl_easy_strerror(ccode));
-			return ccode;
-		}
-	}
-	if ((ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_WRITEFUNCTION, imdocker_container_list_curlCB)) != CURLE_OK) {
-		STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
-		LogError(0, RS_RET_ERR, "imdocker: curl_easy_setopt(CURLOPT_WRITEFUNCTION) error - %d:%s\n",
-				ccode, curl_easy_strerror(ccode));
-		return ccode;
-	}
-	if ((ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_WRITEDATA, req-&gt;buf)) != CURLE_OK) {
-		STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
-		LogError(0, RS_RET_ERR, "imdocker: curl_easy_setopt(CURLOPT_WRITEDATA) error - %d:%s\n",
-				ccode, curl_easy_strerror(ccode));
-		return ccode;
-	}
-	if ((ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_URL, url)) != CURLE_OK) {
-		STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
-		LogError(0, RS_RET_ERR, "imdocker: curl_easy_setopt(CURLOPT_URL) error - %d:%s\n",
-				ccode, curl_easy_strerror(ccode));
-		return ccode;
-	}
-	CURLcode response = curl_easy_perform(req-&gt;curl);
-	return response;
-}
-static char*
-dupDockerContainerName(const char* pname) {
-	int len = strlen(pname);
-	if (len &gt;= 2 &amp;&amp; *pname == '/') {
-		return strdup(pname+1);
-	} else {
-		return strdup(pname);
-	}
-}
-static rsRetVal
-process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pInstances) {
-	DEFiRet;
-	struct fjson_object *json_obj = NULL;
-	int mut_locked = 0;
-	DBGPRINTF("%s() - parsing json=%s\n", __FUNCTION__, json);
-	if (!pInstances) {
-		ABORT_FINALIZE(RS_RET_OK);
-	}
-	json_obj = fjson_tokener_parse(json);
-	if (!json_obj || !fjson_object_is_type(json_obj, fjson_type_array)) {
-		ABORT_FINALIZE(RS_RET_OK);
-	}
-	int length = fjson_object_array_length(json_obj);
-	CHKiConcCtrl(pthread_mutex_lock(&amp;pInstances-&gt;mut));
-	mut_locked = 1;
-	for (int i = 0; i &lt; length; i++) {
-		fjson_object* p_json_elm = json_object_array_get_idx(json_obj, i);
-		DBGPRINTF("element: %d...\n", i);
-		if (p_json_elm) {
-			const char *containerId=NULL;
-			docker_container_info_t containerInfo = {
-				.name=NULL,
-				.image_id=NULL,
-				.created=0,
-				.json_str_labels=NULL
-			};
-			struct fjson_object_iterator it = fjson_object_iter_begin(p_json_elm);
-			struct fjson_object_iterator itEnd = fjson_object_iter_end(p_json_elm);
-			while (!fjson_object_iter_equal(&amp;it, &amp;itEnd)) {
-				if (Debug) {
-					DBGPRINTF("\t%s: '%s'\n",
-							fjson_object_iter_peek_name(&amp;it),
-							fjson_object_get_string(fjson_object_iter_peek_value(&amp;it)));
-				}
-				if (strcmp(fjson_object_iter_peek_name(&amp;it), DOCKER_CONTAINER_ID_PARSE_NAME) == 0) {
-					containerId =
-						fjson_object_get_string(fjson_object_iter_peek_value(&amp;it));
-				} else if (strcmp(fjson_object_iter_peek_name(&amp;it),
-							DOCKER_CONTAINER_NAMES_PARSE_NAME) == 0) {
-					int names_array_length =
-						fjson_object_array_length(fjson_object_iter_peek_value(&amp;it));
-					if (names_array_length) {
-						fjson_object* names_elm =
-<a name="4"></a>							json_object_array_get_idx(fjson_object_iter_peek_value(&amp;it), 0);
-						containerInfo.name = (uchar*)fjson_object_get_string(names_elm);
-					}
-<font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>				} else if (strcmp(fjson_object_iter_peek_name(&amp;it),
-							DOCKER_CONTAINER_IMAGEID_PARSE_NAME) == 0) {
-					containerInfo.image_id =
-						(uchar*)fjson_object_get_string(
-									fjson_object_iter_peek_value(&amp;it)
-									);
-				} else if (strcmp(fjson_object_iter_peek_name(&amp;it),
-							DOCKER_CONTAINER_CREATED_PARSE_NAME) == 0) {
-					containerInfo.created =
-						fjson_object_get_int64(
-									fjson_object_iter_peek_value(&amp;it)
-									);
-				} else if (strcmp(fjson_object_iter_peek_name(&amp;it),
-							DOCKER_CONTAINER_LABELS_PARSE_NAME) == 0) {
-					containerInfo.json_str_labels =
-						(uchar*) fjson_object_get_string(
-									fjson_object_iter_peek_value(&amp;it)
-									);
-					DBGPRINTF("labels: %s\n", containerInfo.json_str_labels);
-				}</b></font>
-				fjson_object_iter_next(&amp;it);
-			}
-			if (containerId) {
-				docker_cont_logs_inst_t *pInst = NULL;
-				iRet = dockerContLogReqsGet(pInstances, &amp;pInst, containerId);
-				if (iRet == RS_RET_NOT_FOUND) {
-#ifdef USE_MULTI_LINE
-					if (dockerContLogsInstNew(&amp;pInst, containerId, &amp;containerInfo, SubmitMsg2)
-#else
-					if (dockerContLogsInstNew(&amp;pInst, containerId, &amp;containerInfo, SubmitMsg)
-#endif
-							== RS_RET_OK) {
-						if (pInstances-&gt;last_container_created &lt; containerInfo.created) {
-							pInstances-&gt;last_container_created = containerInfo.created;
-							if (pInstances-&gt;last_container_id) {
-								free(pInstances-&gt;last_container_id);
-							}
-							pInstances-&gt;last_container_id = (uchar*)strdup(containerId);
-							DBGPRINTF("last_container_id updated: ('%s', %u)\n",
-									pInstances-&gt;last_container_id,
-									(unsigned)pInstances-&gt;last_container_created);
-						}
-						CHKiRet(dockerContLogsInstSetUrlById(isInit, pInst,
-									pInstances-&gt;curlm, containerId));
-						CHKiRet(dockerContLogReqsAdd(pInstances, pInst));
-					}
-				}
-			}
-		}
-	}
-finalize_it:
-	if (mut_locked) {
-		pthread_mutex_unlock(&amp;pInstances-&gt;mut);
-	}
-	if (json_obj) {
-		json_object_put(json_obj);
-	}
-	RETiRet;
-}
-static rsRetVal
-getContainerIds(sbool isInit, docker_cont_log_instances_t *pInstances, const char* url) {
-	DEFiRet;
-	imdocker_req_t *req=NULL;
-	CHKiRet(imdockerReqNew(&amp;req));
-	CURLcode response = docker_get(req, url);
-	if (response != CURLE_OK) {
-		DBGPRINTF("%s() - curl response: %d\n", __FUNCTION__, response);
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	CHKiRet(process_json(isInit, (const char*)req-&gt;buf-&gt;data, pInstances));
-finalize_it:
-	if (req) {
-		imdockerReqDestruct(req);
-	}
-	RETiRet;
-}
-static rsRetVal
-getContainerIdsAndAppend(sbool isInit, docker_cont_log_instances_t *pInstances) {
-	DEFiRet;
-	char url[256];
-	const uchar* pApiAddr = (uchar*)"http:";
-	if (runModConf-&gt;dockerApiAddr) {
-		pApiAddr = runModConf-&gt;dockerApiAddr;
-	}
-	if (pInstances-&gt;last_container_id) {
-		snprintf(url, sizeof(url), "%s/%s/containers/json?%s&amp;filters={\"since\":[\"%s\"]}",
-				pApiAddr, runModConf-&gt;apiVersionStr, runModConf-&gt;listContainersOptions,
-				pInstances-&gt;last_container_id);
-	} else {
-		snprintf(url, sizeof(url), "%s/%s/containers/json?%s",
-			pApiAddr, runModConf-&gt;apiVersionStr, runModConf-&gt;listContainersOptions);
-	}
-	DBGPRINTF("listcontainers url: %s\n", url);
-	CHKiRet(getContainerIds(isInit, pInstances, (const char*)url));
-	if (Debug) { dockerContLogReqsPrint(pInstances); }
-finalize_it:
-	RETiRet;
-}
-static void
-cleanupCompletedContainerRequests(docker_cont_log_instances_t *pInstances) {
-	int rc=0, msgs_left=0;
-	CURLMsg *msg=NULL;
-	CURL *pCurl;
-	while ((msg = curl_multi_info_read(pInstances-&gt;curlm, &amp;msgs_left))) {
-		if (msg-&gt;msg == CURLMSG_DONE) {
-			pCurl = msg-&gt;easy_handle;
-			rc = msg-&gt;data.result;
-			if (rc != CURLE_OK) {
-				STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
-				LogError(0, RS_RET_ERR, "imdocker: %s() - curl error code: %d:%s\n",
-						__FUNCTION__, rc, curl_multi_strerror(rc));
-				continue;
-			}
-			CURLcode ccode;
-			if (Debug) {
-				long http_status=0;
-				curl_easy_getinfo(pCurl, CURLINFO_RESPONSE_CODE, &amp;http_status);
-				DBGPRINTF("http status: %lu\n", http_status);
-			}
-			curl_multi_remove_handle(pInstances-&gt;curlm, pCurl);
-			const char* szContainerId = NULL;
-			if ((ccode = curl_easy_getinfo(pCurl, CURLINFO_PRIVATE, &amp;szContainerId)) == CURLE_OK) {
-				DBGPRINTF("container disconnected: %s\n", szContainerId);
-				dockerContLogReqsRemove(pInstances, szContainerId);
-				DBGPRINTF("container removed...\n");
-			} else {
-				LogError(0, RS_RET_ERR, "imdocker: private data not found "
-						"curl_easy_setopt(CURLINFO_PRIVATE) error - %d:%s\n",
-						ccode, curl_easy_strerror(ccode));
-				STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
-			}
-		}
-	}
-}
-static rsRetVal
-processAndPollContainerLogs(docker_cont_log_instances_t *pInstances) {
-	DEFiRet;
-	int count=0;
-	count = hashtable_count(pInstances-&gt;ht_container_log_insts);
-	DBGPRINTF("%s() - container instances: %d\n", __FUNCTION__, count);
-	int still_running=0;
-	curl_multi_perform(pInstances-&gt;curlm, &amp;still_running);
-	do {
-		int numfds = 0;
-		int res = curl_multi_wait(pInstances-&gt;curlm, NULL, 0, 1000, &amp;numfds);
-		if (res != CURLM_OK) {
-			LogError(0, RS_RET_ERR, "error: curl_multi_wait() numfds=%d, res=%d:%s\n",
-					numfds, res, curl_multi_strerror(res));
-			return res;
-		}
-		int prev_still_running = still_running;
-		curl_multi_perform(pInstances-&gt;curlm, &amp;still_running);
-		if (prev_still_running &gt; still_running) {
-			cleanupCompletedContainerRequests(pInstances);
-		}
-	} while (still_running &amp;&amp; glbl.GetGlobalInputTermState() == 0);
-	cleanupCompletedContainerRequests(pInstances);
-	RETiRet;
-}
-static void*
-getContainersTask(void *pdata) {
-	docker_cont_log_instances_t *pInstances = (docker_cont_log_instances_t*) pdata;
-	while(glbl.GetGlobalInputTermState() == 0) {
-		srSleep(runModConf-&gt;iPollInterval, 10);
-		getContainerIdsAndAppend(false, pInstances);
-	}
-	return pdata;
-}
-BEGINrunInput
-	rsRetVal localRet = RS_RET_OK;
-	docker_cont_log_instances_t *pInstances=NULL;
-	pthread_t thrd_id; 	pthread_attr_t thrd_attr;
-	int get_containers_thread_initialized = 0;
-	time_t now;
-CODESTARTrunInput
-	datetime.GetTime(&amp;now);
-	CHKiRet(ratelimitNew(&amp;ratelimiter, "imdocker", NULL));
-	curl_global_init(CURL_GLOBAL_ALL);
-	localRet = dockerContLogReqsNew(&amp;pInstances);
-	if (localRet != RS_RET_OK) {
-		return localRet;
-	}
-	pInstances-&gt;time_started = now;
-	CHKiRet(getContainerIdsAndAppend(true, pInstances));
-	CHKiConcCtrl(pthread_attr_init(&amp;thrd_attr));
-	CHKiConcCtrl(pthread_create(&amp;thrd_id, &amp;thrd_attr, getContainersTask, pInstances));
-	get_containers_thread_initialized = 1;
-	while(glbl.GetGlobalInputTermState() == 0) {
-		CHKiRet(processAndPollContainerLogs(pInstances));
-		if (glbl.GetGlobalInputTermState() == 0) {
-			srSleep(1, 10);
-		}
-	}
-finalize_it:
-	if (get_containers_thread_initialized) {
-		pthread_kill(thrd_id, SIGTTIN);
-		pthread_join(thrd_id, NULL);
-		pthread_attr_destroy(&amp;thrd_attr);
-	}
-	if (pInstances) {
-		dockerContLogReqsDestruct(pInstances);
-	}
-	if (ratelimiter) {
-		ratelimitDestruct(ratelimiter);
-	}
-ENDrunInput
-BEGINwillRun
-CODESTARTwillRun
-ENDwillRun
-BEGINafterRun
-CODESTARTafterRun
-ENDafterRun
-BEGINmodExit
-CODESTARTmodExit
-	if(pInputName != NULL)
-		prop.Destruct(&amp;pInputName);
-	if(pLocalHostIP != NULL)
-		prop.Destruct(&amp;pLocalHostIP);
-	objRelease(parser, CORE_COMPONENT);
-	objRelease(glbl, CORE_COMPONENT);
-	objRelease(prop, CORE_COMPONENT);
-	objRelease(statsobj, CORE_COMPONENT);
-	objRelease(datetime, CORE_COMPONENT);
-ENDmodExit
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURENonCancelInputTermination)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_IMOD_QUERIES
-CODEqueryEtryPt_STD_CONF2_QUERIES
-CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
-CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
-ENDqueryEtryPt
-BEGINmodInit()
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-	CHKiRet(objUse(prop, CORE_COMPONENT));
-	CHKiRet(objUse(statsobj, CORE_COMPONENT));
-	CHKiRet(objUse(datetime, CORE_COMPONENT));
-	CHKiRet(objUse(parser, CORE_COMPONENT));
-	DBGPRINTF("imdocker version %s initializing\n", VERSION);
-	CHKiRet(prop.Construct(&amp;pInputName));
-	CHKiRet(prop.SetString(pInputName, UCHAR_CONSTANT("imdocker"), sizeof("imdocker") - 1));
-	CHKiRet(prop.ConstructFinalize(pInputName));
-ENDmodInit
+1 #ifdef __sun
+2 #define _XPG4_2
+3 #endif
+4 #include "config.h"
+5 #include "rsyslog.h"
+6 #include &lt;stdlib.h&gt;
+7 #include &lt;stdio.h&gt;
+8 #include &lt;ctype.h&gt;
+9 #include &lt;string.h&gt;
+10 #include &lt;errno.h&gt;
+11 #include &lt;curl/curl.h&gt;
+12 #include &lt;json.h&gt;
+13 #include &lt;assert.h&gt;
+14 #include &lt;signal.h&gt;
+15 #include &lt;stdbool.h&gt;
+16 #include "cfsysline.h"  #include "unicode-helper.h"
+17 #include "module-template.h"
+18 #include "srUtils.h"    #include "errmsg.h"
+19 #include "net.h"
+20 #include "glbl.h"
+21 #include "msg.h"
+22 #include "parser.h"
+23 #include "prop.h"
+24 #include "debug.h"
+25 #include "statsobj.h"
+26 #include "datetime.h"
+27 #include "ratelimit.h"
+28 #include "hashtable.h"
+29 #include "hashtable_itr.h"
+30 #if !defined(_AIX)
+31 #pragma GCC diagnostic ignored "-Wswitch-enum"
+32 #endif
+33 MODULE_TYPE_INPUT
+34 MODULE_TYPE_NOKEEP
+35 MODULE_CNFNAME("imdocker")
+36 extern int Debug;
+37 #define USE_MULTI_LINE
+38 #undef ENABLE_DEBUG_BYTE_BUFFER
+39 #define DOCKER_TAG_NAME                     "docker:"
+40 #define DOCKER_CONTAINER_ID_PARSE_NAME      "Id"
+41 #define DOCKER_CONTAINER_NAMES_PARSE_NAME   "Names"
+42 #define DOCKER_CONTAINER_IMAGEID_PARSE_NAME "ImageID"
+43 #define DOCKER_CONTAINER_CREATED_PARSE_NAME "Created"
+44 #define DOCKER_CONTAINER_LABELS_PARSE_NAME  "Labels"
+45 #define DOCKER_CONTAINER_LABEL_KEY_STARTREGEX "imdocker.startregex"
+46 #define DFLT_pollingInterval   60      #define DFLT_retrieveNewLogsFromStart 1#define DFLT_containersLimit   25      #define DFLT_trimLineOverBytes 4194304 #define DFLT_bEscapeLF         1       
+47 #define DFLT_SEVERITY pri2sev(LOG_INFO)
+48 #define DFLT_FACILITY pri2fac(LOG_USER)
+49 enum {
+50 	dst_invalid = -1,
+51 	dst_stdin,
+52 	dst_stdout,
+53 	dst_stderr,
+54 	dst_stream_type_count
+55 } docker_stream_type_t;
+56 typedef struct imdocker_buf_s {
+57 	uchar  *data;
+58 	size_t len;
+59 	size_t data_size;
+60 } imdocker_buf_t;
+61 typedef struct docker_cont_logs_buf_s {
+62 	imdocker_buf_t *buf;
+63 	int8_t         stream_type;
+64 	size_t         bytes_remaining;
+65 } docker_cont_logs_buf_t;
+66 struct docker_cont_logs_inst_s;
+67 typedef rsRetVal (*submitmsg_funcptr) (struct docker_cont_logs_inst_s *pInst, docker_cont_logs_buf_t *pBufdata,
+68 		const uchar* pszTag);
+69 typedef submitmsg_funcptr SubmitMsgFuncPtr;
+70 typedef struct docker_cont_logs_req_s {
+71 	CURL     *curl;
+72 	docker_cont_logs_buf_t* data_bufs[dst_stream_type_count];
+73 	SubmitMsgFuncPtr submitMsg;
+74 } docker_cont_logs_req_t;
+75 typedef struct imdocker_req_s {
+76 	CURL           *curl;
+77 	imdocker_buf_t *buf;
+78 } imdocker_req_t;
+79 typedef struct docker_container_info_s {
+80 	uchar *name;
+81 	uchar *image_id;
+82 	uint64_t created;
+83 	uchar *json_str_labels;
+84 } docker_container_info_t;
+85 typedef struct docker_cont_logs_inst_s {
+86 	char *id;
+87 	char short_id[12];
+88 	docker_container_info_t *container_info;
+89 	docker_cont_logs_req_t  *logsReq;
+90 	uchar *start_regex;
+91 	regex_t start_preg;  	uint32_t prevSegEnd;
+92 } docker_cont_logs_inst_t;
+93 typedef struct docker_cont_log_instances_s {
+94 	struct hashtable* ht_container_log_insts;
+95 	pthread_mutex_t mut;
+96 	CURLM         *curlm;
+97 	uint64_t last_container_created;
+98 	uchar   *last_container_id;
+99 	time_t  time_started;
+100 } docker_cont_log_instances_t;
+101 static rsRetVal imdockerBufNew(imdocker_buf_t **ppThis);
+102 static void imdockerBufDestruct(imdocker_buf_t *pThis);
+103 static rsRetVal dockerContLogsBufNew(docker_cont_logs_buf_t **ppThis);
+104 static void dockerContLogsBufDestruct(docker_cont_logs_buf_t *pThis);
+105 static rsRetVal dockerContLogsBufWrite(docker_cont_logs_buf_t *pThis, const uchar *pdata,
+106 		size_t write_size);
+107 static rsRetVal imdockerReqNew(imdocker_req_t **ppThis);
+108 static void imdockerReqDestruct(imdocker_req_t *pThis);
+109 static rsRetVal dockerContLogsReqNew(docker_cont_logs_req_t **ppThis, SubmitMsgFuncPtr submitMsg);
+110 static void dockerContLogsReqDestruct(docker_cont_logs_req_t *pThis);
+111 static rsRetVal
+112 dockerContLogsInstNew(docker_cont_logs_inst_t **ppThis, const char* id,
+113 		docker_container_info_t *container_info, SubmitMsgFuncPtr submitMsg);
+114 static void dockerContLogsInstDestruct(docker_cont_logs_inst_t *pThis);
+115 static rsRetVal dockerContLogsInstSetUrlById (sbool isInit, docker_cont_logs_inst_t *pThis,
+116 		CURLM *curlm, const char* containerId);
+117 static rsRetVal dockerContLogReqsNew(docker_cont_log_instances_t **ppThis);
+118 static rsRetVal dockerContLogReqsDestruct(docker_cont_log_instances_t *pThis);
+119 static rsRetVal dockerContLogReqsGet(docker_cont_log_instances_t *pThis,
+120 		docker_cont_logs_inst_t** ppContLogsInst, const char *id);
+121 static rsRetVal dockerContLogReqsPrint(docker_cont_log_instances_t *pThis);
+122 static rsRetVal dockerContLogReqsAdd(docker_cont_log_instances_t *pThis,
+123 		docker_cont_logs_inst_t *pContLogsReqInst);
+124 static rsRetVal dockerContLogReqsRemove(docker_cont_log_instances_t *pThis, const char *id);
+125 static rsRetVal dockerContainerInfoNew(docker_container_info_t **pThis);
+126 static void dockerContainerInfoDestruct(docker_container_info_t *pThis);
+127 static CURLcode docker_get(imdocker_req_t *req, const char* url);
+128 static char* dupDockerContainerName(const char* pname);
+129 static rsRetVal SubmitMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData,
+130 		const uchar* pszTag);
+131 static rsRetVal
+132 SubmitMsg2(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag);
+133 static size_t imdocker_container_list_curlCB(void *data, size_t size, size_t nmemb, void *buffer);
+134 static size_t imdocker_container_logs_curlCB(void *data, size_t size, size_t nmemb, void *buffer);
+135 static sbool get_stream_info(const uchar* data, size_t size, int8_t *stream_type, size_t *payload_size);
+136 static int8_t is_valid_stream_type(int8_t stream_type);
+137 DEF_IMOD_STATIC_DATA
+138 DEFobjCurrIf(glbl)
+139 DEFobjCurrIf(prop)
+140 DEFobjCurrIf(parser)
+141 DEFobjCurrIf(datetime)
+142 DEFobjCurrIf(statsobj)
+143 statsobj_t *modStats;
+144 STATSCOUNTER_DEF(ctrSubmit, mutCtrSubmit)
+145 STATSCOUNTER_DEF(ctrLostRatelimit, mutCtrLostRatelimit)
+146 STATSCOUNTER_DEF(ctrCurlError, mutCtrCurlError)
+147 const char* DFLT_dockerAPIUnixSockAddr  = "/var/run/docker.sock";
+148 const char* DFLT_dockerAPIAdd           = "http://localhost:2375";
+149 const char* DFLT_apiVersionStr          = "v1.27";
+150 const char* DFLT_listContainersOptions  = "";
+151 const char* DFLT_getContainerLogOptions = "timestamps=0&amp;follow=1&amp;stdout=1&amp;stderr=1&amp;tail=1";
+152 const char* DFLT_getContainerLogOptionsWithoutTail = "timestamps=0&amp;follow=1&amp;stdout=1&amp;stderr=1";
+153 struct modConfData_s {
+154 	rsconf_t *pConf;  	uchar    *apiVersionStr;
+155 	uchar    *listContainersOptions;
+156 	uchar    *getContainerLogOptions;
+157 	uchar    *getContainerLogOptionsWithoutTail;
+158 	int      iPollInterval;  	uchar    *dockerApiUnixSockAddr;
+159 	uchar    *dockerApiAddr;
+160 	sbool    retrieveNewLogsFromStart;
+161 	int      containersLimit;
+162 	int      trimLineOverBytes;
+163 	int      iDfltSeverity;
+164 	int      iDfltFacility;
+165 	sbool    bEscapeLf;
+166 };
+167 static modConfData_t *loadModConf = NULL;
+168 static modConfData_t *runModConf = NULL;
+169 static prop_t *pInputName = NULL;   static prop_t *pLocalHostIP = NULL; 
+170 static ratelimit_t *ratelimiter = NULL;
+171 <a name="0"></a>
+172 static struct cnfparamdescr modpdescr[] = {
+173 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "apiversionstr", eCmdHdlrString, 0 },
+174 	{ "dockerapiunixsockaddr", eCmdHdlrString, 0 },
+175 	{ "dockerapiaddr", eCmdHdlrString, 0 },
+176 	{ "listcontainersoptions", eCmdHdlrString, 0 },
+177 	{ "getcontainerlogoptions", eCmdHdlrString, 0 },
+178 	{ "pollinginterval", eCmdHdlrPositiveInt, 0 },
+179 	{ "retrievenewlogsfromstart", eCmdHdlrBinary, 0 },
+180 	{ "trimlineoverbytes", eCmdHdlrPositiveInt, 0 },
+181 	{ "defaultseverity", eCmdHdlrSeverity, 0 },
+182 	{ "defaultfacility", eCmdHdlrFacility, 0 },
+183 	{ "escapelf", eCmdHdlrBinary, 0 },
+184 };
+185 static struct cnfparamblk modpblk =
+186 	{ CNFPARAMBLK_VERSION,
+187 		sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+188 		modpdescr
+189 	};
+190 static int bLegacyCnfModGlobalsPermitted; 
+191 static rsRetVal
+192 imdockerBufNew(imdocker_buf_t **ppThis) {
+193 	DEFiRet;
+194 	imdocker_buf_t *pThis = (imdocker_buf_t*) calloc(1, sizeof(imdocker_buf_t));
+195 	if (!pThis) { return RS_RET_OUT_OF_MEMORY; }
+196 	*ppThis = pThis;
+197 	RETiRet;
+198 }
+199 static void
+200 imdockerBufDestruct(imdocker_buf_t *pThis) {
+201 	if (pThis) {
+202 		if (pThis-&gt;data) {
+203 			free(pThis-&gt;data);
+204 			pThis-&gt;data = NULL;
+205 		}
+206 		free(pThis);
+207 	}
+208 }
+209 static rsRetVal
+210 dockerContLogsBufNew(docker_cont_logs_buf_t **ppThis) {
+211 	DEFiRet;
+212 	docker_cont_logs_buf_t *pThis = (docker_cont_logs_buf_t*) calloc(1, sizeof(docker_cont_logs_buf_t));
+213 	if (pThis &amp;&amp; (iRet = imdockerBufNew(&amp;pThis-&gt;buf)) == RS_RET_OK) {
+214 		pThis-&gt;stream_type = dst_invalid;
+215 		pThis-&gt;bytes_remaining = 0;
+216 		*ppThis = pThis;
+217 	} else {
+218 		dockerContLogsBufDestruct(pThis);
+219 	}
+220 	RETiRet;
+221 }
+222 static void
+223 dockerContLogsBufDestruct(docker_cont_logs_buf_t *pThis) {
+224 	if (pThis) {
+225 		if (pThis-&gt;buf) {
+226 			imdockerBufDestruct(pThis-&gt;buf);
+227 		}
+228 		free(pThis);
+229 	}
+230 }
+231 static rsRetVal
+232 dockerContLogsBufWrite(docker_cont_logs_buf_t *const pThis, const uchar *const pdata, const size_t write_size) {
+233 	DEFiRet;
+234 	imdocker_buf_t *const mem = pThis-&gt;buf;
+235 	if (mem-&gt;len + write_size + 1 &gt; mem-&gt;data_size) {
+236 		uchar *const pbuf = realloc(mem-&gt;data, mem-&gt;len + write_size + 1);
+237 		if(pbuf == NULL) {
+238 			LogError(errno, RS_RET_ERR, "%s() - realloc failed!\n", __FUNCTION__);
+239 			ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+240 		}
+241 		mem-&gt;data = pbuf;
+242 		mem-&gt;data_size = mem-&gt;len+ write_size + 1;
+243 	}
+244 	memcpy(&amp;(mem-&gt;data[mem-&gt;len]), pdata, write_size);
+245 	mem-&gt;len += write_size;
+246 	mem-&gt;data[mem-&gt;len] = '\0';
+247 	if (write_size &gt; pThis-&gt;bytes_remaining) {
+248 		pThis-&gt;bytes_remaining = 0;
+249 	} else {
+250 		pThis-&gt;bytes_remaining -= write_size;
+251 	}
+252 finalize_it:
+253 	RETiRet;
+254 }
+255 rsRetVal imdockerReqNew(imdocker_req_t **ppThis) {
+256 	DEFiRet;
+257 	imdocker_req_t *pThis = (imdocker_req_t*) calloc(1, sizeof(imdocker_req_t));
+258 	CHKmalloc(pThis);
+259 	pThis-&gt;curl = curl_easy_init();
+260 	if (!pThis-&gt;curl) {
+261 		ABORT_FINALIZE(RS_RET_ERR);
+262 	}
+263 	CHKiRet(imdockerBufNew(&amp;(pThis-&gt;buf)));
+264 	*ppThis = pThis;
+265 finalize_it:
+266 	if (iRet != RS_RET_OK &amp;&amp; pThis) {
+267 		imdockerReqDestruct(pThis);
+268 	}
+269 	RETiRet;
+270 }
+271 void imdockerReqDestruct(imdocker_req_t *pThis) {
+272 	if (pThis) {
+273 		if (pThis-&gt;buf) {
+274 			imdockerBufDestruct(pThis-&gt;buf);
+275 		}
+276 		if (pThis-&gt;curl) {
+277 			curl_easy_cleanup(pThis-&gt;curl);
+278 			pThis-&gt;curl = NULL;
+279 		}
+280 		free(pThis);
+281 	}
+282 }
+283 static rsRetVal
+284 dockerContLogsReqNew(docker_cont_logs_req_t **ppThis, SubmitMsgFuncPtr submitMsg) {
+285 	DEFiRet;
+286 	docker_cont_logs_req_t *pThis = (docker_cont_logs_req_t*) calloc(1, sizeof(docker_cont_logs_req_t));
+287 	CHKmalloc(pThis);
+288 	pThis-&gt;submitMsg = submitMsg;
+289 	pThis-&gt;curl = curl_easy_init();
+290 	if (!pThis-&gt;curl) {
+291 		ABORT_FINALIZE(RS_RET_ERR);
+292 	}
+293 	for (int i = 0; i &lt; dst_stream_type_count; i ++) {
+294 		CHKiRet(dockerContLogsBufNew(&amp;pThis-&gt;data_bufs[i]));
+295 	}
+296 	*ppThis = pThis;
+297 finalize_it:
+298 	if (iRet != RS_RET_OK) {
+299 		if (pThis) {
+300 			dockerContLogsReqDestruct(pThis);
+301 		}
+302 	}
+303 	RETiRet;
+304 }
+305 static void
+306 dockerContLogsReqDestruct(docker_cont_logs_req_t *pThis) {
+307 	if (pThis) {
+308 		for (int i = 0; i &lt; dst_stream_type_count; i++) {
+309 			dockerContLogsBufDestruct(pThis-&gt;data_bufs[i]);
+310 		}
+311 		if (pThis-&gt;curl) {
+312 			curl_easy_cleanup(pThis-&gt;curl);
+313 			pThis-&gt;curl=NULL;
+314 		}
+315 		free(pThis);
+316 	}
+317 }
+318 static rsRetVal
+319 dockerContLogsInstPrint(docker_cont_logs_inst_t * pThis) {
+320 	DEFiRet;
+321 	DBGPRINTF("\t container id: %s\n", pThis-&gt;id);
+322 	char* pUrl = NULL;
+323 	curl_easy_getinfo(pThis-&gt;logsReq-&gt;curl, CURLINFO_EFFECTIVE_URL, &amp;pUrl);
+324 	DBGPRINTF("\t container url: %s\n", pUrl);
+325 	RETiRet;
+326 }
+327 static void
+328 dockerContLogsInstDestruct(docker_cont_logs_inst_t *pThis) {
+329 	if (pThis) {
+330 		if (pThis-&gt;id) {
+331 			free((void*)pThis-&gt;id);
+332 		}
+333 		if (pThis-&gt;container_info) {
+334 			dockerContainerInfoDestruct(pThis-&gt;container_info);
+335 		}
+336 		if (pThis-&gt;logsReq) {
+337 			dockerContLogsReqDestruct(pThis-&gt;logsReq);
+338 		}
+339 		if (pThis-&gt;start_regex) {
+340 			free(pThis-&gt;start_regex);
+341 			regfree(&amp;pThis-&gt;start_preg);
+342 		}
+343 		free(pThis);
+344 	}
+345 }
+346 static rsRetVal
+347 parseLabels(docker_cont_logs_inst_t *inst, const uchar* json) {
+348 	DEFiRet;
+349 	DBGPRINTF("%s() - parsing json=%s\n", __FUNCTION__, json);
+350 	struct fjson_object *json_obj = fjson_tokener_parse((const char*)json);
+351 	struct fjson_object_iterator it = fjson_object_iter_begin(json_obj);
+352 	struct fjson_object_iterator itEnd = fjson_object_iter_end(json_obj);
+353 	while (!fjson_object_iter_equal(&amp;it, &amp;itEnd)) {
+354 		if (Debug) {
+355 			DBGPRINTF("%s - \t%s: '%s'\n",
+356 					__FUNCTION__,
+357 					fjson_object_iter_peek_name(&amp;it),
+358 					fjson_object_get_string(fjson_object_iter_peek_value(&amp;it)));
+359 		}
+360 		if (strcmp(fjson_object_iter_peek_name(&amp;it), DOCKER_CONTAINER_LABEL_KEY_STARTREGEX) == 0) {
+361 			inst-&gt;start_regex = (uchar*)strdup(fjson_object_get_string(fjson_object_iter_peek_value(&amp;it)));
+362 			int err = regcomp(&amp;inst-&gt;start_preg, fjson_object_get_string(fjson_object_iter_peek_value(&amp;it)),
+363 					REG_EXTENDED);
+364 			if (err != 0) {
+365 				char errbuf[512];
+366 				regerror(err, &amp;inst-&gt;start_preg, errbuf, sizeof(errbuf));
+367 				LogError(0, err, "%s() - error in startregex compile: %s", __FUNCTION__, errbuf);
+368 				ABORT_FINALIZE(RS_RET_ERR);
+369 			}
+370 		}
+371 		fjson_object_iter_next(&amp;it);
+372 	}
+373 finalize_it:
+374 	if (json_obj) {
+375 		json_object_put(json_obj);
+376 	}
+377 	RETiRet;
+378 }
+379 static rsRetVal
+380 dockerContLogsInstNew(docker_cont_logs_inst_t **ppThis, const char* id,
+381 		docker_container_info_t *container_info, SubmitMsgFuncPtr submitMsg) {
+382 	DEFiRet;
+383 	docker_cont_logs_inst_t *pThis = NULL;
+384 	CHKmalloc(pThis = calloc(1, sizeof(docker_cont_logs_inst_t)));
+385 	pThis-&gt;id = strdup((char*)id);
+386 	strncpy((char*) pThis-&gt;short_id, id, sizeof(pThis-&gt;short_id)-1);
+387 	CHKiRet(dockerContLogsReqNew(&amp;pThis-&gt;logsReq, submitMsg));
+388 	if (container_info) {
+389 		CHKiRet(dockerContainerInfoNew(&amp;pThis-&gt;container_info));
+390 		if (container_info-&gt;image_id) {
+391 			pThis-&gt;container_info-&gt;image_id = (uchar*)strdup((char*)container_info-&gt;image_id);
+392 		}
+393 		if (container_info-&gt;name) {
+394 			const char *pname = (const char*)container_info-&gt;name;
+395 			pThis-&gt;container_info-&gt;name = (uchar*)dupDockerContainerName(pname);
+396 		}
+397 		if (container_info-&gt;json_str_labels) {
+398 			pThis-&gt;container_info-&gt;json_str_labels =
+399 				(uchar*)strdup((char*)container_info-&gt;json_str_labels);
+400 		}
+401 		pThis-&gt;container_info-&gt;created = container_info-&gt;created;
+402 	}
+403 	pThis-&gt;start_regex = NULL;
+404 	pThis-&gt;prevSegEnd = 0;
+405 	if (pThis-&gt;container_info &amp;&amp; pThis-&gt;container_info-&gt;json_str_labels) {
+406 		parseLabels(pThis, pThis-&gt;container_info-&gt;json_str_labels);
+407 	}
+408 	*ppThis = pThis;
+409 finalize_it:
+410 	if (iRet != RS_RET_OK) {
+411 		if (pThis) {
+412 			dockerContLogsInstDestruct(pThis);
+413 		}
+414 	}
+415 	RETiRet;
+416 }
+417 static rsRetVal
+418 dockerContLogsInstSetUrl(docker_cont_logs_inst_t *pThis, CURLM *curlm, const char* pUrl) {
+419 	DEFiRet;
+420 	CURLcode ccode = CURLE_OK;
+421 	CURLMcode mcode = CURLM_OK;
+422 	if (curlm) {
+423 		docker_cont_logs_req_t *req = pThis-&gt;logsReq;
+424 		if (!runModConf-&gt;dockerApiAddr) {
+425 			ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_UNIX_SOCKET_PATH,
+426 					runModConf-&gt;dockerApiUnixSockAddr);
+427 			if (ccode != CURLE_OK) {
+428 				LogError(0, RS_RET_ERR,
+429 						"imdocker: curl_easy_setopt(CURLOPT_UNIX_SOCKET_PATH) error - %d:%s\n",
+430 						ccode, curl_easy_strerror(ccode));
+431 				ABORT_FINALIZE(RS_RET_ERR);
+432 			}
+433 		}
+434 		ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_WRITEFUNCTION, imdocker_container_logs_curlCB);
+435 		if (ccode != CURLE_OK) {
+436 				LogError(0, RS_RET_ERR,
+437 						"imdocker: curl_easy_setopt(CURLOPT_WRITEFUNCTION) error - %d:%s\n",
+438 						ccode, curl_easy_strerror(ccode));
+439 				ABORT_FINALIZE(RS_RET_ERR);
+440 		}
+441 		ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_WRITEDATA, pThis);
+442 		if (ccode != CURLE_OK) {
+443 				LogError(0, RS_RET_ERR, "imdocker: curl_easy_setopt(CURLOPT_WRITEDATA) error - %d:%s\n",
+444 						ccode, curl_easy_strerror(ccode));
+445 				ABORT_FINALIZE(RS_RET_ERR);
+446 		}
+447 		ccode = curl_easy_setopt(pThis-&gt;logsReq-&gt;curl, CURLOPT_URL, pUrl);
+448 		if (ccode != CURLE_OK) {
+449 			LogError(0, RS_RET_ERR, "imdocker: could not set url - %d:%s\n",
+450 					ccode, curl_easy_strerror(ccode));
+451 			ABORT_FINALIZE(RS_RET_ERR);
+452 		}
+453 		ccode = curl_easy_setopt(pThis-&gt;logsReq-&gt;curl, CURLOPT_PRIVATE, pThis-&gt;id);
+454 		if (ccode != CURLE_OK) {
+455 			LogError(0, RS_RET_ERR, "imdocker: could not set private data - %d:%s\n",
+456 					ccode, curl_easy_strerror(ccode));
+457 			ABORT_FINALIZE(RS_RET_ERR);
+458 		}
+459 		mcode = curl_multi_add_handle(curlm, pThis-&gt;logsReq-&gt;curl);
+460 		if (mcode != CURLM_OK) {
+461 			LogError(0, RS_RET_ERR, "imdocker: error curl_multi_add_handle ret- %d:%s\n",
+462 					mcode, curl_multi_strerror(mcode));
+463 			ABORT_FINALIZE(RS_RET_ERR);
+464 		}
+465 	}
+466 finalize_it:
+467 	if (ccode != CURLE_OK) {
+468 		STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
+469 	}
+470 	RETiRet;
+471 }
+472 static rsRetVal
+473 dockerContLogsInstSetUrlById (sbool isInit, docker_cont_logs_inst_t *pThis, CURLM *curlm,
+474 		const char* containerId) {
+475 	char url[256];
+476 	const uchar* container_log_options = runModConf-&gt;getContainerLogOptionsWithoutTail;
+477 	if (isInit || !runModConf-&gt;retrieveNewLogsFromStart) {
+478 		container_log_options = runModConf-&gt;getContainerLogOptions;
+479 	}
+480 	const uchar* pApiAddr = (uchar*)"http:";
+481 	if (runModConf-&gt;dockerApiAddr) {
+482 		pApiAddr = runModConf-&gt;dockerApiAddr;
+483 	}
+484 	snprintf(url, sizeof(url), "%s/%s/containers/%s/logs?%s",
+485 			pApiAddr, runModConf-&gt;apiVersionStr, containerId, container_log_options);
+486 	DBGPRINTF("%s() - url: %s\n", __FUNCTION__, url);
+487 	return dockerContLogsInstSetUrl(pThis, curlm, url);
+488 }
+489 static void
+490 dockerContLogReqsDestructForHashtable(void *pData) {
+491 	docker_cont_logs_inst_t *pThis = (docker_cont_logs_inst_t *) pData;
+492 	dockerContLogsInstDestruct(pThis);
+493 }
+494 static rsRetVal
+495 dockerContLogReqsNew(docker_cont_log_instances_t **ppThis) {
+496 	DEFiRet;
+497 	docker_cont_log_instances_t *pThis = calloc(1, sizeof(docker_cont_log_instances_t));
+498 	CHKmalloc(pThis);
+499 	CHKmalloc(pThis-&gt;ht_container_log_insts =
+500 			create_hashtable(7, hash_from_string, key_equals_string,
+501 				dockerContLogReqsDestructForHashtable));
+502 	CHKiConcCtrl(pthread_mutex_init(&amp;pThis-&gt;mut, NULL));
+503 	pThis-&gt;curlm = curl_multi_init();
+504 	if (!pThis-&gt;curlm) {
+505 		ABORT_FINALIZE(RS_RET_ERR);
+506 	}
+507 	*ppThis = pThis;
+508 finalize_it:
+509 	if (iRet != RS_RET_OK) {
+510 		if (pThis) {
+511 			dockerContLogReqsDestruct(pThis);
+512 		}
+513 	}
+514 	RETiRet;
+515 }
+516 static rsRetVal
+517 dockerContLogReqsDestruct(docker_cont_log_instances_t *pThis) {
+518 	DEFiRet;
+519 	if (pThis) {
+520 		if (pThis-&gt;ht_container_log_insts) {
+521 			pthread_mutex_lock(&amp;pThis-&gt;mut);
+522 			hashtable_destroy(pThis-&gt;ht_container_log_insts, 1);
+523 			pthread_mutex_unlock(&amp;pThis-&gt;mut);
+524 		}
+525 		if (pThis-&gt;last_container_id) {
+526 			free(pThis-&gt;last_container_id);
+527 		}
+528 		curl_multi_cleanup(pThis-&gt;curlm);
+529 		pthread_mutex_destroy(&amp;pThis-&gt;mut);
+530 		free(pThis);
+531 	}
+532 	RETiRet;
+533 }
+534 static rsRetVal
+535 dockerContLogReqsGet(docker_cont_log_instances_t *pThis,
+536 		docker_cont_logs_inst_t** ppContLogsInst, const char *id) {
+537 	DEFiRet;
+538 	if (ppContLogsInst &amp;&amp; id) {
+539 		docker_cont_logs_inst_t *pSearchObj = hashtable_search(pThis-&gt;ht_container_log_insts, (void*)id);
+540 		if (!pSearchObj) {
+541 			return RS_RET_NOT_FOUND;
+542 		}
+543 		*ppContLogsInst = pSearchObj;
+544 	}
+545 	RETiRet;
+546 }
+547 static rsRetVal
+548 dockerContLogReqsPrint(docker_cont_log_instances_t *pThis) {
+549 	DEFiRet;
+550 	int count = 0;
+551 	count = hashtable_count(pThis-&gt;ht_container_log_insts);
+552 	if (count) {
+553 		int ret = 0;
+554 		struct hashtable_itr *itr = hashtable_iterator(pThis-&gt;ht_container_log_insts);
+555 		DBGPRINTF("%s() - All container instances, count=%d...\n", __FUNCTION__, count);
+556 		do {
+557 			docker_cont_logs_inst_t *pObj = hashtable_iterator_value(itr);
+558 			dockerContLogsInstPrint(pObj);
+559 			ret = hashtable_iterator_advance(itr);
+560 		} while (ret);
+561 		free (itr);
+562 		DBGPRINTF("End of container instances.\n");
+563 	}
+564 	RETiRet;
+565 }
+566 static rsRetVal
+567 dockerContLogReqsAdd(docker_cont_log_instances_t *pThis,
+568 		docker_cont_logs_inst_t *pContLogsReqInst)
+569 {
+570 	DEFiRet;
+571 	if (!pContLogsReqInst) {
+572 		return RS_RET_ERR;
+573 	}
+574 	uchar *keyName = (uchar*)strdup((char*)pContLogsReqInst-&gt;id);
+575 	if (keyName) {
+576 		docker_cont_logs_inst_t *pFind;
+577 		if (RS_RET_NOT_FOUND == dockerContLogReqsGet(pThis, &amp;pFind, (void*)keyName)) {
+578 			if (!hashtable_insert(pThis-&gt;ht_container_log_insts, keyName, pContLogsReqInst)) {
+579 				ABORT_FINALIZE(RS_RET_ERR);
+580 			}
+581 			keyName = NULL;
+582 		}
+583 	}
+584 finalize_it:
+585 	free(keyName);
+586 	RETiRet;
+587 }
+588 static rsRetVal
+589 dockerContLogReqsRemove(docker_cont_log_instances_t *pThis, const char *id) {
+590 	DEFiRet;
+591 	if (pThis &amp;&amp; id) {
+592 		CHKiConcCtrl(pthread_mutex_lock(&amp;pThis-&gt;mut));
+593 		docker_cont_logs_inst_t *pRemoved =
+594 			hashtable_remove(pThis-&gt;ht_container_log_insts, (void*)id);
+595 		pthread_mutex_unlock(&amp;pThis-&gt;mut);
+596 		if (pRemoved) {
+597 			dockerContLogsInstDestruct(pRemoved);
+598 		} else {
+599 			iRet = RS_RET_NOT_FOUND;
+600 		}
+601 	}
+602 finalize_it:
+603 	RETiRet;
+604 }
+605 static rsRetVal
+606 dockerContainerInfoNew(docker_container_info_t **ppThis) {
+607 	DEFiRet;
+608 	docker_container_info_t* pThis = calloc(1, sizeof(docker_container_info_t));
+609 	CHKmalloc(pThis);
+610 	*ppThis = pThis;
+611 finalize_it:
+612 	RETiRet;
+613 }
+614 static void
+615 dockerContainerInfoDestruct(docker_container_info_t *pThis) {
+616 	if (pThis) {
+617 		if (pThis-&gt;image_id) { free(pThis-&gt;image_id); }
+618 		if (pThis-&gt;name) { free(pThis-&gt;name); }
+619 		if (pThis-&gt;json_str_labels) { free(pThis-&gt;json_str_labels); }
+620 		free(pThis);
+621 	}
+622 }
+623 BEGINbeginCnfLoad
+624 CODESTARTbeginCnfLoad
+625 	dbgprintf("imdocker: beginCnfLoad\n");
+626 	loadModConf = pModConf;
+627 	pModConf-&gt;pConf = pConf;
+628 	loadModConf-&gt;iPollInterval     = DFLT_pollingInterval; 	loadModConf-&gt;retrieveNewLogsFromStart  = DFLT_retrieveNewLogsFromStart;
+629 	loadModConf-&gt;containersLimit   = DFLT_containersLimit;
+630 	loadModConf-&gt;trimLineOverBytes = DFLT_trimLineOverBytes;
+631 	loadModConf-&gt;bEscapeLf         = DFLT_bEscapeLF;
+632 	loadModConf-&gt;apiVersionStr          = NULL;
+633 	loadModConf-&gt;dockerApiUnixSockAddr  = NULL;
+634 	loadModConf-&gt;dockerApiAddr          = NULL;
+635 	loadModConf-&gt;listContainersOptions  = NULL;
+636 	loadModConf-&gt;getContainerLogOptions = NULL;
+637 	loadModConf-&gt;getContainerLogOptionsWithoutTail = NULL;
+638 	loadModConf-&gt;iDfltFacility = DFLT_FACILITY;
+639 	loadModConf-&gt;iDfltSeverity = DFLT_SEVERITY;
+640 ENDbeginCnfLoad
+641 BEGINsetModCnf
+642 	struct cnfparamvals *pvals = NULL;
+643 	int i;
+644 CODESTARTsetModCnf
+645 	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
+646 	if(pvals == NULL) {
+647 		LogError(0, RS_RET_MISSING_CNFPARAMS, "error processing module "
+648 				"config parameters [module(...)]");
+649 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+650 	}
+651 	if (Debug) {
+652 		dbgprintf("module (global) param blk for imdocker:\n");
+653 		cnfparamsPrint(&amp;modpblk, pvals);
+654 	}
+655 	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
+656 		dbgprintf("%s() - iteration %d\n", __FUNCTION__,i);
+657 		dbgprintf("%s() - modpblk descr: %s\n", __FUNCTION__, modpblk.descr[i].name);
+658 		if(!pvals[i].bUsed)
+659 <a name="1"></a>			continue;
+660 		if(!strcmp(modpblk.descr[i].name, "pollinginterval")) {
+661 			loadModConf-&gt;iPollInterval = (int) pvals[i].val.d.n;
+662 <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		} else if(!strcmp(modpblk.descr[i].name, "containterlimit")) {
+663 			loadModConf-&gt;containersLimit = (int) pvals[i].val.d.n;
+664 		} else if(!strcmp(modpblk.descr[i].name, "trimlineoverbytes")) {
+665 			loadModConf-&gt;trimLineOverBytes = (int) pvals[i].val.d.n;
+666 		} else if(!strcmp(modpblk.descr[i].name, "listcontainersoptions")) {
+667 			loadModConf-&gt;listContainersOptions = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+668 		} else if(!strcmp(modpblk.descr[i].name, "getcontainerlogoptions")) {
+669 			loadModConf-&gt;getContainerLogOptions = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
+670 			size_t offset = 0;
+671 			char buf[256];
+672 			size_t buf_size = sizeof(buf);
+673 			strncpy(buf, (char*)loadModConf-&gt;getContainerLogOptions, buf_size-1);
+674 			size_t option_str_len = strlen((char*)loadModConf-&gt;getContainerLogOptions);
+675 			uchar *option_str = calloc(1, option_str_len);
+676 			CHKmalloc(option_str);
+677 			const char *search_str = "tail=";
+678 			size_t search_str_len = strlen(search_str);
+679 			char *token = strtok(buf, "&amp;");
+680 			while (token != NULL) {
+681 				if (strncmp(token, search_str, search_str_len) == 0) {
+682 					token = strtok(NULL, "&amp;");
+683 					continue;
+684 				}
+685 				int len = strlen(token);
+686 				if (offset + len + 1 &gt;= option_str_len) {
+687 					break;
+688 				}
+689 				int bytes = snprintf((char*)option_str + offset,
+690 						(option_str_len - offset), "%s&amp;", token);
+691 				if (bytes &lt;= 0) {
+692 					break;
+693 				}
+694 				offset += bytes;
+695 				token = strtok(NULL, "&amp;");
+696 			}
+697 			loadModConf-&gt;getContainerLogOptionsWithoutTail = option_str;
+698 		} else if(!strcmp(modpblk.descr[i].name, "dockerapiunixsockaddr")) {
+699 			loadModConf-&gt;dockerApiUnixSockAddr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+700 		} else if(!strcmp(modpblk.descr[i].name, "dockerapiaddr")) {
+701 			loadModConf-&gt;dockerApiAddr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+702 		} else if(!strcmp(modpblk.descr[i].name, "apiversionstr")) {
+703 <a name="3"></a>			loadModConf-&gt;apiVersionStr = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+704 		} else if(!strcmp(modpblk.descr[i].name, "retrievenewlogsfromstart")) {
+705 			loadModConf-&gt;retrieveNewLogsFromStart = (sbool) pvals[i].val.d.n;
+706 <font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		} else if (!strcmp(modpblk.descr[i].name, "defaultseverity")) {
+707 			loadModConf-&gt;iDfltSeverity = (int) pvals[i].val.d.n;
+708 		} else if (!strcmp(modpblk.descr[i].name, "defaultfacility")) {
+709 			loadModConf-&gt;iDfltFacility = (int) pvals[i].val.d.n;
+710 		} else if(!strcmp(modpblk.descr[i].name, "escapelf")) {
+711 			loadModConf-&gt;bEscapeLf = (sbool) pvals[i].val.d.n;</b></font>
+712 		} else {
+713 			LogError(0, RS_RET_INVALID_PARAMS,
+714 					"imdocker: program error, non-handled "
+715 					"param '%s' in setModCnf\n", modpblk.descr[i].name);
+716 		}
+717 	}
+718 	bLegacyCnfModGlobalsPermitted = 0;
+719 finalize_it:
+720 	if(pvals != NULL)
+721 		cnfparamvalsDestruct(pvals, &amp;modpblk);
+722 ENDsetModCnf
+723 BEGINendCnfLoad
+724 CODESTARTendCnfLoad
+725 ENDendCnfLoad
+726 BEGINcheckCnf
+727 CODESTARTcheckCnf
+728 ENDcheckCnf
+729 BEGINactivateCnf
+730 CODESTARTactivateCnf
+731 	if (!loadModConf-&gt;dockerApiUnixSockAddr) {
+732 		loadModConf-&gt;dockerApiUnixSockAddr = (uchar*) strdup(DFLT_dockerAPIUnixSockAddr);
+733 	}
+734 	if (!loadModConf-&gt;apiVersionStr) {
+735 		loadModConf-&gt;apiVersionStr = (uchar*) strdup(DFLT_apiVersionStr);
+736 	}
+737 	if (!loadModConf-&gt;listContainersOptions) {
+738 		loadModConf-&gt;listContainersOptions = (uchar*) strdup(DFLT_listContainersOptions);
+739 	}
+740 	if (!loadModConf-&gt;getContainerLogOptions) {
+741 		loadModConf-&gt;getContainerLogOptions = (uchar*) strdup(DFLT_getContainerLogOptions);
+742 	}
+743 if (!loadModConf-&gt;getContainerLogOptionsWithoutTail) {
+744 		loadModConf-&gt;getContainerLogOptionsWithoutTail =
+745 			(uchar*) strdup(DFLT_getContainerLogOptionsWithoutTail);
+746 	}
+747 	runModConf = loadModConf;
+748 	CHKiRet(statsobj.Construct(&amp;modStats));
+749 	CHKiRet(statsobj.SetName(modStats, UCHAR_CONSTANT("imdocker")));
+750 	CHKiRet(statsobj.SetOrigin(modStats, UCHAR_CONSTANT("imdocker")));
+751 	STATSCOUNTER_INIT(ctrSubmit, mutCtrSubmit);
+752 	CHKiRet(statsobj.AddCounter(modStats, UCHAR_CONSTANT("submitted"),
+753 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;ctrSubmit));
+754 	STATSCOUNTER_INIT(ctrLostRatelimit, mutCtrLostRatelimit);
+755 	CHKiRet(statsobj.AddCounter(modStats, UCHAR_CONSTANT("ratelimit.discarded"),
+756 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;ctrLostRatelimit));
+757 	STATSCOUNTER_INIT(ctrCurlError, mutCtrCurlError);
+758 	CHKiRet(statsobj.AddCounter(modStats, UCHAR_CONSTANT("curl.errors"),
+759 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;ctrCurlError));
+760 	CHKiRet(statsobj.ConstructFinalize(modStats));
+761 finalize_it:
+762 ENDactivateCnf
+763 <a name="2"></a>
+764 BEGINfreeCnf
+765 CODESTARTfreeCnf
+766 <font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if (loadModConf-&gt;dockerApiUnixSockAddr) {
+767 		free(loadModConf-&gt;dockerApiUnixSockAddr);
+768 	}
+769 	if (loadModConf-&gt;dockerApiAddr) {
+770 		free(loadModConf-&gt;dockerApiAddr);
+771 	}
+772 	if (loadModConf-&gt;apiVersionStr) {
+773 		free(loadModConf-&gt;apiVersionStr);
+774 	}
+775 	if (loadModConf-&gt;getContainerLogOptions) {
+776 		free(loadModConf-&gt;getContainerLogOptions);
+777 	}
+778 	if (loadModConf-&gt;getContainerLogOptionsWithoutTail) {
+779 		free(loadModConf-&gt;getContainerLogOptionsWithoutTail);
+780 	}
+781 	if (loadModConf-&gt;listContainersOptions) {
+782 		free(loadModConf-&gt;listContainersOptions);
+783 	}</b></font>
+784 	statsobj.Destruct(&amp;modStats);
+785 ENDfreeCnf
+786 static rsRetVal
+787 addDockerMetaData(const uchar* container_id, docker_container_info_t* pinfo, smsg_t *pMsg) {
+788 	const uchar *names[4] = {
+789 		(const uchar*) DOCKER_CONTAINER_ID_PARSE_NAME,
+790 		(const uchar*) DOCKER_CONTAINER_NAMES_PARSE_NAME,
+791 		(const uchar*) DOCKER_CONTAINER_IMAGEID_PARSE_NAME,
+792 		(const uchar*) DOCKER_CONTAINER_LABELS_PARSE_NAME
+793 	};
+794 	const uchar * empty_str= (const uchar*) "";
+795 	const uchar *id = container_id ? container_id : empty_str;
+796 	const uchar *name = pinfo-&gt;name ? pinfo-&gt;name : empty_str;
+797 	const uchar *image_id = pinfo-&gt;image_id ? pinfo-&gt;image_id : empty_str;
+798 	const uchar *json_str_labels = pinfo-&gt;json_str_labels ? pinfo-&gt;json_str_labels : empty_str;
+799 	const uchar *values[4] = {
+800 		id,
+801 		name,
+802 		image_id,
+803 		json_str_labels
+804 	};
+805 	return msgAddMultiMetadata(pMsg, names, values, 4);
+806 }
+807 static rsRetVal
+808 enqMsg(docker_cont_logs_inst_t *pInst, uchar *msg, size_t len, const uchar *pszTag,
+809 		int facility, int severity, struct timeval *tp)
+810 {
+811 	struct syslogTime st;
+812 	smsg_t *pMsg;
+813 	DEFiRet;
+814 	if (!msg) {
+815 		return RS_RET_ERR;
+816 	}
+817 	if (tp == NULL) {
+818 		CHKiRet(msgConstruct(&amp;pMsg));
+819 	} else {
+820 		datetime.timeval2syslogTime(tp, &amp;st, TIME_IN_LOCALTIME);
+821 		CHKiRet(msgConstructWithTime(&amp;pMsg, &amp;st, tp-&gt;tv_sec));
+822 	}
+823 	MsgSetFlowControlType(pMsg, eFLOWCTL_LIGHT_DELAY);
+824 	MsgSetInputName(pMsg, pInputName);
+825 	MsgSetRawMsg(pMsg, (char*)msg, len);
+826 	if (loadModConf-&gt;bEscapeLf) {
+827 		parser.SanitizeMsg(pMsg);
+828 	} else {
+829 		size_t lenMsg = pMsg-&gt;iLenRawMsg;
+830 		uchar *pszMsg = pMsg-&gt;pszRawMsg;
+831 		if(pszMsg[lenMsg-1] == '\0') {
+832 			DBGPRINTF("dropped NULL at very end of message\n");
+833 			lenMsg--;
+834 		}
+835 		if(glbl.GetParserDropTrailingLFOnReception(loadModConf-&gt;pConf)
+836 				&amp;&amp; lenMsg &gt; 0 &amp;&amp; pszMsg[lenMsg-1] == '\n') {
+837 			DBGPRINTF("dropped LF at very end of message (DropTrailingLF is set)\n");
+838 			lenMsg--;
+839 			pszMsg[lenMsg] = '\0';
+840 		}
+841 		pMsg-&gt;iLenRawMsg = lenMsg;
+842 	}
+843 	MsgSetMSGoffs(pMsg, 0);  	MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
+844 	if (pLocalHostIP) { MsgSetRcvFromIP(pMsg, pLocalHostIP); }
+845 	MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
+846 	MsgSetTAG(pMsg, pszTag, ustrlen(pszTag));
+847 	pMsg-&gt;iFacility = facility;
+848 	pMsg-&gt;iSeverity = severity;
+849 	addDockerMetaData((const uchar*)pInst-&gt;short_id, pInst-&gt;container_info, pMsg);
+850 	const char *name = (const char*)pInst-&gt;container_info-&gt;name;
+851 	DBGPRINTF("imdocker: %s - %s:%s\n", __FUNCTION__, name, msg);
+852 	CHKiRet(ratelimitAddMsg(ratelimiter, NULL, pMsg));
+853 	STATSCOUNTER_INC(ctrSubmit, mutCtrSubmit);
+854 finalize_it:
+855 	if (iRet == RS_RET_DISCARDMSG)
+856 		STATSCOUNTER_INC(ctrLostRatelimit, mutCtrLostRatelimit)
+857 	RETiRet;
+858 }
+859 static int8_t
+860 is_valid_stream_type(int8_t stream_type) {
+861 	return (dst_invalid &lt; stream_type &amp;&amp; stream_type &lt; dst_stream_type_count);
+862 }
+863 static sbool
+864 get_stream_info(const uchar* data, size_t size, int8_t *stream_type, size_t *payload_size) {
+865 	if (size &lt; 8 || !data || !stream_type || !payload_size) {
+866 		return 0;
+867 	}
+868 	const uchar* pdata = data;
+869 	*stream_type = pdata[0];
+870 	pdata += 4;
+871 	uint32_t len = 0;
+872 	memcpy(&amp;len, pdata, sizeof(len));
+873 	*payload_size = ntohl(len);
+874 	return 1;
+875 }
+876 #ifdef ENABLE_DEBUG_BYTE_BUFFER
+877 static void debug_byte_buffer(const uchar* data, size_t size) {
+878 	if (Debug) {
+879 		DBGPRINTF("%s() - ENTER, size=%lu\n", __FUNCTION__, size);
+880 		for (size_t i = 0; i &lt; size; i++) {
+881 			DBGPRINTF("0x%02x,", data[i]);
+882 		}
+883 		DBGPRINTF("\n");
+884 	}
+885 }
+886 #endif
+887 static size_t
+888 imdocker_container_list_curlCB(void *data, size_t size, size_t nmemb, void *buffer) {
+889 	DEFiRet;
+890 	size_t realsize = size*nmemb;
+891 	uchar		*pbuf=NULL;
+892 	imdocker_buf_t *mem = (imdocker_buf_t*)buffer;
+893 	if ((pbuf = realloc(mem-&gt;data, mem-&gt;len + realsize + 1)) == NULL) {
+894 		LogError(errno, RS_RET_ERR, "%s() - realloc failed!\n", __FUNCTION__);
+895 		ABORT_FINALIZE(RS_RET_ERR);
+896 	}
+897 	mem-&gt;data = pbuf;
+898 	mem-&gt;data_size = mem-&gt;len + realsize + 1;
+899 	memcpy(&amp;(mem-&gt;data[mem-&gt;len]), data, realsize);
+900 	mem-&gt;len += realsize;
+901 	mem-&gt;data[mem-&gt;len] = 0;
+902 #ifdef ENABLE_DEBUG_BYTE_BUFFER
+903 	debug_byte_buffer((const uchar*) data, realsize);
+904 #endif
+905 finalize_it:
+906 	if (iRet != RS_RET_OK) {
+907 		return 0;
+908 	}
+909 	return realsize;
+910 }
+911 static rsRetVal
+912 SubmitMultiLineMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData,
+913 		const uchar* pszTag, size_t len) {
+914 	DEFiRet;
+915 	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData-&gt;buf;
+916 	DBGPRINTF("%s() {type=%d, len=%u} %s\n",
+917 			__FUNCTION__, pBufData-&gt;stream_type, (unsigned int)mem-&gt;len, mem-&gt;data);
+918 	uchar* message = (uchar*)mem-&gt;data;
+919 	int facility = loadModConf-&gt;iDfltFacility;
+920 	int severity = pBufData-&gt;stream_type == dst_stderr ? LOG_ERR : loadModConf-&gt;iDfltSeverity;
+921 	enqMsg(pInst, message, len, (const uchar*)pszTag, facility, severity, NULL);
+922 	size_t size = mem-&gt;len - pInst-&gt;prevSegEnd;
+923 	memmove(mem-&gt;data, mem-&gt;data+pInst-&gt;prevSegEnd, size);
+924 	mem-&gt;data[len] = '\0';
+925 	mem-&gt;len = size;
+926 	pBufData-&gt;bytes_remaining = 0;
+927 	RETiRet;
+928 }
+929 static rsRetVal
+930 SubmitMsgWithStartRegex(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
+931 	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData-&gt;buf;
+932 	assert(mem-&gt;data[mem-&gt;len] == 0 || mem-&gt;data[mem-&gt;len] == '\0');
+933 	const char* thisLine = (const char*) mem-&gt;data;
+934 	if (pInst-&gt;prevSegEnd) {
+935 		thisLine = (const char*) mem-&gt;data+pInst-&gt;prevSegEnd;
+936 	}
+937 	DBGPRINTF("prevSeg: %d, thisLine: '%s'\n", pInst-&gt;prevSegEnd, thisLine);
+938 	DBGPRINTF("line(s) so far: '%s'\n", mem-&gt;data);
+939 	regex_t *start_preg = (pInst-&gt;start_regex == NULL) ? NULL : &amp;pInst-&gt;start_preg;
+940 	const int isStartMatch = start_preg ?
+941 		!regexec(start_preg, (char*)thisLine, 0, NULL, 0) : 0;
+942 	if (isStartMatch &amp;&amp; pInst-&gt;prevSegEnd != 0) {
+943 		SubmitMultiLineMsg(pInst, pBufData, pszTag, pInst-&gt;prevSegEnd);
+944 		pInst-&gt;prevSegEnd = 0;
+945 		FINALIZE;
+946 	} else {
+947 		pInst-&gt;prevSegEnd = mem-&gt;len;
+948 	}
+949 finalize_it:
+950 	return RS_RET_OK;
+951 }
+952 static rsRetVal
+953 SubmitMsg2(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
+954 	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData-&gt;buf;
+955 	DBGPRINTF("%s() - {type=%d, len=%u} %s\n",
+956 			__FUNCTION__, pBufData-&gt;stream_type, (unsigned int)mem-&gt;len, mem-&gt;data);
+957 	if (pInst-&gt;start_regex) {
+958 		SubmitMsgWithStartRegex(pInst, pBufData, pszTag);
+959 	} else {
+960 		SubmitMsg(pInst, pBufData, pszTag);
+961 	}
+962 	return RS_RET_OK;
+963 }
+964 static rsRetVal
+965 SubmitMsg(docker_cont_logs_inst_t *pInst, docker_cont_logs_buf_t *pBufData, const uchar* pszTag) {
+966 	imdocker_buf_t *mem = (imdocker_buf_t*)pBufData-&gt;buf;
+967 	DBGPRINTF("%s() - {type=%d, len=%u} %s\n",
+968 			__FUNCTION__, pBufData-&gt;stream_type, (unsigned int)mem-&gt;len, mem-&gt;data);
+969 	uchar* message = mem-&gt;data;
+970 	int facility = loadModConf-&gt;iDfltFacility;
+971 	int severity = pBufData-&gt;stream_type == dst_stderr ? LOG_ERR : loadModConf-&gt;iDfltSeverity;
+972 	enqMsg(pInst, message, mem-&gt;len, (const uchar*)pszTag, facility, severity, NULL);
+973 	mem-&gt;len = 0;
+974 	memset(mem-&gt;data, 0, mem-&gt;data_size);
+975 	pBufData-&gt;bytes_remaining = 0;
+976 	return RS_RET_OK;
+977 }
+978 static size_t
+979 imdocker_container_logs_curlCB(void *data, size_t size, size_t nmemb, void *buffer) {
+980 	DEFiRet;
+981 	const uint8_t frame_size = 8;
+982 	const char imdocker_eol_char = '\n';
+983 	int8_t stream_type = dst_invalid;
+984 	docker_cont_logs_inst_t* pInst = (docker_cont_logs_inst_t*) buffer;
+985 	docker_cont_logs_req_t* req = pInst-&gt;logsReq;
+986 	size_t realsize = size*nmemb;
+987 	const uchar* pdata = data;
+988 	size_t write_size = 0;
+989 #ifdef ENABLE_DEBUG_BYTE_BUFFER
+990 	debug_byte_buffer((const uchar*) data, realsize);
+991 #endif
+992 	if (req-&gt;data_bufs[dst_stdout]-&gt;bytes_remaining || req-&gt;data_bufs[dst_stderr]-&gt;bytes_remaining) {
+993 		if (req-&gt;data_bufs[dst_stdout]-&gt;bytes_remaining) {
+994 			if (req-&gt;data_bufs[dst_stderr]-&gt;bytes_remaining != 0) {
+995 				ABORT_FINALIZE(RS_RET_ERR);
+996 			}
+997 		} else if (req-&gt;data_bufs[dst_stderr]-&gt;bytes_remaining) {
+998 			if (req-&gt;data_bufs[dst_stdout]-&gt;bytes_remaining != 0) {
+999 				ABORT_FINALIZE(RS_RET_ERR);
+1000 			}
+1001 		}
+1002 		stream_type = req-&gt;data_bufs[dst_stdout]-&gt;bytes_remaining ? dst_stdout : dst_stderr;
+1003 		docker_cont_logs_buf_t *pDataBuf = req-&gt;data_bufs[stream_type];
+1004 		DBGPRINTF("Chunk continuation, remaining bytes: type: %d, "
+1005 				"bytes remaining: %u, realsize: %u, data pos: %u\n",
+1006 				stream_type, (unsigned int)pDataBuf-&gt;bytes_remaining,
+1007 				(unsigned int)realsize, (unsigned int)pDataBuf-&gt;buf-&gt;len);
+1008 		write_size = MIN(pDataBuf-&gt;bytes_remaining, realsize);
+1009 		CHKiRet(dockerContLogsBufWrite(pDataBuf, pdata, write_size));
+1010 		if (pDataBuf-&gt;bytes_remaining == 0) {
+1011 			imdocker_buf_t *mem = pDataBuf-&gt;buf;
+1012 			if (mem-&gt;data[mem-&gt;len-1] == imdocker_eol_char) {
+1013 				const char* szContainerId = NULL;
+1014 				CURLcode ccode;
+1015 				if(CURLE_OK != (ccode = curl_easy_getinfo(req-&gt;curl,
+1016 								CURLINFO_PRIVATE,
+1017 								&amp;szContainerId))) {
+1018 					LogError(0, RS_RET_ERR,
+1019 							"imdocker: could not get private data req[%p] - %d:%s\n",
+1020 							req-&gt;curl, ccode, curl_easy_strerror(ccode));
+1021 					ABORT_FINALIZE(RS_RET_ERR);
+1022 				}
+1023 				req-&gt;submitMsg(pInst, pDataBuf, (const uchar*)DOCKER_TAG_NAME);
+1024 			}
+1025 		}
+1026 		pdata += write_size;
+1027 	}
+1028 	if ((size_t)(pdata - (const uchar*)data) &gt;= realsize) {
+1029 		return (pdata - (const uchar*)data);
+1030 	}
+1031 	size_t payload_size = 0;
+1032 	const uchar* pread = pdata + frame_size;
+1033 	docker_cont_logs_buf_t* pDataBuf = NULL;
+1034 	if (get_stream_info(pdata, realsize, &amp;stream_type, &amp;payload_size)
+1035 				&amp;&amp; is_valid_stream_type(stream_type)) {
+1036 		pDataBuf = req-&gt;data_bufs[stream_type];
+1037 		pDataBuf-&gt;stream_type = stream_type;
+1038 		pDataBuf-&gt;bytes_remaining = payload_size;
+1039 		write_size = MIN(payload_size, realsize - frame_size);
+1040 	} else {
+1041 		stream_type = req-&gt;data_bufs[dst_stderr]-&gt;bytes_remaining ? dst_stderr : dst_stdout;
+1042 		pDataBuf = req-&gt;data_bufs[stream_type];
+1043 		pDataBuf-&gt;stream_type = stream_type;
+1044 		pDataBuf-&gt;bytes_remaining = 0;
+1045 		write_size = realsize;
+1046 		pread = pdata;
+1047 	}
+1048 	CHKiRet(dockerContLogsBufWrite(pDataBuf, pread, write_size));
+1049 	if (pDataBuf-&gt;bytes_remaining == 0) {
+1050 		DBGPRINTF("%s() - write size is same as payload_size\n", __FUNCTION__);
+1051 		req-&gt;submitMsg(pInst, pDataBuf, (const uchar*)DOCKER_TAG_NAME);
+1052 	}
+1053 finalize_it:
+1054 	if (iRet != RS_RET_OK) {
+1055 		return 0;
+1056 	}
+1057 	return realsize;
+1058 }
+1059 CURLcode docker_get(imdocker_req_t *req, const char* url) {
+1060 	CURLcode ccode;
+1061 	if (!runModConf-&gt;dockerApiAddr) {
+1062 		if ((ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_UNIX_SOCKET_PATH, runModConf-&gt;dockerApiUnixSockAddr))
+1063 				!= CURLE_OK) {
+1064 			STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
+1065 			LogError(0, RS_RET_ERR, "imdocker: curl_easy_setopt(CURLOPT_UNIX_SOCKET_PATH) error - %d:%s\n",
+1066 					ccode, curl_easy_strerror(ccode));
+1067 			return ccode;
+1068 		}
+1069 	}
+1070 	if ((ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_WRITEFUNCTION, imdocker_container_list_curlCB)) != CURLE_OK) {
+1071 		STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
+1072 		LogError(0, RS_RET_ERR, "imdocker: curl_easy_setopt(CURLOPT_WRITEFUNCTION) error - %d:%s\n",
+1073 				ccode, curl_easy_strerror(ccode));
+1074 		return ccode;
+1075 	}
+1076 	if ((ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_WRITEDATA, req-&gt;buf)) != CURLE_OK) {
+1077 		STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
+1078 		LogError(0, RS_RET_ERR, "imdocker: curl_easy_setopt(CURLOPT_WRITEDATA) error - %d:%s\n",
+1079 				ccode, curl_easy_strerror(ccode));
+1080 		return ccode;
+1081 	}
+1082 	if ((ccode = curl_easy_setopt(req-&gt;curl, CURLOPT_URL, url)) != CURLE_OK) {
+1083 		STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
+1084 		LogError(0, RS_RET_ERR, "imdocker: curl_easy_setopt(CURLOPT_URL) error - %d:%s\n",
+1085 				ccode, curl_easy_strerror(ccode));
+1086 		return ccode;
+1087 	}
+1088 	CURLcode response = curl_easy_perform(req-&gt;curl);
+1089 	return response;
+1090 }
+1091 static char*
+1092 dupDockerContainerName(const char* pname) {
+1093 	int len = strlen(pname);
+1094 	if (len &gt;= 2 &amp;&amp; *pname == '/') {
+1095 		return strdup(pname+1);
+1096 	} else {
+1097 		return strdup(pname);
+1098 	}
+1099 }
+1100 static rsRetVal
+1101 process_json(sbool isInit, const char* json, docker_cont_log_instances_t *pInstances) {
+1102 	DEFiRet;
+1103 	struct fjson_object *json_obj = NULL;
+1104 	int mut_locked = 0;
+1105 	DBGPRINTF("%s() - parsing json=%s\n", __FUNCTION__, json);
+1106 	if (!pInstances) {
+1107 		ABORT_FINALIZE(RS_RET_OK);
+1108 	}
+1109 	json_obj = fjson_tokener_parse(json);
+1110 	if (!json_obj || !fjson_object_is_type(json_obj, fjson_type_array)) {
+1111 		ABORT_FINALIZE(RS_RET_OK);
+1112 	}
+1113 	int length = fjson_object_array_length(json_obj);
+1114 	CHKiConcCtrl(pthread_mutex_lock(&amp;pInstances-&gt;mut));
+1115 	mut_locked = 1;
+1116 	for (int i = 0; i &lt; length; i++) {
+1117 		fjson_object* p_json_elm = json_object_array_get_idx(json_obj, i);
+1118 		DBGPRINTF("element: %d...\n", i);
+1119 		if (p_json_elm) {
+1120 			const char *containerId=NULL;
+1121 			docker_container_info_t containerInfo = {
+1122 				.name=NULL,
+1123 				.image_id=NULL,
+1124 				.created=0,
+1125 				.json_str_labels=NULL
+1126 			};
+1127 			struct fjson_object_iterator it = fjson_object_iter_begin(p_json_elm);
+1128 			struct fjson_object_iterator itEnd = fjson_object_iter_end(p_json_elm);
+1129 			while (!fjson_object_iter_equal(&amp;it, &amp;itEnd)) {
+1130 				if (Debug) {
+1131 					DBGPRINTF("\t%s: '%s'\n",
+1132 							fjson_object_iter_peek_name(&amp;it),
+1133 							fjson_object_get_string(fjson_object_iter_peek_value(&amp;it)));
+1134 				}
+1135 				if (strcmp(fjson_object_iter_peek_name(&amp;it), DOCKER_CONTAINER_ID_PARSE_NAME) == 0) {
+1136 					containerId =
+1137 						fjson_object_get_string(fjson_object_iter_peek_value(&amp;it));
+1138 				} else if (strcmp(fjson_object_iter_peek_name(&amp;it),
+1139 							DOCKER_CONTAINER_NAMES_PARSE_NAME) == 0) {
+1140 					int names_array_length =
+1141 						fjson_object_array_length(fjson_object_iter_peek_value(&amp;it));
+1142 					if (names_array_length) {
+1143 						fjson_object* names_elm =
+1144 <a name="4"></a>							json_object_array_get_idx(fjson_object_iter_peek_value(&amp;it), 0);
+1145 						containerInfo.name = (uchar*)fjson_object_get_string(names_elm);
+1146 					}
+1147 <font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>				} else if (strcmp(fjson_object_iter_peek_name(&amp;it),
+1148 							DOCKER_CONTAINER_IMAGEID_PARSE_NAME) == 0) {
+1149 					containerInfo.image_id =
+1150 						(uchar*)fjson_object_get_string(
+1151 									fjson_object_iter_peek_value(&amp;it)
+1152 									);
+1153 				} else if (strcmp(fjson_object_iter_peek_name(&amp;it),
+1154 							DOCKER_CONTAINER_CREATED_PARSE_NAME) == 0) {
+1155 					containerInfo.created =
+1156 						fjson_object_get_int64(
+1157 									fjson_object_iter_peek_value(&amp;it)
+1158 									);
+1159 				} else if (strcmp(fjson_object_iter_peek_name(&amp;it),
+1160 							DOCKER_CONTAINER_LABELS_PARSE_NAME) == 0) {
+1161 					containerInfo.json_str_labels =
+1162 						(uchar*) fjson_object_get_string(
+1163 									fjson_object_iter_peek_value(&amp;it)
+1164 									);
+1165 					DBGPRINTF("labels: %s\n", containerInfo.json_str_labels);
+1166 				}</b></font>
+1167 				fjson_object_iter_next(&amp;it);
+1168 			}
+1169 			if (containerId) {
+1170 				docker_cont_logs_inst_t *pInst = NULL;
+1171 				iRet = dockerContLogReqsGet(pInstances, &amp;pInst, containerId);
+1172 				if (iRet == RS_RET_NOT_FOUND) {
+1173 #ifdef USE_MULTI_LINE
+1174 					if (dockerContLogsInstNew(&amp;pInst, containerId, &amp;containerInfo, SubmitMsg2)
+1175 #else
+1176 					if (dockerContLogsInstNew(&amp;pInst, containerId, &amp;containerInfo, SubmitMsg)
+1177 #endif
+1178 							== RS_RET_OK) {
+1179 						if (pInstances-&gt;last_container_created &lt; containerInfo.created) {
+1180 							pInstances-&gt;last_container_created = containerInfo.created;
+1181 							if (pInstances-&gt;last_container_id) {
+1182 								free(pInstances-&gt;last_container_id);
+1183 							}
+1184 							pInstances-&gt;last_container_id = (uchar*)strdup(containerId);
+1185 							DBGPRINTF("last_container_id updated: ('%s', %u)\n",
+1186 									pInstances-&gt;last_container_id,
+1187 									(unsigned)pInstances-&gt;last_container_created);
+1188 						}
+1189 						CHKiRet(dockerContLogsInstSetUrlById(isInit, pInst,
+1190 									pInstances-&gt;curlm, containerId));
+1191 						CHKiRet(dockerContLogReqsAdd(pInstances, pInst));
+1192 					}
+1193 				}
+1194 			}
+1195 		}
+1196 	}
+1197 finalize_it:
+1198 	if (mut_locked) {
+1199 		pthread_mutex_unlock(&amp;pInstances-&gt;mut);
+1200 	}
+1201 	if (json_obj) {
+1202 		json_object_put(json_obj);
+1203 	}
+1204 	RETiRet;
+1205 }
+1206 static rsRetVal
+1207 getContainerIds(sbool isInit, docker_cont_log_instances_t *pInstances, const char* url) {
+1208 	DEFiRet;
+1209 	imdocker_req_t *req=NULL;
+1210 	CHKiRet(imdockerReqNew(&amp;req));
+1211 	CURLcode response = docker_get(req, url);
+1212 	if (response != CURLE_OK) {
+1213 		DBGPRINTF("%s() - curl response: %d\n", __FUNCTION__, response);
+1214 		ABORT_FINALIZE(RS_RET_ERR);
+1215 	}
+1216 	CHKiRet(process_json(isInit, (const char*)req-&gt;buf-&gt;data, pInstances));
+1217 finalize_it:
+1218 	if (req) {
+1219 		imdockerReqDestruct(req);
+1220 	}
+1221 	RETiRet;
+1222 }
+1223 static rsRetVal
+1224 getContainerIdsAndAppend(sbool isInit, docker_cont_log_instances_t *pInstances) {
+1225 	DEFiRet;
+1226 	char url[256];
+1227 	const uchar* pApiAddr = (uchar*)"http:";
+1228 	if (runModConf-&gt;dockerApiAddr) {
+1229 		pApiAddr = runModConf-&gt;dockerApiAddr;
+1230 	}
+1231 	if (pInstances-&gt;last_container_id) {
+1232 		snprintf(url, sizeof(url), "%s/%s/containers/json?%s&amp;filters={\"since\":[\"%s\"]}",
+1233 				pApiAddr, runModConf-&gt;apiVersionStr, runModConf-&gt;listContainersOptions,
+1234 				pInstances-&gt;last_container_id);
+1235 	} else {
+1236 		snprintf(url, sizeof(url), "%s/%s/containers/json?%s",
+1237 			pApiAddr, runModConf-&gt;apiVersionStr, runModConf-&gt;listContainersOptions);
+1238 	}
+1239 	DBGPRINTF("listcontainers url: %s\n", url);
+1240 	CHKiRet(getContainerIds(isInit, pInstances, (const char*)url));
+1241 	if (Debug) { dockerContLogReqsPrint(pInstances); }
+1242 finalize_it:
+1243 	RETiRet;
+1244 }
+1245 static void
+1246 cleanupCompletedContainerRequests(docker_cont_log_instances_t *pInstances) {
+1247 	int rc=0, msgs_left=0;
+1248 	CURLMsg *msg=NULL;
+1249 	CURL *pCurl;
+1250 	while ((msg = curl_multi_info_read(pInstances-&gt;curlm, &amp;msgs_left))) {
+1251 		if (msg-&gt;msg == CURLMSG_DONE) {
+1252 			pCurl = msg-&gt;easy_handle;
+1253 			rc = msg-&gt;data.result;
+1254 			if (rc != CURLE_OK) {
+1255 				STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
+1256 				LogError(0, RS_RET_ERR, "imdocker: %s() - curl error code: %d:%s\n",
+1257 						__FUNCTION__, rc, curl_multi_strerror(rc));
+1258 				continue;
+1259 			}
+1260 			CURLcode ccode;
+1261 			if (Debug) {
+1262 				long http_status=0;
+1263 				curl_easy_getinfo(pCurl, CURLINFO_RESPONSE_CODE, &amp;http_status);
+1264 				DBGPRINTF("http status: %lu\n", http_status);
+1265 			}
+1266 			curl_multi_remove_handle(pInstances-&gt;curlm, pCurl);
+1267 			const char* szContainerId = NULL;
+1268 			if ((ccode = curl_easy_getinfo(pCurl, CURLINFO_PRIVATE, &amp;szContainerId)) == CURLE_OK) {
+1269 				DBGPRINTF("container disconnected: %s\n", szContainerId);
+1270 				dockerContLogReqsRemove(pInstances, szContainerId);
+1271 				DBGPRINTF("container removed...\n");
+1272 			} else {
+1273 				LogError(0, RS_RET_ERR, "imdocker: private data not found "
+1274 						"curl_easy_setopt(CURLINFO_PRIVATE) error - %d:%s\n",
+1275 						ccode, curl_easy_strerror(ccode));
+1276 				STATSCOUNTER_INC(ctrCurlError, mutCtrCurlError);
+1277 			}
+1278 		}
+1279 	}
+1280 }
+1281 static rsRetVal
+1282 processAndPollContainerLogs(docker_cont_log_instances_t *pInstances) {
+1283 	DEFiRet;
+1284 	int count=0;
+1285 	count = hashtable_count(pInstances-&gt;ht_container_log_insts);
+1286 	DBGPRINTF("%s() - container instances: %d\n", __FUNCTION__, count);
+1287 	int still_running=0;
+1288 	curl_multi_perform(pInstances-&gt;curlm, &amp;still_running);
+1289 	do {
+1290 		int numfds = 0;
+1291 		int res = curl_multi_wait(pInstances-&gt;curlm, NULL, 0, 1000, &amp;numfds);
+1292 		if (res != CURLM_OK) {
+1293 			LogError(0, RS_RET_ERR, "error: curl_multi_wait() numfds=%d, res=%d:%s\n",
+1294 					numfds, res, curl_multi_strerror(res));
+1295 			return res;
+1296 		}
+1297 		int prev_still_running = still_running;
+1298 		curl_multi_perform(pInstances-&gt;curlm, &amp;still_running);
+1299 		if (prev_still_running &gt; still_running) {
+1300 			cleanupCompletedContainerRequests(pInstances);
+1301 		}
+1302 	} while (still_running &amp;&amp; glbl.GetGlobalInputTermState() == 0);
+1303 	cleanupCompletedContainerRequests(pInstances);
+1304 	RETiRet;
+1305 }
+1306 static void*
+1307 getContainersTask(void *pdata) {
+1308 	docker_cont_log_instances_t *pInstances = (docker_cont_log_instances_t*) pdata;
+1309 	while(glbl.GetGlobalInputTermState() == 0) {
+1310 		srSleep(runModConf-&gt;iPollInterval, 10);
+1311 		getContainerIdsAndAppend(false, pInstances);
+1312 	}
+1313 	return pdata;
+1314 }
+1315 BEGINrunInput
+1316 	rsRetVal localRet = RS_RET_OK;
+1317 	docker_cont_log_instances_t *pInstances=NULL;
+1318 	pthread_t thrd_id; 	pthread_attr_t thrd_attr;
+1319 	int get_containers_thread_initialized = 0;
+1320 	time_t now;
+1321 CODESTARTrunInput
+1322 	datetime.GetTime(&amp;now);
+1323 	CHKiRet(ratelimitNew(&amp;ratelimiter, "imdocker", NULL));
+1324 	curl_global_init(CURL_GLOBAL_ALL);
+1325 	localRet = dockerContLogReqsNew(&amp;pInstances);
+1326 	if (localRet != RS_RET_OK) {
+1327 		return localRet;
+1328 	}
+1329 	pInstances-&gt;time_started = now;
+1330 	CHKiRet(getContainerIdsAndAppend(true, pInstances));
+1331 	CHKiConcCtrl(pthread_attr_init(&amp;thrd_attr));
+1332 	CHKiConcCtrl(pthread_create(&amp;thrd_id, &amp;thrd_attr, getContainersTask, pInstances));
+1333 	get_containers_thread_initialized = 1;
+1334 	while(glbl.GetGlobalInputTermState() == 0) {
+1335 		CHKiRet(processAndPollContainerLogs(pInstances));
+1336 		if (glbl.GetGlobalInputTermState() == 0) {
+1337 			srSleep(1, 10);
+1338 		}
+1339 	}
+1340 finalize_it:
+1341 	if (get_containers_thread_initialized) {
+1342 		pthread_kill(thrd_id, SIGTTIN);
+1343 		pthread_join(thrd_id, NULL);
+1344 		pthread_attr_destroy(&amp;thrd_attr);
+1345 	}
+1346 	if (pInstances) {
+1347 		dockerContLogReqsDestruct(pInstances);
+1348 	}
+1349 	if (ratelimiter) {
+1350 		ratelimitDestruct(ratelimiter);
+1351 	}
+1352 ENDrunInput
+1353 BEGINwillRun
+1354 CODESTARTwillRun
+1355 ENDwillRun
+1356 BEGINafterRun
+1357 CODESTARTafterRun
+1358 ENDafterRun
+1359 BEGINmodExit
+1360 CODESTARTmodExit
+1361 	if(pInputName != NULL)
+1362 		prop.Destruct(&amp;pInputName);
+1363 	if(pLocalHostIP != NULL)
+1364 		prop.Destruct(&amp;pLocalHostIP);
+1365 	objRelease(parser, CORE_COMPONENT);
+1366 	objRelease(glbl, CORE_COMPONENT);
+1367 	objRelease(prop, CORE_COMPONENT);
+1368 	objRelease(statsobj, CORE_COMPONENT);
+1369 	objRelease(datetime, CORE_COMPONENT);
+1370 ENDmodExit
+1371 BEGINisCompatibleWithFeature
+1372 CODESTARTisCompatibleWithFeature
+1373 	if(eFeat == sFEATURENonCancelInputTermination)
+1374 		iRet = RS_RET_OK;
+1375 ENDisCompatibleWithFeature
+1376 BEGINqueryEtryPt
+1377 CODESTARTqueryEtryPt
+1378 CODEqueryEtryPt_STD_IMOD_QUERIES
+1379 CODEqueryEtryPt_STD_CONF2_QUERIES
+1380 CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+1381 CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
+1382 ENDqueryEtryPt
+1383 BEGINmodInit()
+1384 CODESTARTmodInit
+1385 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+1386 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+1387 	CHKiRet(objUse(prop, CORE_COMPONENT));
+1388 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
+1389 	CHKiRet(objUse(datetime, CORE_COMPONENT));
+1390 	CHKiRet(objUse(parser, CORE_COMPONENT));
+1391 	DBGPRINTF("imdocker version %s initializing\n", VERSION);
+1392 	CHKiRet(prop.Construct(&amp;pInputName));
+1393 	CHKiRet(prop.SetString(pInputName, UCHAR_CONSTANT("imdocker"), sizeof("imdocker") - 1));
+1394 	CHKiRet(prop.ConstructFinalize(pInputName));
+1395 ENDmodInit
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -1451,909 +1451,909 @@ ENDmodInit
 </h3>
 <hr/>
 <pre>
-#include "config.h"
-#include &lt;stdio.h&gt;
-#include &lt;syslog.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;fcntl.h&gt;
-#include &lt;sys/wait.h&gt;
-#include &lt;pthread.h&gt;
-#include &lt;poll.h&gt;
-#include "rsyslog.h"
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "template.h"
-#include "module-template.h"
-#include "errmsg.h"
-#include "cfsysline.h"
-#include "glbl.h"
-#include "rsconf.h"
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("omprog")
-extern char **environ; 
-DEF_OMOD_STATIC_DATA
-#define NO_HUP_FORWARD -1	#define DEFAULT_CONFIRM_TIMEOUT_MS 10000
-#define DEFAULT_CLOSE_TIMEOUT_MS 5000
-#define RESPONSE_LINE_BUFFER_SIZE 4096
-#define OUTPUT_CAPTURE_BUFFER_SIZE 4096
-#define MAX_FD_TO_CLOSE 65535
-typedef struct childProcessCtx {
-	int bIsRunning;			pid_t pid;				int fdPipeOut;			int fdPipeIn;		} childProcessCtx_t;
-typedef struct outputCaptureCtx {
-	uchar *szFileName;			mode_t fCreateMode;			pthread_mutex_t mutStart;		pthread_mutex_t mutWrite;		pthread_mutex_t mutTerm;		pthread_cond_t condTerm;		int bIsRunning;				pthread_t thrdID;			int fdPipe[2];				int fdFile;					int bFileErr;				int bReadErr;				int bWriteErr;			} outputCaptureCtx_t;
-typedef struct _instanceData {
-	uchar *szBinary;			char **aParams;				int iParams;				uchar *szTemplateName;		int bConfirmMessages;		long lConfirmTimeout;		int bReportFailures;		int bUseTransactions;		uchar *szBeginTransactionMark;		uchar *szCommitTransactionMark;		int iHUPForward;			int bSignalOnClose;			long lCloseTimeout;			int bKillUnresponsive;		int bForceSingleInst;		childProcessCtx_t *pSingleChildCtx;			pthread_mutex_t *pSingleChildMut;			outputCaptureCtx_t *pOutputCaptureCtx;		time_t block_if_err;			} instanceData;
-typedef struct wrkrInstanceData {
-	instanceData *pData;
-	childProcessCtx_t *pChildCtx;	} wrkrInstanceData_t;
-typedef struct configSettings_s {
-	uchar *szBinary;	} configSettings_t;
-static configSettings_t cs;
-static struct cnfparamdescr actpdescr[] = {
-	{ "binary", eCmdHdlrString, CNFPARAM_REQUIRED },
-<a name="0"></a>	{ "confirmMessages", eCmdHdlrBinary, 0 },
-	{ "confirmTimeout", eCmdHdlrInt, 0 },
-	{ "reportFailures", eCmdHdlrBinary, 0 },
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "useTransactions", eCmdHdlrBinary, 0 },
-	{ "beginTransactionMark", eCmdHdlrString, 0 },
-	{ "commitTransactionMark", eCmdHdlrString, 0 },
-	{ "forceSingleInstance", eCmdHdlrBinary, 0 },
-	{ "hup.signal", eCmdHdlrGetWord, 0 },
-	{ "template", eCmdHdlrGetWord, 0 },
-	{ "signalOnClose", eCmdHdlrBinary, 0 },
-	{ "closeTimeout", eCmdHdlrInt, 0 },
-	{ "killUnresponsive", eCmdHdlrBinary, 0 },
-	{ "output", eCmdHdlrString, 0 },
-	{ "fileCreateMode", eCmdHdlrFileCreateMode, 0 }
-};
-static struct cnfparamblk actpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	  actpdescr
-	};
-static __attribute__((noreturn)) void</b></font>
-execBinary(const instanceData *pData, int fdStdin, int fdStdout)
-{
-	int fdOutput, maxFd, fd, sigNum;
-	struct sigaction sigAct;
-	sigset_t sigSet;
-	char errStr[1024];
-	if(dup2(fdStdin, STDIN_FILENO) == -1) {
-		goto failed;
-	}
-	if(pData-&gt;pOutputCaptureCtx != NULL) {
-		fdOutput = pData-&gt;pOutputCaptureCtx-&gt;fdPipe[1];
-	} else {
-		fdOutput = open("/dev/null", O_WRONLY);
-		if(fdOutput == -1) {
-			goto failed;
-		}
-	}
-	if(fdStdout != -1) {
-		if(dup2(fdStdout, STDOUT_FILENO) == -1) {
-			goto failed;
-		}
-	} else {
-		if(dup2(fdOutput, STDOUT_FILENO) == -1) {
-			goto failed;
-		}
-	}
-	if(dup2(fdOutput, STDERR_FILENO) == -1) {
-		goto failed;
-	}
-	maxFd = sysconf(_SC_OPEN_MAX);
-	if(maxFd &lt; 0 || maxFd &gt; MAX_FD_TO_CLOSE) {
-		maxFd = MAX_FD_TO_CLOSE;
-	}
-#	ifdef VALGRIND
-	else {  		maxFd -= 10;
-	}
-#	endif
-	for(fd = STDERR_FILENO + 1 ; fd &lt;= maxFd ; ++fd) {
-		close(fd);
-	}
-	memset(&amp;sigAct, 0, sizeof(sigAct));
-	sigemptyset(&amp;sigAct.sa_mask);
-	sigAct.sa_handler = SIG_DFL;
-	for(sigNum = 1 ; sigNum &lt; NSIG ; ++sigNum) {
-		sigaction(sigNum, &amp;sigAct, NULL);
-	}
-	sigAct.sa_handler = SIG_IGN;
-	sigaction(SIGINT, &amp;sigAct, NULL);
-	sigemptyset(&amp;sigSet);
-	sigprocmask(SIG_SETMASK, &amp;sigSet, NULL);
-	alarm(0);
-	execve((char*)pData-&gt;szBinary, pData-&gt;aParams, environ);
-failed:
-	rs_strerror_r(errno, errStr, sizeof(errStr));
-	DBGPRINTF("omprog: failed to execute program '%s': %s\n",
-			pData-&gt;szBinary, errStr);
-	openlog("rsyslogd", 0, LOG_SYSLOG);
-	syslog(LOG_ERR, "omprog: failed to execute program '%s': %s\n",
-			pData-&gt;szBinary, errStr);
-	exit(1);
-}
-static rsRetVal
-openPipe(instanceData *pData, childProcessCtx_t *pChildCtx)
-{
-	int pipeStdin[2] = { -1, -1 };
-	int pipeStdout[2] = { -1, -1 };
-	pid_t cpid;
-	DEFiRet;
-	if(pipe(pipeStdin) == -1) {
-		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
-	}
-	if(pData-&gt;bConfirmMessages &amp;&amp; pipe(pipeStdout) == -1) {
-		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
-	}
-	DBGPRINTF("omprog: executing program '%s' with '%d' parameters\n", pData-&gt;szBinary,
-			pData-&gt;iParams);
-	cpid = fork();
-	if(cpid == -1) {
-		ABORT_FINALIZE(RS_RET_ERR_FORK);
-	}
-	if(cpid == 0) {  		close(pipeStdin[1]);
-		if(pipeStdout[0] != -1) {
-			close(pipeStdout[0]);
-		}
-		execBinary(pData, pipeStdin[0], pipeStdout[1]);
-	}
-	DBGPRINTF("omprog: child has pid %d\n", (int) cpid);
-	close(pipeStdin[0]);
-	if(pipeStdout[1] != -1) {
-		close(pipeStdout[1]);
-	}
-	pChildCtx-&gt;fdPipeOut = pipeStdin[1];  	pChildCtx-&gt;fdPipeIn = pipeStdout[0];  	pChildCtx-&gt;pid = cpid;
-	pChildCtx-&gt;bIsRunning = 1;
-finalize_it:
-	if(iRet != RS_RET_OK) {
-		if(pipeStdin[0] != -1) {
-			close(pipeStdin[0]);
-			close(pipeStdin[1]);
-		}
-		if(pipeStdout[0] != -1) {
-			close(pipeStdout[0]);
-			close(pipeStdout[1]);
-		}
-	}
-	RETiRet;
-}
-static void
-waitForChild(instanceData *pData, childProcessCtx_t *pChildCtx)
-{
-	int status;
-	int ret;
-	long counter;
-	counter = pData-&gt;lCloseTimeout / 10;
-	while ((ret = waitpid(pChildCtx-&gt;pid, &amp;status, WNOHANG)) == 0 &amp;&amp; counter &gt; 0) {
-		srSleep(0, 10000);  		--counter;
-	}
-	if (ret == 0) {  		if (!pData-&gt;bKillUnresponsive) {
-			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' (pid %ld) did not terminate "
-					"within timeout (%ld ms); ignoring it", pData-&gt;szBinary,
-					(long) pChildCtx-&gt;pid, pData-&gt;lCloseTimeout);
-			return;
-		}
-		LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' (pid %ld) did not terminate "
-				"within timeout (%ld ms); killing it", pData-&gt;szBinary, (long) pChildCtx-&gt;pid,
-				pData-&gt;lCloseTimeout);
-		if (kill(pChildCtx-&gt;pid, SIGKILL) == -1) {
-			LogError(errno, RS_RET_SYS_ERR, "omprog: could not send SIGKILL to child process");
-			return;
-		}
-		ret = waitpid(pChildCtx-&gt;pid, &amp;status, 0);
-	}
-	if(ret == pChildCtx-&gt;pid) {
-		glblReportChildProcessExit(runConf, pData-&gt;szBinary, pChildCtx-&gt;pid, status);
-	}
-}
-static void
-cleanupChild(instanceData *pData, childProcessCtx_t *pChildCtx)
-{
-	assert(pChildCtx-&gt;bIsRunning);
-	if(pChildCtx-&gt;fdPipeIn != -1) {
-		close(pChildCtx-&gt;fdPipeIn);
-		pChildCtx-&gt;fdPipeIn = -1;
-	}
-	if(pChildCtx-&gt;fdPipeOut != -1) {
-		close(pChildCtx-&gt;fdPipeOut);
-		pChildCtx-&gt;fdPipeOut = -1;
-	}
-	waitForChild(pData, pChildCtx);
-	pChildCtx-&gt;bIsRunning = 0;
-}
-static void
-terminateChild(instanceData *pData, childProcessCtx_t *pChildCtx)
-{
-	assert(pChildCtx-&gt;bIsRunning);
-	if (pData-&gt;bSignalOnClose) {
-		kill(pChildCtx-&gt;pid, SIGTERM);
-	}
-	cleanupChild(pData, pChildCtx);
-}
-static rsRetVal
-sendMessage(instanceData *pData, childProcessCtx_t *pChildCtx, const uchar *szMsg)
-{
-	ssize_t written;
-	size_t offset = 0;
-	DEFiRet;
-	const size_t len = strlen((char*)szMsg);
-	do {
-		written = write(pChildCtx-&gt;fdPipeOut, ((char*)szMsg) + offset, len - offset);
-		if(written == -1) {
-			if(errno == EINTR) {
-				continue;  			}
-			if(errno == EPIPE) {
-				LogMsg(0, RS_RET_ERR_WRITE_PIPE, LOG_WARNING,
-						"omprog: program '%s' (pid %ld) terminated; will be restarted",
-						pData-&gt;szBinary, (long) pChildCtx-&gt;pid);
-				cleanupChild(pData, pChildCtx);  				ABORT_FINALIZE(RS_RET_SUSPENDED);
-			}
-			LogError(errno, RS_RET_ERR_WRITE_PIPE, "omprog: error sending message to program");
-			ABORT_FINALIZE(RS_RET_SUSPENDED);
-		}
-		offset += written;
-	} while(offset &lt; len);
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-lineToStatusCode(instanceData *pData, const char* line)
-{
-	DEFiRet;
-	while(line[0] == '.') {
-<a name="4"></a>		++line;
-	}
-<font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if(strcmp(line, "OK") == 0) {
-		iRet = RS_RET_OK;
-	} else if(strcmp(line, "DEFER_COMMIT") == 0) {
-		iRet = RS_RET_DEFER_COMMIT;
-	} else if(strcmp(line, "PREVIOUS_COMMITTED") == 0) {
-		iRet = RS_RET_PREVIOUS_COMMITTED;
-	} else {</b></font>
-		DBGPRINTF("omprog: program '%s' returned: %s\n", pData-&gt;szBinary, line);
-		if(pData-&gt;bReportFailures) {
-			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' returned: %s",
-					pData-&gt;szBinary, line);
-		}
-		iRet = RS_RET_SUSPENDED;
-	}
-	RETiRet;
-}
-static rsRetVal
-readStatus(instanceData *pData, childProcessCtx_t *pChildCtx)
-{
-	struct pollfd fdToPoll[1];
-	int numReady;
-	char lineBuf[RESPONSE_LINE_BUFFER_SIZE];
-	ssize_t lenRead;
-	size_t offset = 0;
-	int lineEnded = 0;
-	DEFiRet;
-	fdToPoll[0].fd = pChildCtx-&gt;fdPipeIn;
-	fdToPoll[0].events = POLLIN;
-	do {
-		numReady = poll(fdToPoll, 1, pData-&gt;lConfirmTimeout);
-		if(numReady == -1) {
-			if(errno == EINTR) {
-				continue;  			}
-			LogError(errno, RS_RET_SYS_ERR, "omprog: error polling for response from program");
-			ABORT_FINALIZE(RS_RET_SUSPENDED);
-		}
-		if(numReady == 0) {  			LogMsg(0, RS_RET_TIMED_OUT, LOG_WARNING, "omprog: program '%s' (pid %ld) did not respond "
-					"within timeout (%ld ms); will be restarted", pData-&gt;szBinary,
-					(long) pChildCtx-&gt;pid, pData-&gt;lConfirmTimeout);
-			terminateChild(pData, pChildCtx);
-			ABORT_FINALIZE(RS_RET_SUSPENDED);
-		}
-		lenRead = read(pChildCtx-&gt;fdPipeIn, lineBuf + offset, sizeof(lineBuf) - offset - 1);
-		if(lenRead == -1) {
-			if(errno == EINTR) {
-				continue;  			}
-			LogError(errno, RS_RET_READ_ERR, "omprog: error reading response from program");
-			ABORT_FINALIZE(RS_RET_SUSPENDED);
-		}
-		if(lenRead == 0) {
-			LogMsg(0, RS_RET_READ_ERR, LOG_WARNING, "omprog: program '%s' (pid %ld) terminated; "
-					"will be restarted", pData-&gt;szBinary, (long) pChildCtx-&gt;pid);
-			cleanupChild(pData, pChildCtx);
-			ABORT_FINALIZE(RS_RET_SUSPENDED);
-		}
-		offset += lenRead;
-		lineBuf[offset] = '\0';
-		lineEnded = (lineBuf[offset-1] == '\n');
-		if(!lineEnded &amp;&amp; strchr(lineBuf + offset - lenRead, '\n') != NULL) {
-			DBGPRINTF("omprog: program '%s' returned: %s\n", pData-&gt;szBinary, lineBuf);
-			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' returned a multiline response; "
-					"will be restarted", pData-&gt;szBinary);
-			if(pData-&gt;bReportFailures) {
-				LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' returned: %s",
-						pData-&gt;szBinary, lineBuf);
-			}
-			terminateChild(pData, pChildCtx);
-			ABORT_FINALIZE(RS_RET_SUSPENDED);
-		}
-	} while(!lineEnded &amp;&amp; offset &lt; sizeof(lineBuf) - 1);
-	if(!lineEnded) {
-		DBGPRINTF("omprog: program '%s' returned: %s\n", pData-&gt;szBinary, lineBuf);
-		LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' returned a too long response; "
-				"will be restarted", pData-&gt;szBinary);
-		if(pData-&gt;bReportFailures) {
-			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' returned: %s",
-					pData-&gt;szBinary, lineBuf);
-		}
-		terminateChild(pData, pChildCtx);
-		ABORT_FINALIZE(RS_RET_SUSPENDED);
-	}
-	lineBuf[offset-1] = '\0';  
-	iRet = lineToStatusCode(pData, lineBuf);
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-allocChildCtx(childProcessCtx_t **ppChildCtx)
-{
-	childProcessCtx_t *pChildCtx;
-	DEFiRet;
-	CHKmalloc(pChildCtx = calloc(1, sizeof(childProcessCtx_t)));
-	*ppChildCtx = pChildCtx;
-	pChildCtx-&gt;bIsRunning = 0;
-	pChildCtx-&gt;pid = -1;
-	pChildCtx-&gt;fdPipeOut = -1;
-	pChildCtx-&gt;fdPipeIn = -1;
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-startChild(instanceData *pData, childProcessCtx_t *pChildCtx)
-{
-	DEFiRet;
-	assert(!pChildCtx-&gt;bIsRunning);
-	CHKiRet(openPipe(pData, pChildCtx));
-	if(pData-&gt;bConfirmMessages) {
-		CHKiRet(readStatus(pData, pChildCtx));
-	}
-finalize_it:
-	if(iRet != RS_RET_OK &amp;&amp; pChildCtx-&gt;bIsRunning) {
-		terminateChild(pData, pChildCtx);
-	}
-	RETiRet;
-}
-static rsRetVal
-startSingleChildOnce(instanceData *pData)
-{
-	DEFiRet;
-	assert(pData-&gt;bForceSingleInst);
-	CHKiConcCtrl(pthread_mutex_lock(pData-&gt;pSingleChildMut));
-	if(pData-&gt;pSingleChildCtx-&gt;bIsRunning)
-		goto finalize_it;  
-	iRet = startChild(pData, pData-&gt;pSingleChildCtx);
-finalize_it:
-	pthread_mutex_unlock(pData-&gt;pSingleChildMut);
-	RETiRet;
-}
-static void
-writeOutputToFile(outputCaptureCtx_t *pCtx, char *buf, ssize_t len)
-{
-	ssize_t written;
-	ssize_t offset = 0;
-	assert(pCtx-&gt;bIsRunning);
-	pthread_mutex_lock(&amp;pCtx-&gt;mutWrite);
-	if(pCtx-&gt;fdFile == -1) {
-		if(pCtx-&gt;bFileErr) {  			goto done;
-		}
-		pCtx-&gt;fdFile = open((char*)pCtx-&gt;szFileName, O_WRONLY | O_APPEND | O_CREAT,
-				pCtx-&gt;fCreateMode);
-		if(pCtx-&gt;fdFile == -1) {
-			LogError(errno, RS_RET_NO_FILE_ACCESS, "omprog: error opening output file %s; "
-					"output from program will be discarded", pCtx-&gt;szFileName);
-			pCtx-&gt;bFileErr = 1;  			goto done;
-		}
-	}
-	do {
-		written = write(pCtx-&gt;fdFile, buf + offset, len - offset);
-		if(written == -1) {
-			if(errno == EINTR) {
-				continue;  			}
-			if(!pCtx-&gt;bWriteErr) {
-				LogError(errno, RS_RET_SYS_ERR, "omprog: error writing to output file "
-						"(subsequent errors will not be reported)");
-				pCtx-&gt;bWriteErr = 1;  			}
-			break;
-		}
-		if(pCtx-&gt;bWriteErr) {
-			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: resumed writing to output file");
-			pCtx-&gt;bWriteErr = 0;
-		}
-		offset += written;
-	} while(offset &lt; len);
-done:
-	pthread_mutex_unlock(&amp;pCtx-&gt;mutWrite);
-}
-static void
-closeOutputFile(outputCaptureCtx_t *pCtx)
-{
-	DBGPRINTF("omprog: reopening output file upon reception of HUP signal\n");
-	pthread_mutex_lock(&amp;pCtx-&gt;mutWrite);
-	if(pCtx-&gt;fdFile != -1) {
-		close(pCtx-&gt;fdFile);
-		pCtx-&gt;fdFile = -1;
-	}
-	pCtx-&gt;bFileErr = 0;  
-	pthread_mutex_unlock(&amp;pCtx-&gt;mutWrite);
-}
-static void *
-captureOutput(void *_pCtx) {
-	outputCaptureCtx_t *pCtx = (outputCaptureCtx_t *)_pCtx;
-	sigset_t sigSet;
-	char readBuf[OUTPUT_CAPTURE_BUFFER_SIZE];
-	ssize_t lenRead;
-	DBGPRINTF("omprog: starting output capture thread\n");
-	sigfillset(&amp;sigSet);
-	pthread_sigmask(SIG_SETMASK, &amp;sigSet, NULL);
-	for(;;) {
-		lenRead = read(pCtx-&gt;fdPipe[0], readBuf, sizeof(readBuf));
-		if(lenRead == -1) {
-			if(errno == EINTR) {
-				continue;  			}
-			if(!pCtx-&gt;bReadErr) {
-				LogError(errno, RS_RET_SYS_ERR, "omprog: error capturing output from program "
-						"(subsequent errors will not be reported)");
-				pCtx-&gt;bReadErr = 1;  			}
-			continue;  		}
-		if(lenRead == 0) {
-			break;  		}
-		if(pCtx-&gt;bReadErr) {
-			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: resumed capturing output from program");
-			pCtx-&gt;bReadErr = 0;
-		}
-		writeOutputToFile(pCtx, readBuf, lenRead);
-	}
-	DBGPRINTF("omprog: all output-capture pipe ends closed, terminating output capture thread\n");
-	pthread_mutex_lock(&amp;pCtx-&gt;mutTerm);
-	pCtx-&gt;bIsRunning = 0;
-	pthread_cond_signal(&amp;pCtx-&gt;condTerm);
-	pthread_mutex_unlock(&amp;pCtx-&gt;mutTerm);
-	return NULL;
-}
-static rsRetVal
-allocOutputCaptureCtx(outputCaptureCtx_t **ppCtx)
-{
-	outputCaptureCtx_t *pCtx;
-	DEFiRet;
-	CHKmalloc(pCtx = calloc(1, sizeof(outputCaptureCtx_t)));
-	*ppCtx = pCtx;
-	pCtx-&gt;szFileName = NULL;
-	pCtx-&gt;fCreateMode = 0600;
-	pCtx-&gt;bIsRunning = 0;
-	CHKiConcCtrl(pthread_mutex_init(&amp;pCtx-&gt;mutStart, NULL));
-	CHKiConcCtrl(pthread_mutex_init(&amp;pCtx-&gt;mutWrite, NULL));
-	CHKiConcCtrl(pthread_mutex_init(&amp;pCtx-&gt;mutTerm, NULL));
-	CHKiConcCtrl(pthread_cond_init(&amp;pCtx-&gt;condTerm, NULL));
-finalize_it:
-	RETiRet;
-}
-static void
-freeOutputCaptureCtx(outputCaptureCtx_t *pCtx) {
-	if(pCtx-&gt;szFileName != NULL) {
-		free(pCtx-&gt;szFileName);
-	}
-	pthread_cond_destroy(&amp;pCtx-&gt;condTerm);
-	pthread_mutex_destroy(&amp;pCtx-&gt;mutTerm);
-	pthread_mutex_destroy(&amp;pCtx-&gt;mutWrite);
-	pthread_mutex_destroy(&amp;pCtx-&gt;mutStart);
-	free(pCtx);
-}
-static rsRetVal
-startOutputCaptureOnce(outputCaptureCtx_t *pCtx)
-{
-	int pip[2] = { -1, -1 };
-	DEFiRet;
-	CHKiConcCtrl(pthread_mutex_lock(&amp;pCtx-&gt;mutStart));
-	if(pCtx-&gt;bIsRunning)
-		goto finalize_it;  
-	if(pipe(pip) == -1) {
-		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
-	}
-	pCtx-&gt;fdPipe[0] = pip[0];
-	pCtx-&gt;fdPipe[1] = pip[1];
-	pCtx-&gt;fdFile = -1;
-	pCtx-&gt;bFileErr = 0;
-	pCtx-&gt;bReadErr = 0;
-	pCtx-&gt;bWriteErr = 0;
-	CHKiConcCtrl(pthread_create(&amp;pCtx-&gt;thrdID, NULL, captureOutput, (void *)pCtx));
-	pCtx-&gt;bIsRunning = 1;
-finalize_it:
-	if(iRet != RS_RET_OK &amp;&amp; pip[0] != -1) {
-		close(pip[0]);
-		close(pip[1]);
-	}
-	pthread_mutex_unlock(&amp;pCtx-&gt;mutStart);
-	RETiRet;
-}
-static void
-endOutputCapture(outputCaptureCtx_t *pCtx, long timeoutMs)
-{
-	struct timespec ts;
-	int bTimedOut;
-	assert(pCtx-&gt;bIsRunning);
-	close(pCtx-&gt;fdPipe[1]);
-	timeoutComp(&amp;ts, timeoutMs);
-	pthread_mutex_lock(&amp;pCtx-&gt;mutTerm);
-	bTimedOut = 0;
-	while(pCtx-&gt;bIsRunning &amp;&amp; !bTimedOut) {
-		if(pthread_cond_timedwait(&amp;pCtx-&gt;condTerm, &amp;pCtx-&gt;mutTerm, &amp;ts) == ETIMEDOUT) {
-			bTimedOut = 1;
-		}
-	}
-	pthread_mutex_unlock(&amp;pCtx-&gt;mutTerm);
-	if(bTimedOut) {
-		LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: forcing termination of output capture "
-				"thread because of unresponsive child process");
-		pthread_cancel(pCtx-&gt;thrdID);
-		pCtx-&gt;bIsRunning = 0;
-	}
-	pthread_join(pCtx-&gt;thrdID, NULL);
-	close(pCtx-&gt;fdPipe[0]);
-	if(pCtx-&gt;fdFile != -1) {
-		close(pCtx-&gt;fdFile);
-	}
-}
-BEGINinitConfVars		CODESTARTinitConfVars
-	cs.szBinary = NULL;	ENDinitConfVars
-BEGINcreateInstance
-CODESTARTcreateInstance
-	pData-&gt;szBinary = NULL;
-	pData-&gt;szTemplateName = NULL;
-	pData-&gt;aParams = NULL;
-	pData-&gt;iParams = 0;
-	pData-&gt;bConfirmMessages = 0;
-	pData-&gt;block_if_err = 0;
-	pData-&gt;lConfirmTimeout = DEFAULT_CONFIRM_TIMEOUT_MS;
-	pData-&gt;bReportFailures = 0;
-	pData-&gt;bUseTransactions = 0;
-	pData-&gt;szBeginTransactionMark = NULL;
-	pData-&gt;szCommitTransactionMark = NULL;
-	pData-&gt;iHUPForward = NO_HUP_FORWARD;
-	pData-&gt;bSignalOnClose = 0;
-	pData-&gt;lCloseTimeout = DEFAULT_CLOSE_TIMEOUT_MS;
-	pData-&gt;bKillUnresponsive = -1;
-	pData-&gt;bForceSingleInst = 0;
-	pData-&gt;pSingleChildCtx = NULL;
-	pData-&gt;pSingleChildMut = NULL;
-	pData-&gt;pOutputCaptureCtx = NULL;
-ENDcreateInstance
-static rsRetVal
-postInitInstance(instanceData *pData)
-{
-	DEFiRet;
-	if(pData-&gt;bUseTransactions &amp;&amp; pData-&gt;szBeginTransactionMark == NULL) {
-		pData-&gt;szBeginTransactionMark = (uchar*)strdup("BEGIN TRANSACTION");
-	}
-	if(pData-&gt;bUseTransactions &amp;&amp; pData-&gt;szCommitTransactionMark == NULL) {
-		pData-&gt;szCommitTransactionMark = (uchar*)strdup("COMMIT TRANSACTION");
-	}
-	if(pData-&gt;bKillUnresponsive == -1) {  		pData-&gt;bKillUnresponsive = pData-&gt;bSignalOnClose;
-	}
-	if(pData-&gt;pOutputCaptureCtx != NULL &amp;&amp; pData-&gt;pOutputCaptureCtx-&gt;szFileName == NULL) {
-		LogError(0, RS_RET_CONF_PARAM_INVLD, "omprog: the 'fileCreateMode' parameter requires "
-				"specifying the 'output' parameter also");
-		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
-	}
-	if(pData-&gt;bForceSingleInst) {
-		CHKmalloc(pData-&gt;pSingleChildMut = calloc(1, sizeof(pthread_mutex_t)));
-		CHKiConcCtrl(pthread_mutex_init(pData-&gt;pSingleChildMut, NULL));
-		CHKiRet(allocChildCtx(&amp;pData-&gt;pSingleChildCtx));
-	}
-finalize_it:
-	RETiRet;
-}
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-	pWrkrData-&gt;pChildCtx = NULL;
-	if(pWrkrData-&gt;pData-&gt;pOutputCaptureCtx != NULL) {
-		CHKiRet(startOutputCaptureOnce(pWrkrData-&gt;pData-&gt;pOutputCaptureCtx));
-	}
-	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		CHKiRet(startSingleChildOnce(pWrkrData-&gt;pData));
-		pWrkrData-&gt;pChildCtx = pData-&gt;pSingleChildCtx;
-	} else {
-		CHKiRet(allocChildCtx(&amp;pWrkrData-&gt;pChildCtx));
-		CHKiRet(startChild(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
-	}
-finalize_it:
-	if(iRet != RS_RET_OK &amp;&amp; !pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		free(pWrkrData-&gt;pChildCtx);
-	}
-ENDcreateWrkrInstance
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURERepeatedMsgReduction) {
-		iRet = RS_RET_OK;
-	}
-ENDisCompatibleWithFeature
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-ENDdbgPrintInstInfo
-<a name="2"></a>
-BEGINtryResume
-CODESTARTtryResume
-<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
-	}
-	if(!pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {
-		CHKiRet(startChild(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
-	}
-finalize_it:
-	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
-	}
-ENDtryResume
-BEGINbeginTransaction
-CODESTARTbeginTransaction
-	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
-	}
-	if(!pWrkrData-&gt;pData-&gt;bUseTransactions) {
-		FINALIZE;
-	}
-	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx,
-			pWrkrData-&gt;pData-&gt;szBeginTransactionMark));
-	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, (uchar*) "\n"));
-	if(pWrkrData-&gt;pData-&gt;bConfirmMessages) {
-		CHKiRet(readStatus(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
-	}</b></font>
-finalize_it:
-	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
-	}
-ENDbeginTransaction
-BEGINdoAction
-CODESTARTdoAction
-	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
-	}
-	if(!pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {  		ABORT_FINALIZE(RS_RET_SUSPENDED);
-	}
-	const uchar *const szMsg = ppString[0];
-	const size_t len = strlen((char*)szMsg);
-	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, szMsg));
-	if(szMsg[len-1] != '\n') {
-		const time_t tt = time(NULL);
-		if(tt &gt; pWrkrData-&gt;pData-&gt;block_if_err) {
-			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: messages must be terminated with \\n "
-				"at end of message, but this message is not: '%s'\n", ppString[0]);
-			pWrkrData-&gt;pData-&gt;block_if_err = tt + 30;
-		}
-		CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, (uchar*) "\n"));
-	}
-	if(pWrkrData-&gt;pData-&gt;bConfirmMessages) {
-		CHKiRet(readStatus(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
-	} else if(pWrkrData-&gt;pData-&gt;bUseTransactions) {
-		iRet = RS_RET_DEFER_COMMIT;
-	}
-finalize_it:
-	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
-	}
-ENDdoAction
-BEGINendTransaction
-CODESTARTendTransaction
-	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
-	}
-	if(!pWrkrData-&gt;pData-&gt;bUseTransactions) {
-		FINALIZE;
-	}
-	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx,
-			pWrkrData-&gt;pData-&gt;szCommitTransactionMark));
-	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, (uchar*) "\n"));
-	if(pWrkrData-&gt;pData-&gt;bConfirmMessages) {
-		CHKiRet(readStatus(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
-	}
-finalize_it:
-	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
-	}
-ENDendTransaction
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-	if(!pWrkrData-&gt;pData-&gt;bForceSingleInst) {
-		if(pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {
-			terminateChild(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx);
-		}
-		free(pWrkrData-&gt;pChildCtx);
-	}
-ENDfreeWrkrInstance
-BEGINfreeInstance
-	int i;
-CODESTARTfreeInstance
-	if(pData-&gt;pSingleChildCtx != NULL) {
-		if(pData-&gt;pSingleChildCtx-&gt;bIsRunning) {
-			terminateChild(pData, pData-&gt;pSingleChildCtx);
-		}
-		free(pData-&gt;pSingleChildCtx);
-	}
-	if(pData-&gt;pSingleChildMut != NULL) {
-		pthread_mutex_destroy(pData-&gt;pSingleChildMut);
-		free(pData-&gt;pSingleChildMut);
-	}
-	if(pData-&gt;pOutputCaptureCtx != NULL) {
-		if(pData-&gt;pOutputCaptureCtx-&gt;bIsRunning) {
-			endOutputCapture(pData-&gt;pOutputCaptureCtx, pData-&gt;lCloseTimeout);
-		}
-		freeOutputCaptureCtx(pData-&gt;pOutputCaptureCtx);
-	}
-	free(pData-&gt;szBinary);
-	free(pData-&gt;szTemplateName);
-	free(pData-&gt;szBeginTransactionMark);
-	free(pData-&gt;szCommitTransactionMark);
-	if(pData-&gt;aParams != NULL) {
-		for (i = 0; i &lt; pData-&gt;iParams; i++) {
-			free(pData-&gt;aParams[i]);
-		}
-		free(pData-&gt;aParams);
-	}
-ENDfreeInstance
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	int i;
-CODESTARTnewActInst
-	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-	CHKiRet(createInstance(&amp;pData));
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(actpblk.descr[i].name, "binary")) {
-			CHKiRet(split_binary_parameters(&amp;pData-&gt;szBinary, &amp;pData-&gt;aParams, &amp;pData-&gt;iParams,
-				pvals[i].val.d.estr));
-		} else if(!strcmp(actpblk.descr[i].name, "confirmMessages")) {
-<a name="1"></a>			pData-&gt;bConfirmMessages = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "confirmTimeout")) {
-			pData-&gt;lConfirmTimeout = (long) pvals[i].val.d.n;
-<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		} else if(!strcmp(actpblk.descr[i].name, "reportFailures")) {
-			pData-&gt;bReportFailures = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "useTransactions")) {
-			pData-&gt;bUseTransactions = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "beginTransactionMark")) {
-<a name="3"></a>			pData-&gt;szBeginTransactionMark = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "commitTransactionMark")) {
-			pData-&gt;szCommitTransactionMark = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
-<font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		} else if(!strcmp(actpblk.descr[i].name, "forceSingleInstance")) {
-			pData-&gt;bForceSingleInst = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "signalOnClose")) {
-			pData-&gt;bSignalOnClose = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "closeTimeout")) {
-			pData-&gt;lCloseTimeout = (long) pvals[i].val.d.n;</b></font>
-		} else if(!strcmp(actpblk.descr[i].name, "killUnresponsive")) {
-			pData-&gt;bKillUnresponsive = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "hup.signal")) {
-			const char *const sig = es_str2cstr(pvals[i].val.d.estr, NULL);
-			if(!strcmp(sig, "HUP"))
-				pData-&gt;iHUPForward = SIGHUP;
-			else if(!strcmp(sig, "USR1"))
-				pData-&gt;iHUPForward = SIGUSR1;
-			else if(!strcmp(sig, "USR2"))
-				pData-&gt;iHUPForward = SIGUSR2;
-			else if(!strcmp(sig, "INT"))
-				pData-&gt;iHUPForward = SIGINT;
-			else if(!strcmp(sig, "TERM"))
-				pData-&gt;iHUPForward = SIGTERM;
-			else {
-				LogError(0, RS_RET_CONF_PARAM_INVLD,
-					"omprog: hup.signal '%s' in hup.signal parameter", sig);
-				ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
-			}
-			free((void*)sig);
-		} else if(!strcmp(actpblk.descr[i].name, "template")) {
-			pData-&gt;szTemplateName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "output")) {
-			if(pData-&gt;pOutputCaptureCtx == NULL) {
-				CHKiRet(allocOutputCaptureCtx(&amp;pData-&gt;pOutputCaptureCtx));
-			}
-			pData-&gt;pOutputCaptureCtx-&gt;szFileName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "fileCreateMode")) {
-			if(pData-&gt;pOutputCaptureCtx == NULL) {
-				CHKiRet(allocOutputCaptureCtx(&amp;pData-&gt;pOutputCaptureCtx));
-			}
-			pData-&gt;pOutputCaptureCtx-&gt;fCreateMode = (mode_t) pvals[i].val.d.n;
-		} else {
-			DBGPRINTF("omprog: program error, non-handled param '%s'\n", actpblk.descr[i].name);
-		}
-	}
-	CODE_STD_STRING_REQUESTnewActInst(1)
-	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup(pData-&gt;szTemplateName == NULL ?
-			"RSYSLOG_FileFormat" : (char*)pData-&gt;szTemplateName), OMSR_NO_RQD_TPL_OPTS));
-	iRet = postInitInstance(pData);
-CODE_STD_FINALIZERnewActInst
-	cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-BEGINparseSelectorAct
-CODESTARTparseSelectorAct
-CODE_STD_STRING_REQUESTparseSelectorAct(1)
-	if(strncmp((char*) p, ":omprog:", sizeof(":omprog:") - 1)) {
-		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
-	}
-	p += sizeof(":omprog:") - 1; 	if(cs.szBinary == NULL) {
-		LogError(0, RS_RET_CONF_RQRD_PARAM_MISSING, "no binary to execute specified");
-		ABORT_FINALIZE(RS_RET_CONF_RQRD_PARAM_MISSING);
-	}
-	CHKiRet(createInstance(&amp;pData));
-	CHKmalloc(pData-&gt;szBinary = (uchar*) strdup((char*)cs.szBinary));
-	if(*(p-1) == ';')
-		--p;
-	CHKiRet(cflineParseTemplateName(&amp;p, *ppOMSR, 0, 0, (uchar*) "RSYSLOG_FileFormat"));
-	iRet = postInitInstance(pData);
-CODE_STD_FINALIZERparseSelectorAct
-ENDparseSelectorAct
-BEGINdoHUP
-CODESTARTdoHUP
-	if(pData-&gt;bForceSingleInst &amp;&amp; pData-&gt;iHUPForward != NO_HUP_FORWARD &amp;&amp;
-			pData-&gt;pSingleChildCtx-&gt;bIsRunning) {
-		DBGPRINTF("omprog: forwarding HUP to program '%s' (pid %ld) as signal %d\n",
-				pData-&gt;szBinary, (long) pData-&gt;pSingleChildCtx-&gt;pid, pData-&gt;iHUPForward);
-		kill(pData-&gt;pSingleChildCtx-&gt;pid, pData-&gt;iHUPForward);
-	}
-	if(pData-&gt;pOutputCaptureCtx != NULL &amp;&amp; pData-&gt;pOutputCaptureCtx-&gt;bIsRunning) {
-		closeOutputFile(pData-&gt;pOutputCaptureCtx);
-	}
-ENDdoHUP
-BEGINdoHUPWrkr
-CODESTARTdoHUPWrkr
-	if(!pWrkrData-&gt;pData-&gt;bForceSingleInst &amp;&amp; pWrkrData-&gt;pData-&gt;iHUPForward != NO_HUP_FORWARD &amp;&amp;
-	 		pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {
-		DBGPRINTF("omprog: forwarding HUP to program '%s' (pid %ld) as signal %d\n",
-				pWrkrData-&gt;pData-&gt;szBinary, (long) pWrkrData-&gt;pChildCtx-&gt;pid,
-				pWrkrData-&gt;pData-&gt;iHUPForward);
-		kill(pWrkrData-&gt;pChildCtx-&gt;pid, pWrkrData-&gt;pData-&gt;iHUPForward);
-	}
-ENDdoHUPWrkr
-BEGINmodExit
-CODESTARTmodExit
-	free(cs.szBinary);
-	cs.szBinary = NULL;
-ENDmodExit
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_OMOD_QUERIES
-CODEqueryEtryPt_STD_OMOD8_QUERIES
-CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-CODEqueryEtryPt_TXIF_OMOD_QUERIES CODEqueryEtryPt_doHUP
-CODEqueryEtryPt_doHUPWrkr
-ENDqueryEtryPt
-static rsRetVal
-resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
-{
-	DEFiRet;
-	free(cs.szBinary);
-	cs.szBinary = NULL;
-	RETiRet;
-}
-BEGINmodInit()
-CODESTARTmodInit
-INITLegCnfVars
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
-	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
-	if (!bCoreSupportsBatching) {
-		LogError(0, NO_ERRCODE, "omprog: rsyslog core too old (does not support batching)");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionomprogbinary", 0, eCmdHdlrGetWord, NULL, &amp;cs.szBinary,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
-		NULL, STD_LOADABLE_MODULE_ID));
-CODEmodInit_QueryRegCFSLineHdlr
-ENDmodInit
+1 #include "config.h"
+2 #include &lt;stdio.h&gt;
+3 #include &lt;syslog.h&gt;
+4 #include &lt;stdarg.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;assert.h&gt;
+8 #include &lt;signal.h&gt;
+9 #include &lt;errno.h&gt;
+10 #include &lt;unistd.h&gt;
+11 #include &lt;fcntl.h&gt;
+12 #include &lt;sys/wait.h&gt;
+13 #include &lt;pthread.h&gt;
+14 #include &lt;poll.h&gt;
+15 #include "rsyslog.h"
+16 #include "conf.h"
+17 #include "syslogd-types.h"
+18 #include "srUtils.h"
+19 #include "template.h"
+20 #include "module-template.h"
+21 #include "errmsg.h"
+22 #include "cfsysline.h"
+23 #include "glbl.h"
+24 #include "rsconf.h"
+25 MODULE_TYPE_OUTPUT
+26 MODULE_TYPE_NOKEEP
+27 MODULE_CNFNAME("omprog")
+28 extern char **environ; 
+29 DEF_OMOD_STATIC_DATA
+30 #define NO_HUP_FORWARD -1	#define DEFAULT_CONFIRM_TIMEOUT_MS 10000
+31 #define DEFAULT_CLOSE_TIMEOUT_MS 5000
+32 #define RESPONSE_LINE_BUFFER_SIZE 4096
+33 #define OUTPUT_CAPTURE_BUFFER_SIZE 4096
+34 #define MAX_FD_TO_CLOSE 65535
+35 typedef struct childProcessCtx {
+36 	int bIsRunning;			pid_t pid;				int fdPipeOut;			int fdPipeIn;		} childProcessCtx_t;
+37 typedef struct outputCaptureCtx {
+38 	uchar *szFileName;			mode_t fCreateMode;			pthread_mutex_t mutStart;		pthread_mutex_t mutWrite;		pthread_mutex_t mutTerm;		pthread_cond_t condTerm;		int bIsRunning;				pthread_t thrdID;			int fdPipe[2];				int fdFile;					int bFileErr;				int bReadErr;				int bWriteErr;			} outputCaptureCtx_t;
+39 typedef struct _instanceData {
+40 	uchar *szBinary;			char **aParams;				int iParams;				uchar *szTemplateName;		int bConfirmMessages;		long lConfirmTimeout;		int bReportFailures;		int bUseTransactions;		uchar *szBeginTransactionMark;		uchar *szCommitTransactionMark;		int iHUPForward;			int bSignalOnClose;			long lCloseTimeout;			int bKillUnresponsive;		int bForceSingleInst;		childProcessCtx_t *pSingleChildCtx;			pthread_mutex_t *pSingleChildMut;			outputCaptureCtx_t *pOutputCaptureCtx;		time_t block_if_err;			} instanceData;
+41 typedef struct wrkrInstanceData {
+42 	instanceData *pData;
+43 	childProcessCtx_t *pChildCtx;	} wrkrInstanceData_t;
+44 typedef struct configSettings_s {
+45 	uchar *szBinary;	} configSettings_t;
+46 static configSettings_t cs;
+47 static struct cnfparamdescr actpdescr[] = {
+48 	{ "binary", eCmdHdlrString, CNFPARAM_REQUIRED },
+49 <a name="0"></a>	{ "confirmMessages", eCmdHdlrBinary, 0 },
+50 	{ "confirmTimeout", eCmdHdlrInt, 0 },
+51 	{ "reportFailures", eCmdHdlrBinary, 0 },
+52 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "useTransactions", eCmdHdlrBinary, 0 },
+53 	{ "beginTransactionMark", eCmdHdlrString, 0 },
+54 	{ "commitTransactionMark", eCmdHdlrString, 0 },
+55 	{ "forceSingleInstance", eCmdHdlrBinary, 0 },
+56 	{ "hup.signal", eCmdHdlrGetWord, 0 },
+57 	{ "template", eCmdHdlrGetWord, 0 },
+58 	{ "signalOnClose", eCmdHdlrBinary, 0 },
+59 	{ "closeTimeout", eCmdHdlrInt, 0 },
+60 	{ "killUnresponsive", eCmdHdlrBinary, 0 },
+61 	{ "output", eCmdHdlrString, 0 },
+62 	{ "fileCreateMode", eCmdHdlrFileCreateMode, 0 }
+63 };
+64 static struct cnfparamblk actpblk =
+65 	{ CNFPARAMBLK_VERSION,
+66 	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+67 	  actpdescr
+68 	};
+69 static __attribute__((noreturn)) void</b></font>
+70 execBinary(const instanceData *pData, int fdStdin, int fdStdout)
+71 {
+72 	int fdOutput, maxFd, fd, sigNum;
+73 	struct sigaction sigAct;
+74 	sigset_t sigSet;
+75 	char errStr[1024];
+76 	if(dup2(fdStdin, STDIN_FILENO) == -1) {
+77 		goto failed;
+78 	}
+79 	if(pData-&gt;pOutputCaptureCtx != NULL) {
+80 		fdOutput = pData-&gt;pOutputCaptureCtx-&gt;fdPipe[1];
+81 	} else {
+82 		fdOutput = open("/dev/null", O_WRONLY);
+83 		if(fdOutput == -1) {
+84 			goto failed;
+85 		}
+86 	}
+87 	if(fdStdout != -1) {
+88 		if(dup2(fdStdout, STDOUT_FILENO) == -1) {
+89 			goto failed;
+90 		}
+91 	} else {
+92 		if(dup2(fdOutput, STDOUT_FILENO) == -1) {
+93 			goto failed;
+94 		}
+95 	}
+96 	if(dup2(fdOutput, STDERR_FILENO) == -1) {
+97 		goto failed;
+98 	}
+99 	maxFd = sysconf(_SC_OPEN_MAX);
+100 	if(maxFd &lt; 0 || maxFd &gt; MAX_FD_TO_CLOSE) {
+101 		maxFd = MAX_FD_TO_CLOSE;
+102 	}
+103 #	ifdef VALGRIND
+104 	else {  		maxFd -= 10;
+105 	}
+106 #	endif
+107 	for(fd = STDERR_FILENO + 1 ; fd &lt;= maxFd ; ++fd) {
+108 		close(fd);
+109 	}
+110 	memset(&amp;sigAct, 0, sizeof(sigAct));
+111 	sigemptyset(&amp;sigAct.sa_mask);
+112 	sigAct.sa_handler = SIG_DFL;
+113 	for(sigNum = 1 ; sigNum &lt; NSIG ; ++sigNum) {
+114 		sigaction(sigNum, &amp;sigAct, NULL);
+115 	}
+116 	sigAct.sa_handler = SIG_IGN;
+117 	sigaction(SIGINT, &amp;sigAct, NULL);
+118 	sigemptyset(&amp;sigSet);
+119 	sigprocmask(SIG_SETMASK, &amp;sigSet, NULL);
+120 	alarm(0);
+121 	execve((char*)pData-&gt;szBinary, pData-&gt;aParams, environ);
+122 failed:
+123 	rs_strerror_r(errno, errStr, sizeof(errStr));
+124 	DBGPRINTF("omprog: failed to execute program '%s': %s\n",
+125 			pData-&gt;szBinary, errStr);
+126 	openlog("rsyslogd", 0, LOG_SYSLOG);
+127 	syslog(LOG_ERR, "omprog: failed to execute program '%s': %s\n",
+128 			pData-&gt;szBinary, errStr);
+129 	exit(1);
+130 }
+131 static rsRetVal
+132 openPipe(instanceData *pData, childProcessCtx_t *pChildCtx)
+133 {
+134 	int pipeStdin[2] = { -1, -1 };
+135 	int pipeStdout[2] = { -1, -1 };
+136 	pid_t cpid;
+137 	DEFiRet;
+138 	if(pipe(pipeStdin) == -1) {
+139 		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
+140 	}
+141 	if(pData-&gt;bConfirmMessages &amp;&amp; pipe(pipeStdout) == -1) {
+142 		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
+143 	}
+144 	DBGPRINTF("omprog: executing program '%s' with '%d' parameters\n", pData-&gt;szBinary,
+145 			pData-&gt;iParams);
+146 	cpid = fork();
+147 	if(cpid == -1) {
+148 		ABORT_FINALIZE(RS_RET_ERR_FORK);
+149 	}
+150 	if(cpid == 0) {  		close(pipeStdin[1]);
+151 		if(pipeStdout[0] != -1) {
+152 			close(pipeStdout[0]);
+153 		}
+154 		execBinary(pData, pipeStdin[0], pipeStdout[1]);
+155 	}
+156 	DBGPRINTF("omprog: child has pid %d\n", (int) cpid);
+157 	close(pipeStdin[0]);
+158 	if(pipeStdout[1] != -1) {
+159 		close(pipeStdout[1]);
+160 	}
+161 	pChildCtx-&gt;fdPipeOut = pipeStdin[1];  	pChildCtx-&gt;fdPipeIn = pipeStdout[0];  	pChildCtx-&gt;pid = cpid;
+162 	pChildCtx-&gt;bIsRunning = 1;
+163 finalize_it:
+164 	if(iRet != RS_RET_OK) {
+165 		if(pipeStdin[0] != -1) {
+166 			close(pipeStdin[0]);
+167 			close(pipeStdin[1]);
+168 		}
+169 		if(pipeStdout[0] != -1) {
+170 			close(pipeStdout[0]);
+171 			close(pipeStdout[1]);
+172 		}
+173 	}
+174 	RETiRet;
+175 }
+176 static void
+177 waitForChild(instanceData *pData, childProcessCtx_t *pChildCtx)
+178 {
+179 	int status;
+180 	int ret;
+181 	long counter;
+182 	counter = pData-&gt;lCloseTimeout / 10;
+183 	while ((ret = waitpid(pChildCtx-&gt;pid, &amp;status, WNOHANG)) == 0 &amp;&amp; counter &gt; 0) {
+184 		srSleep(0, 10000);  		--counter;
+185 	}
+186 	if (ret == 0) {  		if (!pData-&gt;bKillUnresponsive) {
+187 			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' (pid %ld) did not terminate "
+188 					"within timeout (%ld ms); ignoring it", pData-&gt;szBinary,
+189 					(long) pChildCtx-&gt;pid, pData-&gt;lCloseTimeout);
+190 			return;
+191 		}
+192 		LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' (pid %ld) did not terminate "
+193 				"within timeout (%ld ms); killing it", pData-&gt;szBinary, (long) pChildCtx-&gt;pid,
+194 				pData-&gt;lCloseTimeout);
+195 		if (kill(pChildCtx-&gt;pid, SIGKILL) == -1) {
+196 			LogError(errno, RS_RET_SYS_ERR, "omprog: could not send SIGKILL to child process");
+197 			return;
+198 		}
+199 		ret = waitpid(pChildCtx-&gt;pid, &amp;status, 0);
+200 	}
+201 	if(ret == pChildCtx-&gt;pid) {
+202 		glblReportChildProcessExit(runConf, pData-&gt;szBinary, pChildCtx-&gt;pid, status);
+203 	}
+204 }
+205 static void
+206 cleanupChild(instanceData *pData, childProcessCtx_t *pChildCtx)
+207 {
+208 	assert(pChildCtx-&gt;bIsRunning);
+209 	if(pChildCtx-&gt;fdPipeIn != -1) {
+210 		close(pChildCtx-&gt;fdPipeIn);
+211 		pChildCtx-&gt;fdPipeIn = -1;
+212 	}
+213 	if(pChildCtx-&gt;fdPipeOut != -1) {
+214 		close(pChildCtx-&gt;fdPipeOut);
+215 		pChildCtx-&gt;fdPipeOut = -1;
+216 	}
+217 	waitForChild(pData, pChildCtx);
+218 	pChildCtx-&gt;bIsRunning = 0;
+219 }
+220 static void
+221 terminateChild(instanceData *pData, childProcessCtx_t *pChildCtx)
+222 {
+223 	assert(pChildCtx-&gt;bIsRunning);
+224 	if (pData-&gt;bSignalOnClose) {
+225 		kill(pChildCtx-&gt;pid, SIGTERM);
+226 	}
+227 	cleanupChild(pData, pChildCtx);
+228 }
+229 static rsRetVal
+230 sendMessage(instanceData *pData, childProcessCtx_t *pChildCtx, const uchar *szMsg)
+231 {
+232 	ssize_t written;
+233 	size_t offset = 0;
+234 	DEFiRet;
+235 	const size_t len = strlen((char*)szMsg);
+236 	do {
+237 		written = write(pChildCtx-&gt;fdPipeOut, ((char*)szMsg) + offset, len - offset);
+238 		if(written == -1) {
+239 			if(errno == EINTR) {
+240 				continue;  			}
+241 			if(errno == EPIPE) {
+242 				LogMsg(0, RS_RET_ERR_WRITE_PIPE, LOG_WARNING,
+243 						"omprog: program '%s' (pid %ld) terminated; will be restarted",
+244 						pData-&gt;szBinary, (long) pChildCtx-&gt;pid);
+245 				cleanupChild(pData, pChildCtx);  				ABORT_FINALIZE(RS_RET_SUSPENDED);
+246 			}
+247 			LogError(errno, RS_RET_ERR_WRITE_PIPE, "omprog: error sending message to program");
+248 			ABORT_FINALIZE(RS_RET_SUSPENDED);
+249 		}
+250 		offset += written;
+251 	} while(offset &lt; len);
+252 finalize_it:
+253 	RETiRet;
+254 }
+255 static rsRetVal
+256 lineToStatusCode(instanceData *pData, const char* line)
+257 {
+258 	DEFiRet;
+259 	while(line[0] == '.') {
+260 <a name="4"></a>		++line;
+261 	}
+262 <font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if(strcmp(line, "OK") == 0) {
+263 		iRet = RS_RET_OK;
+264 	} else if(strcmp(line, "DEFER_COMMIT") == 0) {
+265 		iRet = RS_RET_DEFER_COMMIT;
+266 	} else if(strcmp(line, "PREVIOUS_COMMITTED") == 0) {
+267 		iRet = RS_RET_PREVIOUS_COMMITTED;
+268 	} else {</b></font>
+269 		DBGPRINTF("omprog: program '%s' returned: %s\n", pData-&gt;szBinary, line);
+270 		if(pData-&gt;bReportFailures) {
+271 			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' returned: %s",
+272 					pData-&gt;szBinary, line);
+273 		}
+274 		iRet = RS_RET_SUSPENDED;
+275 	}
+276 	RETiRet;
+277 }
+278 static rsRetVal
+279 readStatus(instanceData *pData, childProcessCtx_t *pChildCtx)
+280 {
+281 	struct pollfd fdToPoll[1];
+282 	int numReady;
+283 	char lineBuf[RESPONSE_LINE_BUFFER_SIZE];
+284 	ssize_t lenRead;
+285 	size_t offset = 0;
+286 	int lineEnded = 0;
+287 	DEFiRet;
+288 	fdToPoll[0].fd = pChildCtx-&gt;fdPipeIn;
+289 	fdToPoll[0].events = POLLIN;
+290 	do {
+291 		numReady = poll(fdToPoll, 1, pData-&gt;lConfirmTimeout);
+292 		if(numReady == -1) {
+293 			if(errno == EINTR) {
+294 				continue;  			}
+295 			LogError(errno, RS_RET_SYS_ERR, "omprog: error polling for response from program");
+296 			ABORT_FINALIZE(RS_RET_SUSPENDED);
+297 		}
+298 		if(numReady == 0) {  			LogMsg(0, RS_RET_TIMED_OUT, LOG_WARNING, "omprog: program '%s' (pid %ld) did not respond "
+299 					"within timeout (%ld ms); will be restarted", pData-&gt;szBinary,
+300 					(long) pChildCtx-&gt;pid, pData-&gt;lConfirmTimeout);
+301 			terminateChild(pData, pChildCtx);
+302 			ABORT_FINALIZE(RS_RET_SUSPENDED);
+303 		}
+304 		lenRead = read(pChildCtx-&gt;fdPipeIn, lineBuf + offset, sizeof(lineBuf) - offset - 1);
+305 		if(lenRead == -1) {
+306 			if(errno == EINTR) {
+307 				continue;  			}
+308 			LogError(errno, RS_RET_READ_ERR, "omprog: error reading response from program");
+309 			ABORT_FINALIZE(RS_RET_SUSPENDED);
+310 		}
+311 		if(lenRead == 0) {
+312 			LogMsg(0, RS_RET_READ_ERR, LOG_WARNING, "omprog: program '%s' (pid %ld) terminated; "
+313 					"will be restarted", pData-&gt;szBinary, (long) pChildCtx-&gt;pid);
+314 			cleanupChild(pData, pChildCtx);
+315 			ABORT_FINALIZE(RS_RET_SUSPENDED);
+316 		}
+317 		offset += lenRead;
+318 		lineBuf[offset] = '\0';
+319 		lineEnded = (lineBuf[offset-1] == '\n');
+320 		if(!lineEnded &amp;&amp; strchr(lineBuf + offset - lenRead, '\n') != NULL) {
+321 			DBGPRINTF("omprog: program '%s' returned: %s\n", pData-&gt;szBinary, lineBuf);
+322 			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' returned a multiline response; "
+323 					"will be restarted", pData-&gt;szBinary);
+324 			if(pData-&gt;bReportFailures) {
+325 				LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' returned: %s",
+326 						pData-&gt;szBinary, lineBuf);
+327 			}
+328 			terminateChild(pData, pChildCtx);
+329 			ABORT_FINALIZE(RS_RET_SUSPENDED);
+330 		}
+331 	} while(!lineEnded &amp;&amp; offset &lt; sizeof(lineBuf) - 1);
+332 	if(!lineEnded) {
+333 		DBGPRINTF("omprog: program '%s' returned: %s\n", pData-&gt;szBinary, lineBuf);
+334 		LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' returned a too long response; "
+335 				"will be restarted", pData-&gt;szBinary);
+336 		if(pData-&gt;bReportFailures) {
+337 			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: program '%s' returned: %s",
+338 					pData-&gt;szBinary, lineBuf);
+339 		}
+340 		terminateChild(pData, pChildCtx);
+341 		ABORT_FINALIZE(RS_RET_SUSPENDED);
+342 	}
+343 	lineBuf[offset-1] = '\0';  
+344 	iRet = lineToStatusCode(pData, lineBuf);
+345 finalize_it:
+346 	RETiRet;
+347 }
+348 static rsRetVal
+349 allocChildCtx(childProcessCtx_t **ppChildCtx)
+350 {
+351 	childProcessCtx_t *pChildCtx;
+352 	DEFiRet;
+353 	CHKmalloc(pChildCtx = calloc(1, sizeof(childProcessCtx_t)));
+354 	*ppChildCtx = pChildCtx;
+355 	pChildCtx-&gt;bIsRunning = 0;
+356 	pChildCtx-&gt;pid = -1;
+357 	pChildCtx-&gt;fdPipeOut = -1;
+358 	pChildCtx-&gt;fdPipeIn = -1;
+359 finalize_it:
+360 	RETiRet;
+361 }
+362 static rsRetVal
+363 startChild(instanceData *pData, childProcessCtx_t *pChildCtx)
+364 {
+365 	DEFiRet;
+366 	assert(!pChildCtx-&gt;bIsRunning);
+367 	CHKiRet(openPipe(pData, pChildCtx));
+368 	if(pData-&gt;bConfirmMessages) {
+369 		CHKiRet(readStatus(pData, pChildCtx));
+370 	}
+371 finalize_it:
+372 	if(iRet != RS_RET_OK &amp;&amp; pChildCtx-&gt;bIsRunning) {
+373 		terminateChild(pData, pChildCtx);
+374 	}
+375 	RETiRet;
+376 }
+377 static rsRetVal
+378 startSingleChildOnce(instanceData *pData)
+379 {
+380 	DEFiRet;
+381 	assert(pData-&gt;bForceSingleInst);
+382 	CHKiConcCtrl(pthread_mutex_lock(pData-&gt;pSingleChildMut));
+383 	if(pData-&gt;pSingleChildCtx-&gt;bIsRunning)
+384 		goto finalize_it;  
+385 	iRet = startChild(pData, pData-&gt;pSingleChildCtx);
+386 finalize_it:
+387 	pthread_mutex_unlock(pData-&gt;pSingleChildMut);
+388 	RETiRet;
+389 }
+390 static void
+391 writeOutputToFile(outputCaptureCtx_t *pCtx, char *buf, ssize_t len)
+392 {
+393 	ssize_t written;
+394 	ssize_t offset = 0;
+395 	assert(pCtx-&gt;bIsRunning);
+396 	pthread_mutex_lock(&amp;pCtx-&gt;mutWrite);
+397 	if(pCtx-&gt;fdFile == -1) {
+398 		if(pCtx-&gt;bFileErr) {  			goto done;
+399 		}
+400 		pCtx-&gt;fdFile = open((char*)pCtx-&gt;szFileName, O_WRONLY | O_APPEND | O_CREAT,
+401 				pCtx-&gt;fCreateMode);
+402 		if(pCtx-&gt;fdFile == -1) {
+403 			LogError(errno, RS_RET_NO_FILE_ACCESS, "omprog: error opening output file %s; "
+404 					"output from program will be discarded", pCtx-&gt;szFileName);
+405 			pCtx-&gt;bFileErr = 1;  			goto done;
+406 		}
+407 	}
+408 	do {
+409 		written = write(pCtx-&gt;fdFile, buf + offset, len - offset);
+410 		if(written == -1) {
+411 			if(errno == EINTR) {
+412 				continue;  			}
+413 			if(!pCtx-&gt;bWriteErr) {
+414 				LogError(errno, RS_RET_SYS_ERR, "omprog: error writing to output file "
+415 						"(subsequent errors will not be reported)");
+416 				pCtx-&gt;bWriteErr = 1;  			}
+417 			break;
+418 		}
+419 		if(pCtx-&gt;bWriteErr) {
+420 			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: resumed writing to output file");
+421 			pCtx-&gt;bWriteErr = 0;
+422 		}
+423 		offset += written;
+424 	} while(offset &lt; len);
+425 done:
+426 	pthread_mutex_unlock(&amp;pCtx-&gt;mutWrite);
+427 }
+428 static void
+429 closeOutputFile(outputCaptureCtx_t *pCtx)
+430 {
+431 	DBGPRINTF("omprog: reopening output file upon reception of HUP signal\n");
+432 	pthread_mutex_lock(&amp;pCtx-&gt;mutWrite);
+433 	if(pCtx-&gt;fdFile != -1) {
+434 		close(pCtx-&gt;fdFile);
+435 		pCtx-&gt;fdFile = -1;
+436 	}
+437 	pCtx-&gt;bFileErr = 0;  
+438 	pthread_mutex_unlock(&amp;pCtx-&gt;mutWrite);
+439 }
+440 static void *
+441 captureOutput(void *_pCtx) {
+442 	outputCaptureCtx_t *pCtx = (outputCaptureCtx_t *)_pCtx;
+443 	sigset_t sigSet;
+444 	char readBuf[OUTPUT_CAPTURE_BUFFER_SIZE];
+445 	ssize_t lenRead;
+446 	DBGPRINTF("omprog: starting output capture thread\n");
+447 	sigfillset(&amp;sigSet);
+448 	pthread_sigmask(SIG_SETMASK, &amp;sigSet, NULL);
+449 	for(;;) {
+450 		lenRead = read(pCtx-&gt;fdPipe[0], readBuf, sizeof(readBuf));
+451 		if(lenRead == -1) {
+452 			if(errno == EINTR) {
+453 				continue;  			}
+454 			if(!pCtx-&gt;bReadErr) {
+455 				LogError(errno, RS_RET_SYS_ERR, "omprog: error capturing output from program "
+456 						"(subsequent errors will not be reported)");
+457 				pCtx-&gt;bReadErr = 1;  			}
+458 			continue;  		}
+459 		if(lenRead == 0) {
+460 			break;  		}
+461 		if(pCtx-&gt;bReadErr) {
+462 			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: resumed capturing output from program");
+463 			pCtx-&gt;bReadErr = 0;
+464 		}
+465 		writeOutputToFile(pCtx, readBuf, lenRead);
+466 	}
+467 	DBGPRINTF("omprog: all output-capture pipe ends closed, terminating output capture thread\n");
+468 	pthread_mutex_lock(&amp;pCtx-&gt;mutTerm);
+469 	pCtx-&gt;bIsRunning = 0;
+470 	pthread_cond_signal(&amp;pCtx-&gt;condTerm);
+471 	pthread_mutex_unlock(&amp;pCtx-&gt;mutTerm);
+472 	return NULL;
+473 }
+474 static rsRetVal
+475 allocOutputCaptureCtx(outputCaptureCtx_t **ppCtx)
+476 {
+477 	outputCaptureCtx_t *pCtx;
+478 	DEFiRet;
+479 	CHKmalloc(pCtx = calloc(1, sizeof(outputCaptureCtx_t)));
+480 	*ppCtx = pCtx;
+481 	pCtx-&gt;szFileName = NULL;
+482 	pCtx-&gt;fCreateMode = 0600;
+483 	pCtx-&gt;bIsRunning = 0;
+484 	CHKiConcCtrl(pthread_mutex_init(&amp;pCtx-&gt;mutStart, NULL));
+485 	CHKiConcCtrl(pthread_mutex_init(&amp;pCtx-&gt;mutWrite, NULL));
+486 	CHKiConcCtrl(pthread_mutex_init(&amp;pCtx-&gt;mutTerm, NULL));
+487 	CHKiConcCtrl(pthread_cond_init(&amp;pCtx-&gt;condTerm, NULL));
+488 finalize_it:
+489 	RETiRet;
+490 }
+491 static void
+492 freeOutputCaptureCtx(outputCaptureCtx_t *pCtx) {
+493 	if(pCtx-&gt;szFileName != NULL) {
+494 		free(pCtx-&gt;szFileName);
+495 	}
+496 	pthread_cond_destroy(&amp;pCtx-&gt;condTerm);
+497 	pthread_mutex_destroy(&amp;pCtx-&gt;mutTerm);
+498 	pthread_mutex_destroy(&amp;pCtx-&gt;mutWrite);
+499 	pthread_mutex_destroy(&amp;pCtx-&gt;mutStart);
+500 	free(pCtx);
+501 }
+502 static rsRetVal
+503 startOutputCaptureOnce(outputCaptureCtx_t *pCtx)
+504 {
+505 	int pip[2] = { -1, -1 };
+506 	DEFiRet;
+507 	CHKiConcCtrl(pthread_mutex_lock(&amp;pCtx-&gt;mutStart));
+508 	if(pCtx-&gt;bIsRunning)
+509 		goto finalize_it;  
+510 	if(pipe(pip) == -1) {
+511 		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
+512 	}
+513 	pCtx-&gt;fdPipe[0] = pip[0];
+514 	pCtx-&gt;fdPipe[1] = pip[1];
+515 	pCtx-&gt;fdFile = -1;
+516 	pCtx-&gt;bFileErr = 0;
+517 	pCtx-&gt;bReadErr = 0;
+518 	pCtx-&gt;bWriteErr = 0;
+519 	CHKiConcCtrl(pthread_create(&amp;pCtx-&gt;thrdID, NULL, captureOutput, (void *)pCtx));
+520 	pCtx-&gt;bIsRunning = 1;
+521 finalize_it:
+522 	if(iRet != RS_RET_OK &amp;&amp; pip[0] != -1) {
+523 		close(pip[0]);
+524 		close(pip[1]);
+525 	}
+526 	pthread_mutex_unlock(&amp;pCtx-&gt;mutStart);
+527 	RETiRet;
+528 }
+529 static void
+530 endOutputCapture(outputCaptureCtx_t *pCtx, long timeoutMs)
+531 {
+532 	struct timespec ts;
+533 	int bTimedOut;
+534 	assert(pCtx-&gt;bIsRunning);
+535 	close(pCtx-&gt;fdPipe[1]);
+536 	timeoutComp(&amp;ts, timeoutMs);
+537 	pthread_mutex_lock(&amp;pCtx-&gt;mutTerm);
+538 	bTimedOut = 0;
+539 	while(pCtx-&gt;bIsRunning &amp;&amp; !bTimedOut) {
+540 		if(pthread_cond_timedwait(&amp;pCtx-&gt;condTerm, &amp;pCtx-&gt;mutTerm, &amp;ts) == ETIMEDOUT) {
+541 			bTimedOut = 1;
+542 		}
+543 	}
+544 	pthread_mutex_unlock(&amp;pCtx-&gt;mutTerm);
+545 	if(bTimedOut) {
+546 		LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: forcing termination of output capture "
+547 				"thread because of unresponsive child process");
+548 		pthread_cancel(pCtx-&gt;thrdID);
+549 		pCtx-&gt;bIsRunning = 0;
+550 	}
+551 	pthread_join(pCtx-&gt;thrdID, NULL);
+552 	close(pCtx-&gt;fdPipe[0]);
+553 	if(pCtx-&gt;fdFile != -1) {
+554 		close(pCtx-&gt;fdFile);
+555 	}
+556 }
+557 BEGINinitConfVars		CODESTARTinitConfVars
+558 	cs.szBinary = NULL;	ENDinitConfVars
+559 BEGINcreateInstance
+560 CODESTARTcreateInstance
+561 	pData-&gt;szBinary = NULL;
+562 	pData-&gt;szTemplateName = NULL;
+563 	pData-&gt;aParams = NULL;
+564 	pData-&gt;iParams = 0;
+565 	pData-&gt;bConfirmMessages = 0;
+566 	pData-&gt;block_if_err = 0;
+567 	pData-&gt;lConfirmTimeout = DEFAULT_CONFIRM_TIMEOUT_MS;
+568 	pData-&gt;bReportFailures = 0;
+569 	pData-&gt;bUseTransactions = 0;
+570 	pData-&gt;szBeginTransactionMark = NULL;
+571 	pData-&gt;szCommitTransactionMark = NULL;
+572 	pData-&gt;iHUPForward = NO_HUP_FORWARD;
+573 	pData-&gt;bSignalOnClose = 0;
+574 	pData-&gt;lCloseTimeout = DEFAULT_CLOSE_TIMEOUT_MS;
+575 	pData-&gt;bKillUnresponsive = -1;
+576 	pData-&gt;bForceSingleInst = 0;
+577 	pData-&gt;pSingleChildCtx = NULL;
+578 	pData-&gt;pSingleChildMut = NULL;
+579 	pData-&gt;pOutputCaptureCtx = NULL;
+580 ENDcreateInstance
+581 static rsRetVal
+582 postInitInstance(instanceData *pData)
+583 {
+584 	DEFiRet;
+585 	if(pData-&gt;bUseTransactions &amp;&amp; pData-&gt;szBeginTransactionMark == NULL) {
+586 		pData-&gt;szBeginTransactionMark = (uchar*)strdup("BEGIN TRANSACTION");
+587 	}
+588 	if(pData-&gt;bUseTransactions &amp;&amp; pData-&gt;szCommitTransactionMark == NULL) {
+589 		pData-&gt;szCommitTransactionMark = (uchar*)strdup("COMMIT TRANSACTION");
+590 	}
+591 	if(pData-&gt;bKillUnresponsive == -1) {  		pData-&gt;bKillUnresponsive = pData-&gt;bSignalOnClose;
+592 	}
+593 	if(pData-&gt;pOutputCaptureCtx != NULL &amp;&amp; pData-&gt;pOutputCaptureCtx-&gt;szFileName == NULL) {
+594 		LogError(0, RS_RET_CONF_PARAM_INVLD, "omprog: the 'fileCreateMode' parameter requires "
+595 				"specifying the 'output' parameter also");
+596 		ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+597 	}
+598 	if(pData-&gt;bForceSingleInst) {
+599 		CHKmalloc(pData-&gt;pSingleChildMut = calloc(1, sizeof(pthread_mutex_t)));
+600 		CHKiConcCtrl(pthread_mutex_init(pData-&gt;pSingleChildMut, NULL));
+601 		CHKiRet(allocChildCtx(&amp;pData-&gt;pSingleChildCtx));
+602 	}
+603 finalize_it:
+604 	RETiRet;
+605 }
+606 BEGINcreateWrkrInstance
+607 CODESTARTcreateWrkrInstance
+608 	pWrkrData-&gt;pChildCtx = NULL;
+609 	if(pWrkrData-&gt;pData-&gt;pOutputCaptureCtx != NULL) {
+610 		CHKiRet(startOutputCaptureOnce(pWrkrData-&gt;pData-&gt;pOutputCaptureCtx));
+611 	}
+612 	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+613 		CHKiRet(startSingleChildOnce(pWrkrData-&gt;pData));
+614 		pWrkrData-&gt;pChildCtx = pData-&gt;pSingleChildCtx;
+615 	} else {
+616 		CHKiRet(allocChildCtx(&amp;pWrkrData-&gt;pChildCtx));
+617 		CHKiRet(startChild(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
+618 	}
+619 finalize_it:
+620 	if(iRet != RS_RET_OK &amp;&amp; !pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+621 		free(pWrkrData-&gt;pChildCtx);
+622 	}
+623 ENDcreateWrkrInstance
+624 BEGINisCompatibleWithFeature
+625 CODESTARTisCompatibleWithFeature
+626 	if(eFeat == sFEATURERepeatedMsgReduction) {
+627 		iRet = RS_RET_OK;
+628 	}
+629 ENDisCompatibleWithFeature
+630 BEGINdbgPrintInstInfo
+631 CODESTARTdbgPrintInstInfo
+632 ENDdbgPrintInstInfo
+633 <a name="2"></a>
+634 BEGINtryResume
+635 CODESTARTtryResume
+636 <font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+637 		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
+638 	}
+639 	if(!pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {
+640 		CHKiRet(startChild(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
+641 	}
+642 finalize_it:
+643 	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+644 		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
+645 	}
+646 ENDtryResume
+647 BEGINbeginTransaction
+648 CODESTARTbeginTransaction
+649 	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+650 		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
+651 	}
+652 	if(!pWrkrData-&gt;pData-&gt;bUseTransactions) {
+653 		FINALIZE;
+654 	}
+655 	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx,
+656 			pWrkrData-&gt;pData-&gt;szBeginTransactionMark));
+657 	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, (uchar*) "\n"));
+658 	if(pWrkrData-&gt;pData-&gt;bConfirmMessages) {
+659 		CHKiRet(readStatus(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
+660 	}</b></font>
+661 finalize_it:
+662 	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+663 		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
+664 	}
+665 ENDbeginTransaction
+666 BEGINdoAction
+667 CODESTARTdoAction
+668 	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+669 		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
+670 	}
+671 	if(!pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {  		ABORT_FINALIZE(RS_RET_SUSPENDED);
+672 	}
+673 	const uchar *const szMsg = ppString[0];
+674 	const size_t len = strlen((char*)szMsg);
+675 	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, szMsg));
+676 	if(szMsg[len-1] != '\n') {
+677 		const time_t tt = time(NULL);
+678 		if(tt &gt; pWrkrData-&gt;pData-&gt;block_if_err) {
+679 			LogMsg(0, NO_ERRCODE, LOG_WARNING, "omprog: messages must be terminated with \\n "
+680 				"at end of message, but this message is not: '%s'\n", ppString[0]);
+681 			pWrkrData-&gt;pData-&gt;block_if_err = tt + 30;
+682 		}
+683 		CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, (uchar*) "\n"));
+684 	}
+685 	if(pWrkrData-&gt;pData-&gt;bConfirmMessages) {
+686 		CHKiRet(readStatus(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
+687 	} else if(pWrkrData-&gt;pData-&gt;bUseTransactions) {
+688 		iRet = RS_RET_DEFER_COMMIT;
+689 	}
+690 finalize_it:
+691 	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+692 		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
+693 	}
+694 ENDdoAction
+695 BEGINendTransaction
+696 CODESTARTendTransaction
+697 	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+698 		CHKiConcCtrl(pthread_mutex_lock(pWrkrData-&gt;pData-&gt;pSingleChildMut));
+699 	}
+700 	if(!pWrkrData-&gt;pData-&gt;bUseTransactions) {
+701 		FINALIZE;
+702 	}
+703 	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx,
+704 			pWrkrData-&gt;pData-&gt;szCommitTransactionMark));
+705 	CHKiRet(sendMessage(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx, (uchar*) "\n"));
+706 	if(pWrkrData-&gt;pData-&gt;bConfirmMessages) {
+707 		CHKiRet(readStatus(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx));
+708 	}
+709 finalize_it:
+710 	if(pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+711 		pthread_mutex_unlock(pWrkrData-&gt;pData-&gt;pSingleChildMut);
+712 	}
+713 ENDendTransaction
+714 BEGINfreeWrkrInstance
+715 CODESTARTfreeWrkrInstance
+716 	if(!pWrkrData-&gt;pData-&gt;bForceSingleInst) {
+717 		if(pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {
+718 			terminateChild(pWrkrData-&gt;pData, pWrkrData-&gt;pChildCtx);
+719 		}
+720 		free(pWrkrData-&gt;pChildCtx);
+721 	}
+722 ENDfreeWrkrInstance
+723 BEGINfreeInstance
+724 	int i;
+725 CODESTARTfreeInstance
+726 	if(pData-&gt;pSingleChildCtx != NULL) {
+727 		if(pData-&gt;pSingleChildCtx-&gt;bIsRunning) {
+728 			terminateChild(pData, pData-&gt;pSingleChildCtx);
+729 		}
+730 		free(pData-&gt;pSingleChildCtx);
+731 	}
+732 	if(pData-&gt;pSingleChildMut != NULL) {
+733 		pthread_mutex_destroy(pData-&gt;pSingleChildMut);
+734 		free(pData-&gt;pSingleChildMut);
+735 	}
+736 	if(pData-&gt;pOutputCaptureCtx != NULL) {
+737 		if(pData-&gt;pOutputCaptureCtx-&gt;bIsRunning) {
+738 			endOutputCapture(pData-&gt;pOutputCaptureCtx, pData-&gt;lCloseTimeout);
+739 		}
+740 		freeOutputCaptureCtx(pData-&gt;pOutputCaptureCtx);
+741 	}
+742 	free(pData-&gt;szBinary);
+743 	free(pData-&gt;szTemplateName);
+744 	free(pData-&gt;szBeginTransactionMark);
+745 	free(pData-&gt;szCommitTransactionMark);
+746 	if(pData-&gt;aParams != NULL) {
+747 		for (i = 0; i &lt; pData-&gt;iParams; i++) {
+748 			free(pData-&gt;aParams[i]);
+749 		}
+750 		free(pData-&gt;aParams);
+751 	}
+752 ENDfreeInstance
+753 BEGINnewActInst
+754 	struct cnfparamvals *pvals;
+755 	int i;
+756 CODESTARTnewActInst
+757 	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
+758 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+759 	}
+760 	CHKiRet(createInstance(&amp;pData));
+761 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+762 		if(!pvals[i].bUsed)
+763 			continue;
+764 		if(!strcmp(actpblk.descr[i].name, "binary")) {
+765 			CHKiRet(split_binary_parameters(&amp;pData-&gt;szBinary, &amp;pData-&gt;aParams, &amp;pData-&gt;iParams,
+766 				pvals[i].val.d.estr));
+767 		} else if(!strcmp(actpblk.descr[i].name, "confirmMessages")) {
+768 <a name="1"></a>			pData-&gt;bConfirmMessages = (int) pvals[i].val.d.n;
+769 		} else if(!strcmp(actpblk.descr[i].name, "confirmTimeout")) {
+770 			pData-&gt;lConfirmTimeout = (long) pvals[i].val.d.n;
+771 <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		} else if(!strcmp(actpblk.descr[i].name, "reportFailures")) {
+772 			pData-&gt;bReportFailures = (int) pvals[i].val.d.n;
+773 		} else if(!strcmp(actpblk.descr[i].name, "useTransactions")) {
+774 			pData-&gt;bUseTransactions = (int) pvals[i].val.d.n;
+775 		} else if(!strcmp(actpblk.descr[i].name, "beginTransactionMark")) {
+776 <a name="3"></a>			pData-&gt;szBeginTransactionMark = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+777 		} else if(!strcmp(actpblk.descr[i].name, "commitTransactionMark")) {
+778 			pData-&gt;szCommitTransactionMark = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
+779 <font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		} else if(!strcmp(actpblk.descr[i].name, "forceSingleInstance")) {
+780 			pData-&gt;bForceSingleInst = (int) pvals[i].val.d.n;
+781 		} else if(!strcmp(actpblk.descr[i].name, "signalOnClose")) {
+782 			pData-&gt;bSignalOnClose = (int) pvals[i].val.d.n;
+783 		} else if(!strcmp(actpblk.descr[i].name, "closeTimeout")) {
+784 			pData-&gt;lCloseTimeout = (long) pvals[i].val.d.n;</b></font>
+785 		} else if(!strcmp(actpblk.descr[i].name, "killUnresponsive")) {
+786 			pData-&gt;bKillUnresponsive = (int) pvals[i].val.d.n;
+787 		} else if(!strcmp(actpblk.descr[i].name, "hup.signal")) {
+788 			const char *const sig = es_str2cstr(pvals[i].val.d.estr, NULL);
+789 			if(!strcmp(sig, "HUP"))
+790 				pData-&gt;iHUPForward = SIGHUP;
+791 			else if(!strcmp(sig, "USR1"))
+792 				pData-&gt;iHUPForward = SIGUSR1;
+793 			else if(!strcmp(sig, "USR2"))
+794 				pData-&gt;iHUPForward = SIGUSR2;
+795 			else if(!strcmp(sig, "INT"))
+796 				pData-&gt;iHUPForward = SIGINT;
+797 			else if(!strcmp(sig, "TERM"))
+798 				pData-&gt;iHUPForward = SIGTERM;
+799 			else {
+800 				LogError(0, RS_RET_CONF_PARAM_INVLD,
+801 					"omprog: hup.signal '%s' in hup.signal parameter", sig);
+802 				ABORT_FINALIZE(RS_RET_CONF_PARAM_INVLD);
+803 			}
+804 			free((void*)sig);
+805 		} else if(!strcmp(actpblk.descr[i].name, "template")) {
+806 			pData-&gt;szTemplateName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+807 		} else if(!strcmp(actpblk.descr[i].name, "output")) {
+808 			if(pData-&gt;pOutputCaptureCtx == NULL) {
+809 				CHKiRet(allocOutputCaptureCtx(&amp;pData-&gt;pOutputCaptureCtx));
+810 			}
+811 			pData-&gt;pOutputCaptureCtx-&gt;szFileName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+812 		} else if(!strcmp(actpblk.descr[i].name, "fileCreateMode")) {
+813 			if(pData-&gt;pOutputCaptureCtx == NULL) {
+814 				CHKiRet(allocOutputCaptureCtx(&amp;pData-&gt;pOutputCaptureCtx));
+815 			}
+816 			pData-&gt;pOutputCaptureCtx-&gt;fCreateMode = (mode_t) pvals[i].val.d.n;
+817 		} else {
+818 			DBGPRINTF("omprog: program error, non-handled param '%s'\n", actpblk.descr[i].name);
+819 		}
+820 	}
+821 	CODE_STD_STRING_REQUESTnewActInst(1)
+822 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup(pData-&gt;szTemplateName == NULL ?
+823 			"RSYSLOG_FileFormat" : (char*)pData-&gt;szTemplateName), OMSR_NO_RQD_TPL_OPTS));
+824 	iRet = postInitInstance(pData);
+825 CODE_STD_FINALIZERnewActInst
+826 	cnfparamvalsDestruct(pvals, &amp;actpblk);
+827 ENDnewActInst
+828 BEGINparseSelectorAct
+829 CODESTARTparseSelectorAct
+830 CODE_STD_STRING_REQUESTparseSelectorAct(1)
+831 	if(strncmp((char*) p, ":omprog:", sizeof(":omprog:") - 1)) {
+832 		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
+833 	}
+834 	p += sizeof(":omprog:") - 1; 	if(cs.szBinary == NULL) {
+835 		LogError(0, RS_RET_CONF_RQRD_PARAM_MISSING, "no binary to execute specified");
+836 		ABORT_FINALIZE(RS_RET_CONF_RQRD_PARAM_MISSING);
+837 	}
+838 	CHKiRet(createInstance(&amp;pData));
+839 	CHKmalloc(pData-&gt;szBinary = (uchar*) strdup((char*)cs.szBinary));
+840 	if(*(p-1) == ';')
+841 		--p;
+842 	CHKiRet(cflineParseTemplateName(&amp;p, *ppOMSR, 0, 0, (uchar*) "RSYSLOG_FileFormat"));
+843 	iRet = postInitInstance(pData);
+844 CODE_STD_FINALIZERparseSelectorAct
+845 ENDparseSelectorAct
+846 BEGINdoHUP
+847 CODESTARTdoHUP
+848 	if(pData-&gt;bForceSingleInst &amp;&amp; pData-&gt;iHUPForward != NO_HUP_FORWARD &amp;&amp;
+849 			pData-&gt;pSingleChildCtx-&gt;bIsRunning) {
+850 		DBGPRINTF("omprog: forwarding HUP to program '%s' (pid %ld) as signal %d\n",
+851 				pData-&gt;szBinary, (long) pData-&gt;pSingleChildCtx-&gt;pid, pData-&gt;iHUPForward);
+852 		kill(pData-&gt;pSingleChildCtx-&gt;pid, pData-&gt;iHUPForward);
+853 	}
+854 	if(pData-&gt;pOutputCaptureCtx != NULL &amp;&amp; pData-&gt;pOutputCaptureCtx-&gt;bIsRunning) {
+855 		closeOutputFile(pData-&gt;pOutputCaptureCtx);
+856 	}
+857 ENDdoHUP
+858 BEGINdoHUPWrkr
+859 CODESTARTdoHUPWrkr
+860 	if(!pWrkrData-&gt;pData-&gt;bForceSingleInst &amp;&amp; pWrkrData-&gt;pData-&gt;iHUPForward != NO_HUP_FORWARD &amp;&amp;
+861 	 		pWrkrData-&gt;pChildCtx-&gt;bIsRunning) {
+862 		DBGPRINTF("omprog: forwarding HUP to program '%s' (pid %ld) as signal %d\n",
+863 				pWrkrData-&gt;pData-&gt;szBinary, (long) pWrkrData-&gt;pChildCtx-&gt;pid,
+864 				pWrkrData-&gt;pData-&gt;iHUPForward);
+865 		kill(pWrkrData-&gt;pChildCtx-&gt;pid, pWrkrData-&gt;pData-&gt;iHUPForward);
+866 	}
+867 ENDdoHUPWrkr
+868 BEGINmodExit
+869 CODESTARTmodExit
+870 	free(cs.szBinary);
+871 	cs.szBinary = NULL;
+872 ENDmodExit
+873 BEGINqueryEtryPt
+874 CODESTARTqueryEtryPt
+875 CODEqueryEtryPt_STD_OMOD_QUERIES
+876 CODEqueryEtryPt_STD_OMOD8_QUERIES
+877 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+878 CODEqueryEtryPt_TXIF_OMOD_QUERIES CODEqueryEtryPt_doHUP
+879 CODEqueryEtryPt_doHUPWrkr
+880 ENDqueryEtryPt
+881 static rsRetVal
+882 resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
+883 {
+884 	DEFiRet;
+885 	free(cs.szBinary);
+886 	cs.szBinary = NULL;
+887 	RETiRet;
+888 }
+889 BEGINmodInit()
+890 CODESTARTmodInit
+891 INITLegCnfVars
+892 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+893 	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
+894 	if (!bCoreSupportsBatching) {
+895 		LogError(0, NO_ERRCODE, "omprog: rsyslog core too old (does not support batching)");
+896 		ABORT_FINALIZE(RS_RET_ERR);
+897 	}
+898 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionomprogbinary", 0, eCmdHdlrGetWord, NULL, &amp;cs.szBinary,
+899 		STD_LOADABLE_MODULE_ID));
+900 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
+901 		NULL, STD_LOADABLE_MODULE_ID));
+902 CODEmodInit_QueryRegCFSLineHdlr
+903 ENDmodInit
 </pre>
 </div>
 </div>

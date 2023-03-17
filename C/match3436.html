@@ -40,510 +40,510 @@ Matches for omhttpfs.c &amp; ruleset.c
 </h3>
 <hr/>
 <pre>
-#include "config.h"
-#include "rsyslog.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;curl/curl.h&gt;
-#include &lt;json.h&gt;
-#include &lt;json_object.h&gt;
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "template.h"
-#include "module-template.h"
-#include "errmsg.h"
-#include "cfsysline.h"
-#include "datetime.h"
-#include "statsobj.h"
-#include "unicode-helper.h"
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("omhttpfs")
-DEF_OMOD_STATIC_DATA
-DEFobjCurrIf(glbl)
-DEFobjCurrIf(datetime)
-#define OMHTTPFS_VERSION "1.0"
-#define OMHTTPFS_DEFAULT_PORT 14000
-#define OMHTTPFS_DEFAULT_USER "hdfs"
-#define OMHTTPFS_DEFAULT_HOST "127.0.0.1"
-#define HTTPFS_URL_PREFIX_V1     "/webhdfs/v1"
-#define HTTPFS_URL_PREFIX_V1_SSL "/swebhdfs/v1"
-#define HTTPFS_CONTENT_TYPE      "Content-Type: application/octet-stream"
-#define HTTPFS_USER_AGENT        "omhttpfs by sskaje/" OMHTTPFS_VERSION
-#define HTTPFS_CONTENT_TYPE_JSON "application/json"
-#define HTTPFS_JSON_BOOLEAN_TRUE "{\"boolean\":true}"
-#define HTTPFS_FILEALREADYEXISTSEXCEPTION "FileAlreadyExistsException"
-#define HTTPFS_URL_BUFFER_LENGTH 2048
-#define DPP(x) DBGPRINTF("OMHTTPFS: %s:%d %s(): %s\n", __FILE__, __LINE__, __FUNCTION__, x)
-typedef struct _HTTPFS_JSON_REMOTE_EXCEPTION {
-	char message[1024];
-	char exception[256];
-	char class[256];
-} httpfs_json_remote_exception;
-typedef struct _instanceData {
-	sbool https;
-	uchar* host;
-	uchar* ip;
-	int  port;
-	uchar* user;
-	int timeout;
-	uchar* file;
-	sbool isDynFile;
-	uchar* tplName;
-} instanceData;
-typedef struct wrkrInstanceData {
-	instanceData *pData;
-	CURL* curl;
-	uchar* file;
-	int replyLen;
-	char* reply;
-} wrkrInstanceData_t;
-static struct cnfparamdescr actpdescr[] = {
-	{ "host", eCmdHdlrGetWord, 0 },
-	{ "port", eCmdHdlrInt, 0 },
-<a name="0"></a>	{ "user", eCmdHdlrGetWord, 0 },
-	{ "https", eCmdHdlrBinary, 0 },
-	{ "file", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "isdynfile", eCmdHdlrBinary, 0 },
-	{ "template", eCmdHdlrGetWord, 0 },
-};
-static struct cnfparamblk actpblk = {
-	CNFPARAMBLK_VERSION,
-	sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	actpdescr
-};
-static rsRetVal</b></font>
-httpfs_init_curl(wrkrInstanceData_t *pWrkrData, instanceData *pData)
-{
-	CURL *curl = NULL;
-	curl = curl_easy_init();
-	if (curl) {
-		curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
-		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-		if (pData-&gt;https) {
-			DBGPRINTF("%s(): Enable HTTPS\n", __FUNCTION__);
-			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-		}
-	} else {
-		LogError(0, RS_RET_OBJ_CREATION_FAILED, "omhttpfs: failed to init cURL\n");
-		return RS_RET_OBJ_CREATION_FAILED;
-	}
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, HTTPFS_USER_AGENT);
-	pWrkrData-&gt;curl = curl;
-	return RS_RET_OK;
-}
-static rsRetVal
-httpfs_build_url(wrkrInstanceData_t *pWrkrData, const char* op, es_str_t** url_buf)
-{
-	*url_buf = es_newStr(HTTPFS_URL_BUFFER_LENGTH);
-	if (pWrkrData-&gt;pData-&gt;https) {
-	    es_addBuf(url_buf, "https://", sizeof("https://")-1);
-	} else {
-	    es_addBuf(url_buf, "http://", sizeof("http://")-1);
-	}
-	es_addBuf(url_buf, (char* )pWrkrData-&gt;pData-&gt;host, strlen((char*)pWrkrData-&gt;pData-&gt;host));
-	es_addChar(url_buf, ':');
-	char portBuf[6];
-	snprintf(portBuf, sizeof(portBuf), "%d", pWrkrData-&gt;pData-&gt;port);
-	es_addBuf(url_buf, portBuf, strlen(portBuf));
-	es_addBuf(url_buf, HTTPFS_URL_PREFIX_V1, sizeof(HTTPFS_URL_PREFIX_V1)-1);
-	if (pWrkrData-&gt;file[0] != '/') {
-	    es_addChar(url_buf, '/');
-	}
-	es_addBuf(url_buf, (char* )pWrkrData-&gt;file, strlen((char* )pWrkrData-&gt;file));
-	es_addBuf(url_buf, "?user.name=", sizeof("?user.name=")-1);
-	es_addBuf(url_buf, (char* )pWrkrData-&gt;pData-&gt;user, strlen((char* )pWrkrData-&gt;pData-&gt;user));
-	es_addBuf(url_buf, op, strlen(op));
-	return RS_RET_OK;
-}
-static void httpfs_set_url(wrkrInstanceData_t *pWrkrData, const char* op)
-{
-	es_str_t* url;
-	char* url_cstr;
-	httpfs_build_url(pWrkrData, op, &amp;url);
-	url_cstr = es_str2cstr(url, NULL);
-	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_URL, url_cstr);
-	free(url_cstr);
-}
-static void httpfs_curl_set_put(CURL* curl)
-{
-	curl_easy_setopt(curl, CURLOPT_HTTPGET, 0L);
-	curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
-	curl_easy_setopt(curl, CURLOPT_POST, 0L);
-	curl_easy_setopt(curl, CURLOPT_PUT, 0L);
-	curl_easy_setopt(curl, CURLOPT_UPLOAD, 0L);
-	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-}
-static void httpfs_curl_set_post(CURL* curl)
-{
-	curl_easy_setopt(curl, CURLOPT_HTTPGET, 0L);
-	curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
-	curl_easy_setopt(curl, CURLOPT_PUT, 0L);
-	curl_easy_setopt(curl, CURLOPT_UPLOAD, 0L);
-	curl_easy_setopt(curl, CURLOPT_POST, 1L);
-	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
-}
-static struct curl_slist*
-httpfs_curl_add_header(struct curl_slist* headers, int hdr_count, ...)
-{
-	const char* hdr;
-	va_list ar;
-	va_start(ar, hdr_count);
-	for (; hdr_count &gt; 0; hdr_count--) {
-	    hdr = va_arg(ar, const char*);
-	    if (hdr != NULL
-	            &amp;&amp; hdr[0] != 0) {
-	        headers = curl_slist_append(headers, hdr);
-	    } else {
-	        break;
-	    }
-	}
-	va_end(ar);
-	headers = curl_slist_append(headers, "Expect:");
-	headers = curl_slist_append(headers, "Transfer-Encoding:");
-	return headers;
-}
-static size_t
-httpfs_curl_result_callback(void *contents, size_t size, size_t nmemb, void *userp)
-{
-	size_t realsize = size * nmemb;
-	char *newreply = NULL;
-	wrkrInstanceData_t *mem = (wrkrInstanceData_t *)userp;
-	newreply = realloc(mem-&gt;reply, mem-&gt;replyLen + realsize + 1);
-	if (newreply == NULL) {
-	    dbgprintf("not enough memory (realloc returned NULL)\n");
-	    if (mem-&gt;reply != NULL)
-	        free(mem-&gt;reply);
-	    mem-&gt;reply = NULL;
-	    mem-&gt;replyLen = 0;
-	    return 0;
-	}
-	mem-&gt;reply = newreply;
-	memcpy(&amp;(mem-&gt;reply[mem-&gt;replyLen]), contents, realsize);
-	mem-&gt;replyLen += realsize;
-	mem-&gt;reply[mem-&gt;replyLen] = 0;
-	return realsize;
-}
-#define HTTPFS_CURL_VARS_INIT \
-	struct curl_slist* headers = NULL; \
-	long response_code; \
-	CURLcode res; \
-	char* content_type;
-#define HTTPFS_CURL_VARS_RELEASE \
-	curl_slist_free_all(headers);
-#define HTTPFS_CURL_EXEC \
-	pWrkrData-&gt;reply = NULL; \
-	pWrkrData-&gt;replyLen = 0; \
-	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_WRITEDATA, pWrkrData); \
-	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_WRITEFUNCTION, httpfs_curl_result_callback); \
-	res = curl_easy_perform(pWrkrData-&gt;curl); \
-	if (res == CURLE_OK) { \
-	    curl_easy_getinfo(pWrkrData-&gt;curl, CURLINFO_CONTENT_TYPE, &amp;content_type); \
-	    if (strncmp(content_type, HTTPFS_CONTENT_TYPE_JSON, strlen(HTTPFS_CONTENT_TYPE_JSON))) { \
-	    } \
-	    curl_easy_getinfo(pWrkrData-&gt;curl, CURLINFO_RESPONSE_CODE, &amp;response_code); \
-	    if (pWrkrData-&gt;reply != NULL) { \
-	        pWrkrData-&gt;reply[pWrkrData-&gt;replyLen] = '\0'; \
-	    } \
-	} else { \
-	LogError(0, RS_RET_ERR, "CURL request fail, code=%d, error string=%s\n", res, curl_easy_strerror(res)); \
-	    return -1; \
-	}
-static rsRetVal
-httpfs_parse_exception(char* buf, int length, httpfs_json_remote_exception* jre)
-{
-	DEFiRet;
-	if (!length) {
-	    return RS_RET_JSON_PARSE_ERR;
-	}
-	struct json_tokener* jt = json_tokener_new();
-	json_tokener_reset(jt);
-	struct json_object *json;
-	json = json_tokener_parse_ex(jt, buf, length);
-	if (!json_object_is_type(json, json_type_object)) {
-		ABORT_FINALIZE(RS_RET_JSON_PARSE_ERR);
-	}
-	if (!json_object_object_get_ex(json, "RemoteException", &amp;json)) {
-	ABORT_FINALIZE(RS_RET_JSON_PARSE_ERR);
-	}
-	struct json_object *jobj;
-	memset(jre, 0, sizeof(*jre));
-	const char *str;
-	json_object_object_get_ex(json, "javaClassName", &amp;jobj);
-	str = json_object_get_string(jobj);
-	strncpy(jre-&gt;class, str, sizeof(jre-&gt;class));
-	jre-&gt;class[sizeof(jre-&gt;class)-1] = '\0';
-	json_object_object_get_ex(json, "exception", &amp;jobj);
-	str = json_object_get_string(jobj);
-	strncpy(jre-&gt;exception, str, sizeof(jre-&gt;exception));
-	jre-&gt;exception[sizeof(jre-&gt;exception)-1] = '\0';
-	json_object_object_get_ex(json, "message", &amp;jobj);
-	str = json_object_get_string(jobj);
-	strncpy(jre-&gt;message, str, sizeof(jre-&gt;message));
-	jre-&gt;message[sizeof(jre-&gt;message)-1] = '\0';
-finalize_it:
-	if(jt != NULL)
-		json_tokener_free(jt);
-	if(json != NULL)
-		json_object_put(json);
-	RETiRet;
-}
-static rsRetVal
-httpfs_create_file(wrkrInstanceData_t *pWrkrData, uchar* buf)
-{
-HTTPFS_CURL_VARS_INIT
-	DBGPRINTF("%s(): file=%s\n", __FUNCTION__, pWrkrData-&gt;file);
-	httpfs_curl_set_put(pWrkrData-&gt;curl);
-	httpfs_set_url(pWrkrData, "&amp;op=create&amp;overwrite=false&amp;data=true");
-	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_POSTFIELDS, (char*)buf);
-	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_POSTFIELDSIZE, strlen((char*) buf));
-	DBGPRINTF("%s(): msg=%s\n", __FUNCTION__, buf);
-	headers = httpfs_curl_add_header(headers, 1, HTTPFS_CONTENT_TYPE);
-	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_HTTPHEADER, headers);
-HTTPFS_CURL_EXEC
-	int success = 0;
-	if (response_code == 201) {
-	    success = 1;
-	}
-HTTPFS_CURL_VARS_RELEASE
-	if (success) {
-	    return RS_RET_OK;
-	} else {
-	    return RS_RET_FALSE;
-	}
-}
-static rsRetVal
-httpfs_append_file(wrkrInstanceData_t *pWrkrData, uchar* buf)
-{
-HTTPFS_CURL_VARS_INIT
-	DBGPRINTF("%s(): file=%s\n", __FUNCTION__, pWrkrData-&gt;file);
-	httpfs_curl_set_post(pWrkrData-&gt;curl);
-	httpfs_set_url(pWrkrData, "&amp;op=append&amp;data=true");
-	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_POSTFIELDS, (char*)buf);
-	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_POSTFIELDSIZE, strlen((char*) buf));
-	headers = httpfs_curl_add_header(headers, 1, HTTPFS_CONTENT_TYPE);
-	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_HTTPHEADER, headers);
-	DBGPRINTF("%s(): msg=%s\n", __FUNCTION__, buf);
-HTTPFS_CURL_EXEC
-	int success = 0;
-	if (response_code == 200) {
-	    success = 1;
-	} else if (response_code == 404) {
-	}
-HTTPFS_CURL_VARS_RELEASE
-	if (success) {
-	    return RS_RET_OK;
-	} else {
-	    return RS_RET_FALSE;
-	}
-}
-static rsRetVal
-httpfs_log(wrkrInstanceData_t *pWrkrData, uchar* buf)
-{
-	DEFiRet;
-	long response_code;
-	httpfs_json_remote_exception jre;
-	iRet = httpfs_append_file(pWrkrData, buf);
-	if (iRet == RS_RET_OK) {
-	    DBGPRINTF("omhttpfs: Append success: %s\n", pWrkrData-&gt;file);
-	    return RS_RET_OK;
-	}
-	curl_easy_getinfo(pWrkrData-&gt;curl, CURLINFO_RESPONSE_CODE, &amp;response_code);
-	if (response_code != 404) {
-	    DBGPRINTF("omhttpfs: Append fail HTTP %ld: %s\n", response_code, pWrkrData-&gt;file);
-	    return RS_RET_FALSE;
-	}
-	iRet = httpfs_create_file(pWrkrData, buf);
-	if (iRet == RS_RET_OK) {
-	    DBGPRINTF("omhttpfs: Create file success: %s\n", pWrkrData-&gt;file);
-	    return RS_RET_OK;
-	}
-	curl_easy_getinfo(pWrkrData-&gt;curl, CURLINFO_RESPONSE_CODE, &amp;response_code);
-	if (response_code == 201) {
-	    DBGPRINTF("omhttpfs: Create file success HTTP 201: %s\n", pWrkrData-&gt;file);
-	    return RS_RET_OK;
-	}
-	if (response_code == 500) {
-	    DBGPRINTF("omhttpfs: Create file failed HTTP %ld: %s\n", response_code, pWrkrData-&gt;file);
-	    httpfs_parse_exception(pWrkrData-&gt;reply, pWrkrData-&gt;replyLen, &amp;jre);
-	    if (!strncmp(jre.exception, HTTPFS_FILEALREADYEXISTSEXCEPTION, strlen(HTTPFS_FILEALREADYEXISTSEXCEPTION))) {
-	        DBGPRINTF("omhttpfs: File already exists, append again: %s\n", pWrkrData-&gt;file);
-	        iRet = httpfs_append_file(pWrkrData, buf);
-	        if (iRet == RS_RET_OK) {
-	            DBGPRINTF("omhttpfs: Re-Append success: %s\n", pWrkrData-&gt;file);
-	            return RS_RET_OK;
-	        } else {
-	            DBGPRINTF("omhttpfs: Re-Append failed: %s\n", pWrkrData-&gt;file);
-	        }
-	    } else {
-	        DBGPRINTF("omhttpfs: Create file failed: %s %s\n", pWrkrData-&gt;file, pWrkrData-&gt;reply);
-	    }
-	} else {
-	    DBGPRINTF("omhttpfs: Create file failed: %s %s\n", pWrkrData-&gt;file, pWrkrData-&gt;reply);
-	}
-	return RS_RET_FALSE;
-}
-BEGINinitConfVars
-	CODESTARTinitConfVars
-ENDinitConfVars
-BEGINcreateInstance
-CODESTARTcreateInstance
-	DBGPRINTF("omhttpfs: createInstance\n");
-ENDcreateInstance
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-	DBGPRINTF("omhttpfs: createWrkrInstance\n");
-	pWrkrData-&gt;curl = NULL;
-	iRet = httpfs_init_curl(pWrkrData, pWrkrData-&gt;pData);
-	DBGPRINTF("omhttpfs: createWrkrInstance,pData %p/%p, pWrkrData %p\n",
-	pData, pWrkrData-&gt;pData, pWrkrData);
-ENDcreateWrkrInstance
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURERepeatedMsgReduction)
-	    iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-BEGINfreeInstance
-CODESTARTfreeInstance
-	free(pData-&gt;file);
-	free(pData-&gt;tplName);
-	free(pData-&gt;host);
-	free(pData-&gt;user);
-ENDfreeInstance
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-	free(pWrkrData-&gt;file);
-	if(pWrkrData-&gt;curl) {
-	    curl_easy_cleanup(pWrkrData-&gt;curl);
-	    pWrkrData-&gt;curl = NULL;
-	}
-ENDfreeWrkrInstance
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-	DBGPRINTF("OmHTTPFS\n");
-	DBGPRINTF("Version: %s\n", OMHTTPFS_VERSION);
-	DBGPRINTF("\tHost: %s\n", pData-&gt;host);
-	DBGPRINTF("\tPort: %d\n", pData-&gt;port);
-	DBGPRINTF("\tUser: %s\n", pData-&gt;user);
-	DBGPRINTF("\tFile: %s\n", pData-&gt;file);
-ENDdbgPrintInstInfo
-BEGINtryResume
-CODESTARTtryResume
-	DBGPRINTF("omhttpfs: tryResume called\n");
-	iRet = RS_RET_OK;
-ENDtryResume
-BEGINdoAction
-CODESTARTdoAction
-	DBGPRINTF("omhttpfs: doAction\n");
-	if (pWrkrData-&gt;pData-&gt;isDynFile) {
-	    pWrkrData-&gt;file = ustrdup(ppString[1]);
-	} else {
-	    pWrkrData-&gt;file = ustrdup(pWrkrData-&gt;pData-&gt;file);
-	}
-	iRet = httpfs_log(pWrkrData, ppString[0]);
-	if(iRet != RS_RET_OK) {
-	    DBGPRINTF("omhttpfs: error writing httpfs, suspending\n");
-	    iRet = RS_RET_SUSPENDED;
-	}
-ENDdoAction
-static void
-setInstParamDefaults(instanceData *pData)
-{
-	pData-&gt;host = (uchar*) strdup(OMHTTPFS_DEFAULT_HOST);
-	pData-&gt;port = OMHTTPFS_DEFAULT_PORT;
-	pData-&gt;user = (uchar*) strdup(OMHTTPFS_DEFAULT_USER);
-	pData-&gt;https = 0;
-	pData-&gt;file = NULL;
-	pData-&gt;isDynFile = 0;
-	pData-&gt;tplName = NULL;
-}
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	int i;
-	uchar *tplToUse;
-CODESTARTnewActInst
-	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
-	    ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-	CHKiRet(createInstance(&amp;pData));
-	setInstParamDefaults(pData);
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-	    if(!pvals[i].bUsed)
-	        continue;
-	    if(!strcmp(actpblk.descr[i].name, "host")) {
-	        pData-&gt;host = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-	    } else if(!strcmp(actpblk.descr[i].name, "port")) {
-	        pData-&gt;port = (int) pvals[i].val.d.n;
-	    } else if(!strcmp(actpblk.descr[i].name, "user")) {
-	        pData-&gt;user = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-	    } else if(!strcmp(actpblk.descr[i].name, "https")) {
-	        pData-&gt;https = pvals[i].val.d.n ? 1 : 0;
-	    } else if(!strcmp(actpblk.descr[i].name, "file")) {
-	        pData-&gt;file = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
-	    } else if(!strcmp(actpblk.descr[i].name, "isdynfile")) {
-	        pData-&gt;isDynFile = pvals[i].val.d.n ? 1 : 0;
-	    } else if(!strcmp(actpblk.descr[i].name, "template")) {
-	        pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-	    } else {
-	        DBGPRINTF("omhttpfs: program error, non-handled param '%s'\n", actpblk.descr[i].name);
-	    }
-	}
-	if(pData-&gt;file == NULL) {
-	    LogError(0, RS_RET_INTERNAL_ERROR, "omhttpfs: file is not set "
-		"[this should not be possible]\n");
-	ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
-	}
-	if(pData-&gt;user == NULL || pData-&gt;user[0] == '\0') {
-	    pData-&gt;user = ustrdup((uchar*) OMHTTPFS_DEFAULT_USER);
-	}
-	if(pData-&gt;host == NULL || pData-&gt;host[0] == '\0') {
-	    pData-&gt;host = ustrdup((uchar*) OMHTTPFS_DEFAULT_HOST);
-	}
-	if (pData-&gt;isDynFile) {
-	    CODE_STD_STRING_REQUESTparseSelectorAct(2)
-	    CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData-&gt;file), OMSR_NO_RQD_TPL_OPTS));
-	} else {
-	    CODE_STD_STRING_REQUESTparseSelectorAct(1)
-	}
-	tplToUse = ustrdup((pData-&gt;tplName == NULL) ? (uchar* ) "RSYSLOG_FileFormat" : pData-&gt;tplName);
-	iRet = OMSRsetEntry(*ppOMSR, 0, tplToUse, OMSR_NO_RQD_TPL_OPTS);
-CODE_STD_FINALIZERnewActInst
-	cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-NO_LEGACY_CONF_parseSelectorAct
-BEGINmodExit
-CODESTARTmodExit
-	curl_global_cleanup();
-	objRelease(datetime, CORE_COMPONENT);
-	objRelease(glbl, CORE_COMPONENT);
-ENDmodExit
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-	CODEqueryEtryPt_STD_OMOD_QUERIES
-	CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-	CODEqueryEtryPt_STD_OMOD8_QUERIES
-	CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES
-ENDqueryEtryPt
-BEGINmodInit()
-CODESTARTmodInit
-INITLegCnfVars
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-	CHKiRet(objUse(datetime, CORE_COMPONENT));
-	if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
-	    LogError(0, RS_RET_OBJ_CREATION_FAILED, "CURL fail. -httpfs module init failed");
-	    ABORT_FINALIZE(RS_RET_OBJ_CREATION_FAILED);
-	}
-	DBGPRINTF("omhttpfs version %s is initializing\n", OMHTTPFS_VERSION);
-ENDmodInit
+1 #include "config.h"
+2 #include "rsyslog.h"
+3 #include &lt;stdio.h&gt;
+4 #include &lt;stdarg.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;assert.h&gt;
+8 #include &lt;signal.h&gt;
+9 #include &lt;errno.h&gt;
+10 #include &lt;unistd.h&gt;
+11 #include &lt;curl/curl.h&gt;
+12 #include &lt;json.h&gt;
+13 #include &lt;json_object.h&gt;
+14 #include "conf.h"
+15 #include "syslogd-types.h"
+16 #include "srUtils.h"
+17 #include "template.h"
+18 #include "module-template.h"
+19 #include "errmsg.h"
+20 #include "cfsysline.h"
+21 #include "datetime.h"
+22 #include "statsobj.h"
+23 #include "unicode-helper.h"
+24 MODULE_TYPE_OUTPUT
+25 MODULE_TYPE_NOKEEP
+26 MODULE_CNFNAME("omhttpfs")
+27 DEF_OMOD_STATIC_DATA
+28 DEFobjCurrIf(glbl)
+29 DEFobjCurrIf(datetime)
+30 #define OMHTTPFS_VERSION "1.0"
+31 #define OMHTTPFS_DEFAULT_PORT 14000
+32 #define OMHTTPFS_DEFAULT_USER "hdfs"
+33 #define OMHTTPFS_DEFAULT_HOST "127.0.0.1"
+34 #define HTTPFS_URL_PREFIX_V1     "/webhdfs/v1"
+35 #define HTTPFS_URL_PREFIX_V1_SSL "/swebhdfs/v1"
+36 #define HTTPFS_CONTENT_TYPE      "Content-Type: application/octet-stream"
+37 #define HTTPFS_USER_AGENT        "omhttpfs by sskaje/" OMHTTPFS_VERSION
+38 #define HTTPFS_CONTENT_TYPE_JSON "application/json"
+39 #define HTTPFS_JSON_BOOLEAN_TRUE "{\"boolean\":true}"
+40 #define HTTPFS_FILEALREADYEXISTSEXCEPTION "FileAlreadyExistsException"
+41 #define HTTPFS_URL_BUFFER_LENGTH 2048
+42 #define DPP(x) DBGPRINTF("OMHTTPFS: %s:%d %s(): %s\n", __FILE__, __LINE__, __FUNCTION__, x)
+43 typedef struct _HTTPFS_JSON_REMOTE_EXCEPTION {
+44 	char message[1024];
+45 	char exception[256];
+46 	char class[256];
+47 } httpfs_json_remote_exception;
+48 typedef struct _instanceData {
+49 	sbool https;
+50 	uchar* host;
+51 	uchar* ip;
+52 	int  port;
+53 	uchar* user;
+54 	int timeout;
+55 	uchar* file;
+56 	sbool isDynFile;
+57 	uchar* tplName;
+58 } instanceData;
+59 typedef struct wrkrInstanceData {
+60 	instanceData *pData;
+61 	CURL* curl;
+62 	uchar* file;
+63 	int replyLen;
+64 	char* reply;
+65 } wrkrInstanceData_t;
+66 static struct cnfparamdescr actpdescr[] = {
+67 	{ "host", eCmdHdlrGetWord, 0 },
+68 	{ "port", eCmdHdlrInt, 0 },
+69 <a name="0"></a>	{ "user", eCmdHdlrGetWord, 0 },
+70 	{ "https", eCmdHdlrBinary, 0 },
+71 	{ "file", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
+72 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "isdynfile", eCmdHdlrBinary, 0 },
+73 	{ "template", eCmdHdlrGetWord, 0 },
+74 };
+75 static struct cnfparamblk actpblk = {
+76 	CNFPARAMBLK_VERSION,
+77 	sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+78 	actpdescr
+79 };
+80 static rsRetVal</b></font>
+81 httpfs_init_curl(wrkrInstanceData_t *pWrkrData, instanceData *pData)
+82 {
+83 	CURL *curl = NULL;
+84 	curl = curl_easy_init();
+85 	if (curl) {
+86 		curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
+87 		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+88 		if (pData-&gt;https) {
+89 			DBGPRINTF("%s(): Enable HTTPS\n", __FUNCTION__);
+90 			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+91 			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+92 		}
+93 	} else {
+94 		LogError(0, RS_RET_OBJ_CREATION_FAILED, "omhttpfs: failed to init cURL\n");
+95 		return RS_RET_OBJ_CREATION_FAILED;
+96 	}
+97 	curl_easy_setopt(curl, CURLOPT_USERAGENT, HTTPFS_USER_AGENT);
+98 	pWrkrData-&gt;curl = curl;
+99 	return RS_RET_OK;
+100 }
+101 static rsRetVal
+102 httpfs_build_url(wrkrInstanceData_t *pWrkrData, const char* op, es_str_t** url_buf)
+103 {
+104 	*url_buf = es_newStr(HTTPFS_URL_BUFFER_LENGTH);
+105 	if (pWrkrData-&gt;pData-&gt;https) {
+106 	    es_addBuf(url_buf, "https://", sizeof("https://")-1);
+107 	} else {
+108 	    es_addBuf(url_buf, "http://", sizeof("http://")-1);
+109 	}
+110 	es_addBuf(url_buf, (char* )pWrkrData-&gt;pData-&gt;host, strlen((char*)pWrkrData-&gt;pData-&gt;host));
+111 	es_addChar(url_buf, ':');
+112 	char portBuf[6];
+113 	snprintf(portBuf, sizeof(portBuf), "%d", pWrkrData-&gt;pData-&gt;port);
+114 	es_addBuf(url_buf, portBuf, strlen(portBuf));
+115 	es_addBuf(url_buf, HTTPFS_URL_PREFIX_V1, sizeof(HTTPFS_URL_PREFIX_V1)-1);
+116 	if (pWrkrData-&gt;file[0] != '/') {
+117 	    es_addChar(url_buf, '/');
+118 	}
+119 	es_addBuf(url_buf, (char* )pWrkrData-&gt;file, strlen((char* )pWrkrData-&gt;file));
+120 	es_addBuf(url_buf, "?user.name=", sizeof("?user.name=")-1);
+121 	es_addBuf(url_buf, (char* )pWrkrData-&gt;pData-&gt;user, strlen((char* )pWrkrData-&gt;pData-&gt;user));
+122 	es_addBuf(url_buf, op, strlen(op));
+123 	return RS_RET_OK;
+124 }
+125 static void httpfs_set_url(wrkrInstanceData_t *pWrkrData, const char* op)
+126 {
+127 	es_str_t* url;
+128 	char* url_cstr;
+129 	httpfs_build_url(pWrkrData, op, &amp;url);
+130 	url_cstr = es_str2cstr(url, NULL);
+131 	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_URL, url_cstr);
+132 	free(url_cstr);
+133 }
+134 static void httpfs_curl_set_put(CURL* curl)
+135 {
+136 	curl_easy_setopt(curl, CURLOPT_HTTPGET, 0L);
+137 	curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
+138 	curl_easy_setopt(curl, CURLOPT_POST, 0L);
+139 	curl_easy_setopt(curl, CURLOPT_PUT, 0L);
+140 	curl_easy_setopt(curl, CURLOPT_UPLOAD, 0L);
+141 	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+142 }
+143 static void httpfs_curl_set_post(CURL* curl)
+144 {
+145 	curl_easy_setopt(curl, CURLOPT_HTTPGET, 0L);
+146 	curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
+147 	curl_easy_setopt(curl, CURLOPT_PUT, 0L);
+148 	curl_easy_setopt(curl, CURLOPT_UPLOAD, 0L);
+149 	curl_easy_setopt(curl, CURLOPT_POST, 1L);
+150 	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
+151 }
+152 static struct curl_slist*
+153 httpfs_curl_add_header(struct curl_slist* headers, int hdr_count, ...)
+154 {
+155 	const char* hdr;
+156 	va_list ar;
+157 	va_start(ar, hdr_count);
+158 	for (; hdr_count &gt; 0; hdr_count--) {
+159 	    hdr = va_arg(ar, const char*);
+160 	    if (hdr != NULL
+161 	            &amp;&amp; hdr[0] != 0) {
+162 	        headers = curl_slist_append(headers, hdr);
+163 	    } else {
+164 	        break;
+165 	    }
+166 	}
+167 	va_end(ar);
+168 	headers = curl_slist_append(headers, "Expect:");
+169 	headers = curl_slist_append(headers, "Transfer-Encoding:");
+170 	return headers;
+171 }
+172 static size_t
+173 httpfs_curl_result_callback(void *contents, size_t size, size_t nmemb, void *userp)
+174 {
+175 	size_t realsize = size * nmemb;
+176 	char *newreply = NULL;
+177 	wrkrInstanceData_t *mem = (wrkrInstanceData_t *)userp;
+178 	newreply = realloc(mem-&gt;reply, mem-&gt;replyLen + realsize + 1);
+179 	if (newreply == NULL) {
+180 	    dbgprintf("not enough memory (realloc returned NULL)\n");
+181 	    if (mem-&gt;reply != NULL)
+182 	        free(mem-&gt;reply);
+183 	    mem-&gt;reply = NULL;
+184 	    mem-&gt;replyLen = 0;
+185 	    return 0;
+186 	}
+187 	mem-&gt;reply = newreply;
+188 	memcpy(&amp;(mem-&gt;reply[mem-&gt;replyLen]), contents, realsize);
+189 	mem-&gt;replyLen += realsize;
+190 	mem-&gt;reply[mem-&gt;replyLen] = 0;
+191 	return realsize;
+192 }
+193 #define HTTPFS_CURL_VARS_INIT \
+194 	struct curl_slist* headers = NULL; \
+195 	long response_code; \
+196 	CURLcode res; \
+197 	char* content_type;
+198 #define HTTPFS_CURL_VARS_RELEASE \
+199 	curl_slist_free_all(headers);
+200 #define HTTPFS_CURL_EXEC \
+201 	pWrkrData-&gt;reply = NULL; \
+202 	pWrkrData-&gt;replyLen = 0; \
+203 	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_WRITEDATA, pWrkrData); \
+204 	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_WRITEFUNCTION, httpfs_curl_result_callback); \
+205 	res = curl_easy_perform(pWrkrData-&gt;curl); \
+206 	if (res == CURLE_OK) { \
+207 	    curl_easy_getinfo(pWrkrData-&gt;curl, CURLINFO_CONTENT_TYPE, &amp;content_type); \
+208 	    if (strncmp(content_type, HTTPFS_CONTENT_TYPE_JSON, strlen(HTTPFS_CONTENT_TYPE_JSON))) { \
+209 	    } \
+210 	    curl_easy_getinfo(pWrkrData-&gt;curl, CURLINFO_RESPONSE_CODE, &amp;response_code); \
+211 	    if (pWrkrData-&gt;reply != NULL) { \
+212 	        pWrkrData-&gt;reply[pWrkrData-&gt;replyLen] = '\0'; \
+213 	    } \
+214 	} else { \
+215 	LogError(0, RS_RET_ERR, "CURL request fail, code=%d, error string=%s\n", res, curl_easy_strerror(res)); \
+216 	    return -1; \
+217 	}
+218 static rsRetVal
+219 httpfs_parse_exception(char* buf, int length, httpfs_json_remote_exception* jre)
+220 {
+221 	DEFiRet;
+222 	if (!length) {
+223 	    return RS_RET_JSON_PARSE_ERR;
+224 	}
+225 	struct json_tokener* jt = json_tokener_new();
+226 	json_tokener_reset(jt);
+227 	struct json_object *json;
+228 	json = json_tokener_parse_ex(jt, buf, length);
+229 	if (!json_object_is_type(json, json_type_object)) {
+230 		ABORT_FINALIZE(RS_RET_JSON_PARSE_ERR);
+231 	}
+232 	if (!json_object_object_get_ex(json, "RemoteException", &amp;json)) {
+233 	ABORT_FINALIZE(RS_RET_JSON_PARSE_ERR);
+234 	}
+235 	struct json_object *jobj;
+236 	memset(jre, 0, sizeof(*jre));
+237 	const char *str;
+238 	json_object_object_get_ex(json, "javaClassName", &amp;jobj);
+239 	str = json_object_get_string(jobj);
+240 	strncpy(jre-&gt;class, str, sizeof(jre-&gt;class));
+241 	jre-&gt;class[sizeof(jre-&gt;class)-1] = '\0';
+242 	json_object_object_get_ex(json, "exception", &amp;jobj);
+243 	str = json_object_get_string(jobj);
+244 	strncpy(jre-&gt;exception, str, sizeof(jre-&gt;exception));
+245 	jre-&gt;exception[sizeof(jre-&gt;exception)-1] = '\0';
+246 	json_object_object_get_ex(json, "message", &amp;jobj);
+247 	str = json_object_get_string(jobj);
+248 	strncpy(jre-&gt;message, str, sizeof(jre-&gt;message));
+249 	jre-&gt;message[sizeof(jre-&gt;message)-1] = '\0';
+250 finalize_it:
+251 	if(jt != NULL)
+252 		json_tokener_free(jt);
+253 	if(json != NULL)
+254 		json_object_put(json);
+255 	RETiRet;
+256 }
+257 static rsRetVal
+258 httpfs_create_file(wrkrInstanceData_t *pWrkrData, uchar* buf)
+259 {
+260 HTTPFS_CURL_VARS_INIT
+261 	DBGPRINTF("%s(): file=%s\n", __FUNCTION__, pWrkrData-&gt;file);
+262 	httpfs_curl_set_put(pWrkrData-&gt;curl);
+263 	httpfs_set_url(pWrkrData, "&amp;op=create&amp;overwrite=false&amp;data=true");
+264 	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_POSTFIELDS, (char*)buf);
+265 	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_POSTFIELDSIZE, strlen((char*) buf));
+266 	DBGPRINTF("%s(): msg=%s\n", __FUNCTION__, buf);
+267 	headers = httpfs_curl_add_header(headers, 1, HTTPFS_CONTENT_TYPE);
+268 	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_HTTPHEADER, headers);
+269 HTTPFS_CURL_EXEC
+270 	int success = 0;
+271 	if (response_code == 201) {
+272 	    success = 1;
+273 	}
+274 HTTPFS_CURL_VARS_RELEASE
+275 	if (success) {
+276 	    return RS_RET_OK;
+277 	} else {
+278 	    return RS_RET_FALSE;
+279 	}
+280 }
+281 static rsRetVal
+282 httpfs_append_file(wrkrInstanceData_t *pWrkrData, uchar* buf)
+283 {
+284 HTTPFS_CURL_VARS_INIT
+285 	DBGPRINTF("%s(): file=%s\n", __FUNCTION__, pWrkrData-&gt;file);
+286 	httpfs_curl_set_post(pWrkrData-&gt;curl);
+287 	httpfs_set_url(pWrkrData, "&amp;op=append&amp;data=true");
+288 	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_POSTFIELDS, (char*)buf);
+289 	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_POSTFIELDSIZE, strlen((char*) buf));
+290 	headers = httpfs_curl_add_header(headers, 1, HTTPFS_CONTENT_TYPE);
+291 	curl_easy_setopt(pWrkrData-&gt;curl, CURLOPT_HTTPHEADER, headers);
+292 	DBGPRINTF("%s(): msg=%s\n", __FUNCTION__, buf);
+293 HTTPFS_CURL_EXEC
+294 	int success = 0;
+295 	if (response_code == 200) {
+296 	    success = 1;
+297 	} else if (response_code == 404) {
+298 	}
+299 HTTPFS_CURL_VARS_RELEASE
+300 	if (success) {
+301 	    return RS_RET_OK;
+302 	} else {
+303 	    return RS_RET_FALSE;
+304 	}
+305 }
+306 static rsRetVal
+307 httpfs_log(wrkrInstanceData_t *pWrkrData, uchar* buf)
+308 {
+309 	DEFiRet;
+310 	long response_code;
+311 	httpfs_json_remote_exception jre;
+312 	iRet = httpfs_append_file(pWrkrData, buf);
+313 	if (iRet == RS_RET_OK) {
+314 	    DBGPRINTF("omhttpfs: Append success: %s\n", pWrkrData-&gt;file);
+315 	    return RS_RET_OK;
+316 	}
+317 	curl_easy_getinfo(pWrkrData-&gt;curl, CURLINFO_RESPONSE_CODE, &amp;response_code);
+318 	if (response_code != 404) {
+319 	    DBGPRINTF("omhttpfs: Append fail HTTP %ld: %s\n", response_code, pWrkrData-&gt;file);
+320 	    return RS_RET_FALSE;
+321 	}
+322 	iRet = httpfs_create_file(pWrkrData, buf);
+323 	if (iRet == RS_RET_OK) {
+324 	    DBGPRINTF("omhttpfs: Create file success: %s\n", pWrkrData-&gt;file);
+325 	    return RS_RET_OK;
+326 	}
+327 	curl_easy_getinfo(pWrkrData-&gt;curl, CURLINFO_RESPONSE_CODE, &amp;response_code);
+328 	if (response_code == 201) {
+329 	    DBGPRINTF("omhttpfs: Create file success HTTP 201: %s\n", pWrkrData-&gt;file);
+330 	    return RS_RET_OK;
+331 	}
+332 	if (response_code == 500) {
+333 	    DBGPRINTF("omhttpfs: Create file failed HTTP %ld: %s\n", response_code, pWrkrData-&gt;file);
+334 	    httpfs_parse_exception(pWrkrData-&gt;reply, pWrkrData-&gt;replyLen, &amp;jre);
+335 	    if (!strncmp(jre.exception, HTTPFS_FILEALREADYEXISTSEXCEPTION, strlen(HTTPFS_FILEALREADYEXISTSEXCEPTION))) {
+336 	        DBGPRINTF("omhttpfs: File already exists, append again: %s\n", pWrkrData-&gt;file);
+337 	        iRet = httpfs_append_file(pWrkrData, buf);
+338 	        if (iRet == RS_RET_OK) {
+339 	            DBGPRINTF("omhttpfs: Re-Append success: %s\n", pWrkrData-&gt;file);
+340 	            return RS_RET_OK;
+341 	        } else {
+342 	            DBGPRINTF("omhttpfs: Re-Append failed: %s\n", pWrkrData-&gt;file);
+343 	        }
+344 	    } else {
+345 	        DBGPRINTF("omhttpfs: Create file failed: %s %s\n", pWrkrData-&gt;file, pWrkrData-&gt;reply);
+346 	    }
+347 	} else {
+348 	    DBGPRINTF("omhttpfs: Create file failed: %s %s\n", pWrkrData-&gt;file, pWrkrData-&gt;reply);
+349 	}
+350 	return RS_RET_FALSE;
+351 }
+352 BEGINinitConfVars
+353 	CODESTARTinitConfVars
+354 ENDinitConfVars
+355 BEGINcreateInstance
+356 CODESTARTcreateInstance
+357 	DBGPRINTF("omhttpfs: createInstance\n");
+358 ENDcreateInstance
+359 BEGINcreateWrkrInstance
+360 CODESTARTcreateWrkrInstance
+361 	DBGPRINTF("omhttpfs: createWrkrInstance\n");
+362 	pWrkrData-&gt;curl = NULL;
+363 	iRet = httpfs_init_curl(pWrkrData, pWrkrData-&gt;pData);
+364 	DBGPRINTF("omhttpfs: createWrkrInstance,pData %p/%p, pWrkrData %p\n",
+365 	pData, pWrkrData-&gt;pData, pWrkrData);
+366 ENDcreateWrkrInstance
+367 BEGINisCompatibleWithFeature
+368 CODESTARTisCompatibleWithFeature
+369 	if(eFeat == sFEATURERepeatedMsgReduction)
+370 	    iRet = RS_RET_OK;
+371 ENDisCompatibleWithFeature
+372 BEGINfreeInstance
+373 CODESTARTfreeInstance
+374 	free(pData-&gt;file);
+375 	free(pData-&gt;tplName);
+376 	free(pData-&gt;host);
+377 	free(pData-&gt;user);
+378 ENDfreeInstance
+379 BEGINfreeWrkrInstance
+380 CODESTARTfreeWrkrInstance
+381 	free(pWrkrData-&gt;file);
+382 	if(pWrkrData-&gt;curl) {
+383 	    curl_easy_cleanup(pWrkrData-&gt;curl);
+384 	    pWrkrData-&gt;curl = NULL;
+385 	}
+386 ENDfreeWrkrInstance
+387 BEGINdbgPrintInstInfo
+388 CODESTARTdbgPrintInstInfo
+389 	DBGPRINTF("OmHTTPFS\n");
+390 	DBGPRINTF("Version: %s\n", OMHTTPFS_VERSION);
+391 	DBGPRINTF("\tHost: %s\n", pData-&gt;host);
+392 	DBGPRINTF("\tPort: %d\n", pData-&gt;port);
+393 	DBGPRINTF("\tUser: %s\n", pData-&gt;user);
+394 	DBGPRINTF("\tFile: %s\n", pData-&gt;file);
+395 ENDdbgPrintInstInfo
+396 BEGINtryResume
+397 CODESTARTtryResume
+398 	DBGPRINTF("omhttpfs: tryResume called\n");
+399 	iRet = RS_RET_OK;
+400 ENDtryResume
+401 BEGINdoAction
+402 CODESTARTdoAction
+403 	DBGPRINTF("omhttpfs: doAction\n");
+404 	if (pWrkrData-&gt;pData-&gt;isDynFile) {
+405 	    pWrkrData-&gt;file = ustrdup(ppString[1]);
+406 	} else {
+407 	    pWrkrData-&gt;file = ustrdup(pWrkrData-&gt;pData-&gt;file);
+408 	}
+409 	iRet = httpfs_log(pWrkrData, ppString[0]);
+410 	if(iRet != RS_RET_OK) {
+411 	    DBGPRINTF("omhttpfs: error writing httpfs, suspending\n");
+412 	    iRet = RS_RET_SUSPENDED;
+413 	}
+414 ENDdoAction
+415 static void
+416 setInstParamDefaults(instanceData *pData)
+417 {
+418 	pData-&gt;host = (uchar*) strdup(OMHTTPFS_DEFAULT_HOST);
+419 	pData-&gt;port = OMHTTPFS_DEFAULT_PORT;
+420 	pData-&gt;user = (uchar*) strdup(OMHTTPFS_DEFAULT_USER);
+421 	pData-&gt;https = 0;
+422 	pData-&gt;file = NULL;
+423 	pData-&gt;isDynFile = 0;
+424 	pData-&gt;tplName = NULL;
+425 }
+426 BEGINnewActInst
+427 	struct cnfparamvals *pvals;
+428 	int i;
+429 	uchar *tplToUse;
+430 CODESTARTnewActInst
+431 	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
+432 	    ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+433 	}
+434 	CHKiRet(createInstance(&amp;pData));
+435 	setInstParamDefaults(pData);
+436 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+437 	    if(!pvals[i].bUsed)
+438 	        continue;
+439 	    if(!strcmp(actpblk.descr[i].name, "host")) {
+440 	        pData-&gt;host = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+441 	    } else if(!strcmp(actpblk.descr[i].name, "port")) {
+442 	        pData-&gt;port = (int) pvals[i].val.d.n;
+443 	    } else if(!strcmp(actpblk.descr[i].name, "user")) {
+444 	        pData-&gt;user = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+445 	    } else if(!strcmp(actpblk.descr[i].name, "https")) {
+446 	        pData-&gt;https = pvals[i].val.d.n ? 1 : 0;
+447 	    } else if(!strcmp(actpblk.descr[i].name, "file")) {
+448 	        pData-&gt;file = (uchar *) es_str2cstr(pvals[i].val.d.estr, NULL);
+449 	    } else if(!strcmp(actpblk.descr[i].name, "isdynfile")) {
+450 	        pData-&gt;isDynFile = pvals[i].val.d.n ? 1 : 0;
+451 	    } else if(!strcmp(actpblk.descr[i].name, "template")) {
+452 	        pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+453 	    } else {
+454 	        DBGPRINTF("omhttpfs: program error, non-handled param '%s'\n", actpblk.descr[i].name);
+455 	    }
+456 	}
+457 	if(pData-&gt;file == NULL) {
+458 	    LogError(0, RS_RET_INTERNAL_ERROR, "omhttpfs: file is not set "
+459 		"[this should not be possible]\n");
+460 	ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
+461 	}
+462 	if(pData-&gt;user == NULL || pData-&gt;user[0] == '\0') {
+463 	    pData-&gt;user = ustrdup((uchar*) OMHTTPFS_DEFAULT_USER);
+464 	}
+465 	if(pData-&gt;host == NULL || pData-&gt;host[0] == '\0') {
+466 	    pData-&gt;host = ustrdup((uchar*) OMHTTPFS_DEFAULT_HOST);
+467 	}
+468 	if (pData-&gt;isDynFile) {
+469 	    CODE_STD_STRING_REQUESTparseSelectorAct(2)
+470 	    CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData-&gt;file), OMSR_NO_RQD_TPL_OPTS));
+471 	} else {
+472 	    CODE_STD_STRING_REQUESTparseSelectorAct(1)
+473 	}
+474 	tplToUse = ustrdup((pData-&gt;tplName == NULL) ? (uchar* ) "RSYSLOG_FileFormat" : pData-&gt;tplName);
+475 	iRet = OMSRsetEntry(*ppOMSR, 0, tplToUse, OMSR_NO_RQD_TPL_OPTS);
+476 CODE_STD_FINALIZERnewActInst
+477 	cnfparamvalsDestruct(pvals, &amp;actpblk);
+478 ENDnewActInst
+479 NO_LEGACY_CONF_parseSelectorAct
+480 BEGINmodExit
+481 CODESTARTmodExit
+482 	curl_global_cleanup();
+483 	objRelease(datetime, CORE_COMPONENT);
+484 	objRelease(glbl, CORE_COMPONENT);
+485 ENDmodExit
+486 BEGINqueryEtryPt
+487 CODESTARTqueryEtryPt
+488 	CODEqueryEtryPt_STD_OMOD_QUERIES
+489 	CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+490 	CODEqueryEtryPt_STD_OMOD8_QUERIES
+491 	CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES
+492 ENDqueryEtryPt
+493 BEGINmodInit()
+494 CODESTARTmodInit
+495 INITLegCnfVars
+496 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+497 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+498 	CHKiRet(objUse(datetime, CORE_COMPONENT));
+499 	if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
+500 	    LogError(0, RS_RET_OBJ_CREATION_FAILED, "CURL fail. -httpfs module init failed");
+501 	    ABORT_FINALIZE(RS_RET_OBJ_CREATION_FAILED);
+502 	}
+503 	DBGPRINTF("omhttpfs version %s is initializing\n", OMHTTPFS_VERSION);
+504 ENDmodInit
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -556,872 +556,872 @@ ENDmodInit
 </h3>
 <hr/>
 <pre>
-#include "config.h"
-#include &lt;stdlib.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;ctype.h&gt;
-#include "rsyslog.h"
-#include "obj.h"
-#include "cfsysline.h"
-#include "msg.h"
-#include "ruleset.h"
-#include "errmsg.h"
-#include "parser.h"
-#include "batch.h"
-#include "unicode-helper.h"
-#include "rsconf.h"
-#include "action.h"
-#include "rainerscript.h"
-#include "srUtils.h"
-#include "modules.h"
-#include "wti.h"
-#include "dirty.h" 
-DEFobjStaticHelpers
-DEFobjCurrIf(parser)
-<a name="0"></a>
-static struct cnfparamdescr rspdescr[] = {
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "name", eCmdHdlrString, CNFPARAM_REQUIRED },
-	{ "parser", eCmdHdlrArray, 0 }
-};
-static struct cnfparamblk rspblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(rspdescr)/sizeof(struct cnfparamdescr),
-	  rspdescr
-	};
-static rsRetVal processBatch(batch_t *pBatch, wti_t *pWti);</b></font>
-static rsRetVal scriptExec(struct cnfstmt *root, smsg_t *pMsg, wti_t *pWti);
-rsRetVal
-rulesetKeyDestruct(void __attribute__((unused)) *pData)
-{
-	free(pData);
-	return RS_RET_OK;
-}
-static void
-scriptIterateAllActions(struct cnfstmt *root, rsRetVal (*pFunc)(void*, void*), void* pParam)
-{
-	struct cnfstmt *stmt;
-	for(stmt = root ; stmt != NULL ; stmt = stmt-&gt;next) {
-		switch(stmt-&gt;nodetype) {
-		case S_NOP:
-		case S_STOP:
-		case S_SET:
-		case S_UNSET:
-		case S_CALL_INDIRECT:
-		case S_CALL:			break;
-		case S_ACT:
-			DBGPRINTF("iterateAllActions calling into action %p\n", stmt-&gt;d.act);
-			pFunc(stmt-&gt;d.act, pParam);
-			break;
-		case S_IF:
-			if(stmt-&gt;d.s_if.t_then != NULL)
-				scriptIterateAllActions(stmt-&gt;d.s_if.t_then,
-							pFunc, pParam);
-			if(stmt-&gt;d.s_if.t_else != NULL)
-				scriptIterateAllActions(stmt-&gt;d.s_if.t_else,
-							pFunc, pParam);
-			break;
-		case S_FOREACH:
-			if(stmt-&gt;d.s_foreach.body != NULL)
-				scriptIterateAllActions(stmt-&gt;d.s_foreach.body,
-							pFunc, pParam);
-			break;
-		case S_PRIFILT:
-			if(stmt-&gt;d.s_prifilt.t_then != NULL)
-				scriptIterateAllActions(stmt-&gt;d.s_prifilt.t_then,
-							pFunc, pParam);
-			if(stmt-&gt;d.s_prifilt.t_else != NULL)
-				scriptIterateAllActions(stmt-&gt;d.s_prifilt.t_else,
-							pFunc, pParam);
-			break;
-		case S_PROPFILT:
-			scriptIterateAllActions(stmt-&gt;d.s_propfilt.t_then,
-						pFunc, pParam);
-			break;
-		case S_RELOAD_LOOKUP_TABLE: 			break;
-		default:
-			dbgprintf("error: unknown stmt type %u during iterateAll\n",
-				(unsigned) stmt-&gt;nodetype);
-			#ifndef NDEBUG
-				fprintf(stderr, "error: unknown stmt type %u during iterateAll\n",
-					(unsigned) stmt-&gt;nodetype);
-			#endif
-			assert(0); 			break;
-		}
-	}
-}
-typedef struct iterateAllActions_s {
-	rsRetVal (*pFunc)(void*, void*);
-	void *pParam;
-} iterateAllActions_t;
-DEFFUNC_llExecFunc(doIterateAllActions)
-{
-	DEFiRet;
-	ruleset_t* pThis = (ruleset_t*) pData;
-	iterateAllActions_t *pMyParam = (iterateAllActions_t*) pParam;
-	scriptIterateAllActions(pThis-&gt;root, pMyParam-&gt;pFunc, pMyParam-&gt;pParam);
-	RETiRet;
-}
-static rsRetVal
-iterateAllActions(rsconf_t *conf, rsRetVal (*pFunc)(void*, void*), void* pParam)
-{
-	iterateAllActions_t params;
-	DEFiRet;
-	assert(pFunc != NULL);
-	params.pFunc = pFunc;
-	params.pParam = pParam;
-	CHKiRet(llExecFunc(&amp;(conf-&gt;rulesets.llRulesets), doIterateAllActions, &amp;params));
-finalize_it:
-	RETiRet;
-}
-DEFFUNC_llExecFunc(doActivateRulesetQueues)
-{
-	DEFiRet;
-	ruleset_t* pThis = (ruleset_t*) pData;
-	dbgprintf("Activating Ruleset Queue[%p] for Ruleset %s\n",
-		  pThis-&gt;pQueue, pThis-&gt;pszName);
-	if(pThis-&gt;pQueue != NULL)
-		startMainQueue(runConf, pThis-&gt;pQueue);
-	RETiRet;
-}
-rsRetVal
-activateRulesetQueues(void)
-{
-	llExecFunc(&amp;(runConf-&gt;rulesets.llRulesets), doActivateRulesetQueues, NULL);
-	return RS_RET_OK;
-}
-static rsRetVal
-execAct(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
-{
-	DEFiRet;
-	if(stmt-&gt;d.act-&gt;bDisabled) {
-		DBGPRINTF("action %d died, do NOT execute\n", stmt-&gt;d.act-&gt;iActionNbr);
-		FINALIZE;
-	}
-	DBGPRINTF("executing action %d\n", stmt-&gt;d.act-&gt;iActionNbr);
-	stmt-&gt;d.act-&gt;submitToActQ(stmt-&gt;d.act, pWti, pMsg);
-	if(iRet != RS_RET_DISCARDMSG) {
-		iRet = RS_RET_OK;
-	}
-finalize_it:
-	RETiRet;
-}
-static rsRetVal ATTR_NONNULL()
-execSet(const struct cnfstmt *const stmt,
-	smsg_t *const pMsg,
-	wti_t *const __restrict__ pWti)
-{
-	struct svar result;
-	DEFiRet;
-	cnfexprEval(stmt-&gt;d.s_set.expr, &amp;result, pMsg, pWti);
-	msgSetJSONFromVar(pMsg, stmt-&gt;d.s_set.varname, &amp;result, stmt-&gt;d.s_set.force_reset);
-	varDelete(&amp;result);
-	RETiRet;
-}
-static rsRetVal
-execUnset(struct cnfstmt *stmt, smsg_t *pMsg)
-{
-	DEFiRet;
-	msgDelJSON(pMsg, stmt-&gt;d.s_unset.varname);
-	RETiRet;
-}
-static rsRetVal
-execCallIndirect(struct cnfstmt *const __restrict__ stmt,
-	smsg_t *pMsg,
-	wti_t *const __restrict__ pWti)
-{
-	ruleset_t *pRuleset;
-	struct svar result;
-	int bMustFree; 	DEFiRet;
-	assert(stmt-&gt;d.s_call_ind.expr != NULL);
-	cnfexprEval(stmt-&gt;d.s_call_ind.expr, &amp;result, pMsg, pWti);
-	uchar *const rsName = (uchar*) var2CString(&amp;result, &amp;bMustFree);
-	const rsRetVal localRet = rulesetGetRuleset(runConf, &amp;pRuleset, rsName);
-	if(localRet != RS_RET_OK) {
-		LogError(0, RS_RET_RULESET_NOT_FOUND, "error: CALL_INDIRECT: "
-			"ruleset '%s' cannot be found, treating as NOP\n", rsName);
-		FINALIZE;
-	}
-	DBGPRINTF("CALL_INDIRECT obtained ruleset ptr %p for ruleset '%s' [hasQueue:%d]\n",
-		  pRuleset, rsName, rulesetHasQueue(pRuleset));
-	if(rulesetHasQueue(pRuleset)) {
-		CHKmalloc(pMsg = MsgDup((smsg_t*) pMsg));
-		DBGPRINTF("CALL_INDIRECT: forwarding message to async ruleset %p\n",
-			  pRuleset-&gt;pQueue);
-		MsgSetFlowControlType(pMsg, eFLOWCTL_NO_DELAY);
-		MsgSetRuleset(pMsg, pRuleset);
-		submitMsg2(pMsg);
-	} else {
-		CHKiRet(scriptExec(pRuleset-&gt;root, pMsg, pWti));
-	}
-finalize_it:
-	varDelete(&amp;result);
-	free(rsName);
-	RETiRet;
-}
-static rsRetVal
-execCall(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
-{
-	DEFiRet;
-	if(stmt-&gt;d.s_call.ruleset == NULL) {
-		CHKiRet(scriptExec(stmt-&gt;d.s_call.stmt, pMsg, pWti));
-	} else {
-		CHKmalloc(pMsg = MsgDup((smsg_t*) pMsg));
-		DBGPRINTF("CALL: forwarding message to async ruleset %p\n",
-			  stmt-&gt;d.s_call.ruleset-&gt;pQueue);
-		MsgSetFlowControlType(pMsg, eFLOWCTL_NO_DELAY);
-		MsgSetRuleset(pMsg, stmt-&gt;d.s_call.ruleset);
-		submitMsg2(pMsg);
-	}
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-execIf(struct cnfstmt *const stmt, smsg_t *const pMsg, wti_t *const pWti)
-{
-	sbool bRet;
-	DEFiRet;
-	bRet = cnfexprEvalBool(stmt-&gt;d.s_if.expr, pMsg, pWti);
-	DBGPRINTF("if condition result is %d\n", bRet);
-	if(bRet) {
-		if(stmt-&gt;d.s_if.t_then != NULL)
-			CHKiRet(scriptExec(stmt-&gt;d.s_if.t_then, pMsg, pWti));
-	} else {
-		if(stmt-&gt;d.s_if.t_else != NULL)
-			CHKiRet(scriptExec(stmt-&gt;d.s_if.t_else, pMsg, pWti));
-	}
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-invokeForeachBodyWith(struct cnfstmt *stmt, json_object *o, smsg_t *pMsg, wti_t *pWti) {
-	struct svar v;
-	v.datatype = 'J';
-	v.d.json = o;
-	DEFiRet;
-	CHKiRet(msgSetJSONFromVar(pMsg, (uchar*)stmt-&gt;d.s_foreach.iter-&gt;var, &amp;v, 1));
-	CHKiRet(scriptExec(stmt-&gt;d.s_foreach.body, pMsg, pWti));
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-callForeachArray(struct cnfstmt *stmt, json_object *arr, smsg_t *pMsg, wti_t *pWti) {
-	DEFiRet;
-	int len = json_object_array_length(arr);
-	json_object *curr;
-	for (int i = 0; i &lt; len; i++) {
-		curr = json_object_array_get_idx(arr, i);
-		CHKiRet(invokeForeachBodyWith(stmt, curr, pMsg, pWti));
-	}
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-callForeachObject(struct cnfstmt *stmt, json_object *arr, smsg_t *pMsg, wti_t *pWti) {
-	json_object *entry = NULL;
-	json_object *key = NULL;
-	const char **keys = NULL;
-	json_object *curr = NULL;
-	const char **curr_key;
-	struct json_object_iterator it;
-	struct json_object_iterator itEnd;
-	DEFiRet;
-	int len = json_object_object_length(arr);
-	CHKmalloc(keys = calloc(len, sizeof(char*)));
-	curr_key = keys;
-	it = json_object_iter_begin(arr);
-	itEnd = json_object_iter_end(arr);
-	while (!json_object_iter_equal(&amp;it, &amp;itEnd)) {
-		*curr_key = json_object_iter_peek_name(&amp;it);
-		curr_key++;
-		json_object_iter_next(&amp;it);
-	}
-	CHKmalloc(entry = json_object_new_object());
-	for (int i = 0; i &lt; len; i++) {
-		if (json_object_object_get_ex(arr, keys[i], &amp;curr)) {
-			CHKmalloc(key = json_object_new_string(keys[i]));
-			json_object_object_add(entry, "key", key);
-			key = NULL;
-			json_object_object_add(entry, "value", json_object_get(curr));
-			CHKiRet(invokeForeachBodyWith(stmt, entry, pMsg, pWti));
-		}
-	}
-finalize_it:
-	if (keys != NULL) free(keys);
-	if (entry != NULL) json_object_put(entry);
-	assert(key == NULL);
-	RETiRet;
-}
-static rsRetVal ATTR_NONNULL()
-execForeach(struct cnfstmt *const stmt, smsg_t *const pMsg, wti_t *const pWti)
-{
-	json_object *arr = NULL;
-	DEFiRet;
-	arr = cnfexprEvalCollection(stmt-&gt;d.s_foreach.iter-&gt;collection, pMsg, pWti);
-	if (arr == NULL) {
-		DBGPRINTF("foreach loop skipped, as object to iterate upon is empty\n");
-		FINALIZE;
-	} else if (json_object_is_type(arr, json_type_array) &amp;&amp; json_object_array_length(arr) &gt; 0) {
-		CHKiRet(callForeachArray(stmt, arr, pMsg, pWti));
-	} else if (json_object_is_type(arr, json_type_object) &amp;&amp; json_object_object_length(arr) &gt; 0) {
-		CHKiRet(callForeachObject(stmt, arr, pMsg, pWti));
-	} else {
-		DBGPRINTF("foreach loop skipped, as object to iterate upon is empty or is not an array\n");
-		FINALIZE;
-	}
-	CHKiRet(msgDelJSON(pMsg, (uchar*)stmt-&gt;d.s_foreach.iter-&gt;var));
-finalize_it:
-	if (arr != NULL) json_object_put(arr);
-	RETiRet;
-}
-static rsRetVal
-execPRIFILT(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
-{
-	int bRet;
-	DEFiRet;
-	if( (stmt-&gt;d.s_prifilt.pmask[pMsg-&gt;iFacility] == TABLE_NOPRI) ||
-	   ((stmt-&gt;d.s_prifilt.pmask[pMsg-&gt;iFacility]
-		    &amp; (1&lt;&lt;pMsg-&gt;iSeverity)) == 0) )
-		bRet = 0;
-	else
-		bRet = 1;
-	DBGPRINTF("PRIFILT condition result is %d\n", bRet);
-	if(bRet) {
-		if(stmt-&gt;d.s_prifilt.t_then != NULL)
-			CHKiRet(scriptExec(stmt-&gt;d.s_prifilt.t_then, pMsg, pWti));
-	} else {
-		if(stmt-&gt;d.s_prifilt.t_else != NULL)
-			CHKiRet(scriptExec(stmt-&gt;d.s_prifilt.t_else, pMsg, pWti));
-	}
-finalize_it:
-	RETiRet;
-}
-static int
-evalPROPFILT(struct cnfstmt *stmt, smsg_t *pMsg)
-{
-	unsigned short pbMustBeFreed;
-	uchar *pszPropVal;
-	int bRet = 0;
-	rs_size_t propLen;
-	if(stmt-&gt;d.s_propfilt.prop.id == PROP_INVALID)
-		goto done;
-	pszPropVal = MsgGetProp(pMsg, NULL, &amp;stmt-&gt;d.s_propfilt.prop,
-				&amp;propLen, &amp;pbMustBeFreed, NULL);
-	switch(stmt-&gt;d.s_propfilt.operation ) {
-	case FIOP_CONTAINS:
-		if(rsCStrLocateInSzStr(stmt-&gt;d.s_propfilt.pCSCompValue, (uchar*) pszPropVal) != -1)
-			bRet = 1;
-		break;
-	case FIOP_ISEMPTY:
-		if(propLen == 0)
-			bRet = 1; 		break;
-	case FIOP_ISEQUAL:
-		if(rsCStrSzStrCmp(stmt-&gt;d.s_propfilt.pCSCompValue,
-				  pszPropVal, propLen) == 0)
-			bRet = 1; 		break;
-	case FIOP_STARTSWITH:
-		if(rsCStrSzStrStartsWithCStr(stmt-&gt;d.s_propfilt.pCSCompValue,
-				  pszPropVal, propLen) == 0)
-			bRet = 1; 		break;
-	case FIOP_REGEX:
-		if(rsCStrSzStrMatchRegex(stmt-&gt;d.s_propfilt.pCSCompValue,
-				(unsigned char*) pszPropVal, 0, &amp;stmt-&gt;d.s_propfilt.regex_cache) == RS_RET_OK)
-			bRet = 1;
-		break;
-	case FIOP_EREREGEX:
-		if(rsCStrSzStrMatchRegex(stmt-&gt;d.s_propfilt.pCSCompValue,
-				  (unsigned char*) pszPropVal, 1, &amp;stmt-&gt;d.s_propfilt.regex_cache) == RS_RET_OK)
-			bRet = 1;
-		break;
-	case FIOP_NOP:
-	default:
-		assert(stmt-&gt;d.s_propfilt.operation == FIOP_NOP);
-		bRet = 1; 		break;
-	}
-	if(stmt-&gt;d.s_propfilt.isNegated)
-		bRet = (bRet == 1) ?  0 : 1;
-	if(Debug) {
-		if(stmt-&gt;d.s_propfilt.prop.id == PROP_CEE) {
-			DBGPRINTF("Filter: check for CEE property '%s' (value '%s') ",
-				stmt-&gt;d.s_propfilt.prop.name, pszPropVal);
-		} else if(stmt-&gt;d.s_propfilt.prop.id == PROP_LOCAL_VAR) {
-			DBGPRINTF("Filter: check for local var '%s' (value '%s') ",
-				stmt-&gt;d.s_propfilt.prop.name, pszPropVal);
-		} else if(stmt-&gt;d.s_propfilt.prop.id == PROP_GLOBAL_VAR) {
-			DBGPRINTF("Filter: check for global var '%s' (value '%s') ",
-				stmt-&gt;d.s_propfilt.prop.name, pszPropVal);
-		} else {
-			DBGPRINTF("Filter: check for property '%s' (value '%s') ",
-				propIDToName(stmt-&gt;d.s_propfilt.prop.id), pszPropVal);
-		}
-		if(stmt-&gt;d.s_propfilt.isNegated)
-			DBGPRINTF("NOT ");
-		if(stmt-&gt;d.s_propfilt.operation == FIOP_ISEMPTY) {
-			DBGPRINTF("%s : %s\n",
-			       getFIOPName(stmt-&gt;d.s_propfilt.operation),
-			       bRet ? "TRUE" : "FALSE");
-		} else {
-			DBGPRINTF("%s '%s': %s\n",
-			       getFIOPName(stmt-&gt;d.s_propfilt.operation),
-			       rsCStrGetSzStrNoNULL(stmt-&gt;d.s_propfilt.pCSCompValue),
-			       bRet ? "TRUE" : "FALSE");
-		}
-	}
-	if(pbMustBeFreed)
-		free(pszPropVal);
-done:
-	return bRet;
-}
-static rsRetVal
-execPROPFILT(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
-{
-	sbool bRet;
-	DEFiRet;
-	bRet = evalPROPFILT(stmt, pMsg);
-	DBGPRINTF("PROPFILT condition result is %d\n", bRet);
-	if(bRet)
-		CHKiRet(scriptExec(stmt-&gt;d.s_propfilt.t_then, pMsg, pWti));
-finalize_it:
-	RETiRet;
-}
-static rsRetVal ATTR_NONNULL()
-execReloadLookupTable(struct cnfstmt *stmt)
-{
-	assert(stmt != NULL);
-	lookup_ref_t *t;
-	DEFiRet;
-	t = stmt-&gt;d.s_reload_lookup_table.table;
-	if (t == NULL) {
-		ABORT_FINALIZE(RS_RET_NONE);
-	}
-	iRet = lookupReload(t, stmt-&gt;d.s_reload_lookup_table.stub_value);
-finalize_it:
-	RETiRet;
-}
-static rsRetVal ATTR_NONNULL(2, 3)
-scriptExec(struct cnfstmt *const root, smsg_t *const pMsg, wti_t *const pWti)
-{
-	struct cnfstmt *stmt;
-	DEFiRet;
-	for(stmt = root ; stmt != NULL ; stmt = stmt-&gt;next) {
-		if(*pWti-&gt;pbShutdownImmediate) {
-			DBGPRINTF("scriptExec: ShutdownImmediate set, "
-				  "force terminating\n");
-			ABORT_FINALIZE(RS_RET_FORCE_TERM);
-		}
-		if(Debug) {
-			cnfstmtPrintOnly(stmt, 2, 0);
-		}
-		switch(stmt-&gt;nodetype) {
-		case S_NOP:
-			break;
-		case S_STOP:
-			ABORT_FINALIZE(RS_RET_DISCARDMSG);
-			break;
-		case S_ACT:
-			CHKiRet(execAct(stmt, pMsg, pWti));
-			break;
-		case S_SET:
-			CHKiRet(execSet(stmt, pMsg, pWti));
-			break;
-		case S_UNSET:
-			CHKiRet(execUnset(stmt, pMsg));
-			break;
-		case S_CALL:
-			CHKiRet(execCall(stmt, pMsg, pWti));
-			break;
-		case S_CALL_INDIRECT:
-			CHKiRet(execCallIndirect(stmt, pMsg, pWti));
-			break;
-		case S_IF:
-			CHKiRet(execIf(stmt, pMsg, pWti));
-			break;
-		case S_FOREACH:
-			CHKiRet(execForeach(stmt, pMsg, pWti));
-			break;
-		case S_PRIFILT:
-			CHKiRet(execPRIFILT(stmt, pMsg, pWti));
-			break;
-		case S_PROPFILT:
-			CHKiRet(execPROPFILT(stmt, pMsg, pWti));
-			break;
-		case S_RELOAD_LOOKUP_TABLE:
-			CHKiRet(execReloadLookupTable(stmt));
-			break;
-		default:
-			dbgprintf("error: unknown stmt type %u during exec\n",
-				(unsigned) stmt-&gt;nodetype);
-			break;
-		}
-	}
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-processBatch(batch_t *pBatch, wti_t *pWti)
-{
-	int i;
-	smsg_t *pMsg;
-	ruleset_t *pRuleset;
-	rsRetVal localRet;
-	DEFiRet;
-	DBGPRINTF("processBATCH: batch of %d elements must be processed\n", pBatch-&gt;nElem);
-	wtiResetExecState(pWti, pBatch);
-	for(i = 0 ; i &lt; batchNumMsgs(pBatch) &amp;&amp; !*(pWti-&gt;pbShutdownImmediate) ; ++i) {
-		pMsg = pBatch-&gt;pElem[i].pMsg;
-		DBGPRINTF("processBATCH: next msg %d: %.128s\n", i, pMsg-&gt;pszRawMsg);
-		pRuleset = (pMsg-&gt;pRuleset == NULL) ? runConf-&gt;rulesets.pDflt : pMsg-&gt;pRuleset;
-		localRet = scriptExec(pRuleset-&gt;root, pMsg, pWti);
-		if(localRet == RS_RET_OK)
-			batchSetElemState(pBatch, i, BATCH_STATE_COMM);
-		else if(localRet == RS_RET_SUSPENDED)
-			--i;
-	}
-	DBGPRINTF("END batch execution phase, entering to commit phase "
-		"[processed %d of %d messages]\n", i, batchNumMsgs(pBatch));
-	actionCommitAllDirect(pWti);
-	DBGPRINTF("processBATCH: batch of %d elements has been processed\n", pBatch-&gt;nElem);
-	RETiRet;
-}
-static parserList_t*
-GetParserList(rsconf_t *conf, smsg_t *pMsg)
-{
-	return (pMsg-&gt;pRuleset == NULL) ? conf-&gt;rulesets.pDflt-&gt;pParserLst : pMsg-&gt;pRuleset-&gt;pParserLst;
-}
-static void ATTR_NONNULL(1)
-addScript(ruleset_t *const pThis, struct cnfstmt *const script)
-{
-	if(script == NULL) 		return;
-	if(pThis-&gt;last == NULL)
-		pThis-&gt;root = pThis-&gt;last = script;
-	else {
-		pThis-&gt;last-&gt;next = script;
-		pThis-&gt;last = script;
-	}
-}
-static rsRetVal rulesetSetName(ruleset_t *pThis, uchar *pszName)
-{
-	DEFiRet;
-	free(pThis-&gt;pszName);
-	CHKmalloc(pThis-&gt;pszName = ustrdup(pszName));
-finalize_it:
-	RETiRet;
-}
-static ruleset_t*
-GetCurrent(rsconf_t *conf)
-{
-	return conf-&gt;rulesets.pCurr;
-}
-static qqueue_t*
-GetRulesetQueue(ruleset_t *pThis)
-{
-	ISOBJ_TYPE_assert(pThis, ruleset);
-	return (pThis-&gt;pQueue == NULL) ? runConf-&gt;pMsgQueue : pThis-&gt;pQueue;
-}
-rsRetVal
-rulesetGetRuleset(rsconf_t *conf, ruleset_t **ppRuleset, uchar *pszName)
-{
-	DEFiRet;
-	assert(ppRuleset != NULL);
-	assert(pszName != NULL);
-	CHKiRet(llFind(&amp;(conf-&gt;rulesets.llRulesets), pszName, (void*) ppRuleset));
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-SetDefaultRuleset(rsconf_t *conf, uchar *pszName)
-{
-	ruleset_t *pRuleset;
-	DEFiRet;
-	assert(pszName != NULL);
-	CHKiRet(rulesetGetRuleset(conf, &amp;pRuleset, pszName));
-	conf-&gt;rulesets.pDflt = pRuleset;
-	DBGPRINTF("default rule set changed to %p: '%s'\n", pRuleset, pszName);
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-SetCurrRuleset(rsconf_t *conf, uchar *pszName)
-{
-	ruleset_t *pRuleset;
-	DEFiRet;
-	assert(pszName != NULL);
-	CHKiRet(rulesetGetRuleset(conf, &amp;pRuleset, pszName));
-	conf-&gt;rulesets.pCurr = pRuleset;
-	DBGPRINTF("current rule set changed to %p: '%s'\n", pRuleset, pszName);
-finalize_it:
-	RETiRet;
-}
-BEGINobjConstruct(ruleset) 	pThis-&gt;root = NULL;
-	pThis-&gt;last = NULL;
-ENDobjConstruct(ruleset)
-static rsRetVal
-rulesetConstructFinalize(rsconf_t *conf, ruleset_t *pThis)
-{
-	uchar *keyName;
-	DEFiRet;
-	ISOBJ_TYPE_assert(pThis, ruleset);
-	CHKmalloc(keyName = ustrdup(pThis-&gt;pszName));
-	CHKiRet(llAppend(&amp;(conf-&gt;rulesets.llRulesets), keyName, pThis));
-	if(conf-&gt;rulesets.pDflt == NULL)
-		conf-&gt;rulesets.pDflt = pThis;
-finalize_it:
-	RETiRet;
-}
-BEGINobjDestruct(ruleset) CODESTARTobjDestruct(ruleset)
-	DBGPRINTF("destructing ruleset %p, name %p\n", pThis, pThis-&gt;pszName);
-	if(pThis-&gt;pQueue != NULL) {
-		qqueueDestruct(&amp;pThis-&gt;pQueue);
-	}
-	if(pThis-&gt;pParserLst != NULL) {
-		parser.DestructParserList(&amp;pThis-&gt;pParserLst);
-	}
-	free(pThis-&gt;pszName);
-ENDobjDestruct(ruleset)
-DEFFUNC_llExecFunc(doShutdownQueueWorkers)
-{
-	DEFiRet;
-	ruleset_t *const pThis = (ruleset_t*) pData;
-	DBGPRINTF("shutting down queue workers for ruleset %p, name %s, queue %p\n",
-		pThis, pThis-&gt;pszName, pThis-&gt;pQueue);
-	ISOBJ_TYPE_assert(pThis, ruleset);
-	if(pThis-&gt;pQueue != NULL) {
-		qqueueShutdownWorkers(pThis-&gt;pQueue);
-	}
-	RETiRet;
-}
-DEFFUNC_llExecFunc(doDestructCnfStmt)
-{
-	DEFiRet;
-	ruleset_t *const pThis = (ruleset_t*) pData;
-	DBGPRINTF("shutting down actions and conf stmts for ruleset %p, name %s\n",
-		pThis, pThis-&gt;pszName);
-	ISOBJ_TYPE_assert(pThis, ruleset);
-	cnfstmtDestructLst(pThis-&gt;root);
-	RETiRet;
-}
-static rsRetVal
-destructAllActions(rsconf_t *conf)
-{
-	DEFiRet;
-	DBGPRINTF("rulesetDestructAllActions\n");
-	DBGPRINTF("destructAllActions: queue shutdown\n");
-	llExecFunc(&amp;(conf-&gt;rulesets.llRulesets), doShutdownQueueWorkers, NULL);
-	DBGPRINTF("destructAllActions: action and conf stmt shutdown\n");
-	llExecFunc(&amp;(conf-&gt;rulesets.llRulesets), doDestructCnfStmt, NULL);
-	CHKiRet(llDestroy(&amp;(conf-&gt;rulesets.llRulesets)));
-	CHKiRet(llInit(&amp;(conf-&gt;rulesets.llRulesets), rulesetDestructForLinkedList,
-		rulesetKeyDestruct, strcasecmp));
-	conf-&gt;rulesets.pDflt = NULL;
-finalize_it:
-	RETiRet;
-}
-rsRetVal
-rulesetDestructForLinkedList(void *pData)
-{
-	ruleset_t *pThis = (ruleset_t*) pData;
-	return rulesetDestruct(&amp;pThis);
-}
-BEGINobjDebugPrint(ruleset) CODESTARTobjDebugPrint(ruleset)
-	dbgoprint((obj_t*) pThis, "rsyslog ruleset %s:\n", pThis-&gt;pszName);
-	cnfstmtPrint(pThis-&gt;root, 0);
-	dbgoprint((obj_t*) pThis, "ruleset %s assigned parser list:\n", pThis-&gt;pszName);
-	printParserList(pThis-&gt;pParserLst);
-ENDobjDebugPrint(ruleset)
-DEFFUNC_llExecFunc(doDebugPrintAll)
-{
-	return rulesetDebugPrint((ruleset_t*) pData);
-}
-static rsRetVal
-debugPrintAll(rsconf_t *conf)
-{
-	DEFiRet;
-	dbgprintf("All Rulesets:\n");
-	llExecFunc(&amp;(conf-&gt;rulesets.llRulesets), doDebugPrintAll, NULL);
-	dbgprintf("End of Rulesets.\n");
-	RETiRet;
-}
-struct cnfstmt * removeNOPs(struct cnfstmt *root);
-static void
-rulesetOptimize(ruleset_t *pRuleset)
-{
-	if(Debug) {
-		dbgprintf("ruleset '%s' before optimization:\n",
-			  pRuleset-&gt;pszName);
-		rulesetDebugPrint((ruleset_t*) pRuleset);
-	}
-	pRuleset-&gt;root = cnfstmtOptimize(pRuleset-&gt;root);
-	if(Debug) {
-		dbgprintf("ruleset '%s' after optimization:\n",
-			  pRuleset-&gt;pszName);
-		rulesetDebugPrint((ruleset_t*) pRuleset);
-	}
-}
-DEFFUNC_llExecFunc(doRulesetOptimizeAll)
-{
-	rulesetOptimize((ruleset_t*) pData);
-	return RS_RET_OK;
-}
-rsRetVal
-rulesetOptimizeAll(rsconf_t *conf)
-{
-	DEFiRet;
-	dbgprintf("begin ruleset optimization phase\n");
-	llExecFunc(&amp;(conf-&gt;rulesets.llRulesets), doRulesetOptimizeAll, NULL);
-	dbgprintf("ruleset optimization phase finished.\n");
-	RETiRet;
-}
-static rsRetVal
-doRulesetCreateQueue(rsconf_t *conf, int *pNewVal)
-{
-	uchar *rsname;
-	DEFiRet;
-	if(conf-&gt;rulesets.pCurr == NULL) {
-		LogError(0, RS_RET_NO_CURR_RULESET, "error: currently no specific ruleset specified, thus a "
-				"queue can not be added to it");
-		ABORT_FINALIZE(RS_RET_NO_CURR_RULESET);
-	}
-	if(conf-&gt;rulesets.pCurr-&gt;pQueue != NULL) {
-		LogError(0, RS_RET_RULES_QUEUE_EXISTS, "error: ruleset already has a main queue, can not "
-				"add another one");
-		ABORT_FINALIZE(RS_RET_RULES_QUEUE_EXISTS);
-	}
-	if(pNewVal == 0)
-		FINALIZE; 
-	rsname = (conf-&gt;rulesets.pCurr-&gt;pszName == NULL) ? (uchar*) "[ruleset]" : conf-&gt;rulesets.pCurr-&gt;pszName;
-	DBGPRINTF("adding a ruleset-specific \"main\" queue for ruleset '%s'\n", rsname);
-	CHKiRet(createMainQueue(&amp;conf-&gt;rulesets.pCurr-&gt;pQueue, rsname, NULL));
-finalize_it:
-	RETiRet;
-}
-static rsRetVal
-rulesetCreateQueue(void __attribute__((unused)) *pVal, int *pNewVal)
-{
-	return doRulesetCreateQueue(ourConf, pNewVal);
-}
-static rsRetVal
-doRulesetAddParser(ruleset_t *pRuleset, uchar *pName)
-{
-	parser_t *pParser;
-	DEFiRet;
-	CHKiRet(objUse(parser, CORE_COMPONENT));
-	iRet = parser.FindParser(loadConf-&gt;parsers.pParsLstRoot, &amp;pParser, pName);
-	if(iRet == RS_RET_PARSER_NOT_FOUND) {
-		LogError(0, RS_RET_PARSER_NOT_FOUND, "error: parser '%s' unknown at this time "
-			  	"(maybe defined too late in rsyslog.conf?)", pName);
-		ABORT_FINALIZE(RS_RET_NO_CURR_RULESET);
-	} else if(iRet != RS_RET_OK) {
-		LogError(0, iRet, "error trying to find parser '%s'\n", pName);
-		FINALIZE;
-	}
-	CHKiRet(parser.AddParserToList(&amp;pRuleset-&gt;pParserLst, pParser));
-	DBGPRINTF("added parser '%s' to ruleset '%s'\n", pName, pRuleset-&gt;pszName);
-finalize_it:
-	free(pName); 
-	RETiRet;
-}
-static rsRetVal
-rulesetAddParser(void __attribute__((unused)) *pVal, uchar *pName)
-{
-	return doRulesetAddParser(loadConf-&gt;rulesets.pCurr, pName);
-}
-rsRetVal
-rulesetProcessCnf(struct cnfobj *o)
-{
-	struct cnfparamvals *pvals;
-	rsRetVal localRet;
-	uchar *rsName = NULL;
-	uchar *parserName;
-	int nameIdx, parserIdx;
-	ruleset_t *pRuleset;
-	struct cnfarray *ar;
-	int i;
-	int qtype;
-	uchar *rsname;
-	DEFiRet;
-	pvals = nvlstGetParams(o-&gt;nvlst, &amp;rspblk, NULL);
-	if(pvals == NULL) {
-		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-	}
-	DBGPRINTF("ruleset param blk after rulesetProcessCnf:\n");
-	cnfparamsPrint(&amp;rspblk, pvals);
-	nameIdx = cnfparamGetIdx(&amp;rspblk, "name");
-	rsName = (uchar*)es_str2cstr(pvals[nameIdx].val.d.estr, NULL);
-	localRet = rulesetGetRuleset(loadConf, &amp;pRuleset, rsName);
-	if(localRet == RS_RET_OK) {
-		LogError(0, RS_RET_RULESET_EXISTS,
-			"error: ruleset '%s' specified more than once",
-			rsName);
-		cnfstmtDestructLst(o-&gt;script);
-		ABORT_FINALIZE(RS_RET_RULESET_EXISTS);
-	} else if(localRet != RS_RET_NOT_FOUND) {
-		ABORT_FINALIZE(localRet);
-	}
-	CHKiRet(rulesetConstruct(&amp;pRuleset));
-	if((localRet = rulesetSetName(pRuleset, rsName)) != RS_RET_OK) {
-		rulesetDestruct(&amp;pRuleset);
-		ABORT_FINALIZE(localRet);
-	}
-	if((localRet = rulesetConstructFinalize(loadConf, pRuleset)) != RS_RET_OK) {
-		rulesetDestruct(&amp;pRuleset);
-		ABORT_FINALIZE(localRet);
-	}
-	addScript(pRuleset, o-&gt;script);
-	parserIdx = cnfparamGetIdx(&amp;rspblk, "parser");
-	if(parserIdx != -1  &amp;&amp; pvals[parserIdx].bUsed) {
-		ar = pvals[parserIdx].val.d.ar;
-		for(i = 0 ; i &lt;  ar-&gt;nmemb ; ++i) {
-			parserName = (uchar*)es_str2cstr(ar-&gt;arr[i], NULL);
-			doRulesetAddParser(pRuleset, parserName);
-		}
-	}
-	if(queueCnfParamsSet(o-&gt;nvlst)) {
-		if(pRuleset-&gt;pszName == NULL) {
-			rsname = (uchar*) "[ruleset]";
-			qtype = pRuleset-&gt;pQueue-&gt;qType;
-		} else {
-			rsname = pRuleset-&gt;pszName;
-			qtype = 3;
-		}
-		DBGPRINTF("adding a ruleset-specific \"main\" queue for ruleset '%s', mode %d\n",
-			rsname, qtype);
-		CHKiRet(createMainQueue(&amp;pRuleset-&gt;pQueue, rsname, o-&gt;nvlst));
-	}
-finalize_it:
-	free(rsName);
-	cnfparamvalsDestruct(pvals, &amp;rspblk);
-	RETiRet;
-}
-BEGINobjQueryInterface(ruleset)
-CODESTARTobjQueryInterface(ruleset)
-	if(pIf-&gt;ifVersion != rulesetCURR_IF_VERSION) { 		ABORT_FINALIZE(RS_RET_INTERFACE_NOT_SUPPORTED);
-	}
-	pIf-&gt;Construct = rulesetConstruct;
-	pIf-&gt;ConstructFinalize = rulesetConstructFinalize;
-	pIf-&gt;Destruct = rulesetDestruct;
-	pIf-&gt;DebugPrint = rulesetDebugPrint;
-	pIf-&gt;IterateAllActions = iterateAllActions;
-	pIf-&gt;DestructAllActions = destructAllActions;
-	pIf-&gt;AddScript = addScript;
-	pIf-&gt;ProcessBatch = processBatch;
-	pIf-&gt;SetName = rulesetSetName;
-	pIf-&gt;DebugPrintAll = debugPrintAll;
-	pIf-&gt;GetCurrent = GetCurrent;
-	pIf-&gt;GetRuleset = rulesetGetRuleset;
-	pIf-&gt;SetDefaultRuleset = SetDefaultRuleset;
-	pIf-&gt;SetCurrRuleset = SetCurrRuleset;
-	pIf-&gt;GetRulesetQueue = GetRulesetQueue;
-	pIf-&gt;GetParserList = GetParserList;
-finalize_it:
-ENDobjQueryInterface(ruleset)
-BEGINObjClassExit(ruleset, OBJ_IS_CORE_MODULE) 	objRelease(parser, CORE_COMPONENT);
-ENDObjClassExit(ruleset)
-BEGINObjClassInit(ruleset, 1, OBJ_IS_CORE_MODULE) 
-	OBJSetMethodHandler(objMethod_DEBUGPRINT, rulesetDebugPrint);
-	OBJSetMethodHandler(objMethod_CONSTRUCTION_FINALIZER, rulesetConstructFinalize);
-	CHKiRet(regCfSysLineHdlr((uchar *)"rulesetparser", 0, eCmdHdlrGetWord, rulesetAddParser, NULL, NULL));
-	CHKiRet(regCfSysLineHdlr((uchar *)"rulesetcreatemainqueue", 0, eCmdHdlrBinary, rulesetCreateQueue,
-		NULL, NULL));
-ENDObjClassInit(ruleset)
+1 #include "config.h"
+2 #include &lt;stdlib.h&gt;
+3 #include &lt;assert.h&gt;
+4 #include &lt;ctype.h&gt;
+5 #include "rsyslog.h"
+6 #include "obj.h"
+7 #include "cfsysline.h"
+8 #include "msg.h"
+9 #include "ruleset.h"
+10 #include "errmsg.h"
+11 #include "parser.h"
+12 #include "batch.h"
+13 #include "unicode-helper.h"
+14 #include "rsconf.h"
+15 #include "action.h"
+16 #include "rainerscript.h"
+17 #include "srUtils.h"
+18 #include "modules.h"
+19 #include "wti.h"
+20 #include "dirty.h" 
+21 DEFobjStaticHelpers
+22 DEFobjCurrIf(parser)
+23 <a name="0"></a>
+24 static struct cnfparamdescr rspdescr[] = {
+25 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "name", eCmdHdlrString, CNFPARAM_REQUIRED },
+26 	{ "parser", eCmdHdlrArray, 0 }
+27 };
+28 static struct cnfparamblk rspblk =
+29 	{ CNFPARAMBLK_VERSION,
+30 	  sizeof(rspdescr)/sizeof(struct cnfparamdescr),
+31 	  rspdescr
+32 	};
+33 static rsRetVal processBatch(batch_t *pBatch, wti_t *pWti);</b></font>
+34 static rsRetVal scriptExec(struct cnfstmt *root, smsg_t *pMsg, wti_t *pWti);
+35 rsRetVal
+36 rulesetKeyDestruct(void __attribute__((unused)) *pData)
+37 {
+38 	free(pData);
+39 	return RS_RET_OK;
+40 }
+41 static void
+42 scriptIterateAllActions(struct cnfstmt *root, rsRetVal (*pFunc)(void*, void*), void* pParam)
+43 {
+44 	struct cnfstmt *stmt;
+45 	for(stmt = root ; stmt != NULL ; stmt = stmt-&gt;next) {
+46 		switch(stmt-&gt;nodetype) {
+47 		case S_NOP:
+48 		case S_STOP:
+49 		case S_SET:
+50 		case S_UNSET:
+51 		case S_CALL_INDIRECT:
+52 		case S_CALL:			break;
+53 		case S_ACT:
+54 			DBGPRINTF("iterateAllActions calling into action %p\n", stmt-&gt;d.act);
+55 			pFunc(stmt-&gt;d.act, pParam);
+56 			break;
+57 		case S_IF:
+58 			if(stmt-&gt;d.s_if.t_then != NULL)
+59 				scriptIterateAllActions(stmt-&gt;d.s_if.t_then,
+60 							pFunc, pParam);
+61 			if(stmt-&gt;d.s_if.t_else != NULL)
+62 				scriptIterateAllActions(stmt-&gt;d.s_if.t_else,
+63 							pFunc, pParam);
+64 			break;
+65 		case S_FOREACH:
+66 			if(stmt-&gt;d.s_foreach.body != NULL)
+67 				scriptIterateAllActions(stmt-&gt;d.s_foreach.body,
+68 							pFunc, pParam);
+69 			break;
+70 		case S_PRIFILT:
+71 			if(stmt-&gt;d.s_prifilt.t_then != NULL)
+72 				scriptIterateAllActions(stmt-&gt;d.s_prifilt.t_then,
+73 							pFunc, pParam);
+74 			if(stmt-&gt;d.s_prifilt.t_else != NULL)
+75 				scriptIterateAllActions(stmt-&gt;d.s_prifilt.t_else,
+76 							pFunc, pParam);
+77 			break;
+78 		case S_PROPFILT:
+79 			scriptIterateAllActions(stmt-&gt;d.s_propfilt.t_then,
+80 						pFunc, pParam);
+81 			break;
+82 		case S_RELOAD_LOOKUP_TABLE: 			break;
+83 		default:
+84 			dbgprintf("error: unknown stmt type %u during iterateAll\n",
+85 				(unsigned) stmt-&gt;nodetype);
+86 			#ifndef NDEBUG
+87 				fprintf(stderr, "error: unknown stmt type %u during iterateAll\n",
+88 					(unsigned) stmt-&gt;nodetype);
+89 			#endif
+90 			assert(0); 			break;
+91 		}
+92 	}
+93 }
+94 typedef struct iterateAllActions_s {
+95 	rsRetVal (*pFunc)(void*, void*);
+96 	void *pParam;
+97 } iterateAllActions_t;
+98 DEFFUNC_llExecFunc(doIterateAllActions)
+99 {
+100 	DEFiRet;
+101 	ruleset_t* pThis = (ruleset_t*) pData;
+102 	iterateAllActions_t *pMyParam = (iterateAllActions_t*) pParam;
+103 	scriptIterateAllActions(pThis-&gt;root, pMyParam-&gt;pFunc, pMyParam-&gt;pParam);
+104 	RETiRet;
+105 }
+106 static rsRetVal
+107 iterateAllActions(rsconf_t *conf, rsRetVal (*pFunc)(void*, void*), void* pParam)
+108 {
+109 	iterateAllActions_t params;
+110 	DEFiRet;
+111 	assert(pFunc != NULL);
+112 	params.pFunc = pFunc;
+113 	params.pParam = pParam;
+114 	CHKiRet(llExecFunc(&amp;(conf-&gt;rulesets.llRulesets), doIterateAllActions, &amp;params));
+115 finalize_it:
+116 	RETiRet;
+117 }
+118 DEFFUNC_llExecFunc(doActivateRulesetQueues)
+119 {
+120 	DEFiRet;
+121 	ruleset_t* pThis = (ruleset_t*) pData;
+122 	dbgprintf("Activating Ruleset Queue[%p] for Ruleset %s\n",
+123 		  pThis-&gt;pQueue, pThis-&gt;pszName);
+124 	if(pThis-&gt;pQueue != NULL)
+125 		startMainQueue(runConf, pThis-&gt;pQueue);
+126 	RETiRet;
+127 }
+128 rsRetVal
+129 activateRulesetQueues(void)
+130 {
+131 	llExecFunc(&amp;(runConf-&gt;rulesets.llRulesets), doActivateRulesetQueues, NULL);
+132 	return RS_RET_OK;
+133 }
+134 static rsRetVal
+135 execAct(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
+136 {
+137 	DEFiRet;
+138 	if(stmt-&gt;d.act-&gt;bDisabled) {
+139 		DBGPRINTF("action %d died, do NOT execute\n", stmt-&gt;d.act-&gt;iActionNbr);
+140 		FINALIZE;
+141 	}
+142 	DBGPRINTF("executing action %d\n", stmt-&gt;d.act-&gt;iActionNbr);
+143 	stmt-&gt;d.act-&gt;submitToActQ(stmt-&gt;d.act, pWti, pMsg);
+144 	if(iRet != RS_RET_DISCARDMSG) {
+145 		iRet = RS_RET_OK;
+146 	}
+147 finalize_it:
+148 	RETiRet;
+149 }
+150 static rsRetVal ATTR_NONNULL()
+151 execSet(const struct cnfstmt *const stmt,
+152 	smsg_t *const pMsg,
+153 	wti_t *const __restrict__ pWti)
+154 {
+155 	struct svar result;
+156 	DEFiRet;
+157 	cnfexprEval(stmt-&gt;d.s_set.expr, &amp;result, pMsg, pWti);
+158 	msgSetJSONFromVar(pMsg, stmt-&gt;d.s_set.varname, &amp;result, stmt-&gt;d.s_set.force_reset);
+159 	varDelete(&amp;result);
+160 	RETiRet;
+161 }
+162 static rsRetVal
+163 execUnset(struct cnfstmt *stmt, smsg_t *pMsg)
+164 {
+165 	DEFiRet;
+166 	msgDelJSON(pMsg, stmt-&gt;d.s_unset.varname);
+167 	RETiRet;
+168 }
+169 static rsRetVal
+170 execCallIndirect(struct cnfstmt *const __restrict__ stmt,
+171 	smsg_t *pMsg,
+172 	wti_t *const __restrict__ pWti)
+173 {
+174 	ruleset_t *pRuleset;
+175 	struct svar result;
+176 	int bMustFree; 	DEFiRet;
+177 	assert(stmt-&gt;d.s_call_ind.expr != NULL);
+178 	cnfexprEval(stmt-&gt;d.s_call_ind.expr, &amp;result, pMsg, pWti);
+179 	uchar *const rsName = (uchar*) var2CString(&amp;result, &amp;bMustFree);
+180 	const rsRetVal localRet = rulesetGetRuleset(runConf, &amp;pRuleset, rsName);
+181 	if(localRet != RS_RET_OK) {
+182 		LogError(0, RS_RET_RULESET_NOT_FOUND, "error: CALL_INDIRECT: "
+183 			"ruleset '%s' cannot be found, treating as NOP\n", rsName);
+184 		FINALIZE;
+185 	}
+186 	DBGPRINTF("CALL_INDIRECT obtained ruleset ptr %p for ruleset '%s' [hasQueue:%d]\n",
+187 		  pRuleset, rsName, rulesetHasQueue(pRuleset));
+188 	if(rulesetHasQueue(pRuleset)) {
+189 		CHKmalloc(pMsg = MsgDup((smsg_t*) pMsg));
+190 		DBGPRINTF("CALL_INDIRECT: forwarding message to async ruleset %p\n",
+191 			  pRuleset-&gt;pQueue);
+192 		MsgSetFlowControlType(pMsg, eFLOWCTL_NO_DELAY);
+193 		MsgSetRuleset(pMsg, pRuleset);
+194 		submitMsg2(pMsg);
+195 	} else {
+196 		CHKiRet(scriptExec(pRuleset-&gt;root, pMsg, pWti));
+197 	}
+198 finalize_it:
+199 	varDelete(&amp;result);
+200 	free(rsName);
+201 	RETiRet;
+202 }
+203 static rsRetVal
+204 execCall(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
+205 {
+206 	DEFiRet;
+207 	if(stmt-&gt;d.s_call.ruleset == NULL) {
+208 		CHKiRet(scriptExec(stmt-&gt;d.s_call.stmt, pMsg, pWti));
+209 	} else {
+210 		CHKmalloc(pMsg = MsgDup((smsg_t*) pMsg));
+211 		DBGPRINTF("CALL: forwarding message to async ruleset %p\n",
+212 			  stmt-&gt;d.s_call.ruleset-&gt;pQueue);
+213 		MsgSetFlowControlType(pMsg, eFLOWCTL_NO_DELAY);
+214 		MsgSetRuleset(pMsg, stmt-&gt;d.s_call.ruleset);
+215 		submitMsg2(pMsg);
+216 	}
+217 finalize_it:
+218 	RETiRet;
+219 }
+220 static rsRetVal
+221 execIf(struct cnfstmt *const stmt, smsg_t *const pMsg, wti_t *const pWti)
+222 {
+223 	sbool bRet;
+224 	DEFiRet;
+225 	bRet = cnfexprEvalBool(stmt-&gt;d.s_if.expr, pMsg, pWti);
+226 	DBGPRINTF("if condition result is %d\n", bRet);
+227 	if(bRet) {
+228 		if(stmt-&gt;d.s_if.t_then != NULL)
+229 			CHKiRet(scriptExec(stmt-&gt;d.s_if.t_then, pMsg, pWti));
+230 	} else {
+231 		if(stmt-&gt;d.s_if.t_else != NULL)
+232 			CHKiRet(scriptExec(stmt-&gt;d.s_if.t_else, pMsg, pWti));
+233 	}
+234 finalize_it:
+235 	RETiRet;
+236 }
+237 static rsRetVal
+238 invokeForeachBodyWith(struct cnfstmt *stmt, json_object *o, smsg_t *pMsg, wti_t *pWti) {
+239 	struct svar v;
+240 	v.datatype = 'J';
+241 	v.d.json = o;
+242 	DEFiRet;
+243 	CHKiRet(msgSetJSONFromVar(pMsg, (uchar*)stmt-&gt;d.s_foreach.iter-&gt;var, &amp;v, 1));
+244 	CHKiRet(scriptExec(stmt-&gt;d.s_foreach.body, pMsg, pWti));
+245 finalize_it:
+246 	RETiRet;
+247 }
+248 static rsRetVal
+249 callForeachArray(struct cnfstmt *stmt, json_object *arr, smsg_t *pMsg, wti_t *pWti) {
+250 	DEFiRet;
+251 	int len = json_object_array_length(arr);
+252 	json_object *curr;
+253 	for (int i = 0; i &lt; len; i++) {
+254 		curr = json_object_array_get_idx(arr, i);
+255 		CHKiRet(invokeForeachBodyWith(stmt, curr, pMsg, pWti));
+256 	}
+257 finalize_it:
+258 	RETiRet;
+259 }
+260 static rsRetVal
+261 callForeachObject(struct cnfstmt *stmt, json_object *arr, smsg_t *pMsg, wti_t *pWti) {
+262 	json_object *entry = NULL;
+263 	json_object *key = NULL;
+264 	const char **keys = NULL;
+265 	json_object *curr = NULL;
+266 	const char **curr_key;
+267 	struct json_object_iterator it;
+268 	struct json_object_iterator itEnd;
+269 	DEFiRet;
+270 	int len = json_object_object_length(arr);
+271 	CHKmalloc(keys = calloc(len, sizeof(char*)));
+272 	curr_key = keys;
+273 	it = json_object_iter_begin(arr);
+274 	itEnd = json_object_iter_end(arr);
+275 	while (!json_object_iter_equal(&amp;it, &amp;itEnd)) {
+276 		*curr_key = json_object_iter_peek_name(&amp;it);
+277 		curr_key++;
+278 		json_object_iter_next(&amp;it);
+279 	}
+280 	CHKmalloc(entry = json_object_new_object());
+281 	for (int i = 0; i &lt; len; i++) {
+282 		if (json_object_object_get_ex(arr, keys[i], &amp;curr)) {
+283 			CHKmalloc(key = json_object_new_string(keys[i]));
+284 			json_object_object_add(entry, "key", key);
+285 			key = NULL;
+286 			json_object_object_add(entry, "value", json_object_get(curr));
+287 			CHKiRet(invokeForeachBodyWith(stmt, entry, pMsg, pWti));
+288 		}
+289 	}
+290 finalize_it:
+291 	if (keys != NULL) free(keys);
+292 	if (entry != NULL) json_object_put(entry);
+293 	assert(key == NULL);
+294 	RETiRet;
+295 }
+296 static rsRetVal ATTR_NONNULL()
+297 execForeach(struct cnfstmt *const stmt, smsg_t *const pMsg, wti_t *const pWti)
+298 {
+299 	json_object *arr = NULL;
+300 	DEFiRet;
+301 	arr = cnfexprEvalCollection(stmt-&gt;d.s_foreach.iter-&gt;collection, pMsg, pWti);
+302 	if (arr == NULL) {
+303 		DBGPRINTF("foreach loop skipped, as object to iterate upon is empty\n");
+304 		FINALIZE;
+305 	} else if (json_object_is_type(arr, json_type_array) &amp;&amp; json_object_array_length(arr) &gt; 0) {
+306 		CHKiRet(callForeachArray(stmt, arr, pMsg, pWti));
+307 	} else if (json_object_is_type(arr, json_type_object) &amp;&amp; json_object_object_length(arr) &gt; 0) {
+308 		CHKiRet(callForeachObject(stmt, arr, pMsg, pWti));
+309 	} else {
+310 		DBGPRINTF("foreach loop skipped, as object to iterate upon is empty or is not an array\n");
+311 		FINALIZE;
+312 	}
+313 	CHKiRet(msgDelJSON(pMsg, (uchar*)stmt-&gt;d.s_foreach.iter-&gt;var));
+314 finalize_it:
+315 	if (arr != NULL) json_object_put(arr);
+316 	RETiRet;
+317 }
+318 static rsRetVal
+319 execPRIFILT(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
+320 {
+321 	int bRet;
+322 	DEFiRet;
+323 	if( (stmt-&gt;d.s_prifilt.pmask[pMsg-&gt;iFacility] == TABLE_NOPRI) ||
+324 	   ((stmt-&gt;d.s_prifilt.pmask[pMsg-&gt;iFacility]
+325 		    &amp; (1&lt;&lt;pMsg-&gt;iSeverity)) == 0) )
+326 		bRet = 0;
+327 	else
+328 		bRet = 1;
+329 	DBGPRINTF("PRIFILT condition result is %d\n", bRet);
+330 	if(bRet) {
+331 		if(stmt-&gt;d.s_prifilt.t_then != NULL)
+332 			CHKiRet(scriptExec(stmt-&gt;d.s_prifilt.t_then, pMsg, pWti));
+333 	} else {
+334 		if(stmt-&gt;d.s_prifilt.t_else != NULL)
+335 			CHKiRet(scriptExec(stmt-&gt;d.s_prifilt.t_else, pMsg, pWti));
+336 	}
+337 finalize_it:
+338 	RETiRet;
+339 }
+340 static int
+341 evalPROPFILT(struct cnfstmt *stmt, smsg_t *pMsg)
+342 {
+343 	unsigned short pbMustBeFreed;
+344 	uchar *pszPropVal;
+345 	int bRet = 0;
+346 	rs_size_t propLen;
+347 	if(stmt-&gt;d.s_propfilt.prop.id == PROP_INVALID)
+348 		goto done;
+349 	pszPropVal = MsgGetProp(pMsg, NULL, &amp;stmt-&gt;d.s_propfilt.prop,
+350 				&amp;propLen, &amp;pbMustBeFreed, NULL);
+351 	switch(stmt-&gt;d.s_propfilt.operation ) {
+352 	case FIOP_CONTAINS:
+353 		if(rsCStrLocateInSzStr(stmt-&gt;d.s_propfilt.pCSCompValue, (uchar*) pszPropVal) != -1)
+354 			bRet = 1;
+355 		break;
+356 	case FIOP_ISEMPTY:
+357 		if(propLen == 0)
+358 			bRet = 1; 		break;
+359 	case FIOP_ISEQUAL:
+360 		if(rsCStrSzStrCmp(stmt-&gt;d.s_propfilt.pCSCompValue,
+361 				  pszPropVal, propLen) == 0)
+362 			bRet = 1; 		break;
+363 	case FIOP_STARTSWITH:
+364 		if(rsCStrSzStrStartsWithCStr(stmt-&gt;d.s_propfilt.pCSCompValue,
+365 				  pszPropVal, propLen) == 0)
+366 			bRet = 1; 		break;
+367 	case FIOP_REGEX:
+368 		if(rsCStrSzStrMatchRegex(stmt-&gt;d.s_propfilt.pCSCompValue,
+369 				(unsigned char*) pszPropVal, 0, &amp;stmt-&gt;d.s_propfilt.regex_cache) == RS_RET_OK)
+370 			bRet = 1;
+371 		break;
+372 	case FIOP_EREREGEX:
+373 		if(rsCStrSzStrMatchRegex(stmt-&gt;d.s_propfilt.pCSCompValue,
+374 				  (unsigned char*) pszPropVal, 1, &amp;stmt-&gt;d.s_propfilt.regex_cache) == RS_RET_OK)
+375 			bRet = 1;
+376 		break;
+377 	case FIOP_NOP:
+378 	default:
+379 		assert(stmt-&gt;d.s_propfilt.operation == FIOP_NOP);
+380 		bRet = 1; 		break;
+381 	}
+382 	if(stmt-&gt;d.s_propfilt.isNegated)
+383 		bRet = (bRet == 1) ?  0 : 1;
+384 	if(Debug) {
+385 		if(stmt-&gt;d.s_propfilt.prop.id == PROP_CEE) {
+386 			DBGPRINTF("Filter: check for CEE property '%s' (value '%s') ",
+387 				stmt-&gt;d.s_propfilt.prop.name, pszPropVal);
+388 		} else if(stmt-&gt;d.s_propfilt.prop.id == PROP_LOCAL_VAR) {
+389 			DBGPRINTF("Filter: check for local var '%s' (value '%s') ",
+390 				stmt-&gt;d.s_propfilt.prop.name, pszPropVal);
+391 		} else if(stmt-&gt;d.s_propfilt.prop.id == PROP_GLOBAL_VAR) {
+392 			DBGPRINTF("Filter: check for global var '%s' (value '%s') ",
+393 				stmt-&gt;d.s_propfilt.prop.name, pszPropVal);
+394 		} else {
+395 			DBGPRINTF("Filter: check for property '%s' (value '%s') ",
+396 				propIDToName(stmt-&gt;d.s_propfilt.prop.id), pszPropVal);
+397 		}
+398 		if(stmt-&gt;d.s_propfilt.isNegated)
+399 			DBGPRINTF("NOT ");
+400 		if(stmt-&gt;d.s_propfilt.operation == FIOP_ISEMPTY) {
+401 			DBGPRINTF("%s : %s\n",
+402 			       getFIOPName(stmt-&gt;d.s_propfilt.operation),
+403 			       bRet ? "TRUE" : "FALSE");
+404 		} else {
+405 			DBGPRINTF("%s '%s': %s\n",
+406 			       getFIOPName(stmt-&gt;d.s_propfilt.operation),
+407 			       rsCStrGetSzStrNoNULL(stmt-&gt;d.s_propfilt.pCSCompValue),
+408 			       bRet ? "TRUE" : "FALSE");
+409 		}
+410 	}
+411 	if(pbMustBeFreed)
+412 		free(pszPropVal);
+413 done:
+414 	return bRet;
+415 }
+416 static rsRetVal
+417 execPROPFILT(struct cnfstmt *stmt, smsg_t *pMsg, wti_t *pWti)
+418 {
+419 	sbool bRet;
+420 	DEFiRet;
+421 	bRet = evalPROPFILT(stmt, pMsg);
+422 	DBGPRINTF("PROPFILT condition result is %d\n", bRet);
+423 	if(bRet)
+424 		CHKiRet(scriptExec(stmt-&gt;d.s_propfilt.t_then, pMsg, pWti));
+425 finalize_it:
+426 	RETiRet;
+427 }
+428 static rsRetVal ATTR_NONNULL()
+429 execReloadLookupTable(struct cnfstmt *stmt)
+430 {
+431 	assert(stmt != NULL);
+432 	lookup_ref_t *t;
+433 	DEFiRet;
+434 	t = stmt-&gt;d.s_reload_lookup_table.table;
+435 	if (t == NULL) {
+436 		ABORT_FINALIZE(RS_RET_NONE);
+437 	}
+438 	iRet = lookupReload(t, stmt-&gt;d.s_reload_lookup_table.stub_value);
+439 finalize_it:
+440 	RETiRet;
+441 }
+442 static rsRetVal ATTR_NONNULL(2, 3)
+443 scriptExec(struct cnfstmt *const root, smsg_t *const pMsg, wti_t *const pWti)
+444 {
+445 	struct cnfstmt *stmt;
+446 	DEFiRet;
+447 	for(stmt = root ; stmt != NULL ; stmt = stmt-&gt;next) {
+448 		if(*pWti-&gt;pbShutdownImmediate) {
+449 			DBGPRINTF("scriptExec: ShutdownImmediate set, "
+450 				  "force terminating\n");
+451 			ABORT_FINALIZE(RS_RET_FORCE_TERM);
+452 		}
+453 		if(Debug) {
+454 			cnfstmtPrintOnly(stmt, 2, 0);
+455 		}
+456 		switch(stmt-&gt;nodetype) {
+457 		case S_NOP:
+458 			break;
+459 		case S_STOP:
+460 			ABORT_FINALIZE(RS_RET_DISCARDMSG);
+461 			break;
+462 		case S_ACT:
+463 			CHKiRet(execAct(stmt, pMsg, pWti));
+464 			break;
+465 		case S_SET:
+466 			CHKiRet(execSet(stmt, pMsg, pWti));
+467 			break;
+468 		case S_UNSET:
+469 			CHKiRet(execUnset(stmt, pMsg));
+470 			break;
+471 		case S_CALL:
+472 			CHKiRet(execCall(stmt, pMsg, pWti));
+473 			break;
+474 		case S_CALL_INDIRECT:
+475 			CHKiRet(execCallIndirect(stmt, pMsg, pWti));
+476 			break;
+477 		case S_IF:
+478 			CHKiRet(execIf(stmt, pMsg, pWti));
+479 			break;
+480 		case S_FOREACH:
+481 			CHKiRet(execForeach(stmt, pMsg, pWti));
+482 			break;
+483 		case S_PRIFILT:
+484 			CHKiRet(execPRIFILT(stmt, pMsg, pWti));
+485 			break;
+486 		case S_PROPFILT:
+487 			CHKiRet(execPROPFILT(stmt, pMsg, pWti));
+488 			break;
+489 		case S_RELOAD_LOOKUP_TABLE:
+490 			CHKiRet(execReloadLookupTable(stmt));
+491 			break;
+492 		default:
+493 			dbgprintf("error: unknown stmt type %u during exec\n",
+494 				(unsigned) stmt-&gt;nodetype);
+495 			break;
+496 		}
+497 	}
+498 finalize_it:
+499 	RETiRet;
+500 }
+501 static rsRetVal
+502 processBatch(batch_t *pBatch, wti_t *pWti)
+503 {
+504 	int i;
+505 	smsg_t *pMsg;
+506 	ruleset_t *pRuleset;
+507 	rsRetVal localRet;
+508 	DEFiRet;
+509 	DBGPRINTF("processBATCH: batch of %d elements must be processed\n", pBatch-&gt;nElem);
+510 	wtiResetExecState(pWti, pBatch);
+511 	for(i = 0 ; i &lt; batchNumMsgs(pBatch) &amp;&amp; !*(pWti-&gt;pbShutdownImmediate) ; ++i) {
+512 		pMsg = pBatch-&gt;pElem[i].pMsg;
+513 		DBGPRINTF("processBATCH: next msg %d: %.128s\n", i, pMsg-&gt;pszRawMsg);
+514 		pRuleset = (pMsg-&gt;pRuleset == NULL) ? runConf-&gt;rulesets.pDflt : pMsg-&gt;pRuleset;
+515 		localRet = scriptExec(pRuleset-&gt;root, pMsg, pWti);
+516 		if(localRet == RS_RET_OK)
+517 			batchSetElemState(pBatch, i, BATCH_STATE_COMM);
+518 		else if(localRet == RS_RET_SUSPENDED)
+519 			--i;
+520 	}
+521 	DBGPRINTF("END batch execution phase, entering to commit phase "
+522 		"[processed %d of %d messages]\n", i, batchNumMsgs(pBatch));
+523 	actionCommitAllDirect(pWti);
+524 	DBGPRINTF("processBATCH: batch of %d elements has been processed\n", pBatch-&gt;nElem);
+525 	RETiRet;
+526 }
+527 static parserList_t*
+528 GetParserList(rsconf_t *conf, smsg_t *pMsg)
+529 {
+530 	return (pMsg-&gt;pRuleset == NULL) ? conf-&gt;rulesets.pDflt-&gt;pParserLst : pMsg-&gt;pRuleset-&gt;pParserLst;
+531 }
+532 static void ATTR_NONNULL(1)
+533 addScript(ruleset_t *const pThis, struct cnfstmt *const script)
+534 {
+535 	if(script == NULL) 		return;
+536 	if(pThis-&gt;last == NULL)
+537 		pThis-&gt;root = pThis-&gt;last = script;
+538 	else {
+539 		pThis-&gt;last-&gt;next = script;
+540 		pThis-&gt;last = script;
+541 	}
+542 }
+543 static rsRetVal rulesetSetName(ruleset_t *pThis, uchar *pszName)
+544 {
+545 	DEFiRet;
+546 	free(pThis-&gt;pszName);
+547 	CHKmalloc(pThis-&gt;pszName = ustrdup(pszName));
+548 finalize_it:
+549 	RETiRet;
+550 }
+551 static ruleset_t*
+552 GetCurrent(rsconf_t *conf)
+553 {
+554 	return conf-&gt;rulesets.pCurr;
+555 }
+556 static qqueue_t*
+557 GetRulesetQueue(ruleset_t *pThis)
+558 {
+559 	ISOBJ_TYPE_assert(pThis, ruleset);
+560 	return (pThis-&gt;pQueue == NULL) ? runConf-&gt;pMsgQueue : pThis-&gt;pQueue;
+561 }
+562 rsRetVal
+563 rulesetGetRuleset(rsconf_t *conf, ruleset_t **ppRuleset, uchar *pszName)
+564 {
+565 	DEFiRet;
+566 	assert(ppRuleset != NULL);
+567 	assert(pszName != NULL);
+568 	CHKiRet(llFind(&amp;(conf-&gt;rulesets.llRulesets), pszName, (void*) ppRuleset));
+569 finalize_it:
+570 	RETiRet;
+571 }
+572 static rsRetVal
+573 SetDefaultRuleset(rsconf_t *conf, uchar *pszName)
+574 {
+575 	ruleset_t *pRuleset;
+576 	DEFiRet;
+577 	assert(pszName != NULL);
+578 	CHKiRet(rulesetGetRuleset(conf, &amp;pRuleset, pszName));
+579 	conf-&gt;rulesets.pDflt = pRuleset;
+580 	DBGPRINTF("default rule set changed to %p: '%s'\n", pRuleset, pszName);
+581 finalize_it:
+582 	RETiRet;
+583 }
+584 static rsRetVal
+585 SetCurrRuleset(rsconf_t *conf, uchar *pszName)
+586 {
+587 	ruleset_t *pRuleset;
+588 	DEFiRet;
+589 	assert(pszName != NULL);
+590 	CHKiRet(rulesetGetRuleset(conf, &amp;pRuleset, pszName));
+591 	conf-&gt;rulesets.pCurr = pRuleset;
+592 	DBGPRINTF("current rule set changed to %p: '%s'\n", pRuleset, pszName);
+593 finalize_it:
+594 	RETiRet;
+595 }
+596 BEGINobjConstruct(ruleset) 	pThis-&gt;root = NULL;
+597 	pThis-&gt;last = NULL;
+598 ENDobjConstruct(ruleset)
+599 static rsRetVal
+600 rulesetConstructFinalize(rsconf_t *conf, ruleset_t *pThis)
+601 {
+602 	uchar *keyName;
+603 	DEFiRet;
+604 	ISOBJ_TYPE_assert(pThis, ruleset);
+605 	CHKmalloc(keyName = ustrdup(pThis-&gt;pszName));
+606 	CHKiRet(llAppend(&amp;(conf-&gt;rulesets.llRulesets), keyName, pThis));
+607 	if(conf-&gt;rulesets.pDflt == NULL)
+608 		conf-&gt;rulesets.pDflt = pThis;
+609 finalize_it:
+610 	RETiRet;
+611 }
+612 BEGINobjDestruct(ruleset) CODESTARTobjDestruct(ruleset)
+613 	DBGPRINTF("destructing ruleset %p, name %p\n", pThis, pThis-&gt;pszName);
+614 	if(pThis-&gt;pQueue != NULL) {
+615 		qqueueDestruct(&amp;pThis-&gt;pQueue);
+616 	}
+617 	if(pThis-&gt;pParserLst != NULL) {
+618 		parser.DestructParserList(&amp;pThis-&gt;pParserLst);
+619 	}
+620 	free(pThis-&gt;pszName);
+621 ENDobjDestruct(ruleset)
+622 DEFFUNC_llExecFunc(doShutdownQueueWorkers)
+623 {
+624 	DEFiRet;
+625 	ruleset_t *const pThis = (ruleset_t*) pData;
+626 	DBGPRINTF("shutting down queue workers for ruleset %p, name %s, queue %p\n",
+627 		pThis, pThis-&gt;pszName, pThis-&gt;pQueue);
+628 	ISOBJ_TYPE_assert(pThis, ruleset);
+629 	if(pThis-&gt;pQueue != NULL) {
+630 		qqueueShutdownWorkers(pThis-&gt;pQueue);
+631 	}
+632 	RETiRet;
+633 }
+634 DEFFUNC_llExecFunc(doDestructCnfStmt)
+635 {
+636 	DEFiRet;
+637 	ruleset_t *const pThis = (ruleset_t*) pData;
+638 	DBGPRINTF("shutting down actions and conf stmts for ruleset %p, name %s\n",
+639 		pThis, pThis-&gt;pszName);
+640 	ISOBJ_TYPE_assert(pThis, ruleset);
+641 	cnfstmtDestructLst(pThis-&gt;root);
+642 	RETiRet;
+643 }
+644 static rsRetVal
+645 destructAllActions(rsconf_t *conf)
+646 {
+647 	DEFiRet;
+648 	DBGPRINTF("rulesetDestructAllActions\n");
+649 	DBGPRINTF("destructAllActions: queue shutdown\n");
+650 	llExecFunc(&amp;(conf-&gt;rulesets.llRulesets), doShutdownQueueWorkers, NULL);
+651 	DBGPRINTF("destructAllActions: action and conf stmt shutdown\n");
+652 	llExecFunc(&amp;(conf-&gt;rulesets.llRulesets), doDestructCnfStmt, NULL);
+653 	CHKiRet(llDestroy(&amp;(conf-&gt;rulesets.llRulesets)));
+654 	CHKiRet(llInit(&amp;(conf-&gt;rulesets.llRulesets), rulesetDestructForLinkedList,
+655 		rulesetKeyDestruct, strcasecmp));
+656 	conf-&gt;rulesets.pDflt = NULL;
+657 finalize_it:
+658 	RETiRet;
+659 }
+660 rsRetVal
+661 rulesetDestructForLinkedList(void *pData)
+662 {
+663 	ruleset_t *pThis = (ruleset_t*) pData;
+664 	return rulesetDestruct(&amp;pThis);
+665 }
+666 BEGINobjDebugPrint(ruleset) CODESTARTobjDebugPrint(ruleset)
+667 	dbgoprint((obj_t*) pThis, "rsyslog ruleset %s:\n", pThis-&gt;pszName);
+668 	cnfstmtPrint(pThis-&gt;root, 0);
+669 	dbgoprint((obj_t*) pThis, "ruleset %s assigned parser list:\n", pThis-&gt;pszName);
+670 	printParserList(pThis-&gt;pParserLst);
+671 ENDobjDebugPrint(ruleset)
+672 DEFFUNC_llExecFunc(doDebugPrintAll)
+673 {
+674 	return rulesetDebugPrint((ruleset_t*) pData);
+675 }
+676 static rsRetVal
+677 debugPrintAll(rsconf_t *conf)
+678 {
+679 	DEFiRet;
+680 	dbgprintf("All Rulesets:\n");
+681 	llExecFunc(&amp;(conf-&gt;rulesets.llRulesets), doDebugPrintAll, NULL);
+682 	dbgprintf("End of Rulesets.\n");
+683 	RETiRet;
+684 }
+685 struct cnfstmt * removeNOPs(struct cnfstmt *root);
+686 static void
+687 rulesetOptimize(ruleset_t *pRuleset)
+688 {
+689 	if(Debug) {
+690 		dbgprintf("ruleset '%s' before optimization:\n",
+691 			  pRuleset-&gt;pszName);
+692 		rulesetDebugPrint((ruleset_t*) pRuleset);
+693 	}
+694 	pRuleset-&gt;root = cnfstmtOptimize(pRuleset-&gt;root);
+695 	if(Debug) {
+696 		dbgprintf("ruleset '%s' after optimization:\n",
+697 			  pRuleset-&gt;pszName);
+698 		rulesetDebugPrint((ruleset_t*) pRuleset);
+699 	}
+700 }
+701 DEFFUNC_llExecFunc(doRulesetOptimizeAll)
+702 {
+703 	rulesetOptimize((ruleset_t*) pData);
+704 	return RS_RET_OK;
+705 }
+706 rsRetVal
+707 rulesetOptimizeAll(rsconf_t *conf)
+708 {
+709 	DEFiRet;
+710 	dbgprintf("begin ruleset optimization phase\n");
+711 	llExecFunc(&amp;(conf-&gt;rulesets.llRulesets), doRulesetOptimizeAll, NULL);
+712 	dbgprintf("ruleset optimization phase finished.\n");
+713 	RETiRet;
+714 }
+715 static rsRetVal
+716 doRulesetCreateQueue(rsconf_t *conf, int *pNewVal)
+717 {
+718 	uchar *rsname;
+719 	DEFiRet;
+720 	if(conf-&gt;rulesets.pCurr == NULL) {
+721 		LogError(0, RS_RET_NO_CURR_RULESET, "error: currently no specific ruleset specified, thus a "
+722 				"queue can not be added to it");
+723 		ABORT_FINALIZE(RS_RET_NO_CURR_RULESET);
+724 	}
+725 	if(conf-&gt;rulesets.pCurr-&gt;pQueue != NULL) {
+726 		LogError(0, RS_RET_RULES_QUEUE_EXISTS, "error: ruleset already has a main queue, can not "
+727 				"add another one");
+728 		ABORT_FINALIZE(RS_RET_RULES_QUEUE_EXISTS);
+729 	}
+730 	if(pNewVal == 0)
+731 		FINALIZE; 
+732 	rsname = (conf-&gt;rulesets.pCurr-&gt;pszName == NULL) ? (uchar*) "[ruleset]" : conf-&gt;rulesets.pCurr-&gt;pszName;
+733 	DBGPRINTF("adding a ruleset-specific \"main\" queue for ruleset '%s'\n", rsname);
+734 	CHKiRet(createMainQueue(&amp;conf-&gt;rulesets.pCurr-&gt;pQueue, rsname, NULL));
+735 finalize_it:
+736 	RETiRet;
+737 }
+738 static rsRetVal
+739 rulesetCreateQueue(void __attribute__((unused)) *pVal, int *pNewVal)
+740 {
+741 	return doRulesetCreateQueue(ourConf, pNewVal);
+742 }
+743 static rsRetVal
+744 doRulesetAddParser(ruleset_t *pRuleset, uchar *pName)
+745 {
+746 	parser_t *pParser;
+747 	DEFiRet;
+748 	CHKiRet(objUse(parser, CORE_COMPONENT));
+749 	iRet = parser.FindParser(loadConf-&gt;parsers.pParsLstRoot, &amp;pParser, pName);
+750 	if(iRet == RS_RET_PARSER_NOT_FOUND) {
+751 		LogError(0, RS_RET_PARSER_NOT_FOUND, "error: parser '%s' unknown at this time "
+752 			  	"(maybe defined too late in rsyslog.conf?)", pName);
+753 		ABORT_FINALIZE(RS_RET_NO_CURR_RULESET);
+754 	} else if(iRet != RS_RET_OK) {
+755 		LogError(0, iRet, "error trying to find parser '%s'\n", pName);
+756 		FINALIZE;
+757 	}
+758 	CHKiRet(parser.AddParserToList(&amp;pRuleset-&gt;pParserLst, pParser));
+759 	DBGPRINTF("added parser '%s' to ruleset '%s'\n", pName, pRuleset-&gt;pszName);
+760 finalize_it:
+761 	free(pName); 
+762 	RETiRet;
+763 }
+764 static rsRetVal
+765 rulesetAddParser(void __attribute__((unused)) *pVal, uchar *pName)
+766 {
+767 	return doRulesetAddParser(loadConf-&gt;rulesets.pCurr, pName);
+768 }
+769 rsRetVal
+770 rulesetProcessCnf(struct cnfobj *o)
+771 {
+772 	struct cnfparamvals *pvals;
+773 	rsRetVal localRet;
+774 	uchar *rsName = NULL;
+775 	uchar *parserName;
+776 	int nameIdx, parserIdx;
+777 	ruleset_t *pRuleset;
+778 	struct cnfarray *ar;
+779 	int i;
+780 	int qtype;
+781 	uchar *rsname;
+782 	DEFiRet;
+783 	pvals = nvlstGetParams(o-&gt;nvlst, &amp;rspblk, NULL);
+784 	if(pvals == NULL) {
+785 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+786 	}
+787 	DBGPRINTF("ruleset param blk after rulesetProcessCnf:\n");
+788 	cnfparamsPrint(&amp;rspblk, pvals);
+789 	nameIdx = cnfparamGetIdx(&amp;rspblk, "name");
+790 	rsName = (uchar*)es_str2cstr(pvals[nameIdx].val.d.estr, NULL);
+791 	localRet = rulesetGetRuleset(loadConf, &amp;pRuleset, rsName);
+792 	if(localRet == RS_RET_OK) {
+793 		LogError(0, RS_RET_RULESET_EXISTS,
+794 			"error: ruleset '%s' specified more than once",
+795 			rsName);
+796 		cnfstmtDestructLst(o-&gt;script);
+797 		ABORT_FINALIZE(RS_RET_RULESET_EXISTS);
+798 	} else if(localRet != RS_RET_NOT_FOUND) {
+799 		ABORT_FINALIZE(localRet);
+800 	}
+801 	CHKiRet(rulesetConstruct(&amp;pRuleset));
+802 	if((localRet = rulesetSetName(pRuleset, rsName)) != RS_RET_OK) {
+803 		rulesetDestruct(&amp;pRuleset);
+804 		ABORT_FINALIZE(localRet);
+805 	}
+806 	if((localRet = rulesetConstructFinalize(loadConf, pRuleset)) != RS_RET_OK) {
+807 		rulesetDestruct(&amp;pRuleset);
+808 		ABORT_FINALIZE(localRet);
+809 	}
+810 	addScript(pRuleset, o-&gt;script);
+811 	parserIdx = cnfparamGetIdx(&amp;rspblk, "parser");
+812 	if(parserIdx != -1  &amp;&amp; pvals[parserIdx].bUsed) {
+813 		ar = pvals[parserIdx].val.d.ar;
+814 		for(i = 0 ; i &lt;  ar-&gt;nmemb ; ++i) {
+815 			parserName = (uchar*)es_str2cstr(ar-&gt;arr[i], NULL);
+816 			doRulesetAddParser(pRuleset, parserName);
+817 		}
+818 	}
+819 	if(queueCnfParamsSet(o-&gt;nvlst)) {
+820 		if(pRuleset-&gt;pszName == NULL) {
+821 			rsname = (uchar*) "[ruleset]";
+822 			qtype = pRuleset-&gt;pQueue-&gt;qType;
+823 		} else {
+824 			rsname = pRuleset-&gt;pszName;
+825 			qtype = 3;
+826 		}
+827 		DBGPRINTF("adding a ruleset-specific \"main\" queue for ruleset '%s', mode %d\n",
+828 			rsname, qtype);
+829 		CHKiRet(createMainQueue(&amp;pRuleset-&gt;pQueue, rsname, o-&gt;nvlst));
+830 	}
+831 finalize_it:
+832 	free(rsName);
+833 	cnfparamvalsDestruct(pvals, &amp;rspblk);
+834 	RETiRet;
+835 }
+836 BEGINobjQueryInterface(ruleset)
+837 CODESTARTobjQueryInterface(ruleset)
+838 	if(pIf-&gt;ifVersion != rulesetCURR_IF_VERSION) { 		ABORT_FINALIZE(RS_RET_INTERFACE_NOT_SUPPORTED);
+839 	}
+840 	pIf-&gt;Construct = rulesetConstruct;
+841 	pIf-&gt;ConstructFinalize = rulesetConstructFinalize;
+842 	pIf-&gt;Destruct = rulesetDestruct;
+843 	pIf-&gt;DebugPrint = rulesetDebugPrint;
+844 	pIf-&gt;IterateAllActions = iterateAllActions;
+845 	pIf-&gt;DestructAllActions = destructAllActions;
+846 	pIf-&gt;AddScript = addScript;
+847 	pIf-&gt;ProcessBatch = processBatch;
+848 	pIf-&gt;SetName = rulesetSetName;
+849 	pIf-&gt;DebugPrintAll = debugPrintAll;
+850 	pIf-&gt;GetCurrent = GetCurrent;
+851 	pIf-&gt;GetRuleset = rulesetGetRuleset;
+852 	pIf-&gt;SetDefaultRuleset = SetDefaultRuleset;
+853 	pIf-&gt;SetCurrRuleset = SetCurrRuleset;
+854 	pIf-&gt;GetRulesetQueue = GetRulesetQueue;
+855 	pIf-&gt;GetParserList = GetParserList;
+856 finalize_it:
+857 ENDobjQueryInterface(ruleset)
+858 BEGINObjClassExit(ruleset, OBJ_IS_CORE_MODULE) 	objRelease(parser, CORE_COMPONENT);
+859 ENDObjClassExit(ruleset)
+860 BEGINObjClassInit(ruleset, 1, OBJ_IS_CORE_MODULE) 
+861 	OBJSetMethodHandler(objMethod_DEBUGPRINT, rulesetDebugPrint);
+862 	OBJSetMethodHandler(objMethod_CONSTRUCTION_FINALIZER, rulesetConstructFinalize);
+863 	CHKiRet(regCfSysLineHdlr((uchar *)"rulesetparser", 0, eCmdHdlrGetWord, rulesetAddParser, NULL, NULL));
+864 	CHKiRet(regCfSysLineHdlr((uchar *)"rulesetcreatemainqueue", 0, eCmdHdlrBinary, rulesetCreateQueue,
+865 		NULL, NULL));
+866 ENDObjClassInit(ruleset)
 </pre>
 </div>
 </div>
