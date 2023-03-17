@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for mmexternal.c &amp; omczmq.c</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -41,617 +40,434 @@ Matches for mmexternal.c &amp; omczmq.c
 </h3>
 <hr/>
 <pre>
-/* mmexternal.c
- * This core plugin is an interface module to message modification
- * modules written in languages other than C.
- *
- * Copyright 2014-2018 by Rainer Gerhards
- *
- * This file is part of rsyslog.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *       http://www.apache.org/licenses/LICENSE-2.0
- *       -or-
- *       see COPYING.ASL20 in the source distribution
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-#include "config.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;fcntl.h&gt;
-#include &lt;sys/wait.h&gt;
-#include &lt;sys/uio.h&gt;
-#include "rsyslog.h"
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "module-template.h"
-#include "msg.h"
-#include "errmsg.h"
-#include "cfsysline.h"
-#include "glbl.h"
-#include "rsconf.h"
-
-
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("mmexternal")
-
-/* internal structures
- */
-DEF_OMOD_STATIC_DATA
-
-typedef struct _instanceData {
-	uchar *szBinary;	/* name of binary to call */
-	char **aParams;		/* Optional Parameters for binary command */
-	int iParams;		/* Holds the count of parameters if set*/
-	int bForceSingleInst;	/* only a single wrkr instance of program permitted? */
-	int inputProp;		/* what to provide as input to the external program? */
-#define	INPUT_MSG 0
-#define	INPUT_RAWMSG 1
-#define INPUT_JSON 2
-	uchar *outputFileName;	/* name of file for std[out/err] or NULL if to discard */
-	pthread_mutex_t mut;	/* make sure only one instance is active */
-} instanceData;
-
-typedef struct wrkrInstanceData {
-	instanceData *pData;
-	pid_t pid;		/* pid of currently running process */
-	int fdOutput;		/* it's fd (-1 if closed) */
-	int fdPipeOut;		/* file descriptor to write to */
-	int fdPipeIn;		/* fd we receive messages from the program (if we want to) */
-	int bIsRunning;		/* is binary currently running? 0-no, 1-yes */
-	char *respBuf;		/* buffer to read exernal plugin's response */
-	int maxLenRespBuf;	/* (current) maximum length of response buffer */
-	int lenRespBuf;		/* actual nbr of chars in response buffer */
-	int idxRespBuf;		/* last char read from response buffer */
-} wrkrInstanceData_t;
-
-typedef struct configSettings_s {
-	uchar *szBinary;	/* name of binary to call */
-} configSettings_t;
-static configSettings_t cs;
-
-<a name="0"></a>
-/* tables for interfacing with the v6 config system */
-/* action (instance) parameters */
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>static struct cnfparamdescr actpdescr[] = {
-	{ "binary", eCmdHdlrString, CNFPARAM_REQUIRED },
-	{ "interface.input", eCmdHdlrString, 0 },
-	{ "output", eCmdHdlrString, 0 },
-	{ "forcesingleinstance", eCmdHdlrBinary, 0 }
-};
-static struct cnfparamblk actpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	  actpdescr
-	};</b></font>
-
-BEGINinitConfVars		/* (re)set config variables to default values */
-CODESTARTinitConfVars
-	cs.szBinary = NULL;	/* name of binary to call */
-ENDinitConfVars
-
-/* config settings */
-
-BEGINcreateInstance
-CODESTARTcreateInstance
-	pData-&gt;inputProp = INPUT_MSG;
-	pthread_mutex_init(&amp;pData-&gt;mut, NULL);
-ENDcreateInstance
-
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-	pWrkrData-&gt;fdPipeIn = -1;
-	pWrkrData-&gt;fdPipeOut = -1;
-	pWrkrData-&gt;fdOutput = -1;
-	pWrkrData-&gt;bIsRunning = 0;
-	pWrkrData-&gt;respBuf = NULL;
-	pWrkrData-&gt;maxLenRespBuf = 0;
-	pWrkrData-&gt;lenRespBuf = 0;
-	pWrkrData-&gt;idxRespBuf = 0;
-ENDcreateWrkrInstance
-
-
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURERepeatedMsgReduction)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-
-
-BEGINfreeInstance
-	int i;
-CODESTARTfreeInstance
-	pthread_mutex_destroy(&amp;pData-&gt;mut);
-	free(pData-&gt;szBinary);
-	free(pData-&gt;outputFileName);
-	if(pData-&gt;aParams != NULL) {
-		for (i = 0; i &lt; pData-&gt;iParams; i++) {
-			free(pData-&gt;aParams[i]);
-		}
-		free(pData-&gt;aParams);
-	}
-ENDfreeInstance
-
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-	free(pWrkrData-&gt;respBuf);
-ENDfreeWrkrInstance
-
-
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-ENDdbgPrintInstInfo
-
-
-BEGINtryResume
-CODESTARTtryResume
-ENDtryResume
-
-
-/* As this is just a debug function, we only make
- * best effort to write the message but do *not* try very
- * hard to handle errors. -- rgerhards, 2014-01-16
- */
-static void
-writeOutputDebug(wrkrInstanceData_t *__restrict__ const pWrkrData,
-	const char *__restrict__ const buf,
-	const ssize_t lenBuf)
-{
-	char errStr[1024];
-	ssize_t r;
-
-	if(pWrkrData-&gt;pData-&gt;outputFileName == NULL)
-		goto done;
-
-	if(pWrkrData-&gt;fdOutput == -1) {
-		pWrkrData-&gt;fdOutput = open((char*)pWrkrData-&gt;pData-&gt;outputFileName,
-				       O_WRONLY | O_APPEND | O_CREAT, 0600);
-		if(pWrkrData-&gt;fdOutput == -1) {
-			DBGPRINTF("mmexternal: error opening output file %s: %s\n",
-				   pWrkrData-&gt;pData-&gt;outputFileName,
-				   rs_strerror_r(errno, errStr, sizeof(errStr)));
-			goto done;
-		}
-	}
-
-	r = write(pWrkrData-&gt;fdOutput, buf, (size_t) lenBuf);
-	if(r != lenBuf) {
-		DBGPRINTF("mmexternal: problem writing output file %s: bytes "
-			  "requested %lld, written %lld, msg: %s\n",
-			   pWrkrData-&gt;pData-&gt;outputFileName, (long long) lenBuf, (long long) r,
-			   rs_strerror_r(errno, errStr, sizeof(errStr)));
-	}
-done:	return;
-}
-
-
-/* Get reply from external program. Note that we *must* receive one
- * reply for each message sent (half-duplex protocol). As such, the last
- * char we read MUST be \n ... we cannot have multiple LF as this is
- * forbidden by the plugin interface. We cannot have multiple responses
- * for multiple messages, as we are in half-duplex mode! This makes
- * things quite a bit simpler. So don't think the simple code does
- * not handle those border-cases that are describe to cannot exist!
- */
-static void
-processProgramReply(wrkrInstanceData_t *__restrict__ const pWrkrData, smsg_t *const pMsg)
-{
-	rsRetVal iRet;
-	char errStr[1024];
-	ssize_t r;
-	int numCharsRead;
-	char *newptr;
-
-	numCharsRead = 0;
-	do {
-		if(pWrkrData-&gt;maxLenRespBuf &lt; numCharsRead + 256) { /* 256 to permit at least a decent read */
-			pWrkrData-&gt;maxLenRespBuf += 4096;
-			if((newptr = realloc(pWrkrData-&gt;respBuf, pWrkrData-&gt;maxLenRespBuf)) == NULL) {
-				DBGPRINTF("mmexternal: error realloc responseBuf: %s\n",
-					   rs_strerror_r(errno, errStr, sizeof(errStr)));
-				/* emergency - fake no update */
-				strcpy(pWrkrData-&gt;respBuf, "{}\n");
-				numCharsRead = 3;
-				break;
-			}
-			pWrkrData-&gt;respBuf = newptr;
-		}
-		r = read(pWrkrData-&gt;fdPipeIn, pWrkrData-&gt;respBuf+numCharsRead,
-			 pWrkrData-&gt;maxLenRespBuf-numCharsRead-1);
-		if(r &gt; 0) {
-			numCharsRead += r;
-			pWrkrData-&gt;respBuf[numCharsRead] = '\0'; /* space reserved in read! */
-		} else {
-			/* emergency - fake no update */
-			strcpy(pWrkrData-&gt;respBuf, "{}\n");
-			numCharsRead = 3;
-		}
-		if(Debug &amp;&amp; r == -1) {
-			DBGPRINTF("mmexternal: error reading from external program: %s\n",
-				   rs_strerror_r(errno, errStr, sizeof(errStr)));
-		}
-	} while(pWrkrData-&gt;respBuf[numCharsRead-1] != '\n');
-
-	writeOutputDebug(pWrkrData, pWrkrData-&gt;respBuf, numCharsRead);
-	/* strip LF, which is not part of the JSON message but framing */
-	pWrkrData-&gt;respBuf[numCharsRead-1] = '\0';
-	iRet = MsgSetPropsViaJSON(pMsg, (uchar*)pWrkrData-&gt;respBuf);
-	if(iRet != RS_RET_OK) {
-		LogError(0, iRet, "mmexternal: invalid reply '%s' from program '%s'",
-				pWrkrData-&gt;respBuf, pWrkrData-&gt;pData-&gt;szBinary);
-	}
-
-	return;
-}
-
-
-
-/* execute the child process (must be called in child context
- * after fork).
- * Note: all output will go to std[err/out] of the **child**, so
- * rsyslog will never see it except as script output. Do NOT
- * use dbgprintf() or LogError() and friends.
- */
-static void __attribute__((noreturn))
-execBinary(wrkrInstanceData_t *pWrkrData, const int fdStdin, const int fdStdOutErr)
-{
-	int i;
-	struct sigaction sigAct;
-	sigset_t set;
-	char *newenviron[] = { NULL };
-
-	if(dup2(fdStdin, STDIN_FILENO) == -1) {
-		perror("mmexternal: dup() stdin failed\n");
-	}
-	if(dup2(fdStdOutErr, STDOUT_FILENO) == -1) {
-		perror("mmexternal: dup() stdout failed\n");
-	}
-	if(dup2(fdStdOutErr, STDERR_FILENO) == -1) {
-		perror("mmexternal: dup() stderr failed\n");
-	}
-
-	/* we close all file handles as we fork soon
-	 * Is there a better way to do this? - mail me! rgerhards@adiscon.com
-	 */
-#	ifndef VALGRIND /* we can not use this with valgrind - too many errors... */
-	for(i = 3 ; i &lt;= 65535 ; ++i)
-		close(i);
-#	endif
-
-	/* reset signal handlers to default */
-	memset(&amp;sigAct, 0, sizeof(sigAct));
-	sigemptyset(&amp;sigAct.sa_mask);
-	sigAct.sa_handler = SIG_DFL;
-	for(i = 1 ; i &lt; NSIG ; ++i)
-		sigaction(i, &amp;sigAct, NULL);
-	/* we need to block SIGINT, otherwise the external program is cancelled when we are
-	 * stopped in debug mode.
-	 */
-	sigAct.sa_handler = SIG_IGN;
-	sigaction(SIGINT, &amp;sigAct, NULL);
-	sigemptyset(&amp;set);
-	sigprocmask(SIG_SETMASK, &amp;set, NULL);
-
-	alarm(0);
-
-	/* finally exec child */
-	execve((char*)pWrkrData-&gt;pData-&gt;szBinary, pWrkrData-&gt;pData-&gt;aParams, newenviron);
-
-	/* we should never reach this point, but if we do, we complain and terminate */
-	char errstr[1024];
-	char errbuf[2048];
-	rs_strerror_r(errno, errstr, sizeof(errstr));
-	errstr[sizeof(errstr)-1] = '\0';
-	const size_t lenbuf = snprintf(errbuf, sizeof(errbuf),
-		"mmexternal: failed to execute binary '%s': %s\n",
-		  pWrkrData-&gt;pData-&gt;szBinary, errstr);
-	errbuf[sizeof(errbuf)-1] = '\0';
-	if(write(2, errbuf, lenbuf) != (ssize_t) lenbuf) {
-		/* just keep static analyzers happy... */
-		exit(2);
-	}
-	exit(1);
-}
-
-
-/* creates a pipe and starts program, uses pipe as stdin for program.
- * rgerhards, 2009-04-01
- */
-static rsRetVal
-openPipe(wrkrInstanceData_t *pWrkrData)
-{
-	int pipestdin[2];
-	int pipestdout[2];
-	pid_t cpid;
-	DEFiRet;
-
-	if(pipe(pipestdin) == -1) {
-		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
-	}
-	if(pipe(pipestdout) == -1) {
-		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
-	}
-
-	DBGPRINTF("mmexternal: executing program '%s' with '%d' parameters\n",
-		  pWrkrData-&gt;pData-&gt;szBinary, pWrkrData-&gt;pData-&gt;iParams);
-
-	/* final sanity check */
-	assert(pWrkrData-&gt;pData-&gt;szBinary != NULL);
-	assert(pWrkrData-&gt;pData-&gt;aParams != NULL);
-
-	/* NO OUTPUT AFTER FORK! */
-	cpid = fork();
-	if(cpid == -1) {
-		ABORT_FINALIZE(RS_RET_ERR_FORK);
-	}
-	pWrkrData-&gt;pid = cpid;
-
-	if(cpid == 0) {
-		/* we are now the child, just exec the binary. */
-		close(pipestdin[1]); /* close those pipe "ports" that */
-		close(pipestdout[0]); /* we don't need */
-		execBinary(pWrkrData, pipestdin[0], pipestdout[1]);
-		/*NO CODE HERE - WILL NEVER BE REACHED!*/
-	}
-
-	DBGPRINTF("mmexternal: child has pid %d\n", (int) cpid);
-	pWrkrData-&gt;fdPipeIn = dup(pipestdout[0]);
-	close(pipestdin[0]);
-	close(pipestdout[1]);
-	pWrkrData-&gt;pid = cpid;
-	pWrkrData-&gt;fdPipeOut = pipestdin[1];
-	pWrkrData-&gt;bIsRunning = 1;
-finalize_it:
-	RETiRet;
-}
-
-
-/* clean up after a terminated child
- */
-static rsRetVal
-cleanup(wrkrInstanceData_t *pWrkrData)
-{
-	int status;
-	int ret;
-	DEFiRet;
-
-	assert(pWrkrData-&gt;bIsRunning == 1);
-	ret = waitpid(pWrkrData-&gt;pid, &amp;status, 0);
-
-	/* waitpid will fail with errno == ECHILD if the child process has already
-	   been reaped by the rsyslogd main loop (see rsyslogd.c) */
-	if(ret == pWrkrData-&gt;pid) {
-		glblReportChildProcessExit(runConf, pWrkrData-&gt;pData-&gt;szBinary, pWrkrData-&gt;pid, status);
-	}
-
-	if(pWrkrData-&gt;fdOutput != -1) {
-		close(pWrkrData-&gt;fdOutput);
-		pWrkrData-&gt;fdOutput = -1;
-	}
-	if(pWrkrData-&gt;fdPipeIn != -1) {
-		close(pWrkrData-&gt;fdPipeIn);
-		pWrkrData-&gt;fdPipeIn = -1;
-	}
-	if(pWrkrData-&gt;fdPipeOut != -1) {
-		close(pWrkrData-&gt;fdPipeOut);
-		pWrkrData-&gt;fdPipeOut = -1;
-	}
-	pWrkrData-&gt;bIsRunning = 0;
-	pWrkrData-&gt;bIsRunning = 0;
-	RETiRet;
-}
-
-
-/* try to restart the binary when it has stopped.
- */
-static rsRetVal
-tryRestart(wrkrInstanceData_t *pWrkrData)
-{
-	DEFiRet;
-	assert(pWrkrData-&gt;bIsRunning == 0);
-
-	iRet = openPipe(pWrkrData);
-	RETiRet;
-}
-
-/* write to pipe
- * note that we do not try to run block-free. If the users fears something
- * may block (and this not be acceptable), the action should be run on its
- * own action queue.
- */
-static rsRetVal
-callExtProg(wrkrInstanceData_t *__restrict__ const pWrkrData, smsg_t *__restrict__ const pMsg)
-{
-	int lenWritten;
-	int lenWrite;
-	int writeOffset;
-	int i_iov;
-	struct iovec iov[2];
-	int bFreeInputstr = 1; /* we must only free if it does not point to msg-obj mem! */
-	const uchar *inputstr = NULL; /* string to be processed by external program */
-	DEFiRet;
-
-	if(pWrkrData-&gt;pData-&gt;inputProp == INPUT_MSG) {
-		inputstr = getMSG(pMsg);
-		lenWrite = getMSGLen(pMsg);
-		bFreeInputstr = 0;
-	} else if(pWrkrData-&gt;pData-&gt;inputProp == INPUT_RAWMSG) {
-		getRawMsg(pMsg, (uchar**)&amp;inputstr, &amp;lenWrite);
-		bFreeInputstr = 0;
-	} else  {
-		inputstr = msgGetJSONMESG(pMsg);
-		lenWrite = strlen((const char*)inputstr);
-	}
-
-	writeOffset = 0;
-	do {
-		DBGPRINTF("mmexternal: writing to prog (fd %d, offset %d): %s\n",
-			  pWrkrData-&gt;fdPipeOut, (int) writeOffset, inputstr);
-		i_iov = 0;
-		if(writeOffset &lt; lenWrite) {
-			iov[0].iov_base = (char*)inputstr+writeOffset;
-			iov[0].iov_len = lenWrite - writeOffset;
-			++i_iov;
-		}
-		iov[i_iov].iov_base = (void*)"\n";
-		iov[i_iov].iov_len = 1;
-		lenWritten = writev(pWrkrData-&gt;fdPipeOut, iov, i_iov+1);
-		if(lenWritten == -1) {
-			switch(errno) {
-			case EPIPE:
-				LogMsg(0, RS_RET_ERR_WRITE_PIPE, LOG_WARNING,
-						"mmexternal: program '%s' (pid %ld) terminated; will be restarted",
-						pWrkrData-&gt;pData-&gt;szBinary, (long) pWrkrData-&gt;pid);
-				CHKiRet(cleanup(pWrkrData));
-				CHKiRet(tryRestart(pWrkrData));
-				writeOffset = 0;
-				break;
-			default:
-				LogError(errno, RS_RET_ERR_WRITE_PIPE, "mmexternal: error sending message to program");
-				ABORT_FINALIZE(RS_RET_ERR_WRITE_PIPE);
-				break;
-			}
-		} else {
-			writeOffset += lenWritten;
-		}
-	} while(lenWritten != lenWrite+1);
-
-	processProgramReply(pWrkrData, pMsg);
-
-finalize_it:
-	/* we need to free json input strings, only. All others point to memory
-	 * inside the msg object, which is destroyed when the msg is destroyed.
-	 */
-	if(bFreeInputstr) {
-		free((void*)inputstr);
-	}
-	RETiRet;
-}
-
-
-BEGINdoAction_NoStrings
-	smsg_t **ppMsg = (smsg_t **) pMsgData;
-	smsg_t *pMsg = ppMsg[0];
-	instanceData *pData;
-CODESTARTdoAction
-	pData = pWrkrData-&gt;pData;
-	if(pData-&gt;bForceSingleInst)
-		pthread_mutex_lock(&amp;pData-&gt;mut);
-	if(pWrkrData-&gt;bIsRunning == 0) {
-		openPipe(pWrkrData);
-	}
-
-	iRet = callExtProg(pWrkrData, pMsg);
-
-	if(iRet != RS_RET_OK)
-		iRet = RS_RET_SUSPENDED;
-	if(pData-&gt;bForceSingleInst)
-		pthread_mutex_unlock(&amp;pData-&gt;mut);
-ENDdoAction
-
-
-static void
-setInstParamDefaults(instanceData *pData)
-{
-	pData-&gt;szBinary = NULL;
-	pData-&gt;aParams = NULL;
-	pData-&gt;outputFileName = NULL;
-	pData-&gt;iParams = 0;
-	pData-&gt;bForceSingleInst = 0;
-}
-
-
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	int i;
-	const char *cstr = NULL;
-CODESTARTnewActInst
-	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	CHKiRet(createInstance(&amp;pData));
-	setInstParamDefaults(pData);
-
-	CODE_STD_STRING_REQUESTnewActInst(1)
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(actpblk.descr[i].name, "binary")) {
-			CHKiRet(split_binary_parameters(&amp;pData-&gt;szBinary, &amp;pData-&gt;aParams, &amp;pData-&gt;iParams,
-				pvals[i].val.d.estr));
-		} else if(!strcmp(actpblk.descr[i].name, "output")) {
-			pData-&gt;outputFileName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "forcesingleinstance")) {
-			pData-&gt;bForceSingleInst = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "interface.input")) {
-			cstr = es_str2cstr(pvals[i].val.d.estr, NULL);
-			if(!strcmp(cstr, "msg"))
-				pData-&gt;inputProp = INPUT_MSG;
-			else if(!strcmp(cstr, "rawmsg"))
-				pData-&gt;inputProp = INPUT_RAWMSG;
-			else if(!strcmp(cstr, "fulljson"))
-				pData-&gt;inputProp = INPUT_JSON;
-			else {
-				LogError(0, RS_RET_INVLD_INTERFACE_INPUT,
-					"mmexternal: invalid interface.input parameter '%s'",
-					cstr);
-				ABORT_FINALIZE(RS_RET_INVLD_INTERFACE_INPUT);
-			}
-		} else {
-			DBGPRINTF("mmexternal: program error, non-handled param '%s'\n", actpblk.descr[i].name);
-		}
-	}
-
-	CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
-	DBGPRINTF("mmexternal: bForceSingleInst %d\n", pData-&gt;bForceSingleInst);
-	DBGPRINTF("mmexternal: interface.input '%s', mode %d\n", cstr, pData-&gt;inputProp);
-CODE_STD_FINALIZERnewActInst
-	free((void*)cstr);
-	cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-
-NO_LEGACY_CONF_parseSelectorAct
-
-
-BEGINmodExit
-CODESTARTmodExit
-	free(cs.szBinary);
-	cs.szBinary = NULL;
-ENDmodExit
-
-
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_OMOD_QUERIES
-CODEqueryEtryPt_STD_OMOD8_QUERIES
-CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES
-CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-ENDqueryEtryPt
-
-BEGINmodInit()
-CODESTARTmodInit
-INITLegCnfVars
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
-CODEmodInit_QueryRegCFSLineHdlr
-CODEmodInit_QueryRegCFSLineHdlr
-ENDmodInit
+1 #include "config.h"
+2 #include &lt;stdio.h&gt;
+3 #include &lt;stdarg.h&gt;
+4 #include &lt;stdlib.h&gt;
+5 #include &lt;string.h&gt;
+6 #include &lt;assert.h&gt;
+7 #include &lt;signal.h&gt;
+8 #include &lt;errno.h&gt;
+9 #include &lt;unistd.h&gt;
+10 #include &lt;fcntl.h&gt;
+11 #include &lt;sys/wait.h&gt;
+12 #include &lt;sys/uio.h&gt;
+13 #include "rsyslog.h"
+14 #include "conf.h"
+15 #include "syslogd-types.h"
+16 #include "srUtils.h"
+17 #include "module-template.h"
+18 #include "msg.h"
+19 #include "errmsg.h"
+20 #include "cfsysline.h"
+21 #include "glbl.h"
+22 #include "rsconf.h"
+23 MODULE_TYPE_OUTPUT
+24 MODULE_TYPE_NOKEEP
+25 MODULE_CNFNAME("mmexternal")
+26 DEF_OMOD_STATIC_DATA
+27 typedef struct _instanceData {
+28 	int bForceSingleInst;		int inputProp;		#define	INPUT_MSG 0
+29 #define	INPUT_RAWMSG 1
+30 #define INPUT_JSON 2
+31 	uchar *outputFileName;		pthread_mutex_t mut;	} instanceData;
+32 typedef struct wrkrInstanceData {
+33 	instanceData *pData;
+34 	pid_t pid;			int fdOutput;			int fdPipeOut;			int fdPipeIn;			int bIsRunning;			char *respBuf;			int maxLenRespBuf;		int lenRespBuf;			int idxRespBuf;		} wrkrInstanceData_t;
+35 typedef struct configSettings_s {
+36 	uchar *szBinary;	} configSettings_t;
+37 static configSettings_t cs;
+38 <a name="0"></a>
+39 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>static struct cnfparamdescr actpdescr[] = {
+40 	{ "binary", eCmdHdlrString, CNFPARAM_REQUIRED },
+41 	{ "interface.input", eCmdHdlrString, 0 },
+42 	{ "output", eCmdHdlrString, 0 },
+43 	{ "forcesingleinstance", eCmdHdlrBinary, 0 }
+44 };
+45 static struct cnfparamblk actpblk =
+46 	{ CNFPARAMBLK_VERSION,
+47 	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+48 	  actpdescr
+49 	};</b></font>
+50 BEGINinitConfVars		CODESTARTinitConfVars
+51 	cs.szBinary = NULL;	ENDinitConfVars
+52 BEGINcreateInstance
+53 CODESTARTcreateInstance
+54 	pData-&gt;inputProp = INPUT_MSG;
+55 	pthread_mutex_init(&amp;pData-&gt;mut, NULL);
+56 ENDcreateInstance
+57 BEGINcreateWrkrInstance
+58 CODESTARTcreateWrkrInstance
+59 	pWrkrData-&gt;fdPipeIn = -1;
+60 	pWrkrData-&gt;fdPipeOut = -1;
+61 	pWrkrData-&gt;fdOutput = -1;
+62 	pWrkrData-&gt;bIsRunning = 0;
+63 	pWrkrData-&gt;respBuf = NULL;
+64 	pWrkrData-&gt;maxLenRespBuf = 0;
+65 	pWrkrData-&gt;lenRespBuf = 0;
+66 	pWrkrData-&gt;idxRespBuf = 0;
+67 ENDcreateWrkrInstance
+68 BEGINisCompatibleWithFeature
+69 CODESTARTisCompatibleWithFeature
+70 	if(eFeat == sFEATURERepeatedMsgReduction)
+71 		iRet = RS_RET_OK;
+72 ENDisCompatibleWithFeature
+73 BEGINfreeInstance
+74 	int i;
+75 CODESTARTfreeInstance
+76 	pthread_mutex_destroy(&amp;pData-&gt;mut);
+77 	free(pData-&gt;szBinary);
+78 	free(pData-&gt;outputFileName);
+79 	if(pData-&gt;aParams != NULL) {
+80 		for (i = 0; i &lt; pData-&gt;iParams; i++) {
+81 			free(pData-&gt;aParams[i]);
+82 		}
+83 		free(pData-&gt;aParams);
+84 	}
+85 ENDfreeInstance
+86 BEGINfreeWrkrInstance
+87 CODESTARTfreeWrkrInstance
+88 	free(pWrkrData-&gt;respBuf);
+89 ENDfreeWrkrInstance
+90 BEGINdbgPrintInstInfo
+91 CODESTARTdbgPrintInstInfo
+92 ENDdbgPrintInstInfo
+93 BEGINtryResume
+94 CODESTARTtryResume
+95 ENDtryResume
+96 static void
+97 writeOutputDebug(wrkrInstanceData_t *__restrict__ const pWrkrData,
+98 	const char *__restrict__ const buf,
+99 	const ssize_t lenBuf)
+100 {
+101 	char errStr[1024];
+102 	ssize_t r;
+103 	if(pWrkrData-&gt;pData-&gt;outputFileName == NULL)
+104 		goto done;
+105 	if(pWrkrData-&gt;fdOutput == -1) {
+106 		pWrkrData-&gt;fdOutput = open((char*)pWrkrData-&gt;pData-&gt;outputFileName,
+107 				       O_WRONLY | O_APPEND | O_CREAT, 0600);
+108 		if(pWrkrData-&gt;fdOutput == -1) {
+109 			DBGPRINTF("mmexternal: error opening output file %s: %s\n",
+110 				   pWrkrData-&gt;pData-&gt;outputFileName,
+111 				   rs_strerror_r(errno, errStr, sizeof(errStr)));
+112 			goto done;
+113 		}
+114 	}
+115 	r = write(pWrkrData-&gt;fdOutput, buf, (size_t) lenBuf);
+116 	if(r != lenBuf) {
+117 		DBGPRINTF("mmexternal: problem writing output file %s: bytes "
+118 			  "requested %lld, written %lld, msg: %s\n",
+119 			   pWrkrData-&gt;pData-&gt;outputFileName, (long long) lenBuf, (long long) r,
+120 			   rs_strerror_r(errno, errStr, sizeof(errStr)));
+121 	}
+122 done:	return;
+123 }
+124 static void
+125 processProgramReply(wrkrInstanceData_t *__restrict__ const pWrkrData, smsg_t *const pMsg)
+126 {
+127 	rsRetVal iRet;
+128 	char errStr[1024];
+129 	ssize_t r;
+130 	int numCharsRead;
+131 	char *newptr;
+132 	numCharsRead = 0;
+133 	do {
+134 		if(pWrkrData-&gt;maxLenRespBuf &lt; numCharsRead + 256) { 			pWrkrData-&gt;maxLenRespBuf += 4096;
+135 			if((newptr = realloc(pWrkrData-&gt;respBuf, pWrkrData-&gt;maxLenRespBuf)) == NULL) {
+136 				DBGPRINTF("mmexternal: error realloc responseBuf: %s\n",
+137 					   rs_strerror_r(errno, errStr, sizeof(errStr)));
+138 				strcpy(pWrkrData-&gt;respBuf, "{}\n");
+139 				numCharsRead = 3;
+140 				break;
+141 			}
+142 			pWrkrData-&gt;respBuf = newptr;
+143 		}
+144 		r = read(pWrkrData-&gt;fdPipeIn, pWrkrData-&gt;respBuf+numCharsRead,
+145 			 pWrkrData-&gt;maxLenRespBuf-numCharsRead-1);
+146 		if(r &gt; 0) {
+147 			numCharsRead += r;
+148 			pWrkrData-&gt;respBuf[numCharsRead] = '\0'; 		} else {
+149 			strcpy(pWrkrData-&gt;respBuf, "{}\n");
+150 			numCharsRead = 3;
+151 		}
+152 		if(Debug &amp;&amp; r == -1) {
+153 			DBGPRINTF("mmexternal: error reading from external program: %s\n",
+154 				   rs_strerror_r(errno, errStr, sizeof(errStr)));
+155 		}
+156 	} while(pWrkrData-&gt;respBuf[numCharsRead-1] != '\n');
+157 	writeOutputDebug(pWrkrData, pWrkrData-&gt;respBuf, numCharsRead);
+158 	pWrkrData-&gt;respBuf[numCharsRead-1] = '\0';
+159 	iRet = MsgSetPropsViaJSON(pMsg, (uchar*)pWrkrData-&gt;respBuf);
+160 	if(iRet != RS_RET_OK) {
+161 		LogError(0, iRet, "mmexternal: invalid reply '%s' from program '%s'",
+162 				pWrkrData-&gt;respBuf, pWrkrData-&gt;pData-&gt;szBinary);
+163 	}
+164 	return;
+165 }
+166 static void __attribute__((noreturn))
+167 execBinary(wrkrInstanceData_t *pWrkrData, const int fdStdin, const int fdStdOutErr)
+168 {
+169 	int i;
+170 	struct sigaction sigAct;
+171 	sigset_t set;
+172 	char *newenviron[] = { NULL };
+173 	if(dup2(fdStdin, STDIN_FILENO) == -1) {
+174 		perror("mmexternal: dup() stdin failed\n");
+175 	}
+176 	if(dup2(fdStdOutErr, STDOUT_FILENO) == -1) {
+177 		perror("mmexternal: dup() stdout failed\n");
+178 	}
+179 	if(dup2(fdStdOutErr, STDERR_FILENO) == -1) {
+180 		perror("mmexternal: dup() stderr failed\n");
+181 	}
+182 #	ifndef VALGRIND 	for(i = 3 ; i &lt;= 65535 ; ++i)
+183 		close(i);
+184 #	endif
+185 	memset(&amp;sigAct, 0, sizeof(sigAct));
+186 	sigemptyset(&amp;sigAct.sa_mask);
+187 	sigAct.sa_handler = SIG_DFL;
+188 	for(i = 1 ; i &lt; NSIG ; ++i)
+189 		sigaction(i, &amp;sigAct, NULL);
+190 	sigAct.sa_handler = SIG_IGN;
+191 	sigaction(SIGINT, &amp;sigAct, NULL);
+192 	sigemptyset(&amp;set);
+193 	sigprocmask(SIG_SETMASK, &amp;set, NULL);
+194 	alarm(0);
+195 	execve((char*)pWrkrData-&gt;pData-&gt;szBinary, pWrkrData-&gt;pData-&gt;aParams, newenviron);
+196 	char errstr[1024];
+197 	char errbuf[2048];
+198 	rs_strerror_r(errno, errstr, sizeof(errstr));
+199 	errstr[sizeof(errstr)-1] = '\0';
+200 	const size_t lenbuf = snprintf(errbuf, sizeof(errbuf),
+201 		"mmexternal: failed to execute binary '%s': %s\n",
+202 		  pWrkrData-&gt;pData-&gt;szBinary, errstr);
+203 	errbuf[sizeof(errbuf)-1] = '\0';
+204 	if(write(2, errbuf, lenbuf) != (ssize_t) lenbuf) {
+205 		exit(2);
+206 	}
+207 	exit(1);
+208 }
+209 static rsRetVal
+210 openPipe(wrkrInstanceData_t *pWrkrData)
+211 {
+212 	int pipestdin[2];
+213 	int pipestdout[2];
+214 	pid_t cpid;
+215 	DEFiRet;
+216 	if(pipe(pipestdin) == -1) {
+217 		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
+218 	}
+219 	if(pipe(pipestdout) == -1) {
+220 		ABORT_FINALIZE(RS_RET_ERR_CREAT_PIPE);
+221 	}
+222 	DBGPRINTF("mmexternal: executing program '%s' with '%d' parameters\n",
+223 		  pWrkrData-&gt;pData-&gt;szBinary, pWrkrData-&gt;pData-&gt;iParams);
+224 	assert(pWrkrData-&gt;pData-&gt;szBinary != NULL);
+225 	assert(pWrkrData-&gt;pData-&gt;aParams != NULL);
+226 	cpid = fork();
+227 	if(cpid == -1) {
+228 		ABORT_FINALIZE(RS_RET_ERR_FORK);
+229 	}
+230 	pWrkrData-&gt;pid = cpid;
+231 	if(cpid == 0) {
+232 		close(pipestdin[1]); 		close(pipestdout[0]); 		execBinary(pWrkrData, pipestdin[0], pipestdout[1]);
+233 	}
+234 	DBGPRINTF("mmexternal: child has pid %d\n", (int) cpid);
+235 	pWrkrData-&gt;fdPipeIn = dup(pipestdout[0]);
+236 	close(pipestdin[0]);
+237 	close(pipestdout[1]);
+238 	pWrkrData-&gt;pid = cpid;
+239 	pWrkrData-&gt;fdPipeOut = pipestdin[1];
+240 	pWrkrData-&gt;bIsRunning = 1;
+241 finalize_it:
+242 	RETiRet;
+243 }
+244 static rsRetVal
+245 cleanup(wrkrInstanceData_t *pWrkrData)
+246 {
+247 	int status;
+248 	int ret;
+249 	DEFiRet;
+250 	assert(pWrkrData-&gt;bIsRunning == 1);
+251 	ret = waitpid(pWrkrData-&gt;pid, &amp;status, 0);
+252 	if(ret == pWrkrData-&gt;pid) {
+253 		glblReportChildProcessExit(runConf, pWrkrData-&gt;pData-&gt;szBinary, pWrkrData-&gt;pid, status);
+254 	}
+255 	if(pWrkrData-&gt;fdOutput != -1) {
+256 		close(pWrkrData-&gt;fdOutput);
+257 		pWrkrData-&gt;fdOutput = -1;
+258 	}
+259 	if(pWrkrData-&gt;fdPipeIn != -1) {
+260 		close(pWrkrData-&gt;fdPipeIn);
+261 		pWrkrData-&gt;fdPipeIn = -1;
+262 	}
+263 	if(pWrkrData-&gt;fdPipeOut != -1) {
+264 		close(pWrkrData-&gt;fdPipeOut);
+265 		pWrkrData-&gt;fdPipeOut = -1;
+266 	}
+267 	pWrkrData-&gt;bIsRunning = 0;
+268 	pWrkrData-&gt;bIsRunning = 0;
+269 	RETiRet;
+270 }
+271 static rsRetVal
+272 tryRestart(wrkrInstanceData_t *pWrkrData)
+273 {
+274 	DEFiRet;
+275 	assert(pWrkrData-&gt;bIsRunning == 0);
+276 	iRet = openPipe(pWrkrData);
+277 	RETiRet;
+278 }
+279 static rsRetVal
+280 callExtProg(wrkrInstanceData_t *__restrict__ const pWrkrData, smsg_t *__restrict__ const pMsg)
+281 {
+282 	int lenWritten;
+283 	int lenWrite;
+284 	int writeOffset;
+285 	int i_iov;
+286 	struct iovec iov[2];
+287 	int bFreeInputstr = 1; 	const uchar *inputstr = NULL; 	DEFiRet;
+288 	if(pWrkrData-&gt;pData-&gt;inputProp == INPUT_MSG) {
+289 		inputstr = getMSG(pMsg);
+290 		lenWrite = getMSGLen(pMsg);
+291 		bFreeInputstr = 0;
+292 	} else if(pWrkrData-&gt;pData-&gt;inputProp == INPUT_RAWMSG) {
+293 		getRawMsg(pMsg, (uchar**)&amp;inputstr, &amp;lenWrite);
+294 		bFreeInputstr = 0;
+295 	} else  {
+296 		inputstr = msgGetJSONMESG(pMsg);
+297 		lenWrite = strlen((const char*)inputstr);
+298 	}
+299 	writeOffset = 0;
+300 	do {
+301 		DBGPRINTF("mmexternal: writing to prog (fd %d, offset %d): %s\n",
+302 			  pWrkrData-&gt;fdPipeOut, (int) writeOffset, inputstr);
+303 		i_iov = 0;
+304 		if(writeOffset &lt; lenWrite) {
+305 			iov[0].iov_base = (char*)inputstr+writeOffset;
+306 			iov[0].iov_len = lenWrite - writeOffset;
+307 			++i_iov;
+308 		}
+309 		iov[i_iov].iov_base = (void*)"\n";
+310 		iov[i_iov].iov_len = 1;
+311 		lenWritten = writev(pWrkrData-&gt;fdPipeOut, iov, i_iov+1);
+312 		if(lenWritten == -1) {
+313 			switch(errno) {
+314 			case EPIPE:
+315 				LogMsg(0, RS_RET_ERR_WRITE_PIPE, LOG_WARNING,
+316 						"mmexternal: program '%s' (pid %ld) terminated; will be restarted",
+317 						pWrkrData-&gt;pData-&gt;szBinary, (long) pWrkrData-&gt;pid);
+318 				CHKiRet(cleanup(pWrkrData));
+319 				CHKiRet(tryRestart(pWrkrData));
+320 				writeOffset = 0;
+321 				break;
+322 			default:
+323 				LogError(errno, RS_RET_ERR_WRITE_PIPE, "mmexternal: error sending message to program");
+324 				ABORT_FINALIZE(RS_RET_ERR_WRITE_PIPE);
+325 				break;
+326 			}
+327 		} else {
+328 			writeOffset += lenWritten;
+329 		}
+330 	} while(lenWritten != lenWrite+1);
+331 	processProgramReply(pWrkrData, pMsg);
+332 finalize_it:
+333 	if(bFreeInputstr) {
+334 		free((void*)inputstr);
+335 	}
+336 	RETiRet;
+337 }
+338 BEGINdoAction_NoStrings
+339 	smsg_t **ppMsg = (smsg_t **) pMsgData;
+340 	smsg_t *pMsg = ppMsg[0];
+341 	instanceData *pData;
+342 CODESTARTdoAction
+343 	pData = pWrkrData-&gt;pData;
+344 	if(pData-&gt;bForceSingleInst)
+345 		pthread_mutex_lock(&amp;pData-&gt;mut);
+346 	if(pWrkrData-&gt;bIsRunning == 0) {
+347 		openPipe(pWrkrData);
+348 	}
+349 	iRet = callExtProg(pWrkrData, pMsg);
+350 	if(iRet != RS_RET_OK)
+351 		iRet = RS_RET_SUSPENDED;
+352 	if(pData-&gt;bForceSingleInst)
+353 		pthread_mutex_unlock(&amp;pData-&gt;mut);
+354 ENDdoAction
+355 static void
+356 setInstParamDefaults(instanceData *pData)
+357 {
+358 	pData-&gt;szBinary = NULL;
+359 	pData-&gt;aParams = NULL;
+360 	pData-&gt;outputFileName = NULL;
+361 	pData-&gt;iParams = 0;
+362 	pData-&gt;bForceSingleInst = 0;
+363 }
+364 BEGINnewActInst
+365 	struct cnfparamvals *pvals;
+366 	int i;
+367 	const char *cstr = NULL;
+368 CODESTARTnewActInst
+369 	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
+370 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+371 	}
+372 	CHKiRet(createInstance(&amp;pData));
+373 	setInstParamDefaults(pData);
+374 	CODE_STD_STRING_REQUESTnewActInst(1)
+375 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+376 		if(!pvals[i].bUsed)
+377 			continue;
+378 		if(!strcmp(actpblk.descr[i].name, "binary")) {
+379 			CHKiRet(split_binary_parameters(&amp;pData-&gt;szBinary, &amp;pData-&gt;aParams, &amp;pData-&gt;iParams,
+380 				pvals[i].val.d.estr));
+381 		} else if(!strcmp(actpblk.descr[i].name, "output")) {
+382 			pData-&gt;outputFileName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+383 		} else if(!strcmp(actpblk.descr[i].name, "forcesingleinstance")) {
+384 			pData-&gt;bForceSingleInst = (int) pvals[i].val.d.n;
+385 		} else if(!strcmp(actpblk.descr[i].name, "interface.input")) {
+386 			cstr = es_str2cstr(pvals[i].val.d.estr, NULL);
+387 			if(!strcmp(cstr, "msg"))
+388 				pData-&gt;inputProp = INPUT_MSG;
+389 			else if(!strcmp(cstr, "rawmsg"))
+390 				pData-&gt;inputProp = INPUT_RAWMSG;
+391 			else if(!strcmp(cstr, "fulljson"))
+392 				pData-&gt;inputProp = INPUT_JSON;
+393 			else {
+394 				LogError(0, RS_RET_INVLD_INTERFACE_INPUT,
+395 					"mmexternal: invalid interface.input parameter '%s'",
+396 					cstr);
+397 				ABORT_FINALIZE(RS_RET_INVLD_INTERFACE_INPUT);
+398 			}
+399 		} else {
+400 			DBGPRINTF("mmexternal: program error, non-handled param '%s'\n", actpblk.descr[i].name);
+401 		}
+402 	}
+403 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
+404 	DBGPRINTF("mmexternal: bForceSingleInst %d\n", pData-&gt;bForceSingleInst);
+405 	DBGPRINTF("mmexternal: interface.input '%s', mode %d\n", cstr, pData-&gt;inputProp);
+406 CODE_STD_FINALIZERnewActInst
+407 	free((void*)cstr);
+408 	cnfparamvalsDestruct(pvals, &amp;actpblk);
+409 ENDnewActInst
+410 NO_LEGACY_CONF_parseSelectorAct
+411 BEGINmodExit
+412 CODESTARTmodExit
+413 	free(cs.szBinary);
+414 	cs.szBinary = NULL;
+415 ENDmodExit
+416 BEGINqueryEtryPt
+417 CODESTARTqueryEtryPt
+418 CODEqueryEtryPt_STD_OMOD_QUERIES
+419 CODEqueryEtryPt_STD_OMOD8_QUERIES
+420 CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES
+421 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+422 ENDqueryEtryPt
+423 BEGINmodInit()
+424 CODESTARTmodInit
+425 INITLegCnfVars
+426 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+427 CODEmodInit_QueryRegCFSLineHdlr
+428 ENDmodInit
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -664,658 +480,561 @@ ENDmodInit
 </h3>
 <hr/>
 <pre>
-/* omczmq.c
- * Copyright (C) 2016 Brian Knox
- * Copyright (C) 2014 Rainer Gerhards
- *
- * Author: Brian Knox &lt;bknox@digitalocean.com&gt;
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-
-#include "config.h"
-#include "rsyslog.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;unistd.h&gt;
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "template.h"
-#include "module-template.h"
-#include "errmsg.h"
-#include "cfsysline.h"
-#include &lt;czmq.h&gt;
-
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("omczmq")
-
-DEF_OMOD_STATIC_DATA
-<a name="0"></a>
-static pthread_mutex_t mutDoAct = PTHREAD_MUTEX_INITIALIZER;
-
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>static struct cnfparamdescr modpdescr[] = {
-	{ "authenticator", eCmdHdlrBinary, 0 },
-	{ "authtype", eCmdHdlrGetWord, 0 },
-	{ "clientcertpath", eCmdHdlrGetWord, 0 },
-	{ "servercertpath", eCmdHdlrGetWord, 0 }
-};
-
-static struct cnfparamblk modpblk = {
-	CNFPARAMBLK_VERSION,
-	sizeof(modpdescr)/sizeof(struct cnfparamdescr),
-	modpdescr
-};</b></font>
-
-struct modConfData_s {
-	rsconf_t *pConf;
-	uchar *tplName;
-	int authenticator;
-	char *authType;
-	char *serverCertPath;
-	char *clientCertPath;
-};
-
-static modConfData_t *runModConf = NULL;
-static zactor_t *authActor;
-
-typedef struct _instanceData {
-	zsock_t *sock;
-	bool serverish;
-	int sendTimeout;
-	zlist_t *topics;
-	bool sendError;
-	char *sockEndpoints;
-	int sockType;
-	int sendHWM;
-#if(CZMQ_VERSION_MAJOR &gt;= 4 &amp;&amp; ZMQ_VERSION_MAJOR &gt;=4 &amp;&amp; ZMQ_VERSION_MINOR &gt;=2)
-	int heartbeatIvl;
-	int heartbeatTimeout;
-	int heartbeatTTL;
-	int connectTimeout;
-#endif
-	uchar *tplName;
-	sbool topicFrame;
-	sbool dynaTopic;
-} instanceData;
-
-typedef struct wrkrInstanceData {
-	instanceData *pData;
-} wrkrInstanceData_t;
-
-static struct cnfparamdescr actpdescr[] = {
-	{ "endpoints", eCmdHdlrGetWord, 1 },
-	{ "socktype", eCmdHdlrGetWord, 1 },
-	{ "sendhwm", eCmdHdlrGetWord, 0 },
-#if(CZMQ_VERSION_MAJOR &gt;= 4 &amp;&amp; ZMQ_VERSION_MAJOR &gt;=4 &amp;&amp; ZMQ_VERSION_MINOR &gt;=2)
-	{ "heartbeatttl", eCmdHdlrGetWord, 0},
-	{ "heartbeativl", eCmdHdlrGetWord, 0},
-	{ "heartbeattimeout", eCmdHdlrGetWord, 0},
-	{ "connecttimeout", eCmdHdlrGetWord, 0},
-#endif
-	{ "sendtimeout", eCmdHdlrGetWord, 0 },
-	{ "template", eCmdHdlrGetWord, 0 },
-	{ "topics", eCmdHdlrGetWord, 0 },
-	{ "topicframe", eCmdHdlrGetWord, 0},
-	{ "dynatopic", eCmdHdlrBinary, 0 }
-};
-
-static struct cnfparamblk actpblk = {
-	CNFPARAMBLK_VERSION,
-	sizeof(actpdescr) / sizeof(struct cnfparamdescr),
-	actpdescr
-};
-
-static rsRetVal initCZMQ(instanceData* pData) {
-	DEFiRet;
-	int rc;
-	putenv((char*)"ZSYS_SIGHANDLER=false");
-	pData-&gt;sock = zsock_new(pData-&gt;sockType);
-	if(!pData-&gt;sock) {
-		LogError(0, RS_RET_NO_ERRCODE,
-				"omczmq: new socket failed for endpoints: %s",
-				pData-&gt;sockEndpoints);
-		ABORT_FINALIZE(RS_RET_SUSPENDED);
-	}
-
-	zsock_set_sndtimeo(pData-&gt;sock, pData-&gt;sendTimeout);
-
-#if(CZMQ_VERSION_MAJOR &gt;= 4 &amp;&amp; ZMQ_VERSION_MAJOR &gt;=4 &amp;&amp; ZMQ_VERSION_MINOR &gt;=2)
-	if(pData-&gt;heartbeatIvl &gt; 0 &amp;&amp; pData-&gt;heartbeatTimeout &gt; 0 &amp;&amp; pData-&gt;heartbeatTTL &gt; 0) {
-		zsock_set_heartbeat_ivl(pData-&gt;sock, pData-&gt;heartbeatIvl);
-		zsock_set_heartbeat_timeout(pData-&gt;sock, pData-&gt;heartbeatTimeout);
-		zsock_set_heartbeat_ttl(pData-&gt;sock, pData-&gt;heartbeatTTL);
-	}
-#endif
-
-	if(runModConf-&gt;authType) {
-		if (!strcmp(runModConf-&gt;authType, "CURVESERVER")) {
-			zcert_t *serverCert = zcert_load(runModConf-&gt;serverCertPath);
-			if(!serverCert) {
-				LogError(0, NO_ERRCODE, "could not load cert %s",
-					runModConf-&gt;serverCertPath);
-				ABORT_FINALIZE(RS_RET_ERR);
-			}
-			zsock_set_zap_domain(pData-&gt;sock, "global");
-			zsock_set_curve_server(pData-&gt;sock, 1);
-			zcert_apply(serverCert, pData-&gt;sock);
-			zcert_destroy(&amp;serverCert);
-		}
-		else if(!strcmp(runModConf-&gt;authType, "CURVECLIENT")) {
-			zcert_t *serverCert = zcert_load(runModConf-&gt;serverCertPath);
-			if(!serverCert) {
-				LogError(0, NO_ERRCODE, "could not load cert %s",
-					runModConf-&gt;serverCertPath);
-				ABORT_FINALIZE(RS_RET_ERR);
-			}
-			const char *server_key = zcert_public_txt(serverCert);
-			zcert_destroy(&amp;serverCert);
-			zsock_set_curve_serverkey(pData-&gt;sock, server_key);
-
-			zcert_t *clientCert = zcert_load(runModConf-&gt;clientCertPath);
-			if(!clientCert) {
-				LogError(0, NO_ERRCODE, "could not load cert %s",
-					runModConf-&gt;clientCertPath);
-				ABORT_FINALIZE(RS_RET_ERR);
-			}
-
-			zcert_apply(clientCert, pData-&gt;sock);
-			zcert_destroy(&amp;clientCert);
-		}
-	}
-
-	switch(pData-&gt;sockType) {
-		case ZMQ_PUB:
-#if defined(ZMQ_RADIO)
-		case ZMQ_RADIO:
-#endif
-			pData-&gt;serverish = true;
-			break;
-		case ZMQ_PUSH:
-#if defined(ZMQ_SCATTER)
-		case ZMQ_SCATTER:
-#endif
-		case ZMQ_DEALER:
-#if defined(ZMQ_CLIENT)
-		case ZMQ_CLIENT:
-#endif
-			pData-&gt;serverish = false;
-			break;
-	}
-
-	rc = zsock_attach(pData-&gt;sock, pData-&gt;sockEndpoints, pData-&gt;serverish);
-	if(rc == -1) {
-		LogError(0, NO_ERRCODE, "zsock_attach to %s failed",
-				pData-&gt;sockEndpoints);
-		ABORT_FINALIZE(RS_RET_SUSPENDED);
-	}
-
-finalize_it:
-	RETiRet;
-}
-
-static rsRetVal outputCZMQ(uchar** ppString, instanceData* pData) {
-	DEFiRet;
-
-	if(NULL == pData-&gt;sock) {
-		CHKiRet(initCZMQ(pData));
-	}
-
-	/* if we are using a PUB (or RADIO) socket and we have a topic list then we
-	 * need some special care and attention */
-#if defined(ZMQ_RADIO)
-	DBGPRINTF("omczmq: ZMQ_RADIO is defined...\n");
-	if((pData-&gt;sockType == ZMQ_PUB || pData-&gt;sockType == ZMQ_RADIO) &amp;&amp; pData-&gt;topics) {
-#else
-	DBGPRINTF("omczmq: ZMQ_RADIO is NOT defined...\n");
-	if(pData-&gt;sockType == ZMQ_PUB &amp;&amp; pData-&gt;topics) {
-#endif
-		int templateIndex = 1;
-		const char *topic = (const char *)zlist_first(pData-&gt;topics);
-		while(topic) {
-			int rc;
-			/* if dynaTopic is true, the topic is constructed by rsyslog
-			 * by applying the supplied template to the message properties */
-			if(pData-&gt;dynaTopic)
-				topic = (const char*)ppString[templateIndex];
-
-			if (pData-&gt;sockType == ZMQ_PUB) {
-				/* if topicFrame is true, send the topic as a separate zmq frame */
-				if(pData-&gt;topicFrame) {
-					rc = zstr_sendx(pData-&gt;sock, topic, (char*)ppString[0], NULL);
-				}
-
-				/* if topicFrame is false, concatenate the topic with the
-				 * message in the same frame */
-				else {
-					rc = zstr_sendf(pData-&gt;sock, "%s%s", topic, (char*)ppString[0]);
-				}
-
-				/* if we have a send error notify rsyslog */
-				if(rc != 0) {
-					pData-&gt;sendError = true;
-					ABORT_FINALIZE(RS_RET_SUSPENDED);
-				}
-			}
-#if defined(ZMQ_RADIO)
-			else if(pData-&gt;sockType == ZMQ_RADIO) {
-				DBGPRINTF("omczmq: sending on RADIO socket...\n");
-				zframe_t *frame = zframe_from((char*)ppString[0]);
-				if (!frame) {
-					DBGPRINTF("omczmq: failed to create frame...\n");
-					pData-&gt;sendError = true;
-					ABORT_FINALIZE(RS_RET_SUSPENDED);
-				}
-				rc = zframe_set_group(frame, topic);
-				if (rc != 0) {
-					DBGPRINTF("omczmq: failed to set group '%d'...\n", rc);
-					pData-&gt;sendError = true;
-					ABORT_FINALIZE(RS_RET_SUSPENDED);
-				}
-				DBGPRINTF("omczmq: set RADIO group to '%s'\n", topic);
-				rc = zframe_send(&amp;frame, pData-&gt;sock, 0);
-				if(rc != 0) {
-					pData-&gt;sendError = true;
-					ABORT_FINALIZE(RS_RET_SUSPENDED);
-				}
-			}
-#endif
-
-			/* get the next topic from the list, and increment
-			 * our topic index */
-			topic = zlist_next(pData-&gt;topics);
-			templateIndex++;
-		}
-	}
-
-	/* we aren't a PUB socket and we don't have a topic list - this means
-	 * we can just send the message using the rsyslog template */
-	else {
-		int rc = zstr_send(pData-&gt;sock, (char*)ppString[0]);
-		if(rc != 0) {
-			pData-&gt;sendError = true;
-			DBGPRINTF("omczmq: send error: %d", rc);
-			ABORT_FINALIZE(RS_RET_SUSPENDED);
-		}
-	}
-finalize_it:
-	RETiRet;
-}
-
-static inline void
-setInstParamDefaults(instanceData* pData) {
-	pData-&gt;sockEndpoints = NULL;
-	pData-&gt;sock = NULL;
-	pData-&gt;sendError = false;
-	pData-&gt;serverish = false;
-	pData-&gt;tplName = NULL;
-	pData-&gt;sockType = -1;
-	pData-&gt;sendTimeout = -1;
-	pData-&gt;topics = NULL;
-	pData-&gt;topicFrame = false;
-#if(CZMQ_VERSION_MAJOR &gt;= 4 &amp;&amp; ZMQ_VERSION_MAJOR &gt;=4 &amp;&amp; ZMQ_VERSION_MINOR &gt;=2)
-	pData-&gt;heartbeatIvl = 0;
-	pData-&gt;heartbeatTimeout = 0;
-	pData-&gt;heartbeatTTL = 0;
-#endif
-}
-
-
-BEGINcreateInstance
-CODESTARTcreateInstance
-ENDcreateInstance
-
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-ENDcreateWrkrInstance
-
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURERepeatedMsgReduction) {
-		iRet = RS_RET_OK;
-	}
-ENDisCompatibleWithFeature
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-ENDdbgPrintInstInfo
-
-BEGINfreeInstance
-CODESTARTfreeInstance
-	zlist_destroy(&amp;pData-&gt;topics);
-	zsock_destroy(&amp;pData-&gt;sock);
-	free(pData-&gt;sockEndpoints);
-	free(pData-&gt;tplName);
-ENDfreeInstance
-
-
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-ENDfreeWrkrInstance
-
-BEGINtryResume
-	instanceData *pData;
-CODESTARTtryResume
-	pthread_mutex_lock(&amp;mutDoAct);
-	pData = pWrkrData-&gt;pData;
-	DBGPRINTF("omczmq: trying to resume...\n");
-	zsock_destroy(&amp;pData-&gt;sock);
-	iRet = initCZMQ(pData);
-	pthread_mutex_unlock(&amp;mutDoAct);
-ENDtryResume
-
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	runModConf = pModConf;
-	runModConf-&gt;pConf = pConf;
-	runModConf-&gt;authenticator = 0;
-	runModConf-&gt;authType = NULL;
-	runModConf-&gt;serverCertPath = NULL;
-	runModConf-&gt;clientCertPath = NULL;
-ENDbeginCnfLoad
-
-BEGINcheckCnf
-CODESTARTcheckCnf
-ENDcheckCnf
-
-BEGINactivateCnf
-CODESTARTactivateCnf
-	runModConf = pModConf;
-	if(runModConf-&gt;authenticator == 1) {
-		if(!authActor) {
-			DBGPRINTF("omczmq: starting authActor\n");
-			authActor = zactor_new(zauth, NULL);
-			if(!strcmp(runModConf-&gt;clientCertPath, "*")) {
-				zstr_sendx(authActor, "CURVE", CURVE_ALLOW_ANY, NULL);
-			}
-			else {
-				zstr_sendx(authActor, "CURVE", runModConf-&gt;clientCertPath, NULL);
-			}
-			zsock_wait(authActor);
-		}
-	}
-ENDactivateCnf
-
-BEGINfreeCnf
-CODESTARTfreeCnf
-	free(pModConf-&gt;tplName);
-	free(pModConf-&gt;authType);
-	free(pModConf-&gt;serverCertPath);
-	free(pModConf-&gt;clientCertPath);
-	DBGPRINTF("omczmq: stopping authActor\n");
-	zactor_destroy(&amp;authActor);
-ENDfreeCnf
-
-BEGINsetModCnf
-	struct cnfparamvals *pvals = NULL;
-	int i;
-CODESTARTsetModCnf
-	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
-	if (pvals == NULL) {
-		LogError(0, RS_RET_MISSING_CNFPARAMS, "error processing module");
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	for (i=0; i&lt;modpblk.nParams; ++i) {
-		if(!pvals[i].bUsed) {
-			DBGPRINTF("omczmq: pvals[i].bUSed continuing\n");
-			continue;
-		}
-		if(!strcmp(modpblk.descr[i].name, "authenticator")) {
-			runModConf-&gt;authenticator = (int)pvals[i].val.d.n;
-		}
-		else if(!strcmp(modpblk.descr[i].name, "authtype")) {
-			runModConf-&gt;authType = es_str2cstr(pvals[i].val.d.estr, NULL);
-			DBGPRINTF("omczmq: authtype set to %s\n", runModConf-&gt;authType);
-		}
-		else if(!strcmp(modpblk.descr[i].name, "servercertpath")) {
-			runModConf-&gt;serverCertPath = es_str2cstr(pvals[i].val.d.estr, NULL);
-			DBGPRINTF("omczmq: serverCertPath set to %s\n", runModConf-&gt;serverCertPath);
-		}
-		else if(!strcmp(modpblk.descr[i].name, "clientcertpath")) {
-			runModConf-&gt;clientCertPath = es_str2cstr(pvals[i].val.d.estr, NULL);
-			DBGPRINTF("omczmq: clientCertPath set to %s\n", runModConf-&gt;clientCertPath);
-		}
-		else {
-			LogError(0, RS_RET_INVALID_PARAMS,
-						"omczmq: config error, unknown "
-						"param %s in setModCnf\n",
-						modpblk.descr[i].name);
-		}
-	}
-
-	DBGPRINTF("omczmq: authenticator set to %d\n", runModConf-&gt;authenticator);
-	DBGPRINTF("omczmq: authType set to %s\n", runModConf-&gt;authType);
-	DBGPRINTF("omczmq: serverCertPath set to %s\n", runModConf-&gt;serverCertPath);
-	DBGPRINTF("omczmq: clientCertPath set to %s\n", runModConf-&gt;clientCertPath);
-
-finalize_it:
-		if(pvals != NULL)
-			cnfparamvalsDestruct(pvals, &amp;modpblk);
-ENDsetModCnf
-
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-	runModConf = NULL;
-ENDendCnfLoad
-
-
-BEGINdoAction
-	instanceData *pData;
-CODESTARTdoAction
-	pthread_mutex_lock(&amp;mutDoAct);
-	pData = pWrkrData-&gt;pData;
-	iRet = outputCZMQ(ppString, pData);
-	pthread_mutex_unlock(&amp;mutDoAct);
-ENDdoAction
-
-
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	int i;
-	int iNumTpls;
-CODESTARTnewActInst
-	if ((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	CHKiRet(createInstance(&amp;pData));
-	setInstParamDefaults(pData);
-
-	for(i = 0; i &lt; actpblk.nParams; ++i) {
-		if(!pvals[i].bUsed) {
-			continue;
-		}
-
-		if(!strcmp(actpblk.descr[i].name, "endpoints")) {
-			pData-&gt;sockEndpoints = es_str2cstr(pvals[i].val.d.estr, NULL);
-			DBGPRINTF("omczmq: sockEndPoints set to '%s'\n", pData-&gt;sockEndpoints);
-		}
-		else if(!strcmp(actpblk.descr[i].name, "template")) {
-			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			DBGPRINTF("omczmq: template set to '%s'\n", pData-&gt;tplName);
-		}
-		else if(!strcmp(actpblk.descr[i].name, "dynatopic")) {
-			pData-&gt;dynaTopic = pvals[i].val.d.n;
-			DBGPRINTF("omczmq: dynaTopic set to %s\n", pData-&gt;dynaTopic ? "true" : "false");
-		}
-		else if(!strcmp(actpblk.descr[i].name, "sendtimeout")) {
-			pData-&gt;sendTimeout = atoi(es_str2cstr(pvals[i].val.d.estr, NULL));
-			DBGPRINTF("omczmq: sendTimeout set to %d\n", pData-&gt;sendTimeout);
-		}
-		else if(!strcmp(actpblk.descr[i].name, "sendhwm")) {
-			pData-&gt;sendTimeout = atoi(es_str2cstr(pvals[i].val.d.estr, NULL));
-			DBGPRINTF("omczmq: sendHWM set to %d\n", pData-&gt;sendHWM);
-		}
-#if (CZMQ_VERSION_MAJOR &gt;= 4 &amp;&amp; ZMQ_VERSION_MAJOR &gt;=4 &amp;&amp; ZMQ_VERSION_MINOR &gt;=2)
-		else if(!strcmp(actpblk.descr[i].name, "heartbeativl")) {
-			pData-&gt;heartbeatIvl = atoi(es_str2cstr(pvals[i].val.d.estr, NULL));
-			DBGPRINTF("omczmq: heartbeatbeatIvl set to %d\n", pData-&gt;heartbeatIvl);
-		}
-		else if(!strcmp(actpblk.descr[i].name, "heartbeattimeout")) {
-			pData-&gt;heartbeatTimeout = atoi(es_str2cstr(pvals[i].val.d.estr, NULL));
-			DBGPRINTF("omczmq: heartbeatTimeout set to %d\n", pData-&gt;heartbeatTimeout);
-		}
-		else if(!strcmp(actpblk.descr[i].name, "heartbeatttl")) {
-			pData-&gt;heartbeatTimeout = atoi(es_str2cstr(pvals[i].val.d.estr, NULL));
-			DBGPRINTF("omczmq: heartbeatTTL set to %d\n", pData-&gt;heartbeatTTL);
-		}
-#endif
-		else if(!strcmp(actpblk.descr[i].name, "socktype")){
-			char *stringType = es_str2cstr(pvals[i].val.d.estr, NULL);
-			if(stringType != NULL){
-				if(!strcmp("PUB", stringType)) {
-					pData-&gt;sockType = ZMQ_PUB;
-					DBGPRINTF("omczmq: sockType set to ZMQ_PUB\n");
-				}
-#if defined(ZMQ_RADIO)
-				else if(!strcmp("RADIO", stringType)) {
-					pData-&gt;sockType = ZMQ_RADIO;
-					DBGPRINTF("omczmq: sockType set to ZMQ_RADIO\n");
-				}
-#endif
-				else if(!strcmp("PUSH", stringType)) {
-					pData-&gt;sockType = ZMQ_PUSH;
-					DBGPRINTF("omczmq: sockType set to ZMQ_PUSH\n");
-				}
-#if defined(ZMQ_SCATTER)
-				else if(!strcmp("SCATTER", stringType)) {
-					pData-&gt;sockType = ZMQ_SCATTER;
-					DBGPRINTF("omczmq: sockType set to ZMQ_SCATTER\n");
-				}
-#endif
-				else if(!strcmp("DEALER", stringType)) {
-					pData-&gt;sockType = ZMQ_DEALER;
-					DBGPRINTF("omczmq: sockType set to ZMQ_DEALER\n");
-				}
-#if defined(ZMQ_CLIENT)
-				else if(!strcmp("CLIENT", stringType)) {
-					pData-&gt;sockType = ZMQ_CLIENT;
-					DBGPRINTF("omczmq: sockType set to ZMQ_CLIENT\n");
-				}
-#endif
-				free(stringType);
-			}
-			else{
-				LogError(0, RS_RET_OUT_OF_MEMORY,
-						"omczmq: out of memory");
-				ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-			}
-		}
-		else if(!strcmp(actpblk.descr[i].name, "topicframe")) {
-			pData-&gt;topicFrame = pvals[i].val.d.n;
-			DBGPRINTF("omczmq: topicFrame set to %s\n", pData-&gt;topicFrame ? "true" : "false");
-		}
-		else if(!strcmp(actpblk.descr[i].name, "topics")) {
-			pData-&gt;topics = zlist_new();
-			char *topics = es_str2cstr(pvals[i].val.d.estr, NULL);
-			DBGPRINTF("omczmq: topics set to %s\n", topics);
-			char *topics_org = topics;
-			char topic[256];
-			if(topics == NULL){
-				LogError(0, RS_RET_OUT_OF_MEMORY,
-					"out of memory");
-				ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-			}
-
-			while(*topics) {
-				char *delimiter = strchr(topics, ',');
-				if (!delimiter) {
-					delimiter = topics + strlen(topics);
-				}
-				memcpy (topic, topics, delimiter - topics);
-				topic[delimiter-topics] = 0;
-				char *current_topic = strdup(topic);
-				zlist_append (pData-&gt;topics, current_topic);
-				if(*delimiter == 0) {
-					break;
-				}
-				topics = delimiter + 1;
-			}
-			free(topics_org);
-
-		}
-		else {
-			LogError(0, NO_ERRCODE,
-					"omczmq: config error - '%s' is not a valid option",
-					actpblk.descr[i].name);
-			ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-		}
-	}
-
-	iNumTpls = 1;
-	if (pData-&gt;dynaTopic) {
-		iNumTpls = zlist_size (pData-&gt;topics) + iNumTpls;
-	}
-	CODE_STD_STRING_REQUESTnewActInst(iNumTpls)
-	
-	if (pData-&gt;tplName == NULL) {
-		CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup("RSYSLOG_ForwardFormat"),
-					OMSR_NO_RQD_TPL_OPTS));
-	}
-	else {
-		CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)pData-&gt;tplName, OMSR_NO_RQD_TPL_OPTS));
-	}
-
-	i = 1;
-	if (pData-&gt;dynaTopic) {
-		char *topic = zlist_first(pData-&gt;topics);
-		while (topic) {
-			CHKiRet(OMSRsetEntry(*ppOMSR, i, (uchar*)strdup(topic), OMSR_NO_RQD_TPL_OPTS));
-			i++;
-			topic = zlist_next(pData-&gt;topics);
-		}
-	}
-
-	CODE_STD_FINALIZERnewActInst
-	cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-
-BEGINinitConfVars
-CODESTARTinitConfVars
-ENDinitConfVars
-
-NO_LEGACY_CONF_parseSelectorAct
-
-BEGINmodExit
-CODESTARTmodExit
-ENDmodExit
-
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-	CODEqueryEtryPt_STD_OMOD_QUERIES
-	CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-	CODEqueryEtryPt_STD_CONF2_QUERIES
-	CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
-	CODEqueryEtryPt_STD_OMOD8_QUERIES
-ENDqueryEtryPt
-
-
-BEGINmodInit()
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION;
-CODEmodInit_QueryRegCFSLineHdlr
-	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
-	DBGPRINTF("omczmq: module compiled with rsyslog version %s.\n", VERSION);
-
-	INITLegCnfVars
-ENDmodInit
+1 #include "config.h"
+2 #include "rsyslog.h"
+3 #include &lt;stdio.h&gt;
+4 #include &lt;stdarg.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;assert.h&gt;
+8 #include &lt;signal.h&gt;
+9 #include &lt;errno.h&gt;
+10 #include &lt;unistd.h&gt;
+11 #include "conf.h"
+12 #include "syslogd-types.h"
+13 #include "srUtils.h"
+14 #include "template.h"
+15 #include "module-template.h"
+16 #include "errmsg.h"
+17 #include "cfsysline.h"
+18 #include &lt;czmq.h&gt;
+19 MODULE_TYPE_OUTPUT
+20 MODULE_TYPE_NOKEEP
+21 MODULE_CNFNAME("omczmq")
+22 DEF_OMOD_STATIC_DATA
+23 <a name="0"></a>
+24 static pthread_mutex_t mutDoAct = PTHREAD_MUTEX_INITIALIZER;
+25 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>static struct cnfparamdescr modpdescr[] = {
+26 	{ "authenticator", eCmdHdlrBinary, 0 },
+27 	{ "authtype", eCmdHdlrGetWord, 0 },
+28 	{ "clientcertpath", eCmdHdlrGetWord, 0 },
+29 	{ "servercertpath", eCmdHdlrGetWord, 0 }
+30 };
+31 static struct cnfparamblk modpblk = {
+32 	CNFPARAMBLK_VERSION,
+33 	sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+34 	modpdescr
+35 };</b></font>
+36 struct modConfData_s {
+37 	rsconf_t *pConf;
+38 	uchar *tplName;
+39 	int authenticator;
+40 	char *authType;
+41 	char *serverCertPath;
+42 	char *clientCertPath;
+43 };
+44 static modConfData_t *runModConf = NULL;
+45 static zactor_t *authActor;
+46 typedef struct _instanceData {
+47 	zsock_t *sock;
+48 	bool serverish;
+49 	int sendTimeout;
+50 	zlist_t *topics;
+51 	bool sendError;
+52 	char *sockEndpoints;
+53 	int sockType;
+54 	int sendHWM;
+55 #if(CZMQ_VERSION_MAJOR &gt;= 4 &amp;&amp; ZMQ_VERSION_MAJOR &gt;=4 &amp;&amp; ZMQ_VERSION_MINOR &gt;=2)
+56 	int heartbeatIvl;
+57 	int heartbeatTimeout;
+58 	int heartbeatTTL;
+59 	int connectTimeout;
+60 #endif
+61 	uchar *tplName;
+62 	sbool topicFrame;
+63 	sbool dynaTopic;
+64 } instanceData;
+65 typedef struct wrkrInstanceData {
+66 	instanceData *pData;
+67 } wrkrInstanceData_t;
+68 static struct cnfparamdescr actpdescr[] = {
+69 	{ "endpoints", eCmdHdlrGetWord, 1 },
+70 	{ "socktype", eCmdHdlrGetWord, 1 },
+71 	{ "sendhwm", eCmdHdlrGetWord, 0 },
+72 #if(CZMQ_VERSION_MAJOR &gt;= 4 &amp;&amp; ZMQ_VERSION_MAJOR &gt;=4 &amp;&amp; ZMQ_VERSION_MINOR &gt;=2)
+73 	{ "heartbeatttl", eCmdHdlrGetWord, 0},
+74 	{ "heartbeativl", eCmdHdlrGetWord, 0},
+75 	{ "heartbeattimeout", eCmdHdlrGetWord, 0},
+76 	{ "connecttimeout", eCmdHdlrGetWord, 0},
+77 #endif
+78 	{ "sendtimeout", eCmdHdlrGetWord, 0 },
+79 	{ "template", eCmdHdlrGetWord, 0 },
+80 	{ "topics", eCmdHdlrGetWord, 0 },
+81 	{ "topicframe", eCmdHdlrGetWord, 0},
+82 	{ "dynatopic", eCmdHdlrBinary, 0 }
+83 };
+84 static struct cnfparamblk actpblk = {
+85 	CNFPARAMBLK_VERSION,
+86 	sizeof(actpdescr) / sizeof(struct cnfparamdescr),
+87 	actpdescr
+88 };
+89 static rsRetVal initCZMQ(instanceData* pData) {
+90 	DEFiRet;
+91 	int rc;
+92 	putenv((char*)"ZSYS_SIGHANDLER=false");
+93 	pData-&gt;sock = zsock_new(pData-&gt;sockType);
+94 	if(!pData-&gt;sock) {
+95 		LogError(0, RS_RET_NO_ERRCODE,
+96 				"omczmq: new socket failed for endpoints: %s",
+97 				pData-&gt;sockEndpoints);
+98 		ABORT_FINALIZE(RS_RET_SUSPENDED);
+99 	}
+100 	zsock_set_sndtimeo(pData-&gt;sock, pData-&gt;sendTimeout);
+101 #if(CZMQ_VERSION_MAJOR &gt;= 4 &amp;&amp; ZMQ_VERSION_MAJOR &gt;=4 &amp;&amp; ZMQ_VERSION_MINOR &gt;=2)
+102 	if(pData-&gt;heartbeatIvl &gt; 0 &amp;&amp; pData-&gt;heartbeatTimeout &gt; 0 &amp;&amp; pData-&gt;heartbeatTTL &gt; 0) {
+103 		zsock_set_heartbeat_ivl(pData-&gt;sock, pData-&gt;heartbeatIvl);
+104 		zsock_set_heartbeat_timeout(pData-&gt;sock, pData-&gt;heartbeatTimeout);
+105 		zsock_set_heartbeat_ttl(pData-&gt;sock, pData-&gt;heartbeatTTL);
+106 	}
+107 #endif
+108 	if(runModConf-&gt;authType) {
+109 		if (!strcmp(runModConf-&gt;authType, "CURVESERVER")) {
+110 			zcert_t *serverCert = zcert_load(runModConf-&gt;serverCertPath);
+111 			if(!serverCert) {
+112 				LogError(0, NO_ERRCODE, "could not load cert %s",
+113 					runModConf-&gt;serverCertPath);
+114 				ABORT_FINALIZE(RS_RET_ERR);
+115 			}
+116 			zsock_set_zap_domain(pData-&gt;sock, "global");
+117 			zsock_set_curve_server(pData-&gt;sock, 1);
+118 			zcert_apply(serverCert, pData-&gt;sock);
+119 			zcert_destroy(&amp;serverCert);
+120 		}
+121 		else if(!strcmp(runModConf-&gt;authType, "CURVECLIENT")) {
+122 			zcert_t *serverCert = zcert_load(runModConf-&gt;serverCertPath);
+123 			if(!serverCert) {
+124 				LogError(0, NO_ERRCODE, "could not load cert %s",
+125 					runModConf-&gt;serverCertPath);
+126 				ABORT_FINALIZE(RS_RET_ERR);
+127 			}
+128 			const char *server_key = zcert_public_txt(serverCert);
+129 			zcert_destroy(&amp;serverCert);
+130 			zsock_set_curve_serverkey(pData-&gt;sock, server_key);
+131 			zcert_t *clientCert = zcert_load(runModConf-&gt;clientCertPath);
+132 			if(!clientCert) {
+133 				LogError(0, NO_ERRCODE, "could not load cert %s",
+134 					runModConf-&gt;clientCertPath);
+135 				ABORT_FINALIZE(RS_RET_ERR);
+136 			}
+137 			zcert_apply(clientCert, pData-&gt;sock);
+138 			zcert_destroy(&amp;clientCert);
+139 		}
+140 	}
+141 	switch(pData-&gt;sockType) {
+142 		case ZMQ_PUB:
+143 #if defined(ZMQ_RADIO)
+144 		case ZMQ_RADIO:
+145 #endif
+146 			pData-&gt;serverish = true;
+147 			break;
+148 		case ZMQ_PUSH:
+149 #if defined(ZMQ_SCATTER)
+150 		case ZMQ_SCATTER:
+151 #endif
+152 		case ZMQ_DEALER:
+153 #if defined(ZMQ_CLIENT)
+154 		case ZMQ_CLIENT:
+155 #endif
+156 			pData-&gt;serverish = false;
+157 			break;
+158 	}
+159 	rc = zsock_attach(pData-&gt;sock, pData-&gt;sockEndpoints, pData-&gt;serverish);
+160 	if(rc == -1) {
+161 		LogError(0, NO_ERRCODE, "zsock_attach to %s failed",
+162 				pData-&gt;sockEndpoints);
+163 		ABORT_FINALIZE(RS_RET_SUSPENDED);
+164 	}
+165 finalize_it:
+166 	RETiRet;
+167 }
+168 static rsRetVal outputCZMQ(uchar** ppString, instanceData* pData) {
+169 	DEFiRet;
+170 	if(NULL == pData-&gt;sock) {
+171 		CHKiRet(initCZMQ(pData));
+172 	}
+173 #if defined(ZMQ_RADIO)
+174 	DBGPRINTF("omczmq: ZMQ_RADIO is defined...\n");
+175 	if((pData-&gt;sockType == ZMQ_PUB || pData-&gt;sockType == ZMQ_RADIO) &amp;&amp; pData-&gt;topics) {
+176 #else
+177 	DBGPRINTF("omczmq: ZMQ_RADIO is NOT defined...\n");
+178 	if(pData-&gt;sockType == ZMQ_PUB &amp;&amp; pData-&gt;topics) {
+179 #endif
+180 		int templateIndex = 1;
+181 		const char *topic = (const char *)zlist_first(pData-&gt;topics);
+182 		while(topic) {
+183 			int rc;
+184 			if(pData-&gt;dynaTopic)
+185 				topic = (const char*)ppString[templateIndex];
+186 			if (pData-&gt;sockType == ZMQ_PUB) {
+187 				if(pData-&gt;topicFrame) {
+188 					rc = zstr_sendx(pData-&gt;sock, topic, (char*)ppString[0], NULL);
+189 				}
+190 				else {
+191 					rc = zstr_sendf(pData-&gt;sock, "%s%s", topic, (char*)ppString[0]);
+192 				}
+193 				if(rc != 0) {
+194 					pData-&gt;sendError = true;
+195 					ABORT_FINALIZE(RS_RET_SUSPENDED);
+196 				}
+197 			}
+198 #if defined(ZMQ_RADIO)
+199 			else if(pData-&gt;sockType == ZMQ_RADIO) {
+200 				DBGPRINTF("omczmq: sending on RADIO socket...\n");
+201 				zframe_t *frame = zframe_from((char*)ppString[0]);
+202 				if (!frame) {
+203 					DBGPRINTF("omczmq: failed to create frame...\n");
+204 					pData-&gt;sendError = true;
+205 					ABORT_FINALIZE(RS_RET_SUSPENDED);
+206 				}
+207 				rc = zframe_set_group(frame, topic);
+208 				if (rc != 0) {
+209 					DBGPRINTF("omczmq: failed to set group '%d'...\n", rc);
+210 					pData-&gt;sendError = true;
+211 					ABORT_FINALIZE(RS_RET_SUSPENDED);
+212 				}
+213 				DBGPRINTF("omczmq: set RADIO group to '%s'\n", topic);
+214 				rc = zframe_send(&amp;frame, pData-&gt;sock, 0);
+215 				if(rc != 0) {
+216 					pData-&gt;sendError = true;
+217 					ABORT_FINALIZE(RS_RET_SUSPENDED);
+218 				}
+219 			}
+220 #endif
+221 			topic = zlist_next(pData-&gt;topics);
+222 			templateIndex++;
+223 		}
+224 	}
+225 	else {
+226 		int rc = zstr_send(pData-&gt;sock, (char*)ppString[0]);
+227 		if(rc != 0) {
+228 			pData-&gt;sendError = true;
+229 			DBGPRINTF("omczmq: send error: %d", rc);
+230 			ABORT_FINALIZE(RS_RET_SUSPENDED);
+231 		}
+232 	}
+233 finalize_it:
+234 	RETiRet;
+235 }
+236 static inline void
+237 setInstParamDefaults(instanceData* pData) {
+238 	pData-&gt;sockEndpoints = NULL;
+239 	pData-&gt;sock = NULL;
+240 	pData-&gt;sendError = false;
+241 	pData-&gt;serverish = false;
+242 	pData-&gt;tplName = NULL;
+243 	pData-&gt;sockType = -1;
+244 	pData-&gt;sendTimeout = -1;
+245 	pData-&gt;topics = NULL;
+246 	pData-&gt;topicFrame = false;
+247 #if(CZMQ_VERSION_MAJOR &gt;= 4 &amp;&amp; ZMQ_VERSION_MAJOR &gt;=4 &amp;&amp; ZMQ_VERSION_MINOR &gt;=2)
+248 	pData-&gt;heartbeatIvl = 0;
+249 	pData-&gt;heartbeatTimeout = 0;
+250 	pData-&gt;heartbeatTTL = 0;
+251 #endif
+252 }
+253 BEGINcreateInstance
+254 CODESTARTcreateInstance
+255 ENDcreateInstance
+256 BEGINcreateWrkrInstance
+257 CODESTARTcreateWrkrInstance
+258 ENDcreateWrkrInstance
+259 BEGINisCompatibleWithFeature
+260 CODESTARTisCompatibleWithFeature
+261 	if(eFeat == sFEATURERepeatedMsgReduction) {
+262 		iRet = RS_RET_OK;
+263 	}
+264 ENDisCompatibleWithFeature
+265 BEGINdbgPrintInstInfo
+266 CODESTARTdbgPrintInstInfo
+267 ENDdbgPrintInstInfo
+268 BEGINfreeInstance
+269 CODESTARTfreeInstance
+270 	zlist_destroy(&amp;pData-&gt;topics);
+271 	zsock_destroy(&amp;pData-&gt;sock);
+272 	free(pData-&gt;sockEndpoints);
+273 	free(pData-&gt;tplName);
+274 ENDfreeInstance
+275 BEGINfreeWrkrInstance
+276 CODESTARTfreeWrkrInstance
+277 ENDfreeWrkrInstance
+278 BEGINtryResume
+279 	instanceData *pData;
+280 CODESTARTtryResume
+281 	pthread_mutex_lock(&amp;mutDoAct);
+282 	pData = pWrkrData-&gt;pData;
+283 	DBGPRINTF("omczmq: trying to resume...\n");
+284 	zsock_destroy(&amp;pData-&gt;sock);
+285 	iRet = initCZMQ(pData);
+286 	pthread_mutex_unlock(&amp;mutDoAct);
+287 ENDtryResume
+288 BEGINbeginCnfLoad
+289 CODESTARTbeginCnfLoad
+290 	runModConf = pModConf;
+291 	runModConf-&gt;pConf = pConf;
+292 	runModConf-&gt;authenticator = 0;
+293 	runModConf-&gt;authType = NULL;
+294 	runModConf-&gt;serverCertPath = NULL;
+295 	runModConf-&gt;clientCertPath = NULL;
+296 ENDbeginCnfLoad
+297 BEGINcheckCnf
+298 CODESTARTcheckCnf
+299 ENDcheckCnf
+300 BEGINactivateCnf
+301 CODESTARTactivateCnf
+302 	runModConf = pModConf;
+303 	if(runModConf-&gt;authenticator == 1) {
+304 		if(!authActor) {
+305 			DBGPRINTF("omczmq: starting authActor\n");
+306 			authActor = zactor_new(zauth, NULL);
+307 			if(!strcmp(runModConf-&gt;clientCertPath, "*")) {
+308 				zstr_sendx(authActor, "CURVE", CURVE_ALLOW_ANY, NULL);
+309 			}
+310 			else {
+311 				zstr_sendx(authActor, "CURVE", runModConf-&gt;clientCertPath, NULL);
+312 			}
+313 			zsock_wait(authActor);
+314 		}
+315 	}
+316 ENDactivateCnf
+317 BEGINfreeCnf
+318 CODESTARTfreeCnf
+319 	free(pModConf-&gt;tplName);
+320 	free(pModConf-&gt;authType);
+321 	free(pModConf-&gt;serverCertPath);
+322 	free(pModConf-&gt;clientCertPath);
+323 	DBGPRINTF("omczmq: stopping authActor\n");
+324 	zactor_destroy(&amp;authActor);
+325 ENDfreeCnf
+326 BEGINsetModCnf
+327 	struct cnfparamvals *pvals = NULL;
+328 	int i;
+329 CODESTARTsetModCnf
+330 	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
+331 	if (pvals == NULL) {
+332 		LogError(0, RS_RET_MISSING_CNFPARAMS, "error processing module");
+333 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+334 	}
+335 	for (i=0; i&lt;modpblk.nParams; ++i) {
+336 		if(!pvals[i].bUsed) {
+337 			DBGPRINTF("omczmq: pvals[i].bUSed continuing\n");
+338 			continue;
+339 		}
+340 		if(!strcmp(modpblk.descr[i].name, "authenticator")) {
+341 			runModConf-&gt;authenticator = (int)pvals[i].val.d.n;
+342 		}
+343 		else if(!strcmp(modpblk.descr[i].name, "authtype")) {
+344 			runModConf-&gt;authType = es_str2cstr(pvals[i].val.d.estr, NULL);
+345 			DBGPRINTF("omczmq: authtype set to %s\n", runModConf-&gt;authType);
+346 		}
+347 		else if(!strcmp(modpblk.descr[i].name, "servercertpath")) {
+348 			runModConf-&gt;serverCertPath = es_str2cstr(pvals[i].val.d.estr, NULL);
+349 			DBGPRINTF("omczmq: serverCertPath set to %s\n", runModConf-&gt;serverCertPath);
+350 		}
+351 		else if(!strcmp(modpblk.descr[i].name, "clientcertpath")) {
+352 			runModConf-&gt;clientCertPath = es_str2cstr(pvals[i].val.d.estr, NULL);
+353 			DBGPRINTF("omczmq: clientCertPath set to %s\n", runModConf-&gt;clientCertPath);
+354 		}
+355 		else {
+356 			LogError(0, RS_RET_INVALID_PARAMS,
+357 						"omczmq: config error, unknown "
+358 						"param %s in setModCnf\n",
+359 						modpblk.descr[i].name);
+360 		}
+361 	}
+362 	DBGPRINTF("omczmq: authenticator set to %d\n", runModConf-&gt;authenticator);
+363 	DBGPRINTF("omczmq: authType set to %s\n", runModConf-&gt;authType);
+364 	DBGPRINTF("omczmq: serverCertPath set to %s\n", runModConf-&gt;serverCertPath);
+365 	DBGPRINTF("omczmq: clientCertPath set to %s\n", runModConf-&gt;clientCertPath);
+366 finalize_it:
+367 		if(pvals != NULL)
+368 			cnfparamvalsDestruct(pvals, &amp;modpblk);
+369 ENDsetModCnf
+370 BEGINendCnfLoad
+371 CODESTARTendCnfLoad
+372 	runModConf = NULL;
+373 ENDendCnfLoad
+374 BEGINdoAction
+375 	instanceData *pData;
+376 CODESTARTdoAction
+377 	pthread_mutex_lock(&amp;mutDoAct);
+378 	pData = pWrkrData-&gt;pData;
+379 	iRet = outputCZMQ(ppString, pData);
+380 	pthread_mutex_unlock(&amp;mutDoAct);
+381 ENDdoAction
+382 BEGINnewActInst
+383 	struct cnfparamvals *pvals;
+384 	int i;
+385 	int iNumTpls;
+386 CODESTARTnewActInst
+387 	if ((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
+388 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+389 	}
+390 	CHKiRet(createInstance(&amp;pData));
+391 	setInstParamDefaults(pData);
+392 	for(i = 0; i &lt; actpblk.nParams; ++i) {
+393 		if(!pvals[i].bUsed) {
+394 			continue;
+395 		}
+396 		if(!strcmp(actpblk.descr[i].name, "endpoints")) {
+397 			pData-&gt;sockEndpoints = es_str2cstr(pvals[i].val.d.estr, NULL);
+398 			DBGPRINTF("omczmq: sockEndPoints set to '%s'\n", pData-&gt;sockEndpoints);
+399 		}
+400 		else if(!strcmp(actpblk.descr[i].name, "template")) {
+401 			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+402 			DBGPRINTF("omczmq: template set to '%s'\n", pData-&gt;tplName);
+403 		}
+404 		else if(!strcmp(actpblk.descr[i].name, "dynatopic")) {
+405 			pData-&gt;dynaTopic = pvals[i].val.d.n;
+406 			DBGPRINTF("omczmq: dynaTopic set to %s\n", pData-&gt;dynaTopic ? "true" : "false");
+407 		}
+408 		else if(!strcmp(actpblk.descr[i].name, "sendtimeout")) {
+409 			pData-&gt;sendTimeout = atoi(es_str2cstr(pvals[i].val.d.estr, NULL));
+410 			DBGPRINTF("omczmq: sendTimeout set to %d\n", pData-&gt;sendTimeout);
+411 		}
+412 		else if(!strcmp(actpblk.descr[i].name, "sendhwm")) {
+413 			pData-&gt;sendTimeout = atoi(es_str2cstr(pvals[i].val.d.estr, NULL));
+414 			DBGPRINTF("omczmq: sendHWM set to %d\n", pData-&gt;sendHWM);
+415 		}
+416 #if (CZMQ_VERSION_MAJOR &gt;= 4 &amp;&amp; ZMQ_VERSION_MAJOR &gt;=4 &amp;&amp; ZMQ_VERSION_MINOR &gt;=2)
+417 		else if(!strcmp(actpblk.descr[i].name, "heartbeativl")) {
+418 			pData-&gt;heartbeatIvl = atoi(es_str2cstr(pvals[i].val.d.estr, NULL));
+419 			DBGPRINTF("omczmq: heartbeatbeatIvl set to %d\n", pData-&gt;heartbeatIvl);
+420 		}
+421 		else if(!strcmp(actpblk.descr[i].name, "heartbeattimeout")) {
+422 			pData-&gt;heartbeatTimeout = atoi(es_str2cstr(pvals[i].val.d.estr, NULL));
+423 			DBGPRINTF("omczmq: heartbeatTimeout set to %d\n", pData-&gt;heartbeatTimeout);
+424 		}
+425 		else if(!strcmp(actpblk.descr[i].name, "heartbeatttl")) {
+426 			pData-&gt;heartbeatTimeout = atoi(es_str2cstr(pvals[i].val.d.estr, NULL));
+427 			DBGPRINTF("omczmq: heartbeatTTL set to %d\n", pData-&gt;heartbeatTTL);
+428 		}
+429 #endif
+430 		else if(!strcmp(actpblk.descr[i].name, "socktype")){
+431 			char *stringType = es_str2cstr(pvals[i].val.d.estr, NULL);
+432 			if(stringType != NULL){
+433 				if(!strcmp("PUB", stringType)) {
+434 					pData-&gt;sockType = ZMQ_PUB;
+435 					DBGPRINTF("omczmq: sockType set to ZMQ_PUB\n");
+436 				}
+437 #if defined(ZMQ_RADIO)
+438 				else if(!strcmp("RADIO", stringType)) {
+439 					pData-&gt;sockType = ZMQ_RADIO;
+440 					DBGPRINTF("omczmq: sockType set to ZMQ_RADIO\n");
+441 				}
+442 #endif
+443 				else if(!strcmp("PUSH", stringType)) {
+444 					pData-&gt;sockType = ZMQ_PUSH;
+445 					DBGPRINTF("omczmq: sockType set to ZMQ_PUSH\n");
+446 				}
+447 #if defined(ZMQ_SCATTER)
+448 				else if(!strcmp("SCATTER", stringType)) {
+449 					pData-&gt;sockType = ZMQ_SCATTER;
+450 					DBGPRINTF("omczmq: sockType set to ZMQ_SCATTER\n");
+451 				}
+452 #endif
+453 				else if(!strcmp("DEALER", stringType)) {
+454 					pData-&gt;sockType = ZMQ_DEALER;
+455 					DBGPRINTF("omczmq: sockType set to ZMQ_DEALER\n");
+456 				}
+457 #if defined(ZMQ_CLIENT)
+458 				else if(!strcmp("CLIENT", stringType)) {
+459 					pData-&gt;sockType = ZMQ_CLIENT;
+460 					DBGPRINTF("omczmq: sockType set to ZMQ_CLIENT\n");
+461 				}
+462 #endif
+463 				free(stringType);
+464 			}
+465 			else{
+466 				LogError(0, RS_RET_OUT_OF_MEMORY,
+467 						"omczmq: out of memory");
+468 				ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+469 			}
+470 		}
+471 		else if(!strcmp(actpblk.descr[i].name, "topicframe")) {
+472 			pData-&gt;topicFrame = pvals[i].val.d.n;
+473 			DBGPRINTF("omczmq: topicFrame set to %s\n", pData-&gt;topicFrame ? "true" : "false");
+474 		}
+475 		else if(!strcmp(actpblk.descr[i].name, "topics")) {
+476 			pData-&gt;topics = zlist_new();
+477 			char *topics = es_str2cstr(pvals[i].val.d.estr, NULL);
+478 			DBGPRINTF("omczmq: topics set to %s\n", topics);
+479 			char *topics_org = topics;
+480 			char topic[256];
+481 			if(topics == NULL){
+482 				LogError(0, RS_RET_OUT_OF_MEMORY,
+483 					"out of memory");
+484 				ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+485 			}
+486 			while(*topics) {
+487 				char *delimiter = strchr(topics, ',');
+488 				if (!delimiter) {
+489 					delimiter = topics + strlen(topics);
+490 				}
+491 				memcpy (topic, topics, delimiter - topics);
+492 				topic[delimiter-topics] = 0;
+493 				char *current_topic = strdup(topic);
+494 				zlist_append (pData-&gt;topics, current_topic);
+495 				if(*delimiter == 0) {
+496 					break;
+497 				}
+498 				topics = delimiter + 1;
+499 			}
+500 			free(topics_org);
+501 		}
+502 		else {
+503 			LogError(0, NO_ERRCODE,
+504 					"omczmq: config error - '%s' is not a valid option",
+505 					actpblk.descr[i].name);
+506 			ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+507 		}
+508 	}
+509 	iNumTpls = 1;
+510 	if (pData-&gt;dynaTopic) {
+511 		iNumTpls = zlist_size (pData-&gt;topics) + iNumTpls;
+512 	}
+513 	CODE_STD_STRING_REQUESTnewActInst(iNumTpls)
+514 	if (pData-&gt;tplName == NULL) {
+515 		CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup("RSYSLOG_ForwardFormat"),
+516 					OMSR_NO_RQD_TPL_OPTS));
+517 	}
+518 	else {
+519 		CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)pData-&gt;tplName, OMSR_NO_RQD_TPL_OPTS));
+520 	}
+521 	i = 1;
+522 	if (pData-&gt;dynaTopic) {
+523 		char *topic = zlist_first(pData-&gt;topics);
+524 		while (topic) {
+525 			CHKiRet(OMSRsetEntry(*ppOMSR, i, (uchar*)strdup(topic), OMSR_NO_RQD_TPL_OPTS));
+526 			i++;
+527 			topic = zlist_next(pData-&gt;topics);
+528 		}
+529 	}
+530 	CODE_STD_FINALIZERnewActInst
+531 	cnfparamvalsDestruct(pvals, &amp;actpblk);
+532 ENDnewActInst
+533 BEGINinitConfVars
+534 CODESTARTinitConfVars
+535 ENDinitConfVars
+536 NO_LEGACY_CONF_parseSelectorAct
+537 BEGINmodExit
+538 CODESTARTmodExit
+539 ENDmodExit
+540 BEGINqueryEtryPt
+541 CODESTARTqueryEtryPt
+542 	CODEqueryEtryPt_STD_OMOD_QUERIES
+543 	CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+544 	CODEqueryEtryPt_STD_CONF2_QUERIES
+545 	CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+546 	CODEqueryEtryPt_STD_OMOD8_QUERIES
+547 ENDqueryEtryPt
+548 BEGINmodInit()
+549 CODESTARTmodInit
+550 	*ipIFVersProvided = CURR_MOD_IF_VERSION;
+551 CODEmodInit_QueryRegCFSLineHdlr
+552 	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
+553 	DBGPRINTF("omczmq: module compiled with rsyslog version %s.\n", VERSION);
+554 	INITLegCnfVars
+555 ENDmodInit
 </pre>
 </div>
 </div>

@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for convi.c &amp; jp2kload.c</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -41,1157 +40,668 @@ Matches for convi.c &amp; jp2kload.c
 </h3>
 <hr/>
 <pre>
-/* convi
- *
- * Copyright: 1990, N. Dessipris.
- *
- * Author: Nicos Dessipris &amp; Kirk Martinez
- * Written on: 29/04/1991
- * Modified on: 19/05/1991
- * 8/7/93 JC
- *      - adapted for partial v2
- *      - memory leaks fixed
- *      - ANSIfied
- * 23/7/93 JC
- *	- inner loop unrolled with a switch - 25% speed-up!
- * 13/12/93 JC
- *	- tiny rounding error removed
- * 7/10/94 JC
- *	- new IM_ARRAY() macro
- *	- various simplifications
- *	- evalend callback added
- * 1/2/95 JC
- *	- use of IM_REGION_ADDR() updated
- *	- output size was incorrect! see comment below
- *	- bug with large non-square matricies fixed too
- *	- uses new im_embed() function
- * 13/7/98 JC
- *	- wierd bug ... im_free_imask is no longer directly called for close
- *	  callback, caused SIGKILL on solaris 2.6 ... linker bug?
- * 9/3/01 JC
- *	- reworked and simplified, about 10% faster
- *	- slightly better range clipping
- * 27/7/01 JC
- *	- reject masks with scale == 0
- * 7/4/04 
- *	- im_conv() now uses im_embed() with edge stretching on the input, not
- *	  the output
- *	- sets Xoffset / Yoffset
- * 11/11/05
- * 	- simpler inner loop avoids gcc4 bug 
- * 7/11/07
- * 	- new evalstart/end callbacks
- * 12/5/08
- * 	- int rounding was +1 too much, argh
- * 	- only rebuild the buffer offsets if bpl changes
- * 5/4/09
- * 	- tiny speedups and cleanups
- * 	- add restrict, though it doesn't seem to help gcc
- * 12/11/09
- * 	- only check for non-zero elements once
- * 	- add mask-all-zero check
- * 	- cleanups
- * 3/2/10
- * 	- gtkdoc
- * 	- more cleanups
- * 23/08/10
- * 	- add a special case for 3x3 masks, about 20% faster
- * 1/10/10
- * 	- support complex (just double the bands)
- * 18/10/10
- * 	- add experimental Orc path
- * 29/10/10
- * 	- use VipsVector
- * 	- get rid of im_convsep(), just call this twice, no longer worth
- * 	  keeping two versions
- * 8/11/10
- * 	- add array tiling
- * 9/5/11
- * 	- argh typo in overflow estimation could cause errors
- * 15/10/11 Nicolas
- * 	- handle offset correctly in seperable convolutions
- * 26/1/16 Lovell Fuller
- * 	- remove Duff for a 25% speedup
- * 23/6/16
- * 	- rewritten as a class
- * 	- new fixed-point vector path, up to 2x faster
- * 2/7/17
- * 	- remove pts for a small speedup
- * 12/10/17
- * 	- fix leak of vectors, thanks MHeimbuc 
- * 14/10/17
- * 	- switch to half-float for vector path
- */
-
-/*
-
-    This file is part of VIPS.
-    
-    VIPS is free software; you can redistribute it and/or modify
-    it under the terms of the GNU Lesser General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Lesser General Public License for more details.
-
-    You should have received a copy of the GNU Lesser General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
-
- */
-
-/*
-
-    These files are distributed with VIPS - http://www.vips.ecs.soton.ac.uk
-
- */
-
-/* 
-#define DEBUG
-#define DEBUG_PIXELS
-#define DEBUG_COMPILE
- */
-
-#ifdef HAVE_CONFIG_H
-#include &lt;config.h&gt;
-#endif /*HAVE_CONFIG_H*/
-#include &lt;vips/intl.h&gt;
-
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;limits.h&gt;
-
-#include &lt;vips/vips.h&gt;
-#include &lt;vips/internal.h&gt;
-
-#include "pconvolution.h"
-
-/* Larger than this and we fall back to C.
- */
-#define MAX_PASS (20)
-
-/* A pass with a vector. 
- */
-typedef struct {
-	int first;		/* The index of the first mask coff we use */
-	int last;		/* The index of the last mask coff we use */
-
-	int r;			/* Set previous result in this var */
-
-        /* The code we generate for this section of the mask. 
-	 */
-        VipsVector *vector;
-} Pass;
-
-typedef struct {
-	VipsConvolution parent_instance;
-
-	int n_point;		/* w * h for our matrix */
-
-	/* We make a smaller version of the mask with the zeros squeezed out.
-	 */
-	int nnz;		/* Number of non-zero mask elements */
-	int *coeff;		/* Array of non-zero mask coefficients */
-	int *coeff_pos;		/* Index of each nnz element in mask-&gt;coeff */
-
-	/* And a half float version for the vector path. mant has the signed
-	 * 8-bit mantissas in [-1, +1), sexp has the exponent shift after the
-	 * mul and before the add, and exp has the final exponent shift before
-	 * write-back.
-	 */
-	int *mant;
-	int sexp;
-	int exp;
-
-	/* The set of passes we need for this mask.
-	 */
-	int n_pass;	
-	Pass pass[MAX_PASS];
-
-	/* Code for the final clip back to 8 bits.
-	 */
-	int r;			
-        VipsVector *vector;
-} VipsConvi;
-
-typedef VipsConvolutionClass VipsConviClass;
-
-G_DEFINE_TYPE( VipsConvi, vips_convi, VIPS_TYPE_CONVOLUTION );
-
-/* Our sequence value.
- */
-typedef struct {
-	VipsConvi *convi;
-	VipsRegion *ir;		/* Input region */
-
-	int *offsets;		/* Offsets for each non-zero matrix element */
-
-	int last_bpl;		/* Avoid recalcing offsets, if we can */
-
-	/* We need a pair of intermediate buffers to keep the results of each
-	 * vector conv pass. 
-	 */
-	short *t1;
-	short *t2;
-} VipsConviSequence;
-
-static void
-vips_convi_compile_free( VipsConvi *convi )
-{
-	int i;
-
-	for( i = 0; i &lt; convi-&gt;n_pass; i++ )
-		VIPS_FREEF( vips_vector_free, convi-&gt;pass[i].vector );
-	convi-&gt;n_pass = 0;
-	VIPS_FREEF( vips_vector_free, convi-&gt;vector );
-}
-
-static void
-vips_convi_dispose( GObject *gobject )
-{
-	VipsConvi *convi = (VipsConvi *) gobject;
-
-#ifdef DEBUG
-	printf( "vips_convi_dispose: " );
-	vips_object_print_name( VIPS_OBJECT( gobject ) );
-	printf( "\n" );
-#endif /*DEBUG*/
-
-	vips_convi_compile_free( convi ); 
-
-	G_OBJECT_CLASS( vips_convi_parent_class )-&gt;dispose( gobject );
-}
-
-/* Free a sequence value.
- */
-static int
-vips_convi_stop( void *vseq, void *a, void *b )
-{
-	VipsConviSequence *seq = (VipsConviSequence *) vseq;
-
-	VIPS_UNREF( seq-&gt;ir );
-	VIPS_FREE( seq-&gt;offsets );
-	VIPS_FREE( seq-&gt;t1 );
-	VIPS_FREE( seq-&gt;t2 );
-
-	return( 0 );
-}
-
-/* Convolution start function.
- */
-static void *
-vips_convi_start( VipsImage *out, void *a, void *b )
-{
-	VipsImage *in = (VipsImage *) a;
-	VipsConvi *convi = (VipsConvi *) b;
-	VipsConviSequence *seq;
-
-	if( !(seq = VIPS_NEW( out, VipsConviSequence )) )
-		return( NULL );
-
-	seq-&gt;convi = convi;
-	seq-&gt;ir = NULL;
-	seq-&gt;offsets = NULL;
-	seq-&gt;last_bpl = -1;
-	seq-&gt;t1 = NULL;
-	seq-&gt;t2 = NULL;
-
-	seq-&gt;ir = vips_region_new( in );
-
-	/* C mode.
-	 */
-	if( convi-&gt;nnz ) {
-		if( !(seq-&gt;offsets = VIPS_ARRAY( NULL, convi-&gt;nnz, int )) ) { 
-			vips_convi_stop( seq, in, convi );
-			return( NULL );
-		}
-	}
-
-	/* Vector mode.
-	 */
-	if( convi-&gt;n_pass ) {
-		seq-&gt;t1 = VIPS_ARRAY( NULL, VIPS_IMAGE_N_ELEMENTS( in ), short );
-		seq-&gt;t2 = VIPS_ARRAY( NULL, VIPS_IMAGE_N_ELEMENTS( in ), short );
-
-		if( !seq-&gt;t1 || 
-			!seq-&gt;t2 ) {
-			vips_convi_stop( seq, in, convi );
-			return( NULL );
-		}
-	}
-
-	return( (void *) seq );
-}
-
-#define TEMP( N, S ) vips_vector_temporary( v, (char *) N, S )
-#define PARAM( N, S ) vips_vector_parameter( v, (char *) N, S )
-#define SCANLINE( N, P, S ) vips_vector_source_scanline( v, (char *) N, P, S )
-#define CONST( N, V, S ) vips_vector_constant( v, (char *) N, V, S )
-#define ASM2( OP, A, B ) vips_vector_asm2( v, (char *) OP, A, B )
-#define ASM3( OP, A, B, C ) vips_vector_asm3( v, (char *) OP, A, B, C )
-
-/* Generate code for a section of the mask. first is the index we start
- * at, we set last to the index of the last one we use before we run 
- * out of intermediates / constants / parameters / sources or mask
- * coefficients.
- *
- * 0 for success, -1 on error.
- */
-static int
-vips_convi_compile_section( VipsConvi *convi, VipsImage *in, Pass *pass )
-{
-	VipsConvolution *convolution = (VipsConvolution *) convi;
-	VipsImage *M = convolution-&gt;M;
-
-	VipsVector *v;
-	int i;
-
-#ifdef DEBUG_COMPILE
-	printf( "starting pass %d\n", pass-&gt;first ); 
-#endif /*DEBUG_COMPILE*/
-
-	pass-&gt;vector = v = vips_vector_new( "convi", 2 );
-
-	/* "r" is the array of sums from the previous pass (if any).
-	 */
-	pass-&gt;r = vips_vector_source_name( v, "r", 2 );
-
-	/* The value we fetch from the image, the accumulated sum.
-	 */
-	TEMP( "value", 2 );
-	TEMP( "valueb", 1 );
-	TEMP( "sum", 2 );
-
-	/* Init the sum. If this is the first pass, it's a constant. If this
-	 * is a later pass, we have to init the sum from the result 
-	 * of the previous pass. 
-	 */
-	if( pass-&gt;first == 0 ) {
-		char c0[256];
-
-		CONST( c0, 0, 2 );
-		ASM2( "loadpw", "sum", c0 );
-	}
-	else 
-		ASM2( "loadw", "sum", "r" );
-
-	for( i = pass-&gt;first; i &lt; convi-&gt;n_point; i++ ) {
-		int x = i % M-&gt;Xsize;
-		int y = i / M-&gt;Xsize;
-
-		char source[256];
-		char off[256];
-		char rnd[256];
-		char sexp[256];
-		char coeff[256];
-
-		/* Exclude zero elements.
-		 */
-		if( !convi-&gt;mant[i] )
-			continue;
-
-		/* The source. sl0 is the first scanline in the mask.
-		 */
-		SCANLINE( source, y, 1 );
-
-		/* Load with an offset. Only for non-first-columns though.
-		 */
-		if( x == 0 ) 
-			ASM2( "convubw", "value", source );
-		else {
-			CONST( off, in-&gt;Bands * x, 1 );
-			ASM3( "loadoffb", "valueb", source, off );
-			ASM2( "convubw", "value", "valueb" );
-		}
-
-		/* We need a signed multiply, so the image pixel needs to
-		 * become a signed 16-bit value. We know only the bottom 8 bits
-		 * of the image and coefficient are interesting, so we can take
-		 * the bottom half of a 16x16-&gt;32 multiply. 
-		 */
-		CONST( coeff, convi-&gt;mant[i], 2 );
-		ASM3( "mullw", "value", "value", coeff );
-
-		/* Shift right before add to prevent overflow on large masks.
-		 */
-		CONST( sexp, convi-&gt;sexp, 2 );
-		CONST( rnd, 1 &lt;&lt; (convi-&gt;sexp - 1), 2 );
-		ASM3( "addw", "value", "value", rnd );
-		ASM3( "shrsw", "value", "value", sexp );
-
-		/* We accumulate the signed 16-bit result in sum. Saturated
-		 * add. 
-		 */
-		ASM3( "addssw", "sum", "sum", "value" );
-
-		if( vips_vector_full( v ) )
-			break;
-	}
-
-	pass-&gt;last = i;
-
-	/* And write to our intermediate buffer.
-	 */
-	ASM2( "copyw", "d1", "sum" );
-
-	if( !vips_vector_compile( v ) ) 
-		return( -1 );
-
-#ifdef DEBUG_COMPILE
-	printf( "done coeffs %d to %d\n", pass-&gt;first, pass-&gt;last );
-	vips_vector_print( v );
-#endif /*DEBUG_COMPILE*/
-
-	return( 0 );
-}
-
-/* Generate code for the final 16-&gt;8 conversion. 
- *
- * 0 for success, -1 on error.
- */
-static int
-vips_convi_compile_clip( VipsConvi *convi )
-{
-	VipsConvolution *convolution = (VipsConvolution *) convi;
-	VipsImage *M = convolution-&gt;M;
-	int offset = VIPS_RINT( vips_image_get_offset( M ) );
-
-	VipsVector *v;
-	char rnd[256];
-	char exp[256];
-	char c0[256];
-	char c255[256];
-	char off[256];
-
-	convi-&gt;vector = v = vips_vector_new( "convi", 1 );
-
-	/* "r" is the array of sums we clip down. 
-	 */
-	convi-&gt;r = vips_vector_source_name( v, "r", 2 );
-
-	/* The value we fetch from the image.
-	 */
-	TEMP( "value", 2 );
-
-	CONST( rnd, 1 &lt;&lt; (convi-&gt;exp - 1), 2 );
-	ASM3( "addw", "value", "r", rnd );
-	CONST( exp, convi-&gt;exp, 2 );
-	ASM3( "shrsw", "value", "value", exp );
-
-	CONST( off, offset, 2 ); 
-	ASM3( "addw", "value", "value", off );
-
-	/* You'd think "convsuswb" (convert signed 16-bit to unsigned
-	 * 8-bit with saturation) would be quicker, but it's a lot
-	 * slower.
-	 */
-	CONST( c0, 0, 2 );
-	ASM3( "maxsw", "value", c0, "value" ); 
-	CONST( c255, 255, 2 );
-	ASM3( "minsw", "value", c255, "value" ); 
-
-	ASM2( "convwb", "d1", "value" );
-
-	if( !vips_vector_compile( v ) ) 
-		return( -1 );
-
-	return( 0 );
-}
-
-static int
-vips_convi_compile( VipsConvi *convi, VipsImage *in )
-{
-	int i;
-	Pass *pass;
-
-	/* Generate passes until we've used up the whole mask.
-	 */
-	for( i = 0;; ) {
-		/* Allocate space for another pass.
-		 */
-		if( convi-&gt;n_pass == MAX_PASS ) 
-			return( -1 );
-		pass = &amp;convi-&gt;pass[convi-&gt;n_pass];
-		convi-&gt;n_pass += 1;
-
-		pass-&gt;first = i;
-		pass-&gt;r = -1;
-
-		if( vips_convi_compile_section( convi, in, pass ) )
-			return( -1 );
-		i = pass-&gt;last + 1;
-
-		if( i &gt;= convi-&gt;n_point )
-			break;
-	}
-
-	if( vips_convi_compile_clip( convi ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static int
-vips_convi_gen_vector( VipsRegion *or, 
-	void *vseq, void *a, void *b, gboolean *stop )
-{
-	VipsConviSequence *seq = (VipsConviSequence *) vseq;
-	VipsConvi *convi = (VipsConvi *) b;
-	VipsConvolution *convolution = (VipsConvolution *) convi;
-	VipsImage *M = convolution-&gt;M;
-	VipsImage *in = (VipsImage *) a;
-	VipsRegion *ir = seq-&gt;ir;
-	VipsRect *r = &amp;or-&gt;valid;
-	int ne = r-&gt;width * in-&gt;Bands;
-
-	VipsRect s;
-	int i, y;
-	VipsExecutor executor[MAX_PASS];
-	VipsExecutor clip;
-
-#ifdef DEBUG_PIXELS
-	printf( "vips_convi_gen_vector: generating %d x %d at %d x %d\n",
-		r-&gt;width, r-&gt;height, r-&gt;left, r-&gt;top ); 
-#endif /*DEBUG_PIXELS*/
-
-	/* Prepare the section of the input image we need. A little larger
-	 * than the section of the output image we are producing.
-	 */
-	s = *r;
-	s.width += M-&gt;Xsize - 1;
-	s.height += M-&gt;Ysize - 1;
-	if( vips_region_prepare( ir, &amp;s ) )
-		return( -1 );
-
-	for( i = 0; i &lt; convi-&gt;n_pass; i++ ) 
-		vips_executor_set_program( &amp;executor[i], 
-			convi-&gt;pass[i].vector, ne );
-	vips_executor_set_program( &amp;clip, convi-&gt;vector, ne );
-
-	VIPS_GATE_START( "vips_convi_gen_vector: work" ); 
-
-	for( y = 0; y &lt; r-&gt;height; y ++ ) { 
-		VipsPel *q = VIPS_REGION_ADDR( or, r-&gt;left, r-&gt;top + y );
-	
-#ifdef DEBUG_PIXELS
-{
-		int h, v;
-
-		printf( "before convolve: x = %d, y = %d\n", 
-			r-&gt;left, r-&gt;top + y );
-		for( v = 0; v &lt; M-&gt;Ysize; v++ ) {
-			for( h = 0; h &lt; M-&gt;Xsize; h++ )
-				printf( "%3d ", *VIPS_REGION_ADDR( ir, 
-					r-&gt;left + h, r-&gt;top + y + v ) );
-			printf( "\n" );
-		}
-}
-#endif /*DEBUG_PIXELS*/
-
-		/* We run our n passes to generate this scanline.
-		 */
-		for( i = 0; i &lt; convi-&gt;n_pass; i++ ) {
-			Pass *pass = &amp;convi-&gt;pass[i]; 
-
-			vips_executor_set_scanline( &amp;executor[i], 
-				ir, r-&gt;left, r-&gt;top + y );
-			vips_executor_set_array( &amp;executor[i],
-				pass-&gt;r, seq-&gt;t1 );
-			vips_executor_set_destination( &amp;executor[i], seq-&gt;t2 );
-			vips_executor_run( &amp;executor[i] );
-
-			VIPS_SWAP( signed short *, seq-&gt;t1, seq-&gt;t2 );
-		}
-
-#ifdef DEBUG_PIXELS
-		printf( "before clip: %d\n", ((signed short *) seq-&gt;t1)[0] );
-#endif /*DEBUG_PIXELS*/
-
-		vips_executor_set_array( &amp;clip, convi-&gt;r, seq-&gt;t1 );
-		vips_executor_set_destination( &amp;clip, q ); 
-		vips_executor_run( &amp;clip );
-
-#ifdef DEBUG_PIXELS
-		printf( "after clip: %d\n", 
-			*VIPS_REGION_ADDR( or, r-&gt;left, r-&gt;top + y ) );
-#endif /*DEBUG_PIXELS*/
-	}
-
-	VIPS_GATE_STOP( "vips_convi_gen_vector: work" ); 
-
-	VIPS_COUNT_PIXELS( or, "vips_convi_gen_vector" ); 
-
-	return( 0 );
-}
-
-/* INT inner loops.
- */
-#define CONV_INT( TYPE, CLIP ) { \
-	TYPE * restrict p = (TYPE *) VIPS_REGION_ADDR( ir, le, y ); \
-	TYPE * restrict q = (TYPE *) VIPS_REGION_ADDR( or, le, y ); \
-	int * restrict offsets = seq-&gt;offsets; \
-	\
-	for( x = 0; x &lt; sz; x++ ) {  \
-		int sum; \
-		int i; \
-		\
-		sum = 0; \
-		for ( i = 0; i &lt; nnz; i++ ) \
-			sum += t[i] * p[offsets[i]]; \
-		\
-		sum = ((sum + rounding) / scale) + offset; \
-		\
-		CLIP; \
-		\
-		q[x] = sum;  \
-		p += 1; \
-	}  \
-} 
-
-/* FLOAT inner loops.
- */
-#define CONV_FLOAT( TYPE ) { \
-	TYPE * restrict p = (TYPE *) VIPS_REGION_ADDR( ir, le, y ); \
-	TYPE * restrict q = (TYPE *) VIPS_REGION_ADDR( or, le, y ); \
-	int * restrict offsets = seq-&gt;offsets; \
-	\
-	for( x = 0; x &lt; sz; x++ ) {  \
-		double sum; \
-		int i; \
-		\
-		sum = 0; \
-		for ( i = 0; i &lt; nnz; i++ ) \
-			sum += t[i] * p[offsets[i]]; \
- 		\
-		sum = (sum / scale) + offset; \
-		\
-		q[x] = sum;  \
-		p += 1; \
-	}  \
-} 
-
-/* Various integer range clips. Record over/under flows.
- */
-#define CLIP_UCHAR( V ) \
-G_STMT_START { \
-	if( (V) &lt; 0 ) \
-		(V) = 0; \
-	else if( (V) &gt; UCHAR_MAX ) \
-		(V) = UCHAR_MAX; \
-} G_STMT_END
-
-#define CLIP_CHAR( V ) \
-G_STMT_START { \
-	if( (V) &lt; SCHAR_MIN ) \
-		(V) = SCHAR_MIN; \
-	else if( (V) &gt; SCHAR_MAX ) \
-		(V) = SCHAR_MAX; \
-} G_STMT_END
-
-#define CLIP_USHORT( V ) \
-G_STMT_START { \
-	if( (V) &lt; 0 ) \
-		(V) = 0; \
-	else if( (V) &gt; USHRT_MAX ) \
-		(V) = USHRT_MAX; \
-} G_STMT_END
-
-#define CLIP_SHORT( V ) \
-G_STMT_START { \
-	if( (V) &lt; SHRT_MIN ) \
-		(V) = SHRT_MIN; \
-	else if( (V) &gt; SHRT_MAX ) \
-		(V) = SHRT_MAX; \
-} G_STMT_END
-
-#define CLIP_NONE( V ) {}
-
-/* Convolve!
- */
-static int
-vips_convi_gen( VipsRegion *or, 
-	void *vseq, void *a, void *b, gboolean *stop )
-{
-	VipsConviSequence *seq = (VipsConviSequence *) vseq;
-	VipsConvi *convi = (VipsConvi *) b;
-	VipsConvolution *convolution = (VipsConvolution *) convi;
-	VipsImage *M = convolution-&gt;M;
-	int scale = VIPS_RINT( vips_image_get_scale( M ) ); 
-	int rounding = scale / 2;
-	int offset = VIPS_RINT( vips_image_get_offset( M ) ); 
-	VipsImage *in = (VipsImage *) a;
-	VipsRegion *ir = seq-&gt;ir;
-	int * restrict t = convi-&gt;coeff; 
-	const int nnz = convi-&gt;nnz;
-	VipsRect *r = &amp;or-&gt;valid;
-	int le = r-&gt;left;
-	int to = r-&gt;top;
-	int bo = VIPS_RECT_BOTTOM( r );
-	int sz = VIPS_REGION_N_ELEMENTS( or ) * 
-		(vips_band_format_iscomplex( in-&gt;BandFmt ) ? 2 : 1);
-
-	VipsRect s;
-	int x, y, z, i;
-
-	/* Prepare the section of the input image we need. A little larger
-	 * than the section of the output image we are producing.
-	 */
-	s = *r;
-	s.width += M-&gt;Xsize - 1;
-	s.height += M-&gt;Ysize - 1;
-	if( vips_region_prepare( ir, &amp;s ) )
-		return( -1 );
-
-        /* Fill offset array. Only do this if the bpl has changed since the 
-	 * previous vips_region_prepare().
-	 */
-	if( seq-&gt;last_bpl != VIPS_REGION_LSKIP( ir ) ) {
-		seq-&gt;last_bpl = VIPS_REGION_LSKIP( ir );
-
-		for( i = 0; i &lt; nnz; i++ ) {
-			z = convi-&gt;coeff_pos[i];
-			x = z % M-&gt;Xsize;
-			y = z / M-&gt;Xsize;
-
-			seq-&gt;offsets[i] = 
-				(VIPS_REGION_ADDR( ir, x + le, y + to ) -
-				 VIPS_REGION_ADDR( ir, le, to )) / 
-					VIPS_IMAGE_SIZEOF_ELEMENT( ir-&gt;im ); 
-		}
-	}
-
-	VIPS_GATE_START( "vips_convi_gen: work" ); 
-
-	for( y = to; y &lt; bo; y++ ) { 
-		switch( in-&gt;BandFmt ) {
-		case VIPS_FORMAT_UCHAR: 	
-			CONV_INT( unsigned char, CLIP_UCHAR( sum ) ); 
-			break;
-
-		case VIPS_FORMAT_CHAR:   
-			CONV_INT( signed char, CLIP_CHAR( sum ) ); 
-			break;
-
-		case VIPS_FORMAT_USHORT: 
-			CONV_INT( unsigned short, CLIP_USHORT( sum ) ); 
-			break;
-
-		case VIPS_FORMAT_SHORT:  
-			CONV_INT( signed short, CLIP_SHORT( sum ) ); 
-			break;
-
-		case VIPS_FORMAT_UINT:   
-			CONV_INT( unsigned int, CLIP_NONE( sum ) ); 
-			break;
-
-		case VIPS_FORMAT_INT:    
-			CONV_INT( signed int, CLIP_NONE( sum ) ); 
-			break;
-
-		case VIPS_FORMAT_FLOAT:  
-		case VIPS_FORMAT_COMPLEX:  
-			CONV_FLOAT( float ); 
-			break;
-
-		case VIPS_FORMAT_DOUBLE: 
-		case VIPS_FORMAT_DPCOMPLEX:  
-			CONV_FLOAT( double ); 
-			break;
-
-		default:
-			g_assert_not_reached();
-		}
-	}
-
-	VIPS_GATE_STOP( "vips_convi_gen: work" ); 
-
-	VIPS_COUNT_PIXELS( or, "vips_convi_gen" ); 
-
-	return( 0 );
-}
-
-/* Make an int version of a mask.
- *
- * We rint() everything, then adjust the scale try to match the overall
- * effect.
- */
-int
-vips__image_intize( VipsImage *in, VipsImage **out )
-{
-	VipsImage *t;
-	int x, y;
-	double double_result;
-	double out_scale;
-	double out_offset;
-	int int_result;
-
-	if( vips_check_matrix( "vips2imask", in, &amp;t ) )
-		return( -1 ); 
-	if( !(*out = vips_image_new_matrix( t-&gt;Xsize, t-&gt;Ysize )) ) {
-		g_object_unref( t ); 
-		return( -1 ); 
-	}
-
-	/* We want to make an intmask which has the same input to output ratio
-	 * as the double image.
-	 *
-	 * Imagine convolving with the double image, what's the ratio of
-	 * brightness between input and output? We want the same ratio for the
-	 * int version, if we can.
-	 *
-	 * Imagine an input image where every pixel is 1, what will the output
-	 * be?
-	 */
-	double_result = 0;
-	for( y = 0; y &lt; t-&gt;Ysize; y++ )
-		for( x = 0; x &lt; t-&gt;Xsize; x++ )
-			double_result += *VIPS_MATRIX( t, x, y ); 
-	double_result /= vips_image_get_scale( t );
-
-	for( y = 0; y &lt; t-&gt;Ysize; y++ )
-		for( x = 0; x &lt; t-&gt;Xsize; x++ )
-			*VIPS_MATRIX( *out, x, y ) = 
-				VIPS_RINT( *VIPS_MATRIX( t, x, y ) );
-
-	out_scale = VIPS_RINT( vips_image_get_scale( t ) );
-	if( out_scale == 0 )
-		out_scale = 1;
-	out_offset = VIPS_RINT( vips_image_get_offset( t ) );
-
-	/* Now convolve a 1 everywhere image with the int version we've made,
-	 * what do we get?
-	 */
-	int_result = 0;
-	for( y = 0; y &lt; t-&gt;Ysize; y++ )
-		for( x = 0; x &lt; t-&gt;Xsize; x++ )
-			int_result += *VIPS_MATRIX( *out, x, y ); 
-	int_result /= out_scale;
-
-	/* And adjust the scale to get as close to a match as we can. 
-	 */
-	out_scale = VIPS_RINT( out_scale + (int_result - double_result) );
-	if( out_scale == 0 ) 
-		out_scale = 1;
-
-	vips_image_set_double( *out, "scale", out_scale );
-	vips_image_set_double( *out, "offset", out_offset );
-
-	g_object_unref( t ); 
-
-	return( 0 );
-}
-
-/* Make an int version of a mask. Each element is 8.8 float, with the same
- * exponent for each element (so just 8 bits in @out).
- *
- * @out is a w x h int array.
- */
-static int
-vips_convi_intize( VipsConvi *convi, VipsImage *M )
-{
-	VipsImage *t;
-	double scale;
-	double *scaled;
-	double mx;
-	double mn;
-	int shift;
-	int i;
-
-	if( vips_check_matrix( "vips2imask", M, &amp;t ) )
-		return( -1 ); 
-
-	/* Bake the scale into the mask to make a double version.
-	 */
-	scale = vips_image_get_scale( t );
-        if( !(scaled = VIPS_ARRAY( convi, convi-&gt;n_point, double )) ) {
-		g_object_unref( t ); 
-		return( -1 );
-	}
-	for( i = 0; i &lt; convi-&gt;n_point; i++ ) 
-		scaled[i] = VIPS_MATRIX( t, 0, 0 )[i] / scale;
-	g_object_unref( t ); 
-
-#ifdef DEBUG_COMPILE
-{
-	int x, y;
-
-	printf( "vips_convi_intize: double version\n" ); 
-	for( y = 0; y &lt; t-&gt;Ysize; y++ ) {
-		printf( "\t" ); 
-		for( x = 0; x &lt; t-&gt;Xsize; x++ ) 
-			printf( "%g ", scaled[y * t-&gt;Xsize + x] ); 
-		printf( "\n" ); 
-	}
-}
-#endif /*DEBUG_COMPILE*/
-
-	mx = scaled[0];
-	mn = scaled[0];
-	for( i = 1; i &lt; convi-&gt;n_point; i++ ) {
-		if( scaled[i] &gt; mx )
-			mx = scaled[i];
-		if( scaled[i] &lt; mn )
-			mn = scaled[i];
-	}
-
-	/* The mask max rounded up to the next power of two gives the exponent
-	 * all elements share. Values are eg. -3 for 1/8, 3 for 8.
-	 *
-	 * Add one so we round up stuff exactly on x.0. We multiply by 128
-	 * later, so 1.0 (for example) would become 128, which is outside
-	 * signed 8 bit. 
-	 */
-	shift = ceil( log2( mx ) + 1 );
-
-	/* We need to sum n_points, so we have to shift right before adding a
-	 * new value to make sure we have enough range. 
-	 */
-	convi-&gt;sexp = ceil( log2( convi-&gt;n_point ) );
-	if( convi-&gt;sexp &gt; 10 ) {
-		g_info( "vips_convi_intize: mask too large" ); 
-		return( -1 ); 
-	}
-
-	/* With that already done, the final shift must be ...
-	 */
-	convi-&gt;exp = 7 - shift - convi-&gt;sexp;
-
-	if( !(convi-&gt;mant = VIPS_ARRAY( convi, convi-&gt;n_point, int )) )
-		return( -1 );
-	for( i = 0; i &lt; convi-&gt;n_point; i++ ) {
-		/* 128 since this is signed. 
-		 */
-		convi-&gt;mant[i] = VIPS_RINT( 128 * scaled[i] * pow(2, -shift) );
-
-		if( convi-&gt;mant[i] &lt; -128 ||
-			convi-&gt;mant[i] &gt; 127 ) {
-			g_info( "vips_convi_intize: mask range too large" ); 
-			return( -1 );
-		}
-	}
-
-#ifdef DEBUG_COMPILE
-{
-	int x, y;
-
-	printf( "vips_convi_intize:\n" ); 
-	printf( "sexp = %d\n", convi-&gt;sexp ); 
-	printf( "exp = %d\n", convi-&gt;exp ); 
-	for( y = 0; y &lt; t-&gt;Ysize; y++ ) {
-		printf( "\t" ); 
-		for( x = 0; x &lt; t-&gt;Xsize; x++ ) 
-			printf( "%4d ", convi-&gt;mant[y * t-&gt;Xsize + x] ); 
-		printf( "\n" ); 
-	}
-}
-#endif /*DEBUG_COMPILE*/
-
-	/* Verify accuracy.
-	 */
-{
-	double true_sum;
-	int int_sum;
-	int true_value;
-	int int_value;
-
-	true_sum = 0.0;
-	int_sum = 0;
-	for( i = 0; i &lt; convi-&gt;n_point; i++ ) {
-		int value;
-
-		true_sum += 128 * scaled[i];
-		value = 128 * convi-&gt;mant[i];
-		value = (value + (1 &lt;&lt; (convi-&gt;sexp - 1))) &gt;&gt; convi-&gt;sexp;
-		int_sum += value;
-		int_sum = VIPS_CLIP( SHRT_MIN, int_sum, SHRT_MAX ); 
-	}
-
-	true_value = VIPS_CLIP( 0, true_sum, 255 ); 
-
-	if( convi-&gt;exp &gt; 0 )
-		int_value = (int_sum + (1 &lt;&lt; (convi-&gt;exp - 1))) &gt;&gt; convi-&gt;exp;
-	else
-		int_value = VIPS_LSHIFT_INT( int_sum, convi-&gt;exp );
-	int_value = VIPS_CLIP( 0, int_value, 255 ); 
-
-	if( VIPS_ABS( true_value - int_value ) &gt; 2 ) {
-		g_info( "vips_convi_intize: too inaccurate" );
-		return( -1 ); 
-	}
-}
-
-	return( 0 );
-}
-
-static int
-vips_convi_build( VipsObject *object )
-{
-	VipsConvolution *convolution = (VipsConvolution *) object;
-	VipsConvi *convi = (VipsConvi *) object;
-	VipsImage **t = (VipsImage **) vips_object_local_array( object, 4 );
-
-	VipsImage *in;
-	VipsImage *M;
-	VipsGenerateFn generate;
-	double *coeff;
-        int i;
-
-	if( VIPS_OBJECT_CLASS( vips_convi_parent_class )-&gt;build( object ) )
-		return( -1 );
-
-	in = convolution-&gt;in;
-	M = convolution-&gt;M;
-	convi-&gt;n_point = M-&gt;Xsize * M-&gt;Ysize;
-
-	if( vips_embed( in, &amp;t[0], 
-		M-&gt;Xsize / 2, M-&gt;Ysize / 2, 
-		in-&gt;Xsize + M-&gt;Xsize - 1, in-&gt;Ysize + M-&gt;Ysize - 1,
-		"extend", VIPS_EXTEND_COPY,
-		NULL ) )
-		return( -1 );
-	in = t[0]; 
-
-	/* Default to the C path.
-	 */
-	generate = vips_convi_gen;
-
-	/* For uchar input, try to make a vector path.
-	 */
-	if( vips_vector_isenabled() &amp;&amp;
-		in-&gt;BandFmt == VIPS_FORMAT_UCHAR ) {
-		if( !vips_convi_intize( convi, M ) &amp;&amp;
-			!vips_convi_compile( convi, in ) ) {
-			generate = vips_convi_gen_vector;
-			g_info( "convi: using vector path" ); 
-		}
-		else
-			vips_convi_compile_free( convi );
-	}
-
-	/* Make the data for the C path.
-	 */
-	if( generate == vips_convi_gen ) { 
-		g_info( "convi: using C path" ); 
-
-		/* Make an int version of our mask.
-		 */
-		if( vips__image_intize( M, &amp;t[1] ) )
-			return( -1 ); 
-		M = t[1];
-
-		coeff = VIPS_MATRIX( M, 0, 0 ); 
-		if( !(convi-&gt;coeff = VIPS_ARRAY( object, convi-&gt;n_point, int )) ||
-			!(convi-&gt;coeff_pos = 
-				VIPS_ARRAY( object, convi-&gt;n_point, int )) )
-			return( -1 );
-
-		/* Squeeze out zero mask elements. 
-		 */
-		convi-&gt;nnz = 0;
-		for( i = 0; i &lt; convi-&gt;n_point; i++ )
-			if( coeff[i] ) {
-				convi-&gt;coeff[convi-&gt;nnz] = coeff[i];
-				convi-&gt;coeff_pos[convi-&gt;nnz] = i;
-				convi-&gt;nnz += 1;
-			}
-
-		/* Was the whole mask zero? We must have at least 1 element 
-		 * in there: set it to zero.
-		 */
-		if( convi-&gt;nnz == 0 ) {
-			convi-&gt;coeff[0] = 0;
-			convi-&gt;coeff_pos[0] = 0;
-			convi-&gt;nnz = 1;
-		}
-	}
-
-	g_object_set( convi, "out", vips_image_new(), NULL ); 
-	if( vips_image_pipelinev( convolution-&gt;out, 
-		VIPS_DEMAND_STYLE_SMALLTILE, in, NULL ) )
-		return( -1 );
-
-	/* Prepare output. Consider a 7x7 mask and a 7x7 image --- the output
-	 * would be 1x1.
-	 */
-	convolution-&gt;out-&gt;Xsize -= M-&gt;Xsize - 1;
-	convolution-&gt;out-&gt;Ysize -= M-&gt;Ysize - 1;
-
-	if( vips_image_generate( convolution-&gt;out, 
-		vips_convi_start, generate, vips_convi_stop, in, convi ) )
-<a name="0"></a>		return( -1 );
-
-	convolution-&gt;out-&gt;Xoffset = -M-&gt;Xsize / 2;
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	convolution-&gt;out-&gt;Yoffset = -M-&gt;Ysize / 2;
-
-	return( 0 );
-}
-
-static void
-vips_convi_class_init( VipsConviClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-
-	gobject_class-&gt;dispose = vips_convi_dispose;</b></font>
-
-	object_class-&gt;nickname = "convi";
-	object_class-&gt;description = _( "int convolution operation" );
-	object_class-&gt;build = vips_convi_build;
-}
-
-static void
-vips_convi_init( VipsConvi *convi )
-{
-        convi-&gt;nnz = 0;
-        convi-&gt;coeff = NULL;
-        convi-&gt;coeff_pos = NULL;
-}
-
-/**
- * vips_convi: (method)
- * @in: input image
- * @out: (out): output image
- * @mask: convolve with this mask
- * @...: %NULL-terminated list of optional named arguments
- *
- * Integer convolution. This is a low-level operation, see vips_conv() for 
- * something more convenient. 
- *
- * @mask is converted to an integer mask with rint() of each element, rint of
- * scale and rint of offset. Each output pixel is then calculated as 
- *
- * |[
- * sigma[i]{pixel[i] * mask[i]} / scale + offset
- * ]|
- *
- * The output image always has the same #VipsBandFormat as the input image. 
- *
- * For #VIPS_FORMAT_UCHAR images, vips_convi() uses a fast vector path based on
- * half-float arithmetic. This can produce slightly different results. 
- * Disable the vector path with `--vips-novector` or `VIPS_NOVECTOR` or
- * vips_vector_set_enabled().
- *
- * See also: vips_conv().
- *
- * Returns: 0 on success, -1 on error
- */
-int 
-vips_convi( VipsImage *in, VipsImage **out, VipsImage *mask, ... )
-{
-	va_list ap;
-	int result;
-
-	va_start( ap, mask );
-	result = vips_call_split( "convi", ap, in, out, mask );
-	va_end( ap );
-
-	return( result );
-}
-
+1 #ifdef HAVE_CONFIG_H
+2 #include &lt;config.h&gt;
+3 #include &lt;vips/intl.h&gt;
+4 #include &lt;stdio.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;limits.h&gt;
+7 #include &lt;vips/vips.h&gt;
+8 #include &lt;vips/internal.h&gt;
+9 #include "pconvolution.h"
+10 #define MAX_PASS (20)
+11 typedef struct {
+12 	int first;			int last;		
+13 	int r;			
+14         VipsVector *vector;
+15 } Pass;
+16 typedef struct {
+17 	VipsConvolution parent_instance;
+18 	int n_point;		
+19 	int nnz;			int *coeff;			int *coeff_pos;		
+20 	int *mant;
+21 	int sexp;
+22 	int exp;
+23 	int n_pass;	
+24 	Pass pass[MAX_PASS];
+25 	int r;			
+26         VipsVector *vector;
+27 } VipsConvi;
+28 typedef VipsConvolutionClass VipsConviClass;
+29 G_DEFINE_TYPE( VipsConvi, vips_convi, VIPS_TYPE_CONVOLUTION );
+30 typedef struct {
+31 	VipsConvi *convi;
+32 	VipsRegion *ir;		
+33 	int *offsets;		
+34 	int last_bpl;		
+35 	short *t1;
+36 	short *t2;
+37 } VipsConviSequence;
+38 static void
+39 vips_convi_compile_free( VipsConvi *convi )
+40 {
+41 	int i;
+42 	for( i = 0; i &lt; convi-&gt;n_pass; i++ )
+43 		VIPS_FREEF( vips_vector_free, convi-&gt;pass[i].vector );
+44 	convi-&gt;n_pass = 0;
+45 	VIPS_FREEF( vips_vector_free, convi-&gt;vector );
+46 }
+47 static void
+48 vips_convi_dispose( GObject *gobject )
+49 {
+50 	VipsConvi *convi = (VipsConvi *) gobject;
+51 #ifdef DEBUG
+52 	printf( "vips_convi_dispose: " );
+53 	vips_object_print_name( VIPS_OBJECT( gobject ) );
+54 	printf( "\n" );
+55 	vips_convi_compile_free( convi ); 
+56 	G_OBJECT_CLASS( vips_convi_parent_class )-&gt;dispose( gobject );
+57 }
+58 static int
+59 vips_convi_stop( void *vseq, void *a, void *b )
+60 {
+61 	VipsConviSequence *seq = (VipsConviSequence *) vseq;
+62 	VIPS_UNREF( seq-&gt;ir );
+63 	VIPS_FREE( seq-&gt;offsets );
+64 	VIPS_FREE( seq-&gt;t1 );
+65 	VIPS_FREE( seq-&gt;t2 );
+66 	return( 0 );
+67 }
+68 static void *
+69 vips_convi_start( VipsImage *out, void *a, void *b )
+70 {
+71 	VipsImage *in = (VipsImage *) a;
+72 	VipsConvi *convi = (VipsConvi *) b;
+73 	VipsConviSequence *seq;
+74 	if( !(seq = VIPS_NEW( out, VipsConviSequence )) )
+75 		return( NULL );
+76 	seq-&gt;convi = convi;
+77 	seq-&gt;ir = NULL;
+78 	seq-&gt;offsets = NULL;
+79 	seq-&gt;last_bpl = -1;
+80 	seq-&gt;t1 = NULL;
+81 	seq-&gt;t2 = NULL;
+82 	seq-&gt;ir = vips_region_new( in );
+83 	if( convi-&gt;nnz ) {
+84 		if( !(seq-&gt;offsets = VIPS_ARRAY( NULL, convi-&gt;nnz, int )) ) { 
+85 			vips_convi_stop( seq, in, convi );
+86 			return( NULL );
+87 		}
+88 	}
+89 	if( convi-&gt;n_pass ) {
+90 		seq-&gt;t1 = VIPS_ARRAY( NULL, VIPS_IMAGE_N_ELEMENTS( in ), short );
+91 		seq-&gt;t2 = VIPS_ARRAY( NULL, VIPS_IMAGE_N_ELEMENTS( in ), short );
+92 		if( !seq-&gt;t1 || 
+93 			!seq-&gt;t2 ) {
+94 			vips_convi_stop( seq, in, convi );
+95 			return( NULL );
+96 		}
+97 	}
+98 	return( (void *) seq );
+99 }
+100 #define TEMP( N, S ) vips_vector_temporary( v, (char *) N, S )
+101 #define PARAM( N, S ) vips_vector_parameter( v, (char *) N, S )
+102 #define SCANLINE( N, P, S ) vips_vector_source_scanline( v, (char *) N, P, S )
+103 #define CONST( N, V, S ) vips_vector_constant( v, (char *) N, V, S )
+104 #define ASM2( OP, A, B ) vips_vector_asm2( v, (char *) OP, A, B )
+105 #define ASM3( OP, A, B, C ) vips_vector_asm3( v, (char *) OP, A, B, C )
+106 static int
+107 vips_convi_compile_section( VipsConvi *convi, VipsImage *in, Pass *pass )
+108 {
+109 	VipsConvolution *convolution = (VipsConvolution *) convi;
+110 	VipsImage *M = convolution-&gt;M;
+111 	VipsVector *v;
+112 	int i;
+113 #ifdef DEBUG_COMPILE
+114 	printf( "starting pass %d\n", pass-&gt;first ); 
+115 	pass-&gt;vector = v = vips_vector_new( "convi", 2 );
+116 	pass-&gt;r = vips_vector_source_name( v, "r", 2 );
+117 	TEMP( "value", 2 );
+118 	TEMP( "valueb", 1 );
+119 	TEMP( "sum", 2 );
+120 	if( pass-&gt;first == 0 ) {
+121 		char c0[256];
+122 		CONST( c0, 0, 2 );
+123 		ASM2( "loadpw", "sum", c0 );
+124 	}
+125 	else 
+126 		ASM2( "loadw", "sum", "r" );
+127 	for( i = pass-&gt;first; i &lt; convi-&gt;n_point; i++ ) {
+128 		int x = i % M-&gt;Xsize;
+129 		int y = i / M-&gt;Xsize;
+130 		char source[256];
+131 		char off[256];
+132 		char rnd[256];
+133 		char sexp[256];
+134 		char coeff[256];
+135 		if( !convi-&gt;mant[i] )
+136 			continue;
+137 		SCANLINE( source, y, 1 );
+138 		if( x == 0 ) 
+139 			ASM2( "convubw", "value", source );
+140 		else {
+141 			CONST( off, in-&gt;Bands * x, 1 );
+142 			ASM3( "loadoffb", "valueb", source, off );
+143 			ASM2( "convubw", "value", "valueb" );
+144 		}
+145 		CONST( coeff, convi-&gt;mant[i], 2 );
+146 		ASM3( "mullw", "value", "value", coeff );
+147 		CONST( sexp, convi-&gt;sexp, 2 );
+148 		CONST( rnd, 1 &lt;&lt; (convi-&gt;sexp - 1), 2 );
+149 		ASM3( "addw", "value", "value", rnd );
+150 		ASM3( "shrsw", "value", "value", sexp );
+151 		ASM3( "addssw", "sum", "sum", "value" );
+152 		if( vips_vector_full( v ) )
+153 			break;
+154 	}
+155 	pass-&gt;last = i;
+156 	ASM2( "copyw", "d1", "sum" );
+157 	if( !vips_vector_compile( v ) ) 
+158 		return( -1 );
+159 #ifdef DEBUG_COMPILE
+160 	printf( "done coeffs %d to %d\n", pass-&gt;first, pass-&gt;last );
+161 	vips_vector_print( v );
+162 	return( 0 );
+163 }
+164 static int
+165 vips_convi_compile_clip( VipsConvi *convi )
+166 {
+167 	VipsConvolution *convolution = (VipsConvolution *) convi;
+168 	VipsImage *M = convolution-&gt;M;
+169 	int offset = VIPS_RINT( vips_image_get_offset( M ) );
+170 	VipsVector *v;
+171 	char rnd[256];
+172 	char exp[256];
+173 	char c0[256];
+174 	char c255[256];
+175 	char off[256];
+176 	convi-&gt;vector = v = vips_vector_new( "convi", 1 );
+177 	convi-&gt;r = vips_vector_source_name( v, "r", 2 );
+178 	TEMP( "value", 2 );
+179 	CONST( rnd, 1 &lt;&lt; (convi-&gt;exp - 1), 2 );
+180 	ASM3( "addw", "value", "r", rnd );
+181 	CONST( exp, convi-&gt;exp, 2 );
+182 	ASM3( "shrsw", "value", "value", exp );
+183 	CONST( off, offset, 2 ); 
+184 	ASM3( "addw", "value", "value", off );
+185 	CONST( c0, 0, 2 );
+186 	ASM3( "maxsw", "value", c0, "value" ); 
+187 	CONST( c255, 255, 2 );
+188 	ASM3( "minsw", "value", c255, "value" ); 
+189 	ASM2( "convwb", "d1", "value" );
+190 	if( !vips_vector_compile( v ) ) 
+191 		return( -1 );
+192 	return( 0 );
+193 }
+194 static int
+195 vips_convi_compile( VipsConvi *convi, VipsImage *in )
+196 {
+197 	int i;
+198 	Pass *pass;
+199 	for( i = 0;; ) {
+200 		if( convi-&gt;n_pass == MAX_PASS ) 
+201 			return( -1 );
+202 		pass = &amp;convi-&gt;pass[convi-&gt;n_pass];
+203 		convi-&gt;n_pass += 1;
+204 		pass-&gt;first = i;
+205 		pass-&gt;r = -1;
+206 		if( vips_convi_compile_section( convi, in, pass ) )
+207 			return( -1 );
+208 		i = pass-&gt;last + 1;
+209 		if( i &gt;= convi-&gt;n_point )
+210 			break;
+211 	}
+212 	if( vips_convi_compile_clip( convi ) )
+213 		return( -1 );
+214 	return( 0 );
+215 }
+216 static int
+217 vips_convi_gen_vector( VipsRegion *or, 
+218 	void *vseq, void *a, void *b, gboolean *stop )
+219 {
+220 	VipsConviSequence *seq = (VipsConviSequence *) vseq;
+221 	VipsConvi *convi = (VipsConvi *) b;
+222 	VipsConvolution *convolution = (VipsConvolution *) convi;
+223 	VipsImage *M = convolution-&gt;M;
+224 	VipsImage *in = (VipsImage *) a;
+225 	VipsRegion *ir = seq-&gt;ir;
+226 	VipsRect *r = &amp;or-&gt;valid;
+227 	int ne = r-&gt;width * in-&gt;Bands;
+228 	VipsRect s;
+229 	int i, y;
+230 	VipsExecutor executor[MAX_PASS];
+231 	VipsExecutor clip;
+232 #ifdef DEBUG_PIXELS
+233 	printf( "vips_convi_gen_vector: generating %d x %d at %d x %d\n",
+234 		r-&gt;width, r-&gt;height, r-&gt;left, r-&gt;top ); 
+235 	s = *r;
+236 	s.width += M-&gt;Xsize - 1;
+237 	s.height += M-&gt;Ysize - 1;
+238 	if( vips_region_prepare( ir, &amp;s ) )
+239 		return( -1 );
+240 	for( i = 0; i &lt; convi-&gt;n_pass; i++ ) 
+241 		vips_executor_set_program( &amp;executor[i], 
+242 			convi-&gt;pass[i].vector, ne );
+243 	vips_executor_set_program( &amp;clip, convi-&gt;vector, ne );
+244 	VIPS_GATE_START( "vips_convi_gen_vector: work" ); 
+245 	for( y = 0; y &lt; r-&gt;height; y ++ ) { 
+246 		VipsPel *q = VIPS_REGION_ADDR( or, r-&gt;left, r-&gt;top + y );
+247 #ifdef DEBUG_PIXELS
+248 {
+249 		int h, v;
+250 		printf( "before convolve: x = %d, y = %d\n", 
+251 			r-&gt;left, r-&gt;top + y );
+252 		for( v = 0; v &lt; M-&gt;Ysize; v++ ) {
+253 			for( h = 0; h &lt; M-&gt;Xsize; h++ )
+254 				printf( "%3d ", *VIPS_REGION_ADDR( ir, 
+255 					r-&gt;left + h, r-&gt;top + y + v ) );
+256 			printf( "\n" );
+257 		}
+258 }
+259 		for( i = 0; i &lt; convi-&gt;n_pass; i++ ) {
+260 			Pass *pass = &amp;convi-&gt;pass[i]; 
+261 			vips_executor_set_scanline( &amp;executor[i], 
+262 				ir, r-&gt;left, r-&gt;top + y );
+263 			vips_executor_set_array( &amp;executor[i],
+264 				pass-&gt;r, seq-&gt;t1 );
+265 			vips_executor_set_destination( &amp;executor[i], seq-&gt;t2 );
+266 			vips_executor_run( &amp;executor[i] );
+267 			VIPS_SWAP( signed short *, seq-&gt;t1, seq-&gt;t2 );
+268 		}
+269 #ifdef DEBUG_PIXELS
+270 		printf( "before clip: %d\n", ((signed short *) seq-&gt;t1)[0] );
+271 		vips_executor_set_array( &amp;clip, convi-&gt;r, seq-&gt;t1 );
+272 		vips_executor_set_destination( &amp;clip, q ); 
+273 		vips_executor_run( &amp;clip );
+274 #ifdef DEBUG_PIXELS
+275 		printf( "after clip: %d\n", 
+276 			*VIPS_REGION_ADDR( or, r-&gt;left, r-&gt;top + y ) );
+277 	}
+278 	VIPS_GATE_STOP( "vips_convi_gen_vector: work" ); 
+279 	VIPS_COUNT_PIXELS( or, "vips_convi_gen_vector" ); 
+280 	return( 0 );
+281 }
+282 #define CONV_INT( TYPE, CLIP ) { \
+283 	TYPE * restrict p = (TYPE *) VIPS_REGION_ADDR( ir, le, y ); \
+284 	TYPE * restrict q = (TYPE *) VIPS_REGION_ADDR( or, le, y ); \
+285 	int * restrict offsets = seq-&gt;offsets; \
+286 	\
+287 	for( x = 0; x &lt; sz; x++ ) {  \
+288 		int sum; \
+289 		int i; \
+290 		\
+291 		sum = 0; \
+292 		for ( i = 0; i &lt; nnz; i++ ) \
+293 			sum += t[i] * p[offsets[i]]; \
+294 		\
+295 		sum = ((sum + rounding) / scale) + offset; \
+296 		\
+297 		CLIP; \
+298 		\
+299 		q[x] = sum;  \
+300 		p += 1; \
+301 	}  \
+302 } 
+303 #define CONV_FLOAT( TYPE ) { \
+304 	TYPE * restrict p = (TYPE *) VIPS_REGION_ADDR( ir, le, y ); \
+305 	TYPE * restrict q = (TYPE *) VIPS_REGION_ADDR( or, le, y ); \
+306 	int * restrict offsets = seq-&gt;offsets; \
+307 	\
+308 	for( x = 0; x &lt; sz; x++ ) {  \
+309 		double sum; \
+310 		int i; \
+311 		\
+312 		sum = 0; \
+313 		for ( i = 0; i &lt; nnz; i++ ) \
+314 			sum += t[i] * p[offsets[i]]; \
+315  		\
+316 		sum = (sum / scale) + offset; \
+317 		\
+318 		q[x] = sum;  \
+319 		p += 1; \
+320 	}  \
+321 } 
+322 #define CLIP_UCHAR( V ) \
+323 G_STMT_START { \
+324 	if( (V) &lt; 0 ) \
+325 		(V) = 0; \
+326 	else if( (V) &gt; UCHAR_MAX ) \
+327 		(V) = UCHAR_MAX; \
+328 } G_STMT_END
+329 #define CLIP_CHAR( V ) \
+330 G_STMT_START { \
+331 	if( (V) &lt; SCHAR_MIN ) \
+332 		(V) = SCHAR_MIN; \
+333 	else if( (V) &gt; SCHAR_MAX ) \
+334 		(V) = SCHAR_MAX; \
+335 } G_STMT_END
+336 #define CLIP_USHORT( V ) \
+337 G_STMT_START { \
+338 	if( (V) &lt; 0 ) \
+339 		(V) = 0; \
+340 	else if( (V) &gt; USHRT_MAX ) \
+341 		(V) = USHRT_MAX; \
+342 } G_STMT_END
+343 #define CLIP_SHORT( V ) \
+344 G_STMT_START { \
+345 	if( (V) &lt; SHRT_MIN ) \
+346 		(V) = SHRT_MIN; \
+347 	else if( (V) &gt; SHRT_MAX ) \
+348 		(V) = SHRT_MAX; \
+349 } G_STMT_END
+350 #define CLIP_NONE( V ) {}
+351 static int
+352 vips_convi_gen( VipsRegion *or, 
+353 	void *vseq, void *a, void *b, gboolean *stop )
+354 {
+355 	VipsConviSequence *seq = (VipsConviSequence *) vseq;
+356 	VipsConvi *convi = (VipsConvi *) b;
+357 	VipsConvolution *convolution = (VipsConvolution *) convi;
+358 	VipsImage *M = convolution-&gt;M;
+359 	int scale = VIPS_RINT( vips_image_get_scale( M ) ); 
+360 	int rounding = scale / 2;
+361 	int offset = VIPS_RINT( vips_image_get_offset( M ) ); 
+362 	VipsImage *in = (VipsImage *) a;
+363 	VipsRegion *ir = seq-&gt;ir;
+364 	int * restrict t = convi-&gt;coeff; 
+365 	const int nnz = convi-&gt;nnz;
+366 	VipsRect *r = &amp;or-&gt;valid;
+367 	int le = r-&gt;left;
+368 	int to = r-&gt;top;
+369 	int bo = VIPS_RECT_BOTTOM( r );
+370 	int sz = VIPS_REGION_N_ELEMENTS( or ) * 
+371 		(vips_band_format_iscomplex( in-&gt;BandFmt ) ? 2 : 1);
+372 	VipsRect s;
+373 	int x, y, z, i;
+374 	s = *r;
+375 	s.width += M-&gt;Xsize - 1;
+376 	s.height += M-&gt;Ysize - 1;
+377 	if( vips_region_prepare( ir, &amp;s ) )
+378 		return( -1 );
+379 	if( seq-&gt;last_bpl != VIPS_REGION_LSKIP( ir ) ) {
+380 		seq-&gt;last_bpl = VIPS_REGION_LSKIP( ir );
+381 		for( i = 0; i &lt; nnz; i++ ) {
+382 			z = convi-&gt;coeff_pos[i];
+383 			x = z % M-&gt;Xsize;
+384 			y = z / M-&gt;Xsize;
+385 			seq-&gt;offsets[i] = 
+386 				(VIPS_REGION_ADDR( ir, x + le, y + to ) -
+387 				 VIPS_REGION_ADDR( ir, le, to )) / 
+388 					VIPS_IMAGE_SIZEOF_ELEMENT( ir-&gt;im ); 
+389 		}
+390 	}
+391 	VIPS_GATE_START( "vips_convi_gen: work" ); 
+392 	for( y = to; y &lt; bo; y++ ) { 
+393 		switch( in-&gt;BandFmt ) {
+394 		case VIPS_FORMAT_UCHAR: 	
+395 			CONV_INT( unsigned char, CLIP_UCHAR( sum ) ); 
+396 			break;
+397 		case VIPS_FORMAT_CHAR:   
+398 			CONV_INT( signed char, CLIP_CHAR( sum ) ); 
+399 			break;
+400 		case VIPS_FORMAT_USHORT: 
+401 			CONV_INT( unsigned short, CLIP_USHORT( sum ) ); 
+402 			break;
+403 		case VIPS_FORMAT_SHORT:  
+404 			CONV_INT( signed short, CLIP_SHORT( sum ) ); 
+405 			break;
+406 		case VIPS_FORMAT_UINT:   
+407 			CONV_INT( unsigned int, CLIP_NONE( sum ) ); 
+408 			break;
+409 		case VIPS_FORMAT_INT:    
+410 			CONV_INT( signed int, CLIP_NONE( sum ) ); 
+411 			break;
+412 		case VIPS_FORMAT_FLOAT:  
+413 		case VIPS_FORMAT_COMPLEX:  
+414 			CONV_FLOAT( float ); 
+415 			break;
+416 		case VIPS_FORMAT_DOUBLE: 
+417 		case VIPS_FORMAT_DPCOMPLEX:  
+418 			CONV_FLOAT( double ); 
+419 			break;
+420 		default:
+421 			g_assert_not_reached();
+422 		}
+423 	}
+424 	VIPS_GATE_STOP( "vips_convi_gen: work" ); 
+425 	VIPS_COUNT_PIXELS( or, "vips_convi_gen" ); 
+426 	return( 0 );
+427 }
+428 int
+429 vips__image_intize( VipsImage *in, VipsImage **out )
+430 {
+431 	VipsImage *t;
+432 	int x, y;
+433 	double double_result;
+434 	double out_scale;
+435 	double out_offset;
+436 	int int_result;
+437 	if( vips_check_matrix( "vips2imask", in, &amp;t ) )
+438 		return( -1 ); 
+439 	if( !(*out = vips_image_new_matrix( t-&gt;Xsize, t-&gt;Ysize )) ) {
+440 		g_object_unref( t ); 
+441 		return( -1 ); 
+442 	}
+443 	double_result = 0;
+444 	for( y = 0; y &lt; t-&gt;Ysize; y++ )
+445 		for( x = 0; x &lt; t-&gt;Xsize; x++ )
+446 			double_result += *VIPS_MATRIX( t, x, y ); 
+447 	double_result /= vips_image_get_scale( t );
+448 	for( y = 0; y &lt; t-&gt;Ysize; y++ )
+449 		for( x = 0; x &lt; t-&gt;Xsize; x++ )
+450 			*VIPS_MATRIX( *out, x, y ) = 
+451 				VIPS_RINT( *VIPS_MATRIX( t, x, y ) );
+452 	out_scale = VIPS_RINT( vips_image_get_scale( t ) );
+453 	if( out_scale == 0 )
+454 		out_scale = 1;
+455 	out_offset = VIPS_RINT( vips_image_get_offset( t ) );
+456 	int_result = 0;
+457 	for( y = 0; y &lt; t-&gt;Ysize; y++ )
+458 		for( x = 0; x &lt; t-&gt;Xsize; x++ )
+459 			int_result += *VIPS_MATRIX( *out, x, y ); 
+460 	int_result /= out_scale;
+461 	out_scale = VIPS_RINT( out_scale + (int_result - double_result) );
+462 	if( out_scale == 0 ) 
+463 		out_scale = 1;
+464 	vips_image_set_double( *out, "scale", out_scale );
+465 	vips_image_set_double( *out, "offset", out_offset );
+466 	g_object_unref( t ); 
+467 	return( 0 );
+468 }
+469 static int
+470 vips_convi_intize( VipsConvi *convi, VipsImage *M )
+471 {
+472 	VipsImage *t;
+473 	double scale;
+474 	double *scaled;
+475 	double mx;
+476 	double mn;
+477 	int shift;
+478 	int i;
+479 	if( vips_check_matrix( "vips2imask", M, &amp;t ) )
+480 		return( -1 ); 
+481 	scale = vips_image_get_scale( t );
+482         if( !(scaled = VIPS_ARRAY( convi, convi-&gt;n_point, double )) ) {
+483 		g_object_unref( t ); 
+484 		return( -1 );
+485 	}
+486 	for( i = 0; i &lt; convi-&gt;n_point; i++ ) 
+487 		scaled[i] = VIPS_MATRIX( t, 0, 0 )[i] / scale;
+488 	g_object_unref( t ); 
+489 #ifdef DEBUG_COMPILE
+490 {
+491 	int x, y;
+492 	printf( "vips_convi_intize: double version\n" ); 
+493 	for( y = 0; y &lt; t-&gt;Ysize; y++ ) {
+494 		printf( "\t" ); 
+495 		for( x = 0; x &lt; t-&gt;Xsize; x++ ) 
+496 			printf( "%g ", scaled[y * t-&gt;Xsize + x] ); 
+497 		printf( "\n" ); 
+498 	}
+499 }
+500 	mx = scaled[0];
+501 	mn = scaled[0];
+502 	for( i = 1; i &lt; convi-&gt;n_point; i++ ) {
+503 		if( scaled[i] &gt; mx )
+504 			mx = scaled[i];
+505 		if( scaled[i] &lt; mn )
+506 			mn = scaled[i];
+507 	}
+508 	shift = ceil( log2( mx ) + 1 );
+509 	convi-&gt;sexp = ceil( log2( convi-&gt;n_point ) );
+510 	if( convi-&gt;sexp &gt; 10 ) {
+511 		g_info( "vips_convi_intize: mask too large" ); 
+512 		return( -1 ); 
+513 	}
+514 	convi-&gt;exp = 7 - shift - convi-&gt;sexp;
+515 	if( !(convi-&gt;mant = VIPS_ARRAY( convi, convi-&gt;n_point, int )) )
+516 		return( -1 );
+517 	for( i = 0; i &lt; convi-&gt;n_point; i++ ) {
+518 		convi-&gt;mant[i] = VIPS_RINT( 128 * scaled[i] * pow(2, -shift) );
+519 		if( convi-&gt;mant[i] &lt; -128 ||
+520 			convi-&gt;mant[i] &gt; 127 ) {
+521 			g_info( "vips_convi_intize: mask range too large" ); 
+522 			return( -1 );
+523 		}
+524 	}
+525 #ifdef DEBUG_COMPILE
+526 {
+527 	int x, y;
+528 	printf( "vips_convi_intize:\n" ); 
+529 	printf( "sexp = %d\n", convi-&gt;sexp ); 
+530 	printf( "exp = %d\n", convi-&gt;exp ); 
+531 	for( y = 0; y &lt; t-&gt;Ysize; y++ ) {
+532 		printf( "\t" ); 
+533 		for( x = 0; x &lt; t-&gt;Xsize; x++ ) 
+534 			printf( "%4d ", convi-&gt;mant[y * t-&gt;Xsize + x] ); 
+535 		printf( "\n" ); 
+536 	}
+537 }
+538 {
+539 	double true_sum;
+540 	int int_sum;
+541 	int true_value;
+542 	int int_value;
+543 	true_sum = 0.0;
+544 	int_sum = 0;
+545 	for( i = 0; i &lt; convi-&gt;n_point; i++ ) {
+546 		int value;
+547 		true_sum += 128 * scaled[i];
+548 		value = 128 * convi-&gt;mant[i];
+549 		value = (value + (1 &lt;&lt; (convi-&gt;sexp - 1))) &gt;&gt; convi-&gt;sexp;
+550 		int_sum += value;
+551 		int_sum = VIPS_CLIP( SHRT_MIN, int_sum, SHRT_MAX ); 
+552 	}
+553 	true_value = VIPS_CLIP( 0, true_sum, 255 ); 
+554 	if( convi-&gt;exp &gt; 0 )
+555 		int_value = (int_sum + (1 &lt;&lt; (convi-&gt;exp - 1))) &gt;&gt; convi-&gt;exp;
+556 	else
+557 		int_value = VIPS_LSHIFT_INT( int_sum, convi-&gt;exp );
+558 	int_value = VIPS_CLIP( 0, int_value, 255 ); 
+559 	if( VIPS_ABS( true_value - int_value ) &gt; 2 ) {
+560 		g_info( "vips_convi_intize: too inaccurate" );
+561 		return( -1 ); 
+562 	}
+563 }
+564 	return( 0 );
+565 }
+566 static int
+567 vips_convi_build( VipsObject *object )
+568 {
+569 	VipsConvolution *convolution = (VipsConvolution *) object;
+570 	VipsConvi *convi = (VipsConvi *) object;
+571 	VipsImage **t = (VipsImage **) vips_object_local_array( object, 4 );
+572 	VipsImage *in;
+573 	VipsImage *M;
+574 	VipsGenerateFn generate;
+575 	double *coeff;
+576         int i;
+577 	if( VIPS_OBJECT_CLASS( vips_convi_parent_class )-&gt;build( object ) )
+578 		return( -1 );
+579 	in = convolution-&gt;in;
+580 	M = convolution-&gt;M;
+581 	convi-&gt;n_point = M-&gt;Xsize * M-&gt;Ysize;
+582 	if( vips_embed( in, &amp;t[0], 
+583 		M-&gt;Xsize / 2, M-&gt;Ysize / 2, 
+584 		in-&gt;Xsize + M-&gt;Xsize - 1, in-&gt;Ysize + M-&gt;Ysize - 1,
+585 		"extend", VIPS_EXTEND_COPY,
+586 		NULL ) )
+587 		return( -1 );
+588 	in = t[0]; 
+589 	generate = vips_convi_gen;
+590 	if( vips_vector_isenabled() &amp;&amp;
+591 		in-&gt;BandFmt == VIPS_FORMAT_UCHAR ) {
+592 		if( !vips_convi_intize( convi, M ) &amp;&amp;
+593 			!vips_convi_compile( convi, in ) ) {
+594 			generate = vips_convi_gen_vector;
+595 			g_info( "convi: using vector path" ); 
+596 		}
+597 		else
+598 			vips_convi_compile_free( convi );
+599 	}
+600 	if( generate == vips_convi_gen ) { 
+601 		g_info( "convi: using C path" ); 
+602 		if( vips__image_intize( M, &amp;t[1] ) )
+603 			return( -1 ); 
+604 		M = t[1];
+605 		coeff = VIPS_MATRIX( M, 0, 0 ); 
+606 		if( !(convi-&gt;coeff = VIPS_ARRAY( object, convi-&gt;n_point, int )) ||
+607 			!(convi-&gt;coeff_pos = 
+608 				VIPS_ARRAY( object, convi-&gt;n_point, int )) )
+609 			return( -1 );
+610 		convi-&gt;nnz = 0;
+611 		for( i = 0; i &lt; convi-&gt;n_point; i++ )
+612 			if( coeff[i] ) {
+613 				convi-&gt;coeff[convi-&gt;nnz] = coeff[i];
+614 				convi-&gt;coeff_pos[convi-&gt;nnz] = i;
+615 				convi-&gt;nnz += 1;
+616 			}
+617 		if( convi-&gt;nnz == 0 ) {
+618 			convi-&gt;coeff[0] = 0;
+619 			convi-&gt;coeff_pos[0] = 0;
+620 			convi-&gt;nnz = 1;
+621 		}
+622 	}
+623 	g_object_set( convi, "out", vips_image_new(), NULL ); 
+624 	if( vips_image_pipelinev( convolution-&gt;out, 
+625 		VIPS_DEMAND_STYLE_SMALLTILE, in, NULL ) )
+626 		return( -1 );
+627 	convolution-&gt;out-&gt;Xsize -= M-&gt;Xsize - 1;
+628 	convolution-&gt;out-&gt;Ysize -= M-&gt;Ysize - 1;
+629 	if( vips_image_generate( convolution-&gt;out, 
+630 		vips_convi_start, generate, vips_convi_stop, in, convi ) )
+631 <a name="0"></a>		return( -1 );
+632 	convolution-&gt;out-&gt;Xoffset = -M-&gt;Xsize / 2;
+633 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	convolution-&gt;out-&gt;Yoffset = -M-&gt;Ysize / 2;
+634 	return( 0 );
+635 }
+636 static void
+637 vips_convi_class_init( VipsConviClass *class )
+638 {
+639 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+640 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+641 	gobject_class-&gt;dispose = vips_convi_dispose;</b></font>
+642 	object_class-&gt;nickname = "convi";
+643 	object_class-&gt;description = _( "int convolution operation" );
+644 	object_class-&gt;build = vips_convi_build;
+645 }
+646 static void
+647 vips_convi_init( VipsConvi *convi )
+648 {
+649         convi-&gt;nnz = 0;
+650         convi-&gt;coeff = NULL;
+651         convi-&gt;coeff_pos = NULL;
+652 }
+653 int 
+654 vips_convi( VipsImage *in, VipsImage **out, VipsImage *mask, ... )
+655 {
+656 	va_list ap;
+657 	int result;
+658 	va_start( ap, mask );
+659 	result = vips_call_split( "convi", ap, in, out, mask );
+660 	va_end( ap );
+661 	return( result );
+662 }
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -1204,1380 +714,892 @@ vips_convi( VipsImage *in, VipsImage **out, VipsImage *mask, ... )
 </h3>
 <hr/>
 <pre>
-/* load jpeg2000
- *
- * 18/3/20
- * 	- from heifload.c
- */
-
-/*
-
-    This file is part of VIPS.
-    
-    VIPS is free software; you can redistribute it and/or modify
-    it under the terms of the GNU Lesser General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Lesser General Public License for more details.
-
-    You should have received a copy of the GNU Lesser General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
-
- */
-
-/*
-
-    These files are distributed with VIPS - http://www.vips.ecs.soton.ac.uk
-
- */
-
-/*
-#define DEBUG_VERBOSE
-#define DEBUG
- */
-
-#ifdef HAVE_CONFIG_H
-#include &lt;config.h&gt;
-#endif /*HAVE_CONFIG_H*/
-#include &lt;vips/intl.h&gt;
-
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-
-#include &lt;vips/vips.h&gt;
-#include &lt;vips/debug.h&gt;
-#include &lt;vips/internal.h&gt;
-
-#ifdef HAVE_LIBOPENJP2
-
-#include &lt;openjpeg.h&gt;
-
-#include "pforeign.h"
-
-/* Surely enough ... does anyone do multispectral imaging with jp2k?
- */
-#define MAX_BANDS (100)
-
-typedef struct _VipsForeignLoadJp2k {
-	VipsForeignLoad parent_object;
-
-	/* Source to load from (set by subclasses).
-	 */
-	VipsSource *source;
-
-	/* Page set by user, then we translate that into shrink factor.
-	 */
-	int page;
-	int shrink;
-
-	/* Decompress state.
-	 */
-        opj_stream_t *stream;		/* Source as an opj stream */
-	OPJ_CODEC_FORMAT format;	/* libopenjp2 format */
-        opj_codec_t *codec;		/* Decompress codec */
-	opj_dparameters_t parameters;	/* Core decompress params */
-	opj_image_t *image;		/* Read image to here */ 
-	opj_codestream_info_v2_t *info;	/* Tile geometry */
-
-	/* Number of errors reported during load -- use this to block load of
-	 * corrupted images.
-	 */
-	int n_errors;
-
-	/* If we need to upsample tiles read from opj.
-	 */
-	gboolean upsample;
-
-	/* If we need to do ycc-&gt;rgb conversion on load.
-	 */
-	gboolean ycc_to_rgb;
-} VipsForeignLoadJp2k;
-
-typedef VipsForeignLoadClass VipsForeignLoadJp2kClass;
-
-G_DEFINE_ABSTRACT_TYPE( VipsForeignLoadJp2k, vips_foreign_load_jp2k, 
-	VIPS_TYPE_FOREIGN_LOAD );
-
-static void
-vips_foreign_load_jp2k_dispose( GObject *gobject )
-{
-	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) gobject;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_jp2k_dispose:\n" );
-#endif /*DEBUG*/
-
-	/*
-	 * FIXME ... do we need this? seems to just cause warnings
-	 *
-	if( jp2k-&gt;codec &amp;&amp;
-		jp2k-&gt;stream ) 
-		opj_end_decompress( jp2k-&gt;codec, jp2k-&gt;stream );
-	 *
-	 */
-
-	if( jp2k-&gt;info )
-		opj_destroy_cstr_info( &amp;jp2k-&gt;info );
-	VIPS_FREEF( opj_destroy_codec, jp2k-&gt;codec );
-	VIPS_FREEF( opj_stream_destroy, jp2k-&gt;stream );
-	VIPS_FREEF( opj_image_destroy, jp2k-&gt;image );
-	VIPS_UNREF( jp2k-&gt;source );
-
-	G_OBJECT_CLASS( vips_foreign_load_jp2k_parent_class )-&gt;
-		dispose( gobject );
-}
-
-static OPJ_SIZE_T
-vips_foreign_load_jp2k_read_source( void *buffer, size_t length, void *client )
-{
-	VipsSource *source = VIPS_SOURCE( client );
-	gint64 bytes_read = vips_source_read( source, buffer, length );
-
-	/* openjpeg read uses -1 for both EOF and error return.
-	 */
-	return( bytes_read == 0 ? -1 : bytes_read );
-}
-
-static OPJ_OFF_T
-vips_foreign_load_jp2k_skip_source( OPJ_OFF_T n_bytes, void *client )
-{
-	VipsSource *source = VIPS_SOURCE( client );
-
-	if( vips_source_seek( source, n_bytes, SEEK_CUR ) == -1 )
-		/* openjpeg skip uses -1 for both end of stream and error.
-		 */
-		return( -1 );
-
-	return( n_bytes );
-}
-
-static OPJ_BOOL
-vips_foreign_load_jp2k_seek_source( OPJ_OFF_T position, void *client )
-{
-	VipsSource *source = VIPS_SOURCE( client );
-
-	if( vips_source_seek( source, position, SEEK_SET ) == -1 )
-		/* openjpeg seek uses FALSE for both end of stream and error.
-		 */
-		return( OPJ_FALSE );
-
-	return( OPJ_TRUE );
-}
-
-/* Make a libopenjp2 stream that wraps a VipsSource.
- */
-static opj_stream_t *
-vips_foreign_load_jp2k_stream( VipsSource *source )
-{
-	opj_stream_t *stream;
-
-	/* TRUE means a read stream.
-	 */
-	if( !(stream = opj_stream_create( OPJ_J2K_STREAM_CHUNK_SIZE, TRUE )) ) 
-		return( NULL );
-
-	opj_stream_set_user_data( stream, source, NULL );
-	/* Unfortunately, jp2k requires the length, so pipe sources will have
-	 * to buffer in memory.
-	 */
-	opj_stream_set_user_data_length( stream,
-		vips_source_length( source ) );
-	opj_stream_set_read_function( stream, 
-		vips_foreign_load_jp2k_read_source );
-	opj_stream_set_skip_function( stream, 
-		vips_foreign_load_jp2k_skip_source );
-	opj_stream_set_seek_function( stream, 
-		vips_foreign_load_jp2k_seek_source );
-
-	return( stream );
-}
-
-static int
-vips_foreign_load_jp2k_build( VipsObject *object )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( object );
-	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) object;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_jp2k_build:\n" );
-#endif /*DEBUG*/
-
-	/* Default parameters.
-	 */
-        jp2k-&gt;parameters.decod_format = -1;
-        jp2k-&gt;parameters.cod_format = -1;
-        opj_set_default_decoder_parameters( &amp;jp2k-&gt;parameters );
-
-	/* Link the openjpeg stream to our VipsSource.
-	 */
-	if( jp2k-&gt;source ) {
-		jp2k-&gt;stream = vips_foreign_load_jp2k_stream( jp2k-&gt;source );
-		if( !jp2k-&gt;stream ) {
-			vips_error( class-&gt;nickname, 
-				"%s", _( "unable to create jp2k stream" ) );
-			return( -1 );
-		}
-	}
-
-	if( VIPS_OBJECT_CLASS( vips_foreign_load_jp2k_parent_class )-&gt;
-		build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-#define JP2_RFC3745_MAGIC "\x00\x00\x00\x0c\x6a\x50\x20\x20\x0d\x0a\x87\x0a"
-#define JP2_MAGIC "\x0d\x0a\x87\x0a"
-/* position 45: "\xff\x52" */
-#define J2K_CODESTREAM_MAGIC "\xff\x4f\xff\x51"
-
-/* Return the image format. OpenJPEG supports several different image types.
- */
-static OPJ_CODEC_FORMAT
-vips_foreign_load_jp2k_get_format( VipsSource *source )
-{
-	unsigned char *data;
-
-	if( vips_source_sniff_at_most( source, &amp;data, 12 ) &lt; 12 )
-		return( -1 );
-
-	/* There's also OPJ_CODEC_JPT for xxx.jpt files, but we don't support
-	 * that.
-	 */
-	if( memcmp( data, JP2_RFC3745_MAGIC, 12) == 0 || 
-		memcmp( data, JP2_MAGIC, 4 ) == 0 ) 
-		return( OPJ_CODEC_JP2 );
-	else if( memcmp( data, J2K_CODESTREAM_MAGIC, 4 ) == 0 )
-		return( OPJ_CODEC_J2K );
-	else
-		return( -1 );
-}
-
-static gboolean
-vips_foreign_load_jp2k_is_a_source( VipsSource *source )
-{
-	return( vips_foreign_load_jp2k_get_format( source ) != -1 ); 
-}
-
-static VipsForeignFlags
-vips_foreign_load_jp2k_get_flags( VipsForeignLoad *load )
-{
-	return( VIPS_FOREIGN_PARTIAL );
-}
-
-static void 
-vips_foreign_load_jp2k_error_callback( const char *msg, void *client )
-{
-	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) client;
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( jp2k );
-
-	vips_error( class-&gt;nickname, "%s", msg ); 
-	jp2k-&gt;n_errors += 1;
-}
-
-/* The openjpeg info and warning callbacks are incredibly chatty.
- */
-static void 
-vips_foreign_load_jp2k_warning_callback( const char *msg, void *client )
-{
-#ifdef DEBUG
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( client );
-
-	g_warning( "%s: %s",  class-&gt;nickname, msg );
-#endif /*DEBUG*/
-}
-
-/* The openjpeg info and warning callbacks are incredibly chatty.
- */
-static void 
-vips_foreign_load_jp2k_info_callback( const char *msg, void *client )
-{
-#ifdef DEBUG
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( client );
-
-	g_info( "%s: %s",  class-&gt;nickname, msg );
-#endif /*DEBUG*/
-}
-
-static void
-vips_foreign_load_jp2k_attach_handlers( VipsForeignLoadJp2k *jp2k,
-	opj_codec_t *codec )
-{
-	opj_set_info_handler( codec, 
-		vips_foreign_load_jp2k_info_callback, jp2k );
-	opj_set_warning_handler( codec, 
-		vips_foreign_load_jp2k_warning_callback, jp2k );
-	opj_set_error_handler( codec, 
-		vips_foreign_load_jp2k_error_callback, jp2k );
-}
-
-#ifdef DEBUG
-static void
-vips_foreign_load_jp2k_print_image( opj_image_t *image )
-{
-	printf( "image:\n" );
-	printf( "x0 = %u, y0 = %u, x1 = %u, y1 = %u, numcomps = %u, "
-		"color_space = %u\n",
-		image-&gt;x0, image-&gt;y0, image-&gt;x1, image-&gt;y1, 
-		image-&gt;numcomps, image-&gt;color_space ); 
-	printf( "icc_profile_buf = %p, icc_profile_len = %x\n", 
-		image-&gt;icc_profile_buf, image-&gt;icc_profile_len ); 
-}
-
-static void
-vips_foreign_load_jp2k_print( VipsForeignLoadJp2k *jp2k )
-{
-	int i;
-
-	vips_foreign_load_jp2k_print_image( jp2k-&gt;image );
-
-	printf( "components:\n" );
-	for( i = 0; i &lt; jp2k-&gt;image-&gt;numcomps; i++ ) {
-		opj_image_comp_t *this = &amp;jp2k-&gt;image-&gt;comps[i];
-
-		printf( "%i) dx = %u, dy = %u, w = %u, h = %u, "
-			"x0 = %u, y0 = %u\n", 
-			i, this-&gt;dx, this-&gt;dy, this-&gt;w, this-&gt;h, 
-			this-&gt;x0, this-&gt;y0 );
-		printf( "    prec = %x, bpp = %x, sgnd = %x, "
-			"resno_decoded = %u, factor = %u\n",
-			this-&gt;prec, this-&gt;bpp, this-&gt;sgnd, 
-			this-&gt;resno_decoded, this-&gt;factor );
-		printf( "    data = %p, alpha = %u\n",
-			this-&gt;data, this-&gt;alpha );
-	}
-
-	printf( "info:\n" );
-	printf( "tx0 = %u, ty0 = %d, tdx = %u, tdy = %u, tw = %u, th = %u\n",
-		jp2k-&gt;info-&gt;tx0, jp2k-&gt;info-&gt;ty0, 
-		jp2k-&gt;info-&gt;tdx, jp2k-&gt;info-&gt;tdy, 
-		jp2k-&gt;info-&gt;tw, jp2k-&gt;info-&gt;th );
-	printf( "nbcomps = %u, tile_info = %p\n", 
-		jp2k-&gt;info-&gt;nbcomps, jp2k-&gt;info-&gt;tile_info );
-}
-#endif /*DEBUG*/
-
-static int
-vips_foreign_load_jp2k_set_header( VipsForeignLoadJp2k *jp2k, VipsImage *out )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( jp2k );
-	opj_image_comp_t *first = &amp;jp2k-&gt;image-&gt;comps[0];
-
-	VipsBandFormat format;
-	VipsInterpretation interpretation;
-
-	/* OpenJPEG only supports up to 31 bpp. Treat it as 32.
-	 */
-	if( first-&gt;prec &lt;= 8 ) 
-		format = first-&gt;sgnd ? VIPS_FORMAT_CHAR : VIPS_FORMAT_UCHAR;
-	else if( first-&gt;prec &lt;= 16 ) 
-		format = first-&gt;sgnd ? VIPS_FORMAT_SHORT : VIPS_FORMAT_USHORT;
-	else
-		format = first-&gt;sgnd ? VIPS_FORMAT_INT : VIPS_FORMAT_UINT;
-
-	switch( jp2k-&gt;image-&gt;color_space ) {
-	case OPJ_CLRSPC_SYCC:
-	case OPJ_CLRSPC_EYCC:
-		/* Map these to RGB.
-		 */
-		interpretation = vips_format_sizeof( format ) == 1 ? 
-			VIPS_INTERPRETATION_sRGB :
-			VIPS_INTERPRETATION_RGB16;
-		jp2k-&gt;ycc_to_rgb = TRUE;
-		break;
-
-	case OPJ_CLRSPC_GRAY:
-		interpretation = vips_format_sizeof( format ) == 1 ? 
-			VIPS_INTERPRETATION_B_W :
-			VIPS_INTERPRETATION_GREY16;
-		break;
-
-	case OPJ_CLRSPC_SRGB:
-		interpretation = vips_format_sizeof( format ) == 1 ? 
-			VIPS_INTERPRETATION_sRGB :
-			VIPS_INTERPRETATION_RGB16;
-		break;
-
-	case OPJ_CLRSPC_CMYK:
-		interpretation = VIPS_INTERPRETATION_CMYK;
-		break;
-
-	case OPJ_CLRSPC_UNSPECIFIED:
-		/* Try to guess something sensible.
-		 */
-		if( jp2k-&gt;image-&gt;numcomps &lt; 3 )
-			interpretation = vips_format_sizeof( format ) == 1 ? 
-				VIPS_INTERPRETATION_B_W :
-				VIPS_INTERPRETATION_GREY16;
-		else
-			interpretation = vips_format_sizeof( format ) == 1 ? 
-				VIPS_INTERPRETATION_sRGB :
-				VIPS_INTERPRETATION_RGB16;
-
-		/* Unspecified with three bands and subsampling on bands 2 and
-		 * 3 is usually YCC. 
-		 */
-		if( jp2k-&gt;image-&gt;numcomps == 3 &amp;&amp;
-			jp2k-&gt;image-&gt;comps[0].dx == 1 &amp;&amp;
-			jp2k-&gt;image-&gt;comps[0].dy == 1 &amp;&amp;
-			jp2k-&gt;image-&gt;comps[1].dx &gt; 1 &amp;&amp;
-			jp2k-&gt;image-&gt;comps[1].dy &gt; 1 &amp;&amp;
-			jp2k-&gt;image-&gt;comps[2].dx &gt; 1 &amp;&amp;
-			jp2k-&gt;image-&gt;comps[2].dy &gt; 1)
-			jp2k-&gt;ycc_to_rgb = TRUE;
-
-		break;
-
-	default:
-		vips_error( class-&gt;nickname, 
-			_( "unsupported colourspace %d" ), 
-			jp2k-&gt;image-&gt;color_space );
-		return( -1 );
-	}
-
-	/* Even though this is a tiled reader, we hint thinstrip since with
-	 * the cache we are quite happy serving that if anything downstream 
-	 * would like it.
-	 */
-        if( vips_image_pipelinev( out, VIPS_DEMAND_STYLE_THINSTRIP, NULL ) )
-		return( -1 );
-
-	vips_image_init_fields( out,
-		first-&gt;w, first-&gt;h, jp2k-&gt;image-&gt;numcomps, format, 
-		VIPS_CODING_NONE, interpretation, 1.0, 1.0 );
-
-	/* openjpeg allows left and top of the coordinate grid to be
-	 * non-zero. These are always in unshrunk coordinates.
-	 */
-	out-&gt;Xoffset = 
-		-VIPS_ROUND_INT( (double) jp2k-&gt;image-&gt;x0 / jp2k-&gt;shrink );
-	out-&gt;Yoffset = 
-		-VIPS_ROUND_INT( (double) jp2k-&gt;image-&gt;y0 / jp2k-&gt;shrink );
-
-	if( jp2k-&gt;image-&gt;icc_profile_buf &amp;&amp;
-		jp2k-&gt;image-&gt;icc_profile_len &gt; 0 )
-		vips_image_set_blob_copy( out, VIPS_META_ICC_NAME, 
-			jp2k-&gt;image-&gt;icc_profile_buf,
-			jp2k-&gt;image-&gt;icc_profile_len );
-
-	/* Map number of layers in image to pages. 
-	 */
-	if( jp2k-&gt;info &amp;&amp;
-		jp2k-&gt;info-&gt;m_default_tile_info.tccp_info )
-		vips_image_set_int( out, VIPS_META_N_PAGES, 
-			jp2k-&gt;info-&gt;m_default_tile_info.tccp_info-&gt;
-				numresolutions );
-
-	return( 0 );
-}
-
-static int
-vips_foreign_load_jp2k_header( VipsForeignLoad *load )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( load );
-	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) load;
-
-	opj_image_comp_t *first;
-	int i;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_jp2k_header:\n" );
-#endif /*DEBUG*/
-
-	jp2k-&gt;format = vips_foreign_load_jp2k_get_format( jp2k-&gt;source );
-	vips_source_rewind( jp2k-&gt;source );
-	if( !(jp2k-&gt;codec = opj_create_decompress( jp2k-&gt;format )) )
-		return( -1 );
-
-	vips_foreign_load_jp2k_attach_handlers( jp2k, jp2k-&gt;codec );
-
-	jp2k-&gt;shrink = 1 &lt;&lt; jp2k-&gt;page;
-	jp2k-&gt;parameters.cp_reduce = jp2k-&gt;page;
-	if( !opj_setup_decoder( jp2k-&gt;codec, &amp;jp2k-&gt;parameters ) ) 
-		return( -1 );
-
-	opj_codec_set_threads( jp2k-&gt;codec, vips_concurrency_get() );
-
-	if( !opj_read_header( jp2k-&gt;stream, jp2k-&gt;codec, &amp;jp2k-&gt;image ) )
-		return( -1 );
-	if( !(jp2k-&gt;info = opj_get_cstr_info( jp2k-&gt;codec )) )
-		return( -1 );
-
-#ifdef DEBUG
-	vips_foreign_load_jp2k_print( jp2k );
-#endif /*DEBUG*/
-
-	/* We only allow images where all components have the same format.
-	 */
-	if( jp2k-&gt;image-&gt;numcomps &gt; MAX_BANDS ) {
-		vips_error( class-&gt;nickname, 
-			"%s", _( "too many image bands" ) );
-		return( -1 );
-	}
-	if( jp2k-&gt;image-&gt;numcomps == 0 ) {
-		vips_error( class-&gt;nickname, 
-			"%s", _( "no image components" ) );
-		return( -1 );
-	}
-	first = &amp;jp2k-&gt;image-&gt;comps[0];
-	for( i = 1; i &lt; jp2k-&gt;image-&gt;numcomps; i++ ) {
-		opj_image_comp_t *this = &amp;jp2k-&gt;image-&gt;comps[i];
-
-		if( this-&gt;x0 != first-&gt;x0 ||
-			this-&gt;y0 != first-&gt;y0 ||
-			this-&gt;w * this-&gt;dx != first-&gt;w * first-&gt;dx ||
-			this-&gt;h * this-&gt;dy != first-&gt;h * first-&gt;dy ||
-			this-&gt;resno_decoded != first-&gt;resno_decoded ||
-			this-&gt;factor != first-&gt;factor ) {
-			vips_error( class-&gt;nickname, 
-				"%s", _( "components differ in geometry" ) );
-			return( -1 );
-		}
-
-		if( this-&gt;prec != first-&gt;prec ||
-			this-&gt;bpp != first-&gt;bpp ||
-			this-&gt;sgnd != first-&gt;sgnd ) {
-			vips_error( class-&gt;nickname, 
-				"%s", _( "components differ in precision" ) );
-			return( -1 );
-		}
-
-		/* If dx/dy are not 1, we'll need to upsample components during
-		 * tile packing.
-		 */
-		if( this-&gt;dx != first-&gt;dx ||
-			this-&gt;dy != first-&gt;dy ||
-			first-&gt;dx != 1 ||
-			first-&gt;dy != 1 )
-			jp2k-&gt;upsample = TRUE;
-	}
-
-	if( vips_foreign_load_jp2k_set_header( jp2k, load-&gt;out ) ) 
-		return( -1 );
-
-	VIPS_SETSTR( load-&gt;out-&gt;filename, 
-		vips_connection_filename( VIPS_CONNECTION( jp2k-&gt;source ) ) );
-
-	return( 0 );
-}
-
-#define PACK( TYPE ) { \
-	TYPE *tq = (TYPE *) q; \
-	\
-	for( x = 0; x &lt; length; x++ ) { \
-		for( i = 0; i &lt; b; i++ ) \
-			tq[i] = planes[i][x]; \
-		\
-		tq += b; \
-	} \
-}
-
-#define PACK_UPSAMPLE( TYPE ) { \
-	TYPE *tq = (TYPE *) q; \
-	\
-	for( x = 0; x &lt; length; x++ ) { \
-		for( i = 0; i &lt; b; i++ ) { \
-			int dx = image-&gt;comps[i].dx; \
-			int pixel = planes[i][x / dx]; \
-			\
-			tq[i] = pixel; \
-		} \
-		\
-		tq += b; \
-	} \
-}
-
-/* Pack a line of openjpeg pixels into libvips format. left/top are the
- * offsets into the opj image in pixel coordinates where we should start 
- * reading.
- *
- * Set upsample if any opj component is subsampled.
- */
-static void
-vips_foreign_load_jp2k_pack( gboolean upsample, 
-	opj_image_t *image, VipsImage *im, 
-	VipsPel *q, int left, int top, int length )
-{
-	int *planes[MAX_BANDS];
-	int b = image-&gt;numcomps;
-
-	int x, i;
-
-#ifdef DEBUG_VERBOSE
-	printf( "vips_foreign_load_jp2k_pack: "
-		"upsample = %d, left = %d, top = %d, length = %d\n", 
-		upsample, left, top, length ); 
-#endif /*DEBUG_VERBOSE*/
-
-	for( i = 0; i &lt; b; i++ ) {
-		opj_image_comp_t *comp = &amp;image-&gt;comps[i];
-
-		planes[i] = comp-&gt;data + (top / comp-&gt;dy) * comp-&gt;w + 
-			(left / comp-&gt;dx);
-	}
-
-	if( upsample ) 
-		switch( im-&gt;BandFmt ) {
-		case VIPS_FORMAT_CHAR:
-		case VIPS_FORMAT_UCHAR:
-			PACK_UPSAMPLE( unsigned char );
-			break;
-
-		case VIPS_FORMAT_SHORT:
-		case VIPS_FORMAT_USHORT:
-			PACK_UPSAMPLE( unsigned short );
-			break;
-
-		case VIPS_FORMAT_INT:
-		case VIPS_FORMAT_UINT:
-			PACK_UPSAMPLE( unsigned int );
-			break;
-
-		default:
-			g_assert_not_reached();
-			break;
-		}
-	else 
-		/* Fast no-upsample path.
-		 */
-		switch( im-&gt;BandFmt ) {
-		case VIPS_FORMAT_CHAR:
-		case VIPS_FORMAT_UCHAR:
-			PACK( unsigned char );
-			break;
-
-		case VIPS_FORMAT_SHORT:
-		case VIPS_FORMAT_USHORT:
-			PACK( unsigned short );
-			break;
-
-		case VIPS_FORMAT_INT:
-		case VIPS_FORMAT_UINT:
-			PACK( unsigned int );
-			break;
-
-		default:
-			g_assert_not_reached();
-			break;
-		}
-}
-
-/* ycc-&gt;rgb coversion adapted from openjpeg src/bin/common/color.c
- *
- * See also https://en.wikipedia.org/wiki/YCbCr#JPEG_conversion
- */
-#define YCC_TO_RGB( TYPE ) { \
-	TYPE *tq = (TYPE *) q; \
-	\
-	for( x = 0; x &lt; length; x++ ) { \
-		int y = tq[0]; \
-		int cb = tq[1] - offset; \
-		int cr = tq[2] - offset; \
-		\
-		int r, g, b; \
-		\
-		r = y + (int)(1.402 * (float)cr); \
-		tq[0] = VIPS_CLIP( 0, r, upb ); \
-		\
-		g = y - (int)(0.344 * (float)cb + 0.714 * (float)cr); \
-		tq[1] = VIPS_CLIP( 0, g, upb ); \
-		\
-		b = y + (int)(1.772 * (float)cb); \
-		tq[2] = VIPS_CLIP( 0, b, upb ); \
-		\
-		tq += 3; \
-	} \
-}
-
-/* YCC-&gt;RGB for a line of pels.
- */
-static void
-vips_foreign_load_jp2k_ycc_to_rgb( opj_image_t *image, VipsImage *im, 
-	VipsPel *q, int length )
-{
-	int prec = image-&gt;comps[0].prec;
-	int offset = 1 &lt;&lt; (prec - 1);
-	int upb = (1 &lt;&lt; prec) - 1;
-
-	int x;
-
-	switch( im-&gt;BandFmt ) {
-	case VIPS_FORMAT_CHAR:
-	case VIPS_FORMAT_UCHAR:
-		YCC_TO_RGB( unsigned char );
-		break;
-
-	case VIPS_FORMAT_SHORT:
-	case VIPS_FORMAT_USHORT:
-		YCC_TO_RGB( unsigned short );
-		break;
-
-	case VIPS_FORMAT_INT:
-	case VIPS_FORMAT_UINT:
-		YCC_TO_RGB( unsigned int );
-		break;
-
-	default:
-		g_assert_not_reached();
-		break;
-	}
-}
-
-/* Loop over the output region, painting in tiles from the file.
- */
-static int
-vips_foreign_load_jp2k_generate( VipsRegion *out, 
-	void *seq, void *a, void *b, gboolean *stop )
-{
-	VipsForeignLoad *load = (VipsForeignLoad *) a;
-	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) load;
-	VipsRect *r = &amp;out-&gt;valid;
-
-	/* jp2k get smaller with the layer size.
-	 */
-	int tile_width = VIPS_ROUND_UINT( 
-		(double) jp2k-&gt;info-&gt;tdx / jp2k-&gt;shrink );
-	int tile_height = VIPS_ROUND_UINT( 
-		(double) jp2k-&gt;info-&gt;tdy / jp2k-&gt;shrink );
-
-	/* ... so tiles_across is always the same.
-	 */
-	int tiles_across = jp2k-&gt;info-&gt;tw;
-
-	int x, y, z;
-
-#ifdef DEBUG_VERBOSE
-	printf( "vips_foreign_load_jp2k_generate: "
-		"left = %d, top = %d, width = %d, height = %d\n", 
-		r-&gt;left, r-&gt;top, r-&gt;width, r-&gt;height ); 
-#endif /*DEBUG_VERBOSE*/
-
-	/* If openjpeg has flagged an error, the library is not in a known
-	 * state and it's not safe to call again.
-	 */
-	if( jp2k-&gt;n_errors )
-		return( 0 );
-
-	y = 0;
-	while( y &lt; r-&gt;height ) {
-		VipsRect tile, hit;
-
-		/* Not necessary, but it stops static analyzers complaining
-		 * about a used-before-set.
-		 */
-		hit.height = 0;
-
-		x = 0;
-		while( x &lt; r-&gt;width ) { 
-			/* Tile the xy falls in, in tile numbers.
-			 */
-			int tx = (r-&gt;left + x) / tile_width;
-			int ty = (r-&gt;top + y) / tile_height;
-
-			/* Pixel coordinates of the tile that xy falls in.
-			 */
-			int xs = tx * tile_width;
-			int ys = ty * tile_height;
-
-			int tile_index = ty * tiles_across + tx;
-
-			/* Fetch the tile.
-			 */
-#ifdef DEBUG_VERBOSE
-			printf( "   fetch tile %d\n", tile_index );
-#endif /*DEBUG_VERBOSE*/
-			if( !opj_get_decoded_tile( jp2k-&gt;codec, 
-				jp2k-&gt;stream, jp2k-&gt;image, tile_index ) )
-				return( -1 );
-
-			/* Intersect tile with request to get pixels we need
-			 * to copy out.
-			 */
-			tile.left = xs;
-			tile.top = ys;
-			tile.width = tile_width;
-			tile.height = tile_height;
-			vips_rect_intersectrect( &amp;tile, r, &amp;hit );
-
-			/* Unpack hit pixels to buffer in vips layout. 
-			 */
-			for( z = 0; z &lt; hit.height; z++ ) {
-				VipsPel *q = VIPS_REGION_ADDR( out, 
-					hit.left, hit.top + z );
-
-				vips_foreign_load_jp2k_pack( jp2k-&gt;upsample, 
-					jp2k-&gt;image, out-&gt;im, q,
-					hit.left - tile.left,
-					hit.top - tile.top + z,
-					hit.width ); 
-
-				if( jp2k-&gt;ycc_to_rgb )
-					vips_foreign_load_jp2k_ycc_to_rgb( 
-						jp2k-&gt;image, out-&gt;im, q, 
-						hit.width );
-			}
-
-			x += hit.width;
-		}
-
-		/* This will be the same for all tiles in the row we've just
-		 * done.
-		 */
-		y += hit.height;
-	}
-
-	if( load-&gt;fail &amp;&amp;
-		jp2k-&gt;n_errors &gt; 0 ) 
-		return( -1 );
-
-	return( 0 );
-}
-
-static int
-vips_foreign_load_jp2k_load( VipsForeignLoad *load )
-{
-	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) load;
-
-	/* jp2k tiles get smaller with the layer size, but we don't want tiny
-	 * tiles for the libvips tile cache, so leave them at the base size.
-	 */
-	int tile_width = jp2k-&gt;info-&gt;tdx;
-	int tile_height = jp2k-&gt;info-&gt;tdy;
-	int tiles_across = jp2k-&gt;info-&gt;tw;
-
-	VipsImage **t = (VipsImage **) 
-		vips_object_local_array( VIPS_OBJECT( load ), 3 );
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_jp2k_load:\n" );
-#endif /*DEBUG*/
-
-	t[0] = vips_image_new();
-	if( vips_foreign_load_jp2k_set_header( jp2k, t[0] ) ) 
-		return( -1 );
-
-	if( vips_image_generate( t[0], 
-		NULL, vips_foreign_load_jp2k_generate, NULL, jp2k, NULL ) )
-		return( -1 );
-
-	/* Copy to out, adding a cache. Enough tiles for two complete 
-	 * rows, plus 50%.
-	 */
-	if( vips_tilecache( t[0], &amp;t[1], 
-		"tile_width", tile_width,
-		"tile_height", tile_height,
-		"max_tiles", 3 * tiles_across,
-		NULL ) ) 
-		return( -1 );
-	if( vips_image_write( t[1], load-&gt;real ) ) 
-		return( -1 );
-
-	return( 0 );
-}
-
-static void
-vips_foreign_load_jp2k_class_init( VipsForeignLoadJp2kClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;dispose = vips_foreign_load_jp2k_dispose;
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "jp2kload_base";
-	object_class-&gt;description = _( "load JPEG2000 image" );
-	object_class-&gt;build = vips_foreign_load_jp2k_build;
-
-	load_class-&gt;get_flags = vips_foreign_load_jp2k_get_flags;
-	load_class-&gt;header = vips_foreign_load_jp2k_header;
-	load_class-&gt;load = vips_foreign_load_jp2k_load;
-
-	VIPS_ARG_INT( class, "page", 20, 
-		_( "Page" ), 
-		_( "Load this page from the image" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT,
-		G_STRUCT_OFFSET( VipsForeignLoadJp2k, page ),
-		0, 100000, 0 );
-
-}
-
-static void
-vips_foreign_load_jp2k_init( VipsForeignLoadJp2k *jp2k )
-{
-}
-
-typedef struct _VipsForeignLoadJp2kFile {
-	VipsForeignLoadJp2k parent_object;
-
-	/* Filename for load.
-	 */
-	char *filename; 
-
-} VipsForeignLoadJp2kFile;
-
-typedef VipsForeignLoadJp2kClass VipsForeignLoadJp2kFileClass;
-
-G_DEFINE_TYPE( VipsForeignLoadJp2kFile, vips_foreign_load_jp2k_file, 
-	vips_foreign_load_jp2k_get_type() );
-
-static int
-vips_foreign_load_jp2k_file_build( VipsObject *object )
-{
-	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) object;
-	VipsForeignLoadJp2kFile *file = (VipsForeignLoadJp2kFile *) object;
-
-	if( file-&gt;filename &amp;&amp;
-		!(jp2k-&gt;source = vips_source_new_from_file( file-&gt;filename )) )
-		return( -1 );
-
-	if( VIPS_OBJECT_CLASS( vips_foreign_load_jp2k_file_parent_class )-&gt;
-		build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-const char *vips__jp2k_suffs[] = 
-	{ ".j2k", ".jp2", ".jpt", ".j2c", ".jpc", NULL };
-
-static int
-vips_foreign_load_jp2k_is_a( const char *filename )
-{
-	VipsSource *source;
-	gboolean result;
-<a name="0"></a>
-	if( !(source = vips_source_new_from_file( filename )) )
-		return( FALSE );
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	result = vips_foreign_load_jp2k_is_a_source( source );
-	VIPS_UNREF( source );
-
-	return( result );
-}
-
-static void
-vips_foreign_load_jp2k_file_class_init( 
-	VipsForeignLoadJp2kFileClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignClass *foreign_class = (VipsForeignClass *) class;</b></font>
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "jp2kload";
-	object_class-&gt;build = vips_foreign_load_jp2k_file_build;
-
-	foreign_class-&gt;suffs = vips__jp2k_suffs;
-
-	load_class-&gt;is_a = vips_foreign_load_jp2k_is_a;
-
-	VIPS_ARG_STRING( class, "filename", 1, 
-		_( "Filename" ),
-		_( "Filename to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadJp2kFile, filename ),
-		NULL );
-
-}
-
-static void
-vips_foreign_load_jp2k_file_init( VipsForeignLoadJp2kFile *jp2k )
-{
-}
-
-typedef struct _VipsForeignLoadJp2kBuffer {
-	VipsForeignLoadJp2k parent_object;
-
-	/* Load from a buffer.
-	 */
-	VipsArea *buf;
-
-} VipsForeignLoadJp2kBuffer;
-
-typedef VipsForeignLoadJp2kClass VipsForeignLoadJp2kBufferClass;
-
-G_DEFINE_TYPE( VipsForeignLoadJp2kBuffer, vips_foreign_load_jp2k_buffer, 
-	vips_foreign_load_jp2k_get_type() );
-
-static int
-vips_foreign_load_jp2k_buffer_build( VipsObject *object )
-{
-	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) object;
-	VipsForeignLoadJp2kBuffer *buffer = 
-		(VipsForeignLoadJp2kBuffer *) object;
-
-	if( buffer-&gt;buf )
-		if( !(jp2k-&gt;source = vips_source_new_from_memory( 
-			VIPS_AREA( buffer-&gt;buf )-&gt;data, 
-			VIPS_AREA( buffer-&gt;buf )-&gt;length )) )
-			return( -1 );
-
-	if( VIPS_OBJECT_CLASS( vips_foreign_load_jp2k_file_parent_class )-&gt;
-		build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static gboolean
-vips_foreign_load_jp2k_buffer_is_a( const void *buf, size_t len )
-{
-	VipsSource *source;
-	gboolean result;
-
-	if( !(source = vips_source_new_from_memory( buf, len )) )
-		return( FALSE );
-	result = vips_foreign_load_jp2k_is_a_source( source );
-	VIPS_UNREF( source );
-
-	return( result );
-}
-
-static void
-vips_foreign_load_jp2k_buffer_class_init( 
-	VipsForeignLoadJp2kBufferClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "jp2kload_buffer";
-	object_class-&gt;build = vips_foreign_load_jp2k_buffer_build;
-
-	load_class-&gt;is_a_buffer = vips_foreign_load_jp2k_buffer_is_a;
-
-	VIPS_ARG_BOXED( class, "buffer", 1, 
-		_( "Buffer" ),
-		_( "Buffer to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadJp2kBuffer, buf ),
-		VIPS_TYPE_BLOB );
-
-}
-
-static void
-vips_foreign_load_jp2k_buffer_init( VipsForeignLoadJp2kBuffer *buffer )
-{
-}
-
-typedef struct _VipsForeignLoadJp2kSource {
-	VipsForeignLoadJp2k parent_object;
-
-	/* Load from a source.
-	 */
-	VipsSource *source;
-
-} VipsForeignLoadJp2kSource;
-
-typedef VipsForeignLoadJp2kClass VipsForeignLoadJp2kSourceClass;
-
-G_DEFINE_TYPE( VipsForeignLoadJp2kSource, vips_foreign_load_jp2k_source, 
-	vips_foreign_load_jp2k_get_type() );
-
-static int
-vips_foreign_load_jp2k_source_build( VipsObject *object )
-{
-	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) object;
-	VipsForeignLoadJp2kSource *source = 
-		(VipsForeignLoadJp2kSource *) object;
-
-	if( source-&gt;source ) {
-		jp2k-&gt;source = source-&gt;source;
-		g_object_ref( jp2k-&gt;source );
-	}
-
-	if( VIPS_OBJECT_CLASS( 
-		vips_foreign_load_jp2k_source_parent_class )-&gt;
-			build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static void
-vips_foreign_load_jp2k_source_class_init( 
-	VipsForeignLoadJp2kSourceClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "jp2kload_source";
-	object_class-&gt;build = vips_foreign_load_jp2k_source_build;
-
-	load_class-&gt;is_a_source = vips_foreign_load_jp2k_is_a_source;
-
-	VIPS_ARG_OBJECT( class, "source", 1,
-		_( "Source" ),
-		_( "Source to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadJp2kSource, source ),
-		VIPS_TYPE_SOURCE );
-
-}
-
-static void
-vips_foreign_load_jp2k_source_init( 
-	VipsForeignLoadJp2kSource *jp2k )
-{
-}
-
-static void 
-warning_callback( const char *msg G_GNUC_UNUSED, void *data G_GNUC_UNUSED ) 
-{
-	/* There are a lot of warnings ...
-	 */
-}
-
-static void 
-error_callback( const char *msg, void *data ) 
-{
-	printf( "OpenJPEG: %s", msg ); 
-	vips_error( "OpenJPEG", "%s", msg ); 
-}
-
-typedef struct _TileDecompress {
-	VipsSource *source;
-        opj_stream_t *stream;
-        opj_codec_t *codec;
-	opj_image_t *image;
-} TileDecompress;
-
-static void
-vips__foreign_load_jp2k_decompress_free( TileDecompress *decompress )
-{
-	VIPS_FREEF( opj_destroy_codec, decompress-&gt;codec );
-	VIPS_FREEF( opj_image_destroy, decompress-&gt;image );
-	VIPS_FREEF( opj_stream_destroy, decompress-&gt;stream );
-	VIPS_UNREF( decompress-&gt;source );
-}
-
-/* Called from tiff2vips to decode a jp2k-compressed tile. 
- *
- * width/height is the tile size. If this is an edge tile, and smaller than 
- * this, we still write a full-size tile and our caller will clip.
- */
-int
-vips__foreign_load_jp2k_decompress( VipsImage *out, 
-	int width, int height, gboolean ycc_to_rgb, 
-	void *from, size_t from_length, 
-	void *to, size_t to_length )
-{
-	size_t pel_size = VIPS_IMAGE_SIZEOF_PEL( out );
-	size_t line_size = pel_size * width;
-
-	TileDecompress decompress = { 0 };
-	opj_dparameters_t parameters;
-	int i;
-	gboolean upsample;
-	VipsPel *q;
-	int y;
-
-#ifdef DEBUG
-	printf( "vips__foreign_load_jp2k_decompress: width = %d, height = %d, "
-		"ycc_to_rgb = %d, from_length = %zd, to_length = %zd\n",
-		width, height, ycc_to_rgb, from_length, to_length );
-#endif /*DEBUG*/
-
-	/* Our ycc-&gt;rgb only works for exactly 3 bands.
-	 */
-	ycc_to_rgb = ycc_to_rgb &amp;&amp; out-&gt;Bands == 3;
-
-	decompress.codec = opj_create_decompress( OPJ_CODEC_J2K );
-	opj_set_default_decoder_parameters( &amp;parameters );
-	opj_setup_decoder( decompress.codec, &amp;parameters );
-	opj_set_warning_handler( decompress.codec, warning_callback, NULL );
-	opj_set_error_handler( decompress.codec, error_callback, NULL );
-
-	decompress.source = vips_source_new_from_memory( from, from_length );
-	decompress.stream = vips_foreign_load_jp2k_stream( decompress.source );
-	if( !opj_read_header( decompress.stream, 
-		decompress.codec, &amp;decompress.image ) ) {
-		vips_error( "jp2kload", "%s", ( "header error" ) );
-		vips__foreign_load_jp2k_decompress_free( &amp;decompress ); 
-		return( -1 );
-	}
-
-	if( decompress.image-&gt;x1 &gt; width || 
-		decompress.image-&gt;y1 &gt; height ||
-		line_size * height &gt; to_length ) {
-		vips_error( "jp2kload", "%s", ( "bad dimensions" ) );
-		vips__foreign_load_jp2k_decompress_free( &amp;decompress ); 
-    		return( -1 );
-	}
-
-	if( !opj_decode( decompress.codec, 
-		decompress.stream, decompress.image ) ) {
-		vips_error( "jp2kload", "%s", ( "decode error" ) );
-		vips__foreign_load_jp2k_decompress_free( &amp;decompress ); 
-		return( -1 );
-	}
-
-	/* Do any components need upsampling?
-	 */
-	upsample = FALSE;
-	for( i = 0; i &lt; decompress.image-&gt;numcomps; i++ ) {
-		opj_image_comp_t *this = &amp;decompress.image-&gt;comps[i];
-
-		if( this-&gt;dx &gt; 1 ||
-			this-&gt;dy &gt; 1 )
-			upsample = TRUE;
-	}
-
-	/* Unpack hit pixels to buffer in vips layout. 
-	 */
-	q = to;
-	for( y = 0; y &lt; height; y++ ) {
-		vips_foreign_load_jp2k_pack( upsample, 
-			decompress.image, out, q,
-			0, y, width ); 
-
-		if( ycc_to_rgb )
-			vips_foreign_load_jp2k_ycc_to_rgb( 
-				decompress.image, out, q, 
-				width );
-
-		q += line_size;
-	}
-
-	vips__foreign_load_jp2k_decompress_free( &amp;decompress ); 
-
-	return( 0 );
-}
-
-#else /*!HAVE_LIBOPENJP2*/
-
-int
-vips__foreign_load_jp2k_decompress( VipsImage *out, 
-	int width, int height, gboolean ycc_to_rgb, 
-	void *from, size_t from_length, 
-	void *to, size_t to_length )
-{
-	vips_error( "jp2k", 
-		"%s", _( "libvips built without JPEG2000 support" ) );
-	return( -1 );
-}
-
-#endif /*HAVE_LIBOPENJP2*/
-
-/**
- * vips_jp2kload:
- * @filename: file to load
- * @out: (out): decompressed image
- * @...: %NULL-terminated list of optional named arguments
- *
- * Optional arguments:
- *
- * * @page: %gint, load this page
- *
- * Read a JPEG2000 image. The loader supports 8, 16 and 32-bit int pixel
- * values, signed and unsigned. 
- * It supports greyscale, RGB, YCC, CMYK and
- * multispectral colour spaces. 
- * It will read any ICC profile on
- * the image. 
- *
- * It will only load images where all channels are the same format.
- *
- * Use @page to set the page to load, where page 0 is the base resolution
- * image and higher-numbered pages are x2 reductions. Use the metadata item
- * "n-pages" to find the number of pyramid layers.
- *
- * See also: vips_image_new_from_file().
- *
- * Returns: 0 on success, -1 on error.
- */
-int
-vips_jp2kload( const char *filename, VipsImage **out, ... )
-{
-	va_list ap;
-	int result;
-
-	va_start( ap, out );
-	result = vips_call_split( "jp2kload", ap, filename, out );
-	va_end( ap );
-
-	return( result );
-}
-
-/**
- * vips_jp2kload_buffer:
- * @buf: (array length=len) (element-type guint8): memory area to load
- * @len: (type gsize): size of memory area
- * @out: (out): image to write
- * @...: %NULL-terminated list of optional named arguments
- *
- * Optional arguments:
- *
- * * @page: %gint, load this page
- *
- * Exactly as vips_jp2kload(), but read from a source. 
- *
- * Returns: 0 on success, -1 on error.
- */
-int
-vips_jp2kload_buffer( void *buf, size_t len, VipsImage **out, ... )
-{
-	va_list ap;
-	VipsBlob *blob;
-	int result;
-
-	/* We don't take a copy of the data or free it.
-	 */
-	blob = vips_blob_new( NULL, buf, len );
-
-	va_start( ap, out );
-	result = vips_call_split( "jp2kload_buffer", ap, blob, out );
-	va_end( ap );
-
-	vips_area_unref( VIPS_AREA( blob ) );
-
-	return( result );
-}
-
-/**
- * vips_jp2kload_source:
- * @source: source to load from
- * @out: (out): decompressed image
- * @...: %NULL-terminated list of optional named arguments
- *
- * Optional arguments:
- *
- * * @page: %gint, load this page
- *
- * Exactly as vips_jp2kload(), but read from a source. 
- *
- * Returns: 0 on success, -1 on error.
- */
-int
-vips_jp2kload_source( VipsSource *source, VipsImage **out, ... )
-{
-	va_list ap;
-	int result;
-
-	va_start( ap, out );
-	result = vips_call_split( "jp2kload_source", ap, source, out );
-	va_end( ap );
-
-	return( result );
-}
+1 #ifdef HAVE_CONFIG_H
+2 #include &lt;config.h&gt;
+3 #include &lt;vips/intl.h&gt;
+4 #include &lt;stdio.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;vips/vips.h&gt;
+8 #include &lt;vips/debug.h&gt;
+9 #include &lt;vips/internal.h&gt;
+10 #ifdef HAVE_LIBOPENJP2
+11 #include &lt;openjpeg.h&gt;
+12 #include "pforeign.h"
+13 #define MAX_BANDS (100)
+14 typedef struct _VipsForeignLoadJp2k {
+15 	VipsForeignLoad parent_object;
+16 	VipsSource *source;
+17 	int page;
+18 	int shrink;
+19         opj_stream_t *stream;			OPJ_CODEC_FORMAT format;	        opj_codec_t *codec;			opj_dparameters_t parameters;		opj_image_t *image;			opj_codestream_info_v2_t *info;	
+20 	int n_errors;
+21 	gboolean upsample;
+22 	gboolean ycc_to_rgb;
+23 } VipsForeignLoadJp2k;
+24 typedef VipsForeignLoadClass VipsForeignLoadJp2kClass;
+25 G_DEFINE_ABSTRACT_TYPE( VipsForeignLoadJp2k, vips_foreign_load_jp2k, 
+26 	VIPS_TYPE_FOREIGN_LOAD );
+27 static void
+28 vips_foreign_load_jp2k_dispose( GObject *gobject )
+29 {
+30 	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) gobject;
+31 #ifdef DEBUG
+32 	printf( "vips_foreign_load_jp2k_dispose:\n" );
+33 	if( jp2k-&gt;info )
+34 		opj_destroy_cstr_info( &amp;jp2k-&gt;info );
+35 	VIPS_FREEF( opj_destroy_codec, jp2k-&gt;codec );
+36 	VIPS_FREEF( opj_stream_destroy, jp2k-&gt;stream );
+37 	VIPS_FREEF( opj_image_destroy, jp2k-&gt;image );
+38 	VIPS_UNREF( jp2k-&gt;source );
+39 	G_OBJECT_CLASS( vips_foreign_load_jp2k_parent_class )-&gt;
+40 		dispose( gobject );
+41 }
+42 static OPJ_SIZE_T
+43 vips_foreign_load_jp2k_read_source( void *buffer, size_t length, void *client )
+44 {
+45 	VipsSource *source = VIPS_SOURCE( client );
+46 	gint64 bytes_read = vips_source_read( source, buffer, length );
+47 	return( bytes_read == 0 ? -1 : bytes_read );
+48 }
+49 static OPJ_OFF_T
+50 vips_foreign_load_jp2k_skip_source( OPJ_OFF_T n_bytes, void *client )
+51 {
+52 	VipsSource *source = VIPS_SOURCE( client );
+53 	if( vips_source_seek( source, n_bytes, SEEK_CUR ) == -1 )
+54 		return( -1 );
+55 	return( n_bytes );
+56 }
+57 static OPJ_BOOL
+58 vips_foreign_load_jp2k_seek_source( OPJ_OFF_T position, void *client )
+59 {
+60 	VipsSource *source = VIPS_SOURCE( client );
+61 	if( vips_source_seek( source, position, SEEK_SET ) == -1 )
+62 		return( OPJ_FALSE );
+63 	return( OPJ_TRUE );
+64 }
+65 static opj_stream_t *
+66 vips_foreign_load_jp2k_stream( VipsSource *source )
+67 {
+68 	opj_stream_t *stream;
+69 	if( !(stream = opj_stream_create( OPJ_J2K_STREAM_CHUNK_SIZE, TRUE )) ) 
+70 		return( NULL );
+71 	opj_stream_set_user_data( stream, source, NULL );
+72 	opj_stream_set_user_data_length( stream,
+73 		vips_source_length( source ) );
+74 	opj_stream_set_read_function( stream, 
+75 		vips_foreign_load_jp2k_read_source );
+76 	opj_stream_set_skip_function( stream, 
+77 		vips_foreign_load_jp2k_skip_source );
+78 	opj_stream_set_seek_function( stream, 
+79 		vips_foreign_load_jp2k_seek_source );
+80 	return( stream );
+81 }
+82 static int
+83 vips_foreign_load_jp2k_build( VipsObject *object )
+84 {
+85 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( object );
+86 	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) object;
+87 #ifdef DEBUG
+88 	printf( "vips_foreign_load_jp2k_build:\n" );
+89         jp2k-&gt;parameters.decod_format = -1;
+90         jp2k-&gt;parameters.cod_format = -1;
+91         opj_set_default_decoder_parameters( &amp;jp2k-&gt;parameters );
+92 	if( jp2k-&gt;source ) {
+93 		jp2k-&gt;stream = vips_foreign_load_jp2k_stream( jp2k-&gt;source );
+94 		if( !jp2k-&gt;stream ) {
+95 			vips_error( class-&gt;nickname, 
+96 				"%s", _( "unable to create jp2k stream" ) );
+97 			return( -1 );
+98 		}
+99 	}
+100 	if( VIPS_OBJECT_CLASS( vips_foreign_load_jp2k_parent_class )-&gt;
+101 		build( object ) )
+102 		return( -1 );
+103 	return( 0 );
+104 }
+105 #define JP2_RFC3745_MAGIC "\x00\x00\x00\x0c\x6a\x50\x20\x20\x0d\x0a\x87\x0a"
+106 #define JP2_MAGIC "\x0d\x0a\x87\x0a"
+107 #define J2K_CODESTREAM_MAGIC "\xff\x4f\xff\x51"
+108 static OPJ_CODEC_FORMAT
+109 vips_foreign_load_jp2k_get_format( VipsSource *source )
+110 {
+111 	unsigned char *data;
+112 	if( vips_source_sniff_at_most( source, &amp;data, 12 ) &lt; 12 )
+113 		return( -1 );
+114 	if( memcmp( data, JP2_RFC3745_MAGIC, 12) == 0 || 
+115 		memcmp( data, JP2_MAGIC, 4 ) == 0 ) 
+116 		return( OPJ_CODEC_JP2 );
+117 	else if( memcmp( data, J2K_CODESTREAM_MAGIC, 4 ) == 0 )
+118 		return( OPJ_CODEC_J2K );
+119 	else
+120 		return( -1 );
+121 }
+122 static gboolean
+123 vips_foreign_load_jp2k_is_a_source( VipsSource *source )
+124 {
+125 	return( vips_foreign_load_jp2k_get_format( source ) != -1 ); 
+126 }
+127 static VipsForeignFlags
+128 vips_foreign_load_jp2k_get_flags( VipsForeignLoad *load )
+129 {
+130 	return( VIPS_FOREIGN_PARTIAL );
+131 }
+132 static void 
+133 vips_foreign_load_jp2k_error_callback( const char *msg, void *client )
+134 {
+135 	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) client;
+136 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( jp2k );
+137 	vips_error( class-&gt;nickname, "%s", msg ); 
+138 	jp2k-&gt;n_errors += 1;
+139 }
+140 static void 
+141 vips_foreign_load_jp2k_warning_callback( const char *msg, void *client )
+142 {
+143 #ifdef DEBUG
+144 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( client );
+145 	g_warning( "%s: %s",  class-&gt;nickname, msg );
+146 }
+147 static void 
+148 vips_foreign_load_jp2k_info_callback( const char *msg, void *client )
+149 {
+150 #ifdef DEBUG
+151 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( client );
+152 	g_info( "%s: %s",  class-&gt;nickname, msg );
+153 }
+154 static void
+155 vips_foreign_load_jp2k_attach_handlers( VipsForeignLoadJp2k *jp2k,
+156 	opj_codec_t *codec )
+157 {
+158 	opj_set_info_handler( codec, 
+159 		vips_foreign_load_jp2k_info_callback, jp2k );
+160 	opj_set_warning_handler( codec, 
+161 		vips_foreign_load_jp2k_warning_callback, jp2k );
+162 	opj_set_error_handler( codec, 
+163 		vips_foreign_load_jp2k_error_callback, jp2k );
+164 }
+165 #ifdef DEBUG
+166 static void
+167 vips_foreign_load_jp2k_print_image( opj_image_t *image )
+168 {
+169 	printf( "image:\n" );
+170 	printf( "x0 = %u, y0 = %u, x1 = %u, y1 = %u, numcomps = %u, "
+171 		"color_space = %u\n",
+172 		image-&gt;x0, image-&gt;y0, image-&gt;x1, image-&gt;y1, 
+173 		image-&gt;numcomps, image-&gt;color_space ); 
+174 	printf( "icc_profile_buf = %p, icc_profile_len = %x\n", 
+175 		image-&gt;icc_profile_buf, image-&gt;icc_profile_len ); 
+176 }
+177 static void
+178 vips_foreign_load_jp2k_print( VipsForeignLoadJp2k *jp2k )
+179 {
+180 	int i;
+181 	vips_foreign_load_jp2k_print_image( jp2k-&gt;image );
+182 	printf( "components:\n" );
+183 	for( i = 0; i &lt; jp2k-&gt;image-&gt;numcomps; i++ ) {
+184 		opj_image_comp_t *this = &amp;jp2k-&gt;image-&gt;comps[i];
+185 		printf( "%i) dx = %u, dy = %u, w = %u, h = %u, "
+186 			"x0 = %u, y0 = %u\n", 
+187 			i, this-&gt;dx, this-&gt;dy, this-&gt;w, this-&gt;h, 
+188 			this-&gt;x0, this-&gt;y0 );
+189 		printf( "    prec = %x, bpp = %x, sgnd = %x, "
+190 			"resno_decoded = %u, factor = %u\n",
+191 			this-&gt;prec, this-&gt;bpp, this-&gt;sgnd, 
+192 			this-&gt;resno_decoded, this-&gt;factor );
+193 		printf( "    data = %p, alpha = %u\n",
+194 			this-&gt;data, this-&gt;alpha );
+195 	}
+196 	printf( "info:\n" );
+197 	printf( "tx0 = %u, ty0 = %d, tdx = %u, tdy = %u, tw = %u, th = %u\n",
+198 		jp2k-&gt;info-&gt;tx0, jp2k-&gt;info-&gt;ty0, 
+199 		jp2k-&gt;info-&gt;tdx, jp2k-&gt;info-&gt;tdy, 
+200 		jp2k-&gt;info-&gt;tw, jp2k-&gt;info-&gt;th );
+201 	printf( "nbcomps = %u, tile_info = %p\n", 
+202 		jp2k-&gt;info-&gt;nbcomps, jp2k-&gt;info-&gt;tile_info );
+203 }
+204 static int
+205 vips_foreign_load_jp2k_set_header( VipsForeignLoadJp2k *jp2k, VipsImage *out )
+206 {
+207 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( jp2k );
+208 	opj_image_comp_t *first = &amp;jp2k-&gt;image-&gt;comps[0];
+209 	VipsBandFormat format;
+210 	VipsInterpretation interpretation;
+211 	if( first-&gt;prec &lt;= 8 ) 
+212 		format = first-&gt;sgnd ? VIPS_FORMAT_CHAR : VIPS_FORMAT_UCHAR;
+213 	else if( first-&gt;prec &lt;= 16 ) 
+214 		format = first-&gt;sgnd ? VIPS_FORMAT_SHORT : VIPS_FORMAT_USHORT;
+215 	else
+216 		format = first-&gt;sgnd ? VIPS_FORMAT_INT : VIPS_FORMAT_UINT;
+217 	switch( jp2k-&gt;image-&gt;color_space ) {
+218 	case OPJ_CLRSPC_SYCC:
+219 	case OPJ_CLRSPC_EYCC:
+220 		interpretation = vips_format_sizeof( format ) == 1 ? 
+221 			VIPS_INTERPRETATION_sRGB :
+222 			VIPS_INTERPRETATION_RGB16;
+223 		jp2k-&gt;ycc_to_rgb = TRUE;
+224 		break;
+225 	case OPJ_CLRSPC_GRAY:
+226 		interpretation = vips_format_sizeof( format ) == 1 ? 
+227 			VIPS_INTERPRETATION_B_W :
+228 			VIPS_INTERPRETATION_GREY16;
+229 		break;
+230 	case OPJ_CLRSPC_SRGB:
+231 		interpretation = vips_format_sizeof( format ) == 1 ? 
+232 			VIPS_INTERPRETATION_sRGB :
+233 			VIPS_INTERPRETATION_RGB16;
+234 		break;
+235 	case OPJ_CLRSPC_CMYK:
+236 		interpretation = VIPS_INTERPRETATION_CMYK;
+237 		break;
+238 	case OPJ_CLRSPC_UNSPECIFIED:
+239 		if( jp2k-&gt;image-&gt;numcomps &lt; 3 )
+240 			interpretation = vips_format_sizeof( format ) == 1 ? 
+241 				VIPS_INTERPRETATION_B_W :
+242 				VIPS_INTERPRETATION_GREY16;
+243 		else
+244 			interpretation = vips_format_sizeof( format ) == 1 ? 
+245 				VIPS_INTERPRETATION_sRGB :
+246 				VIPS_INTERPRETATION_RGB16;
+247 		if( jp2k-&gt;image-&gt;numcomps == 3 &amp;&amp;
+248 			jp2k-&gt;image-&gt;comps[0].dx == 1 &amp;&amp;
+249 			jp2k-&gt;image-&gt;comps[0].dy == 1 &amp;&amp;
+250 			jp2k-&gt;image-&gt;comps[1].dx &gt; 1 &amp;&amp;
+251 			jp2k-&gt;image-&gt;comps[1].dy &gt; 1 &amp;&amp;
+252 			jp2k-&gt;image-&gt;comps[2].dx &gt; 1 &amp;&amp;
+253 			jp2k-&gt;image-&gt;comps[2].dy &gt; 1)
+254 			jp2k-&gt;ycc_to_rgb = TRUE;
+255 		break;
+256 	default:
+257 		vips_error( class-&gt;nickname, 
+258 			_( "unsupported colourspace %d" ), 
+259 			jp2k-&gt;image-&gt;color_space );
+260 		return( -1 );
+261 	}
+262         if( vips_image_pipelinev( out, VIPS_DEMAND_STYLE_THINSTRIP, NULL ) )
+263 		return( -1 );
+264 	vips_image_init_fields( out,
+265 		first-&gt;w, first-&gt;h, jp2k-&gt;image-&gt;numcomps, format, 
+266 		VIPS_CODING_NONE, interpretation, 1.0, 1.0 );
+267 	out-&gt;Xoffset = 
+268 		-VIPS_ROUND_INT( (double) jp2k-&gt;image-&gt;x0 / jp2k-&gt;shrink );
+269 	out-&gt;Yoffset = 
+270 		-VIPS_ROUND_INT( (double) jp2k-&gt;image-&gt;y0 / jp2k-&gt;shrink );
+271 	if( jp2k-&gt;image-&gt;icc_profile_buf &amp;&amp;
+272 		jp2k-&gt;image-&gt;icc_profile_len &gt; 0 )
+273 		vips_image_set_blob_copy( out, VIPS_META_ICC_NAME, 
+274 			jp2k-&gt;image-&gt;icc_profile_buf,
+275 			jp2k-&gt;image-&gt;icc_profile_len );
+276 	if( jp2k-&gt;info &amp;&amp;
+277 		jp2k-&gt;info-&gt;m_default_tile_info.tccp_info )
+278 		vips_image_set_int( out, VIPS_META_N_PAGES, 
+279 			jp2k-&gt;info-&gt;m_default_tile_info.tccp_info-&gt;
+280 				numresolutions );
+281 	return( 0 );
+282 }
+283 static int
+284 vips_foreign_load_jp2k_header( VipsForeignLoad *load )
+285 {
+286 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( load );
+287 	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) load;
+288 	opj_image_comp_t *first;
+289 	int i;
+290 #ifdef DEBUG
+291 	printf( "vips_foreign_load_jp2k_header:\n" );
+292 	jp2k-&gt;format = vips_foreign_load_jp2k_get_format( jp2k-&gt;source );
+293 	vips_source_rewind( jp2k-&gt;source );
+294 	if( !(jp2k-&gt;codec = opj_create_decompress( jp2k-&gt;format )) )
+295 		return( -1 );
+296 	vips_foreign_load_jp2k_attach_handlers( jp2k, jp2k-&gt;codec );
+297 	jp2k-&gt;shrink = 1 &lt;&lt; jp2k-&gt;page;
+298 	jp2k-&gt;parameters.cp_reduce = jp2k-&gt;page;
+299 	if( !opj_setup_decoder( jp2k-&gt;codec, &amp;jp2k-&gt;parameters ) ) 
+300 		return( -1 );
+301 	opj_codec_set_threads( jp2k-&gt;codec, vips_concurrency_get() );
+302 	if( !opj_read_header( jp2k-&gt;stream, jp2k-&gt;codec, &amp;jp2k-&gt;image ) )
+303 		return( -1 );
+304 	if( !(jp2k-&gt;info = opj_get_cstr_info( jp2k-&gt;codec )) )
+305 		return( -1 );
+306 #ifdef DEBUG
+307 	vips_foreign_load_jp2k_print( jp2k );
+308 	if( jp2k-&gt;image-&gt;numcomps &gt; MAX_BANDS ) {
+309 		vips_error( class-&gt;nickname, 
+310 			"%s", _( "too many image bands" ) );
+311 		return( -1 );
+312 	}
+313 	if( jp2k-&gt;image-&gt;numcomps == 0 ) {
+314 		vips_error( class-&gt;nickname, 
+315 			"%s", _( "no image components" ) );
+316 		return( -1 );
+317 	}
+318 	first = &amp;jp2k-&gt;image-&gt;comps[0];
+319 	for( i = 1; i &lt; jp2k-&gt;image-&gt;numcomps; i++ ) {
+320 		opj_image_comp_t *this = &amp;jp2k-&gt;image-&gt;comps[i];
+321 		if( this-&gt;x0 != first-&gt;x0 ||
+322 			this-&gt;y0 != first-&gt;y0 ||
+323 			this-&gt;w * this-&gt;dx != first-&gt;w * first-&gt;dx ||
+324 			this-&gt;h * this-&gt;dy != first-&gt;h * first-&gt;dy ||
+325 			this-&gt;resno_decoded != first-&gt;resno_decoded ||
+326 			this-&gt;factor != first-&gt;factor ) {
+327 			vips_error( class-&gt;nickname, 
+328 				"%s", _( "components differ in geometry" ) );
+329 			return( -1 );
+330 		}
+331 		if( this-&gt;prec != first-&gt;prec ||
+332 			this-&gt;bpp != first-&gt;bpp ||
+333 			this-&gt;sgnd != first-&gt;sgnd ) {
+334 			vips_error( class-&gt;nickname, 
+335 				"%s", _( "components differ in precision" ) );
+336 			return( -1 );
+337 		}
+338 		if( this-&gt;dx != first-&gt;dx ||
+339 			this-&gt;dy != first-&gt;dy ||
+340 			first-&gt;dx != 1 ||
+341 			first-&gt;dy != 1 )
+342 			jp2k-&gt;upsample = TRUE;
+343 	}
+344 	if( vips_foreign_load_jp2k_set_header( jp2k, load-&gt;out ) ) 
+345 		return( -1 );
+346 	VIPS_SETSTR( load-&gt;out-&gt;filename, 
+347 		vips_connection_filename( VIPS_CONNECTION( jp2k-&gt;source ) ) );
+348 	return( 0 );
+349 }
+350 #define PACK( TYPE ) { \
+351 	TYPE *tq = (TYPE *) q; \
+352 	\
+353 	for( x = 0; x &lt; length; x++ ) { \
+354 		for( i = 0; i &lt; b; i++ ) \
+355 			tq[i] = planes[i][x]; \
+356 		\
+357 		tq += b; \
+358 	} \
+359 }
+360 #define PACK_UPSAMPLE( TYPE ) { \
+361 	TYPE *tq = (TYPE *) q; \
+362 	\
+363 	for( x = 0; x &lt; length; x++ ) { \
+364 		for( i = 0; i &lt; b; i++ ) { \
+365 			int dx = image-&gt;comps[i].dx; \
+366 			int pixel = planes[i][x / dx]; \
+367 			\
+368 			tq[i] = pixel; \
+369 		} \
+370 		\
+371 		tq += b; \
+372 	} \
+373 }
+374 static void
+375 vips_foreign_load_jp2k_pack( gboolean upsample, 
+376 	opj_image_t *image, VipsImage *im, 
+377 	VipsPel *q, int left, int top, int length )
+378 {
+379 	int *planes[MAX_BANDS];
+380 	int b = image-&gt;numcomps;
+381 	int x, i;
+382 #ifdef DEBUG_VERBOSE
+383 	printf( "vips_foreign_load_jp2k_pack: "
+384 		"upsample = %d, left = %d, top = %d, length = %d\n", 
+385 		upsample, left, top, length ); 
+386 	for( i = 0; i &lt; b; i++ ) {
+387 		opj_image_comp_t *comp = &amp;image-&gt;comps[i];
+388 		planes[i] = comp-&gt;data + (top / comp-&gt;dy) * comp-&gt;w + 
+389 			(left / comp-&gt;dx);
+390 	}
+391 	if( upsample ) 
+392 		switch( im-&gt;BandFmt ) {
+393 		case VIPS_FORMAT_CHAR:
+394 		case VIPS_FORMAT_UCHAR:
+395 			PACK_UPSAMPLE( unsigned char );
+396 			break;
+397 		case VIPS_FORMAT_SHORT:
+398 		case VIPS_FORMAT_USHORT:
+399 			PACK_UPSAMPLE( unsigned short );
+400 			break;
+401 		case VIPS_FORMAT_INT:
+402 		case VIPS_FORMAT_UINT:
+403 			PACK_UPSAMPLE( unsigned int );
+404 			break;
+405 		default:
+406 			g_assert_not_reached();
+407 			break;
+408 		}
+409 	else 
+410 		switch( im-&gt;BandFmt ) {
+411 		case VIPS_FORMAT_CHAR:
+412 		case VIPS_FORMAT_UCHAR:
+413 			PACK( unsigned char );
+414 			break;
+415 		case VIPS_FORMAT_SHORT:
+416 		case VIPS_FORMAT_USHORT:
+417 			PACK( unsigned short );
+418 			break;
+419 		case VIPS_FORMAT_INT:
+420 		case VIPS_FORMAT_UINT:
+421 			PACK( unsigned int );
+422 			break;
+423 		default:
+424 			g_assert_not_reached();
+425 			break;
+426 		}
+427 }
+428 #define YCC_TO_RGB( TYPE ) { \
+429 	TYPE *tq = (TYPE *) q; \
+430 	\
+431 	for( x = 0; x &lt; length; x++ ) { \
+432 		int y = tq[0]; \
+433 		int cb = tq[1] - offset; \
+434 		int cr = tq[2] - offset; \
+435 		\
+436 		int r, g, b; \
+437 		\
+438 		r = y + (int)(1.402 * (float)cr); \
+439 		tq[0] = VIPS_CLIP( 0, r, upb ); \
+440 		\
+441 		g = y - (int)(0.344 * (float)cb + 0.714 * (float)cr); \
+442 		tq[1] = VIPS_CLIP( 0, g, upb ); \
+443 		\
+444 		b = y + (int)(1.772 * (float)cb); \
+445 		tq[2] = VIPS_CLIP( 0, b, upb ); \
+446 		\
+447 		tq += 3; \
+448 	} \
+449 }
+450 static void
+451 vips_foreign_load_jp2k_ycc_to_rgb( opj_image_t *image, VipsImage *im, 
+452 	VipsPel *q, int length )
+453 {
+454 	int prec = image-&gt;comps[0].prec;
+455 	int offset = 1 &lt;&lt; (prec - 1);
+456 	int upb = (1 &lt;&lt; prec) - 1;
+457 	int x;
+458 	switch( im-&gt;BandFmt ) {
+459 	case VIPS_FORMAT_CHAR:
+460 	case VIPS_FORMAT_UCHAR:
+461 		YCC_TO_RGB( unsigned char );
+462 		break;
+463 	case VIPS_FORMAT_SHORT:
+464 	case VIPS_FORMAT_USHORT:
+465 		YCC_TO_RGB( unsigned short );
+466 		break;
+467 	case VIPS_FORMAT_INT:
+468 	case VIPS_FORMAT_UINT:
+469 		YCC_TO_RGB( unsigned int );
+470 		break;
+471 	default:
+472 		g_assert_not_reached();
+473 		break;
+474 	}
+475 }
+476 static int
+477 vips_foreign_load_jp2k_generate( VipsRegion *out, 
+478 	void *seq, void *a, void *b, gboolean *stop )
+479 {
+480 	VipsForeignLoad *load = (VipsForeignLoad *) a;
+481 	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) load;
+482 	VipsRect *r = &amp;out-&gt;valid;
+483 	int tile_width = VIPS_ROUND_UINT( 
+484 		(double) jp2k-&gt;info-&gt;tdx / jp2k-&gt;shrink );
+485 	int tile_height = VIPS_ROUND_UINT( 
+486 		(double) jp2k-&gt;info-&gt;tdy / jp2k-&gt;shrink );
+487 	int tiles_across = jp2k-&gt;info-&gt;tw;
+488 	int x, y, z;
+489 #ifdef DEBUG_VERBOSE
+490 	printf( "vips_foreign_load_jp2k_generate: "
+491 		"left = %d, top = %d, width = %d, height = %d\n", 
+492 		r-&gt;left, r-&gt;top, r-&gt;width, r-&gt;height ); 
+493 	if( jp2k-&gt;n_errors )
+494 		return( 0 );
+495 	y = 0;
+496 	while( y &lt; r-&gt;height ) {
+497 		VipsRect tile, hit;
+498 		hit.height = 0;
+499 		x = 0;
+500 		while( x &lt; r-&gt;width ) { 
+501 			int tx = (r-&gt;left + x) / tile_width;
+502 			int ty = (r-&gt;top + y) / tile_height;
+503 			int xs = tx * tile_width;
+504 			int ys = ty * tile_height;
+505 			int tile_index = ty * tiles_across + tx;
+506 #ifdef DEBUG_VERBOSE
+507 			printf( "   fetch tile %d\n", tile_index );
+508 			if( !opj_get_decoded_tile( jp2k-&gt;codec, 
+509 				jp2k-&gt;stream, jp2k-&gt;image, tile_index ) )
+510 				return( -1 );
+511 			tile.left = xs;
+512 			tile.top = ys;
+513 			tile.width = tile_width;
+514 			tile.height = tile_height;
+515 			vips_rect_intersectrect( &amp;tile, r, &amp;hit );
+516 			for( z = 0; z &lt; hit.height; z++ ) {
+517 				VipsPel *q = VIPS_REGION_ADDR( out, 
+518 					hit.left, hit.top + z );
+519 				vips_foreign_load_jp2k_pack( jp2k-&gt;upsample, 
+520 					jp2k-&gt;image, out-&gt;im, q,
+521 					hit.left - tile.left,
+522 					hit.top - tile.top + z,
+523 					hit.width ); 
+524 				if( jp2k-&gt;ycc_to_rgb )
+525 					vips_foreign_load_jp2k_ycc_to_rgb( 
+526 						jp2k-&gt;image, out-&gt;im, q, 
+527 						hit.width );
+528 			}
+529 			x += hit.width;
+530 		}
+531 		y += hit.height;
+532 	}
+533 	if( load-&gt;fail &amp;&amp;
+534 		jp2k-&gt;n_errors &gt; 0 ) 
+535 		return( -1 );
+536 	return( 0 );
+537 }
+538 static int
+539 vips_foreign_load_jp2k_load( VipsForeignLoad *load )
+540 {
+541 	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) load;
+542 	int tile_width = jp2k-&gt;info-&gt;tdx;
+543 	int tile_height = jp2k-&gt;info-&gt;tdy;
+544 	int tiles_across = jp2k-&gt;info-&gt;tw;
+545 	VipsImage **t = (VipsImage **) 
+546 		vips_object_local_array( VIPS_OBJECT( load ), 3 );
+547 #ifdef DEBUG
+548 	printf( "vips_foreign_load_jp2k_load:\n" );
+549 	t[0] = vips_image_new();
+550 	if( vips_foreign_load_jp2k_set_header( jp2k, t[0] ) ) 
+551 		return( -1 );
+552 	if( vips_image_generate( t[0], 
+553 		NULL, vips_foreign_load_jp2k_generate, NULL, jp2k, NULL ) )
+554 		return( -1 );
+555 	if( vips_tilecache( t[0], &amp;t[1], 
+556 		"tile_width", tile_width,
+557 		"tile_height", tile_height,
+558 		"max_tiles", 3 * tiles_across,
+559 		NULL ) ) 
+560 		return( -1 );
+561 	if( vips_image_write( t[1], load-&gt;real ) ) 
+562 		return( -1 );
+563 	return( 0 );
+564 }
+565 static void
+566 vips_foreign_load_jp2k_class_init( VipsForeignLoadJp2kClass *class )
+567 {
+568 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+569 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+570 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+571 	gobject_class-&gt;dispose = vips_foreign_load_jp2k_dispose;
+572 	gobject_class-&gt;set_property = vips_object_set_property;
+573 	gobject_class-&gt;get_property = vips_object_get_property;
+574 	object_class-&gt;nickname = "jp2kload_base";
+575 	object_class-&gt;description = _( "load JPEG2000 image" );
+576 	object_class-&gt;build = vips_foreign_load_jp2k_build;
+577 	load_class-&gt;get_flags = vips_foreign_load_jp2k_get_flags;
+578 	load_class-&gt;header = vips_foreign_load_jp2k_header;
+579 	load_class-&gt;load = vips_foreign_load_jp2k_load;
+580 	VIPS_ARG_INT( class, "page", 20, 
+581 		_( "Page" ), 
+582 		_( "Load this page from the image" ),
+583 		VIPS_ARGUMENT_OPTIONAL_INPUT,
+584 		G_STRUCT_OFFSET( VipsForeignLoadJp2k, page ),
+585 		0, 100000, 0 );
+586 }
+587 static void
+588 vips_foreign_load_jp2k_init( VipsForeignLoadJp2k *jp2k )
+589 {
+590 }
+591 typedef struct _VipsForeignLoadJp2kFile {
+592 	VipsForeignLoadJp2k parent_object;
+593 	char *filename; 
+594 } VipsForeignLoadJp2kFile;
+595 typedef VipsForeignLoadJp2kClass VipsForeignLoadJp2kFileClass;
+596 G_DEFINE_TYPE( VipsForeignLoadJp2kFile, vips_foreign_load_jp2k_file, 
+597 	vips_foreign_load_jp2k_get_type() );
+598 static int
+599 vips_foreign_load_jp2k_file_build( VipsObject *object )
+600 {
+601 	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) object;
+602 	VipsForeignLoadJp2kFile *file = (VipsForeignLoadJp2kFile *) object;
+603 	if( file-&gt;filename &amp;&amp;
+604 		!(jp2k-&gt;source = vips_source_new_from_file( file-&gt;filename )) )
+605 		return( -1 );
+606 	if( VIPS_OBJECT_CLASS( vips_foreign_load_jp2k_file_parent_class )-&gt;
+607 		build( object ) )
+608 		return( -1 );
+609 	return( 0 );
+610 }
+611 const char *vips__jp2k_suffs[] = 
+612 	{ ".j2k", ".jp2", ".jpt", ".j2c", ".jpc", NULL };
+613 static int
+614 vips_foreign_load_jp2k_is_a( const char *filename )
+615 {
+616 	VipsSource *source;
+617 	gboolean result;
+618 <a name="0"></a>
+619 	if( !(source = vips_source_new_from_file( filename )) )
+620 		return( FALSE );
+621 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	result = vips_foreign_load_jp2k_is_a_source( source );
+622 	VIPS_UNREF( source );
+623 	return( result );
+624 }
+625 static void
+626 vips_foreign_load_jp2k_file_class_init( 
+627 	VipsForeignLoadJp2kFileClass *class )
+628 {
+629 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+630 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+631 	VipsForeignClass *foreign_class = (VipsForeignClass *) class;</b></font>
+632 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+633 	gobject_class-&gt;set_property = vips_object_set_property;
+634 	gobject_class-&gt;get_property = vips_object_get_property;
+635 	object_class-&gt;nickname = "jp2kload";
+636 	object_class-&gt;build = vips_foreign_load_jp2k_file_build;
+637 	foreign_class-&gt;suffs = vips__jp2k_suffs;
+638 	load_class-&gt;is_a = vips_foreign_load_jp2k_is_a;
+639 	VIPS_ARG_STRING( class, "filename", 1, 
+640 		_( "Filename" ),
+641 		_( "Filename to load from" ),
+642 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+643 		G_STRUCT_OFFSET( VipsForeignLoadJp2kFile, filename ),
+644 		NULL );
+645 }
+646 static void
+647 vips_foreign_load_jp2k_file_init( VipsForeignLoadJp2kFile *jp2k )
+648 {
+649 }
+650 typedef struct _VipsForeignLoadJp2kBuffer {
+651 	VipsForeignLoadJp2k parent_object;
+652 	VipsArea *buf;
+653 } VipsForeignLoadJp2kBuffer;
+654 typedef VipsForeignLoadJp2kClass VipsForeignLoadJp2kBufferClass;
+655 G_DEFINE_TYPE( VipsForeignLoadJp2kBuffer, vips_foreign_load_jp2k_buffer, 
+656 	vips_foreign_load_jp2k_get_type() );
+657 static int
+658 vips_foreign_load_jp2k_buffer_build( VipsObject *object )
+659 {
+660 	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) object;
+661 	VipsForeignLoadJp2kBuffer *buffer = 
+662 		(VipsForeignLoadJp2kBuffer *) object;
+663 	if( buffer-&gt;buf )
+664 		if( !(jp2k-&gt;source = vips_source_new_from_memory( 
+665 			VIPS_AREA( buffer-&gt;buf )-&gt;data, 
+666 			VIPS_AREA( buffer-&gt;buf )-&gt;length )) )
+667 			return( -1 );
+668 	if( VIPS_OBJECT_CLASS( vips_foreign_load_jp2k_file_parent_class )-&gt;
+669 		build( object ) )
+670 		return( -1 );
+671 	return( 0 );
+672 }
+673 static gboolean
+674 vips_foreign_load_jp2k_buffer_is_a( const void *buf, size_t len )
+675 {
+676 	VipsSource *source;
+677 	gboolean result;
+678 	if( !(source = vips_source_new_from_memory( buf, len )) )
+679 		return( FALSE );
+680 	result = vips_foreign_load_jp2k_is_a_source( source );
+681 	VIPS_UNREF( source );
+682 	return( result );
+683 }
+684 static void
+685 vips_foreign_load_jp2k_buffer_class_init( 
+686 	VipsForeignLoadJp2kBufferClass *class )
+687 {
+688 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+689 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+690 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+691 	gobject_class-&gt;set_property = vips_object_set_property;
+692 	gobject_class-&gt;get_property = vips_object_get_property;
+693 	object_class-&gt;nickname = "jp2kload_buffer";
+694 	object_class-&gt;build = vips_foreign_load_jp2k_buffer_build;
+695 	load_class-&gt;is_a_buffer = vips_foreign_load_jp2k_buffer_is_a;
+696 	VIPS_ARG_BOXED( class, "buffer", 1, 
+697 		_( "Buffer" ),
+698 		_( "Buffer to load from" ),
+699 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+700 		G_STRUCT_OFFSET( VipsForeignLoadJp2kBuffer, buf ),
+701 		VIPS_TYPE_BLOB );
+702 }
+703 static void
+704 vips_foreign_load_jp2k_buffer_init( VipsForeignLoadJp2kBuffer *buffer )
+705 {
+706 }
+707 typedef struct _VipsForeignLoadJp2kSource {
+708 	VipsForeignLoadJp2k parent_object;
+709 	VipsSource *source;
+710 } VipsForeignLoadJp2kSource;
+711 typedef VipsForeignLoadJp2kClass VipsForeignLoadJp2kSourceClass;
+712 G_DEFINE_TYPE( VipsForeignLoadJp2kSource, vips_foreign_load_jp2k_source, 
+713 	vips_foreign_load_jp2k_get_type() );
+714 static int
+715 vips_foreign_load_jp2k_source_build( VipsObject *object )
+716 {
+717 	VipsForeignLoadJp2k *jp2k = (VipsForeignLoadJp2k *) object;
+718 	VipsForeignLoadJp2kSource *source = 
+719 		(VipsForeignLoadJp2kSource *) object;
+720 	if( source-&gt;source ) {
+721 		jp2k-&gt;source = source-&gt;source;
+722 		g_object_ref( jp2k-&gt;source );
+723 	}
+724 	if( VIPS_OBJECT_CLASS( 
+725 		vips_foreign_load_jp2k_source_parent_class )-&gt;
+726 			build( object ) )
+727 		return( -1 );
+728 	return( 0 );
+729 }
+730 static void
+731 vips_foreign_load_jp2k_source_class_init( 
+732 	VipsForeignLoadJp2kSourceClass *class )
+733 {
+734 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+735 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+736 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+737 	gobject_class-&gt;set_property = vips_object_set_property;
+738 	gobject_class-&gt;get_property = vips_object_get_property;
+739 	object_class-&gt;nickname = "jp2kload_source";
+740 	object_class-&gt;build = vips_foreign_load_jp2k_source_build;
+741 	load_class-&gt;is_a_source = vips_foreign_load_jp2k_is_a_source;
+742 	VIPS_ARG_OBJECT( class, "source", 1,
+743 		_( "Source" ),
+744 		_( "Source to load from" ),
+745 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+746 		G_STRUCT_OFFSET( VipsForeignLoadJp2kSource, source ),
+747 		VIPS_TYPE_SOURCE );
+748 }
+749 static void
+750 vips_foreign_load_jp2k_source_init( 
+751 	VipsForeignLoadJp2kSource *jp2k )
+752 {
+753 }
+754 static void 
+755 warning_callback( const char *msg G_GNUC_UNUSED, void *data G_GNUC_UNUSED ) 
+756 {
+757 }
+758 static void 
+759 error_callback( const char *msg, void *data ) 
+760 {
+761 	printf( "OpenJPEG: %s", msg ); 
+762 	vips_error( "OpenJPEG", "%s", msg ); 
+763 }
+764 typedef struct _TileDecompress {
+765 	VipsSource *source;
+766         opj_stream_t *stream;
+767         opj_codec_t *codec;
+768 	opj_image_t *image;
+769 } TileDecompress;
+770 static void
+771 vips__foreign_load_jp2k_decompress_free( TileDecompress *decompress )
+772 {
+773 	VIPS_FREEF( opj_destroy_codec, decompress-&gt;codec );
+774 	VIPS_FREEF( opj_image_destroy, decompress-&gt;image );
+775 	VIPS_FREEF( opj_stream_destroy, decompress-&gt;stream );
+776 	VIPS_UNREF( decompress-&gt;source );
+777 }
+778 int
+779 vips__foreign_load_jp2k_decompress( VipsImage *out, 
+780 	int width, int height, gboolean ycc_to_rgb, 
+781 	void *from, size_t from_length, 
+782 	void *to, size_t to_length )
+783 {
+784 	size_t pel_size = VIPS_IMAGE_SIZEOF_PEL( out );
+785 	size_t line_size = pel_size * width;
+786 	TileDecompress decompress = { 0 };
+787 	opj_dparameters_t parameters;
+788 	int i;
+789 	gboolean upsample;
+790 	VipsPel *q;
+791 	int y;
+792 #ifdef DEBUG
+793 	printf( "vips__foreign_load_jp2k_decompress: width = %d, height = %d, "
+794 		"ycc_to_rgb = %d, from_length = %zd, to_length = %zd\n",
+795 		width, height, ycc_to_rgb, from_length, to_length );
+796 	ycc_to_rgb = ycc_to_rgb &amp;&amp; out-&gt;Bands == 3;
+797 	decompress.codec = opj_create_decompress( OPJ_CODEC_J2K );
+798 	opj_set_default_decoder_parameters( &amp;parameters );
+799 	opj_setup_decoder( decompress.codec, &amp;parameters );
+800 	opj_set_warning_handler( decompress.codec, warning_callback, NULL );
+801 	opj_set_error_handler( decompress.codec, error_callback, NULL );
+802 	decompress.source = vips_source_new_from_memory( from, from_length );
+803 	decompress.stream = vips_foreign_load_jp2k_stream( decompress.source );
+804 	if( !opj_read_header( decompress.stream, 
+805 		decompress.codec, &amp;decompress.image ) ) {
+806 		vips_error( "jp2kload", "%s", ( "header error" ) );
+807 		vips__foreign_load_jp2k_decompress_free( &amp;decompress ); 
+808 		return( -1 );
+809 	}
+810 	if( decompress.image-&gt;x1 &gt; width || 
+811 		decompress.image-&gt;y1 &gt; height ||
+812 		line_size * height &gt; to_length ) {
+813 		vips_error( "jp2kload", "%s", ( "bad dimensions" ) );
+814 		vips__foreign_load_jp2k_decompress_free( &amp;decompress ); 
+815     		return( -1 );
+816 	}
+817 	if( !opj_decode( decompress.codec, 
+818 		decompress.stream, decompress.image ) ) {
+819 		vips_error( "jp2kload", "%s", ( "decode error" ) );
+820 		vips__foreign_load_jp2k_decompress_free( &amp;decompress ); 
+821 		return( -1 );
+822 	}
+823 	upsample = FALSE;
+824 	for( i = 0; i &lt; decompress.image-&gt;numcomps; i++ ) {
+825 		opj_image_comp_t *this = &amp;decompress.image-&gt;comps[i];
+826 		if( this-&gt;dx &gt; 1 ||
+827 			this-&gt;dy &gt; 1 )
+828 			upsample = TRUE;
+829 	}
+830 	q = to;
+831 	for( y = 0; y &lt; height; y++ ) {
+832 		vips_foreign_load_jp2k_pack( upsample, 
+833 			decompress.image, out, q,
+834 			0, y, width ); 
+835 		if( ycc_to_rgb )
+836 			vips_foreign_load_jp2k_ycc_to_rgb( 
+837 				decompress.image, out, q, 
+838 				width );
+839 		q += line_size;
+840 	}
+841 	vips__foreign_load_jp2k_decompress_free( &amp;decompress ); 
+842 	return( 0 );
+843 }
+844 int
+845 vips__foreign_load_jp2k_decompress( VipsImage *out, 
+846 	int width, int height, gboolean ycc_to_rgb, 
+847 	void *from, size_t from_length, 
+848 	void *to, size_t to_length )
+849 {
+850 	vips_error( "jp2k", 
+851 		"%s", _( "libvips built without JPEG2000 support" ) );
+852 	return( -1 );
+853 }
+854 int
+855 vips_jp2kload( const char *filename, VipsImage **out, ... )
+856 {
+857 	va_list ap;
+858 	int result;
+859 	va_start( ap, out );
+860 	result = vips_call_split( "jp2kload", ap, filename, out );
+861 	va_end( ap );
+862 	return( result );
+863 }
+864 int
+865 vips_jp2kload_buffer( void *buf, size_t len, VipsImage **out, ... )
+866 {
+867 	va_list ap;
+868 	VipsBlob *blob;
+869 	int result;
+870 	blob = vips_blob_new( NULL, buf, len );
+871 	va_start( ap, out );
+872 	result = vips_call_split( "jp2kload_buffer", ap, blob, out );
+873 	va_end( ap );
+874 	vips_area_unref( VIPS_AREA( blob ) );
+875 	return( result );
+876 }
+877 int
+878 vips_jp2kload_source( VipsSource *source, VipsImage **out, ... )
+879 {
+880 	va_list ap;
+881 	int result;
+882 	va_start( ap, out );
+883 	result = vips_call_split( "jp2kload_source", ap, source, out );
+884 	va_end( ap );
+885 	return( result );
+886 }
 </pre>
 </div>
 </div>

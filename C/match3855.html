@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for omrabbitmq.c &amp; miniamqpsrvr.c</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -41,1299 +40,912 @@ Matches for omrabbitmq.c &amp; miniamqpsrvr.c
 </h3>
 <hr/>
 <pre>
-/* omrabbitmq.c
- *
- * This output plugin enables rsyslog to send messages to the RabbitMQ.
- *
- * Copyright 2012-2013 Vaclav Tomec
- * Copyright 2014 Rainer Gerhards
- *
- * This program is free software: you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public License
- * as published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this program. If not, see
- * &lt;http://www.gnu.org/licenses/&gt;.
- *
- * Author: Vaclav Tomec
- * &lt;vaclav.tomec@gmail.com&gt;
- */
-#include "config.h"
-#include &lt;pthread.h&gt;
-#include &lt;stdio.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;time.h&gt;
-#include &lt;sys/time.h&gt;
-
-#include "rsyslog.h"
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "template.h"
-#include "module-template.h"
-#include "errmsg.h"
-#include "cfsysline.h"
-#include "debug.h"
-#include "datetime.h"
-#include "rsconf.h"
-
-#include &lt;sys/socket.h&gt;
-
-#include "amqp.h"
-#include "amqp_framing.h"
-#include "amqp_tcp_socket.h"
-#if (AMQP_VERSION_MAJOR == 0) &amp;&amp; (AMQP_VERSION_MINOR &lt; 4)
-#error "rabbitmq-c version must be &gt;= 0.4.0"
-#endif
-
-#define RABBITMQ_CHANNEL 1
-
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("omrabbitmq")
-
-/*
- * internal structures
- */
-DEF_OMOD_STATIC_DATA
-DEFobjCurrIf(glbl)
-DEFobjCurrIf(datetime)
-
-static int instance_counter = 0;
-static int mode_test = 0;
-
-typedef struct  {
-	char *host;                    /* rabbitmq server fqdn or IP */
-	int port;                      /* rabbitmq server port */
-} server_t;
-
-typedef struct  {
-	server_t s;                    /* rabbitmq server */
-	int failures;                  /* rabbitmq server failures */
-} server_wrk_t;
-
-
-typedef struct {
-	time_t return_check_interval;      /* time interval between usual server health checks */
-	time_t half_return_check_interval; /* for computing */
-	time_t quick_oscillation_interval; /* time interval below which the service is not stable */
-	int quick_oscillation_max; /* number of quick oscillation after which the connection is kept on backup */
-	time_t graceful_interval; /* time interval the connection is kept on backup after which the usual server
-							   * check restarts */
-	int quick_oscillation_count; /* current number of simultaneous quick oscillation detected */
-} recover_t;
-
-typedef struct _instanceData {
-	/* here you need to define all action-specific data. A record of type
-	 * instanceData will be handed over to each instance of the action. Keep
-	 * in mind that there may be several invocations of the same type of action
-	 * inside rsyslog.conf, and this is what keeps them apart. Do NOT use
-	 * static data for this!
-	 */
-	amqp_bytes_t exchange;                    /* exchange to send message to */
-
-	amqp_bytes_t routing_key;                 /* fixed routing_key to use */
-	uchar *routing_key_template;              /* routing_key template */
-	int idx_routing_key_template;             /* routing_key template index in doAction tab */
-
-	sbool populate_properties;                /* populates message properties */
-	int delivery_mode;                        /* delivery mode transient or persistent message */
-	amqp_bytes_t expiration;                  /* message expiration */
-
-	uchar *body_template;                     /* body template */
-	int idx_body_template;                    /* body template index in doAction tab */
-
-	amqp_basic_properties_t amqp_props_tpl_type; /*  */
-	char *content_type;                       /*  */
-	amqp_basic_properties_t amqp_props_plaintext;   /*  */
-
-	char *exchange_type;                      /*  */
-	int durable;                              /*  */
-	int auto_delete;                          /*  */
-
-	int iidx;
-	int nbWrkr;
-
-	server_t server1;               /* first rabbitmq server  */
-	server_t server2;               /* second rabbitmq server */
-
-	char *vhost;                    /* rabbitmq server vhost */
-	char *user;                     /* rabbitmq username */
-	char *password;                 /* rabbitmq username's password */
-
-	recover_t recover_policy;
-
-} instanceData;
-
-typedef struct wrkrInstanceData {
-	amqp_connection_state_t a_conn; /* amqp connection */
-
-	int connected;
-	int channel_opened;
-
-	pthread_t thread;               /*  */
-	short thread_running;           /*  */
-	pthread_mutex_t send_mutex;     /*  */
-	pthread_cond_t cond;            /*  */
-
-	rsRetVal state;                 /* state of the connection */
-
-	server_wrk_t serverPrefered;              /* usual rabbitmq server */
-	server_wrk_t serverBackup;                /* backup rabbitmq server */
-	server_wrk_t *serverActive;               /* active rabbitmq server */
-
-	instanceData *pData;
-
-	recover_t recover_policy;
-	time_t last_failback;
-
-	int iidx;
-	int widx;
-	int go_on;
-} wrkrInstanceData_t;
-
-typedef struct _msg2amqp_props_ {
-	propid_t id;
-	const char *name;
-	amqp_bytes_t *standardprop;
-	int flag;
-} msg2amqp_props_t;
-
-/* tables for interfacing with the v6 config system */
-/* action (instance) parameters */
-static struct cnfparamdescr actpdescr[] = {
-	{ "host", eCmdHdlrString, 0 },
-	{ "port", eCmdHdlrInt, 0 },
-	{ "virtual_host", eCmdHdlrGetWord, 0 },
-	{ "user", eCmdHdlrGetWord, 0 },
-	{ "password", eCmdHdlrGetWord, 0 },
-	{ "exchange", eCmdHdlrGetWord, 0 },
-	{ "routing_key", eCmdHdlrGetWord, 0 },
-	{ "routing_key_template", eCmdHdlrGetWord, 0 },
-	{ "delivery_mode", eCmdHdlrGetWord, 0 },
-	{ "expiration", eCmdHdlrNonNegInt, 0 },
-	{ "populate_properties", eCmdHdlrBinary, 0 },
-	{ "body_template", eCmdHdlrGetWord, 0 },
-	{ "content_type", eCmdHdlrGetWord, 0 },
-	{ "recover_policy", eCmdHdlrString, 0 },
-	{ "exchange_type", eCmdHdlrGetWord, 0},
-	{ "durable", eCmdHdlrBinary, 0},
-	{ "auto_delete", eCmdHdlrBinary, 0},
-};
-static struct cnfparamblk actpblk =
-	{
-		CNFPARAMBLK_VERSION,
-		sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-		actpdescr
-	};
-
-static amqp_bytes_t cstring_bytes(const char *str)
-{
-	return str ? amqp_cstring_bytes(str) : amqp_empty_bytes;
-}
-
-/* Initialize recover structure from the configuration string
- */
-static void init_recover(recover_t *fb, char *str)
-{
-	time_t value[4] = { 0, 0, 0, 0 };
-
-	if (str &amp;&amp; *str){
-		int i = -1;
-		do {
-			value[++i] = strtoul(str, &amp;str, 10);
-			if (*str) str++;
-		} while (i &lt; 3 &amp;&amp; value[i] &amp;&amp; *str);
-	}
-
-	fb-&gt;return_check_interval = (value[0]) ? value[0] : 60;
-	fb-&gt;half_return_check_interval = fb-&gt;return_check_interval / 2;
-	fb-&gt;quick_oscillation_interval = (value[1]) ? value[1] : (fb-&gt;return_check_interval / 10);
-	fb-&gt;quick_oscillation_max = (value[2]) ? (int)(value[2]) : 3;
-	fb-&gt;graceful_interval = (value[3]) ? value[3] : (fb-&gt;return_check_interval * 10) -
-							fb-&gt;half_return_check_interval;
-	fb-&gt;quick_oscillation_count = 0;
-}
-
-/* this method compute the delay before next reconnection attempt according
- */
-static unsigned long next_check(recover_t *fb, time_t last_failback)
-{
-	time_t now = time(NULL);
-	srandom(now);
-
-	if (now - last_failback &lt; fb-&gt;quick_oscillation_interval) {
-		/* quick oscillation detected */
-		fb-&gt;quick_oscillation_count++;
-
-		if (fb-&gt;quick_oscillation_count &gt; fb-&gt;quick_oscillation_max) {
-			/* too much oscillation inserting a graceful sleep */
-			fb-&gt;quick_oscillation_count = 0;
-			return fb-&gt;graceful_interval + fb-&gt;return_check_interval * random() / RAND_MAX;
-		}
-	} else
-		fb-&gt;quick_oscillation_count = 0;
-
-	/* returning a standard delay between 0,5 and 1,5 * return_check_interval */
-	return fb-&gt;half_return_check_interval + fb-&gt;return_check_interval * random() / RAND_MAX;
-}
-
-/* authenticate to rabbitmq server and set connection parameter according to rsyslog configuration
- */
-static int amqp_authenticate(wrkrInstanceData_t *self, amqp_connection_state_t a_conn)
-{
-	amqp_rpc_reply_t ret;
-
-	/* define the frame size */
-	int frame_size = (glbl.GetMaxLine(runConf)&lt;130000) ? 131072 : (glbl.GetMaxLine(runConf)+1072);
-
-	/* authenticate */
-	ret = amqp_login(a_conn, (char const *)self-&gt;pData-&gt;vhost, 1, frame_size, 0,
-			AMQP_SASL_METHOD_PLAIN, self-&gt;pData-&gt;user, self-&gt;pData-&gt;password);
-
-	if (ret.reply_type != AMQP_RESPONSE_NORMAL)
-	{
-		LogError(0, RS_RET_RABBITMQ_LOGIN_ERR, "omrabbitmq module %d/%d: login to AMQP "
-				"server %s failed. (%d / %s)",
-				self-&gt;iidx, self-&gt;widx, self-&gt;serverActive-&gt;s.host, ret.reply_type,
-				amqp_error_string2(ret.library_error));
-		return 0;
-	}
-
-	/* open the communication channel */
-	amqp_channel_open(a_conn, 1);
-
-	if (amqp_get_rpc_reply(a_conn).reply_type != AMQP_RESPONSE_NORMAL)
-	{
-		LogError(0, RS_RET_RABBITMQ_CHANNEL_ERR, "omrabbitmq module %d/%d: open channel failed.",
-				self-&gt;iidx, self-&gt;widx);
-		return 0;
-	}
-
-	if (self-&gt;pData-&gt;exchange_type) {
-		/* we declare the exchange according to specifications */
-		amqp_table_t props = { 0, NULL };
-		#if (AMQP_VERSION_MAJOR == 0) &amp;&amp; (AMQP_VERSION_MINOR &lt; 6)
-		amqp_exchange_declare(a_conn, 1, self-&gt;pData-&gt;exchange, cstring_bytes(self-&gt;pData-&gt;exchange_type),
-		                      0, self-&gt;pData-&gt;durable, props);
-		#else
-		amqp_exchange_declare(a_conn, 1, self-&gt;pData-&gt;exchange, cstring_bytes(self-&gt;pData-&gt;exchange_type),
-		                      0, self-&gt;pData-&gt;durable, self-&gt;pData-&gt;auto_delete, 0, props);
-		#endif
-
-		if (amqp_get_rpc_reply(a_conn).reply_type != AMQP_RESPONSE_NORMAL)
-		{
-			/* if a problem occurs on declaring the exchange we receive a channel_close with the
-			 * error then we can log the error, respond a channel_close_ok and reopen it
-			 * so we can work with the existing exchange.
-			 */
-			amqp_channel_close_ok_t chan_cls_ok;
-			amqp_channel_close_t *chan_cls =
-							(amqp_channel_close_t*)amqp_get_rpc_reply(a_conn).reply.decoded;
-
-			if (amqp_get_rpc_reply(a_conn).reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION) {
-				LogError(0, RS_RET_RABBITMQ_CHANNEL_ERR,
-						"omrabbitmq module %d/%d: disconnected while exchange declare (%d)",
-						self-&gt;iidx, self-&gt;widx, amqp_get_rpc_reply(a_conn).library_error);
-				return 0;
-			}
-
-			LogError(0, RS_RET_RABBITMQ_CHANNEL_ERR,
-			    "omrabbitmq module %d/%d: exchange declare failed %.*s.", self-&gt;iidx, self-&gt;widx,
-					(int)chan_cls-&gt;reply_text.len, (char*)chan_cls-&gt;reply_text.bytes);
-
-			chan_cls_ok.dummy = '\0';
-			amqp_send_method(a_conn, 1, AMQP_CHANNEL_CLOSE_OK_METHOD, &amp;chan_cls_ok);
-
-			/* reopen the communication channel in case of error it should be close by server*/
-			amqp_channel_open(a_conn, 1);
-
-			if (amqp_get_rpc_reply(a_conn).reply_type != AMQP_RESPONSE_NORMAL)
-			{
-				LogError(0, RS_RET_RABBITMQ_CHANNEL_ERR, "omrabbitmq module %d/%d: "
-				    "open channel failed.", self-&gt;iidx, self-&gt;widx);
-				return 0;
-			}
-
-		}
-	}
-	/* release the buffers if possible */
-	amqp_maybe_release_buffers(a_conn);
-
-	return 1;
-}
-
-/* This method establish a new connection
- * @self pointer on the worker datas
- * @server pointer on the server datas (preferred or backup)
- * @return the connection state or NULL on error
- */
-static amqp_connection_state_t tryConnection(wrkrInstanceData_t *self, server_t *server)
-{
-	int retconn = 0;
-	struct timeval delay;
-	delay.tv_sec = 1;
-	delay.tv_usec = 0;
-
-	amqp_connection_state_t a_conn = amqp_new_connection();
-	amqp_socket_t *sockfd = (a_conn) ? amqp_tcp_socket_new(a_conn) : NULL;
-
-	if (sockfd)
-	{
-		LogError(0, RS_RET_RABBITMQ_CHANNEL_ERR,
-		    "omrabbitmq module %d/%d: server %s port %d.", self-&gt;iidx, self-&gt;widx,
-		    server-&gt;host, server-&gt;port);
-
-		#if defined(_AIX)
-		retconn = amqp_socket_open(sockfd, server-&gt;host, server-&gt;port);
-		#else
-		retconn = amqp_socket_open_noblock(sockfd, (const char*)server-&gt;host, server-&gt;port, &amp;delay);
-		#endif
-	}
-
-	if (retconn == AMQP_STATUS_OK &amp;&amp; amqp_authenticate(self, a_conn))
-		return a_conn;
-
-	/* the connection failed so free it and return NULL */
-	amqp_connection_close(a_conn, 200);
-	amqp_destroy_connection(a_conn);
-
-	return NULL;
-}
-
-static int manage_connection(wrkrInstanceData_t *self, 	amqp_frame_t *pFrame)
-{
-	int result;
-
-	pthread_mutex_unlock(&amp;self-&gt;send_mutex);
-
-	do {
-		if (self-&gt;serverActive == &amp;self-&gt;serverBackup)
-		{
-			amqp_connection_state_t new_conn;
-			struct timeval delay;
-
-			/* The worker is connected to the backup server.
-			 * next_check function compute the delay before trying to recover
-			 * the connection to the preferred server according to recover_policy
-			 */
-			delay.tv_sec = next_check(&amp;self-&gt;recover_policy, self-&gt;last_failback);
-			delay.tv_usec = 0;
-
-			result = amqp_simple_wait_frame_noblock(self-&gt;a_conn, pFrame, &amp;delay);
-
-			/* if connected to backup server then check if usual server is alive.
-			 * if so then disconnect from backup */
-			if (result == AMQP_STATUS_TIMEOUT &amp;&amp;
-					(new_conn = tryConnection(self,
-							&amp;(self-&gt;serverPrefered.s)))
-					!= NULL) {
-				/* connection is re-established to preferred server so
-				 * swap connections */
-				amqp_connection_state_t old_conn = self-&gt;a_conn;
-
-				/* now lock to avoid message publishing. */
-				pthread_mutex_lock(&amp;self-&gt;send_mutex);
-				self-&gt;a_conn = new_conn;
-				self-&gt;serverActive = &amp;self-&gt;serverPrefered;
-				self-&gt;serverActive-&gt;failures = 0;
-				pthread_mutex_unlock(&amp;self-&gt;send_mutex);
-				/* back to unlock mode */
-
-				DBGPRINTF("omrabbitmq module %d: reconnects to usual server.\n",
-							self-&gt;iidx);
-				amqp_connection_close(old_conn, 200);
-				amqp_destroy_connection(old_conn);
-			}
-
-		} else {
-
-			result = amqp_simple_wait_frame(self-&gt;a_conn, pFrame);
-
-		}
-	} while(result == AMQP_STATUS_TIMEOUT);
-
-	/* now lock the mutex to avoid message publishing. */
-	pthread_mutex_lock(&amp;self-&gt;send_mutex);
-
-	return result;
-}
-
-static void send_connection_close(amqp_connection_state_t state) {
-	amqp_connection_close_t *req = malloc(sizeof(amqp_connection_close_t));
-	memset(req, 0, sizeof(amqp_connection_close_t));
-	req-&gt;reply_code = 200;
-	req-&gt;reply_text.bytes = (void*)"200";
-	req-&gt;reply_text.len = 3;
-	req-&gt;class_id = (uint16_t)(AMQP_CONNECTION_CLOSE_METHOD &gt;&gt; 16);
-	req-&gt;method_id = (uint16_t)(AMQP_CONNECTION_CLOSE_METHOD &amp; 0xFFFF);
-	amqp_send_method(state, 0, AMQP_CONNECTION_CLOSE_METHOD, req);
-	free(req);
-}
-
-static void send_channel_close(amqp_connection_state_t state, amqp_channel_t ch) {
-	amqp_channel_close_t *req = malloc(sizeof(amqp_channel_close_t));
-	memset(req, 0, sizeof(amqp_channel_close_t));
-	req-&gt;reply_code = 200;
-	req-&gt;reply_text.bytes = (void*)"200";
-	req-&gt;reply_text.len = 3;
-	req-&gt;class_id = (uint16_t)(AMQP_CHANNEL_CLOSE_METHOD &gt;&gt; 16);
-	req-&gt;method_id = (uint16_t)(AMQP_CHANNEL_CLOSE_METHOD &amp; 0xFFFF);
-	amqp_send_method(state, ch, AMQP_CHANNEL_CLOSE_METHOD, req);
-	free(req);
-}
-
-static void send_connection_close_ok(amqp_connection_state_t state) {
-	amqp_connection_close_ok_t *req = malloc(sizeof(amqp_connection_close_ok_t));
-	memset(req, 0, sizeof(amqp_connection_close_ok_t));
-	req-&gt;dummy = '\0';
-	amqp_send_method(state, 0, AMQP_CONNECTION_CLOSE_OK_METHOD, req);
-	free(req);
-}
-
-static void send_channel_close_ok(amqp_connection_state_t state, amqp_channel_t ch) {
-	amqp_channel_close_ok_t *req = malloc(sizeof(amqp_channel_close_ok_t));
-	memset(req, 0, sizeof(amqp_channel_close_ok_t));
-	req-&gt;dummy = '\0';
-	amqp_send_method(state, ch, AMQP_CHANNEL_CLOSE_OK_METHOD, req);
-	free(req);
-}
-
-/* run_connection_routine is the thread monitoring of the rabbitmq connection.
- * This method manage reconnection to preferred and backup servers apply the recover_policy
- */
-static void* run_connection_routine(void* arg)
-{
-	wrkrInstanceData_t *self = (wrkrInstanceData_t *) arg;
-	amqp_frame_t frm;
-	int result;
-	self-&gt;connected = 0;
-	self-&gt;channel_opened = 0;
-	rsRetVal state_out = RS_RET_SUSPENDED;
-
-	dbgSetThrdName((uchar*)"amqp connection");
-
-	/* now lock to avoid message publishing during part of the thread loop */
-	pthread_mutex_lock(&amp;self-&gt;send_mutex);
-
-	self-&gt;thread_running = 1;
-
-	self-&gt;state = RS_RET_OK;
-
-	srSleep(0,100);
-
-	DBGPRINTF("omrabbitmq module %d/%d: connection thread started\n", self-&gt;iidx, self-&gt;widx);
-
-	int go_on = self-&gt;go_on;
-
-	while (go_on) // this loop is used to reconnect on connection failure
-	{
-		if (self-&gt;a_conn != NULL)
-		{
-			amqp_connection_close(self-&gt;a_conn, 200);
-			amqp_destroy_connection(self-&gt;a_conn);
-		}
-
-		self-&gt;a_conn = NULL;
-
-		if (!self-&gt;go_on)
-		{
-			go_on = 0;
-			state_out = RS_RET_DISABLE_ACTION;
-			continue; /* lets go back to wile (go_on) and leave cleanly */
-		}
-
-		if (self-&gt;serverActive == &amp;self-&gt;serverBackup) {
-			self-&gt;serverBackup.failures = 0;
-			self-&gt;serverPrefered.failures = 0;
-			self-&gt;serverActive = &amp;self-&gt;serverPrefered;
-		}
-
-		do { /* this loop tries 3 times per server before switching servers */
-			if ((self-&gt;a_conn = tryConnection(self, &amp;(self-&gt;serverActive-&gt;s))) != NULL) {
-				self-&gt;serverActive-&gt;failures = 0;
-			} else {
-				/* set 1 second before retry */
-				struct timeval delay;
-
-				delay.tv_sec = 1;
-				delay.tv_usec = 0;
-
-				self-&gt;serverActive-&gt;failures++;
-
-				/* if 3 tries */
-				if (self-&gt;serverActive-&gt;failures == 3) {
-
-					if (!self-&gt;serverBackup.s.host || self-&gt;serverBackup.failures == 3)
-					{
-						LogError(0, RS_RET_RABBITMQ_CONN_ERR, "omrabbitmq module connection "
-								"failed 3 times on each server.");
-					}
-
-					if (self-&gt;serverActive == &amp;self-&gt;serverBackup) {
-						self-&gt;serverBackup.failures = 0;
-						self-&gt;serverPrefered.failures = 0;
-						self-&gt;serverActive = &amp;self-&gt;serverPrefered;
-					} else {
-						/* on usual server switch to backup server */
-						if (self-&gt;serverBackup.s.host)
-							self-&gt;serverActive = &amp;self-&gt;serverBackup;
-						else
-							self-&gt;serverPrefered.failures = 0;
-					}
-					/* set 5 second before new round trip */
-					delay.tv_sec = 5;
-				}
-				select(0,NULL,NULL,NULL,&amp;delay);
-			}
-		}
-		while (self-&gt;a_conn == NULL &amp;&amp; self-&gt;go_on);
-
-		if (!self-&gt;go_on)
-		{
-			go_on = 0;
-			state_out = RS_RET_DISABLE_ACTION;
-			continue; /* lets go back to wile (go_on) and leave cleanly */
-		}
-
-		/* signal that the thread is started */
-		pthread_cond_signal(&amp;self-&gt;cond);
-
-		self-&gt;connected = 1;
-		self-&gt;channel_opened = 1;
-
-		DBGPRINTF("omrabbitmq module %d: connected.\n", self-&gt;iidx);
-
-		self-&gt;state = RS_RET_OK;
-
-		if (self-&gt;serverActive == &amp;self-&gt;serverBackup)
-			self-&gt;last_failback = time(NULL);
-
-		while (self-&gt;connected) // this loop is used to manage an established connection
-		{
-
-			result = manage_connection(self, &amp;frm);
-
-			switch (result)
-			{
-			case AMQP_STATUS_NO_MEMORY:
-				LogError(0, RS_RET_OUT_OF_MEMORY, "omrabbitmq module %d/%d: no memory "
-					": aborting module.", self-&gt;iidx, self-&gt;widx);
-				go_on = 0; /* non recoverable error let's go out */
-<a name="0"></a>				self-&gt;connected = 0;
-				state_out = RS_RET_DISABLE_ACTION;
-				break;
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>			case AMQP_STATUS_BAD_AMQP_DATA:
-				LogError(0, RS_RET_RABBITMQ_CONN_ERR, "omrabbitmq module %d/%d: bad "
-					"data received : reconnect.", self-&gt;iidx, self-&gt;widx);
-				self-&gt;connected = 0;
-				break;
-			case AMQP_STATUS_SOCKET_ERROR:
-				LogError(0, RS_RET_RABBITMQ_CONN_ERR, "omrabbitmq module %d/%d: Socket"
-					" error : reconnect.", self-&gt;iidx, self-&gt;widx);
-				self-&gt;connected = 0;
-				break;
-			case AMQP_STATUS_CONNECTION_CLOSED:
-				LogError(0, RS_RET_OUT_OF_MEMORY, "omrabbitmq module %d/%d: Connection"
-					" closed : reconnect.", self-&gt;iidx, self-&gt;widx);
-				self-&gt;connected = 0;
-				break;
-			case AMQP_STATUS_OK:
-				/* perhaps not a frame type so ignore it */
-				if (frm.frame_type == AMQP_FRAME_METHOD)
-				{
-					amqp_method_number_t id = frm.payload.method.id;</b></font>
-					/* now handle frames from the server */
-					switch (id)
-					{
-					case AMQP_CONNECTION_CLOSE_OK_METHOD:
-
-						/* We asked to close the connection and server has responded to us */
-						self-&gt;connected = 0;
-						go_on = 0;
-						break;
-
-					case AMQP_CHANNEL_CLOSE_OK_METHOD:
-
-						/* We asked to close the channel and server has responded to us */
-						send_connection_close(self-&gt;a_conn);
-						self-&gt;channel_opened = 0;
-						break;
-
-					case AMQP_CHANNEL_CLOSE_METHOD:
-
-						/* the server wants to close the channel then the connection */
-						LogMsg(0, RS_RET_OK, LOG_WARNING,"omrabbitmq module %d/%d: "
-							"Close Channel Received (%X).", self-&gt;iidx, self-&gt;widx, id);
-						 /* answer the server request &amp; send the method */
-						send_channel_close_ok(self-&gt;a_conn, frm.channel);
-						self-&gt;channel_opened = 0;
-						break;
-
-					case AMQP_CONNECTION_CLOSE_METHOD:
-
-						/* the server want to close the connection */
-						LogMsg(0, RS_RET_OK, LOG_WARNING, "omrabbitmq module %d/%d: "
-							"Close Connection Received (%X).", self-&gt;iidx, self-&gt;widx, id);
-						/* answer the server request */
-						send_connection_close_ok(self-&gt;a_conn);
-						self-&gt;connected = 0;
-						break;
-
-					default :
-
-						LogMsg(0, RS_RET_OK, LOG_WARNING, "omrabbitmq module %d/%d: "
-							"Unmanaged amqp method received (%X) : ignored.",
-							self-&gt;iidx, self-&gt;widx, id);
-					} /* switch (frm.payload.method.id) */
-				} /* if (frm.frame_type == AMQP_FRAME_METHOD) */
-				break;
-			} /* switch (result) */
-		}
-	}
-	self-&gt;state = state_out;
-
-	/* The core ask to die so let's disconnect */
-	if (self-&gt;a_conn != NULL)
-	{
-		if (self-&gt;channel_opened)
-			amqp_channel_close(self-&gt;a_conn, 1, 200);
-		if (self-&gt;connected)
-			amqp_connection_close(self-&gt;a_conn, 200);
-		amqp_destroy_connection(self-&gt;a_conn);
-		self-&gt;a_conn = NULL;
-	}
-
-	self-&gt;thread_running = 0;
-
-	/* Finishing by unlocking before the end of the thread */
-	pthread_mutex_unlock(&amp;self-&gt;send_mutex);
-
-	/* Now notify the worker that this thread is stopping */
-	pthread_cond_signal(&amp;self-&gt;cond);
-
-	return NULL;
-}
-
-/* ============================================================================================
- * Main thread
- * ============================================================================================
- */
-
-static rsRetVal startAMQPConnection(wrkrInstanceData_t *self)
-{
-	DEFiRet;
-	pthread_mutex_lock(&amp;self-&gt;send_mutex);
-	self-&gt;go_on = 1;
-	if (self-&gt;thread_running == 0)
-	{
-		if (!pthread_create(&amp;self-&gt;thread, NULL, run_connection_routine, self))
-		{
-			pthread_cond_wait(&amp;self-&gt;cond,&amp;self-&gt;send_mutex);
-			iRet = self-&gt;state;
-		}else{
-			iRet = RS_RET_DISABLE_ACTION;
-		}
-	}
-	pthread_mutex_unlock(&amp;self-&gt;send_mutex);
-	RETiRet;
-}
-
-static void closeAMQPConnection(wrkrInstanceData_t *self)
-{
-	if (!self || !self-&gt;a_conn) return;
-
-	void *ret;
-
-	/* Now locks to allow exclusive access to sock */
-	pthread_mutex_lock(&amp;self-&gt;send_mutex);
-
-	self-&gt;go_on = 0;
-
-	/* send the method */
-	if (self-&gt;a_conn)
-	{
-		if (self-&gt;channel_opened){
-			send_channel_close(self-&gt;a_conn, 0);
-		} else {
-			send_connection_close(self-&gt;a_conn);
-		}
-	}
-	/* Release the lock */
-	pthread_mutex_unlock(&amp;self-&gt;send_mutex);
-
-	/* Now wvait for the thread to stop */
-	pthread_join(self-&gt;thread, &amp;ret);
-}
-
-/*
- * Report general error
- */
-static int manage_error(int x, char const *context)
-{
-	int retVal = 0; // false
-
-	if (x &lt; 0) {
-		#if (AMQP_VERSION_MINOR &gt;= 4)
-		const char *errstr = amqp_error_string2(-x);
-		LogError(0, RS_RET_ERR, "omrabbitmq: %s: %s", context, errstr);
-		#else
-		char *errstr = amqp_error_string(-x);
-		LogError(0, RS_RET_ERR, "omrabbitmq: %s: %s", context, errstr);
-		free(errstr);
-		#endif
-		retVal = 1; // true
-	}
-
-	return retVal;
-}
-
-static rsRetVal publishRabbitMQ(wrkrInstanceData_t *self, amqp_bytes_t exchange,
-		amqp_bytes_t routing_key, amqp_basic_properties_t *p_amqp_props,
-		amqp_bytes_t body_bytes)
-{
-	DEFiRet;
-	/* locks to allow exclusive access to connection */
-	if (mode_test &gt; 0) {
-		struct timeval tv;
-		tv.tv_sec = mode_test/1000;
-		tv.tv_usec = mode_test%1000 * 1000;
-		select(0, NULL, NULL, NULL, &amp;tv);
-	}
-
-	pthread_mutex_lock(&amp;self-&gt;send_mutex);
-
-	if (self-&gt;state != RS_RET_OK)
-		 ABORT_FINALIZE(self-&gt;state);
-
-	if (!self-&gt;a_conn){
-		ABORT_FINALIZE(RS_RET_RABBITMQ_CONN_ERR);
-	}
-
-	if (manage_error(amqp_basic_publish(self-&gt;a_conn, 1, exchange, routing_key,
-			0, 0, p_amqp_props, body_bytes), "amqp_basic_publish")) {
-		/* error already notified */
-		FINALIZE;
-	}
-
-finalize_it:
-	/* release exclusive access to connection */
-	pthread_mutex_unlock(&amp;self-&gt;send_mutex);
-	RETiRet;
-}
-
-BEGINdoAction
-	int iLen;
-CODESTARTdoAction
-	/* The first element is a smsg_t pointer */
-	smsg_t **pMsg = (smsg_t **)pMsgData;
-	smsg_t *msg = pMsg[0];
-
-	amqp_bytes_t body_bytes;
-	amqp_basic_properties_t *amqp_props_msg;
-
-	if (!pWrkrData-&gt;pData-&gt;idx_body_template)
-	{
-		/* No body template so send it as rawmsg */
-		getRawMsg(msg, (uchar**)(&amp;body_bytes.bytes), &amp;iLen);
-		body_bytes.len = (size_t)iLen;
-		amqp_props_msg = &amp;pWrkrData-&gt;pData-&gt;amqp_props_plaintext;
-	}
-	else
-	{
-		/* we have a body template */
-		body_bytes = cstring_bytes((char*)ppString[pWrkrData-&gt;pData-&gt;idx_body_template]);
-		amqp_props_msg = &amp;pWrkrData-&gt;pData-&gt;amqp_props_tpl_type;
-	}
-
-	if (pWrkrData-&gt;pData-&gt;populate_properties) {
-		/* populate amqp message properties */
-		msgPropDescr_t pProp;
-		int i, custom = 0;
-		amqp_basic_properties_t amqp_props;
-
-		memcpy(&amp;amqp_props, amqp_props_msg, sizeof(amqp_basic_properties_t));
-
-		/* list and mapping of smsg to amqp properties */
-		msg2amqp_props_t prop_list[] = {
-			{ PROP_SYSLOGFACILITY_TEXT, "facility",  NULL, 0 },
-			{ PROP_SYSLOGSEVERITY_TEXT, "severity",  NULL, 0 },
-			{ PROP_HOSTNAME, "hostname", NULL, 0 },
-			{ PROP_FROMHOST, "fromhost", NULL, 0 },
-			{ PROP_SYSLOGTAG, NULL, &amp;(amqp_props.app_id), AMQP_BASIC_APP_ID_FLAG }
-		};
-		int len = sizeof(prop_list)/sizeof(msg2amqp_props_t);
-		uchar *val[sizeof(prop_list)/sizeof(msg2amqp_props_t)];
-		rs_size_t valLen[sizeof(prop_list)/sizeof(msg2amqp_props_t)];
-		unsigned short mustBeFreed[sizeof(prop_list)/sizeof(msg2amqp_props_t)];
-		struct amqp_table_entry_t_ tab_entries[sizeof(prop_list)/sizeof(msg2amqp_props_t)];
-
-		amqp_props.headers.entries = tab_entries;
-
-		amqp_props.timestamp = (uint64_t)datetime.syslogTime2time_t(&amp;msg-&gt;tTIMESTAMP);
-		amqp_props._flags |= AMQP_BASIC_TIMESTAMP_FLAG;
-
-		for (i=0; i&lt;len; i++)
-		{
-			/* for each msg property in list get the value and initialize flags */
-			pProp.id = prop_list[i].id;
-			valLen[i] = 0;
-			mustBeFreed[i] = 0;
-			val[i] = (uchar*)MsgGetProp(msg, NULL, &amp;pProp, &amp;(valLen[i]), &amp;(mustBeFreed[i]), NULL);
-			if (val[i] &amp;&amp; *val[i])
-			{
-				if (prop_list[i].name)
-				{
-					/* custom amqp properties */
-					tab_entries[custom].key = amqp_cstring_bytes(prop_list[i].name);
-					tab_entries[custom].value.kind = AMQP_FIELD_KIND_UTF8;
-					tab_entries[custom].value.value.bytes = amqp_cstring_bytes((char*)val[i]);
-					amqp_props._flags |= AMQP_BASIC_HEADERS_FLAG;
-					custom++;
-				} else {
-					/* standard amqp properties*/
-					prop_list[i].standardprop-&gt;bytes = val[i];
-					prop_list[i].standardprop-&gt;len = (size_t)valLen[i];
-					amqp_props._flags |= prop_list[i].flag;
-				}
-			}
-		}
-		amqp_props.headers.num_entries = custom;
-
-		/* CHKiRet could not be used because we need to release allocations */
-		iRet = publishRabbitMQ(pWrkrData, pWrkrData-&gt;pData-&gt;exchange,
-			(pWrkrData-&gt;pData-&gt;routing_key_template)?
-				cstring_bytes((char*)ppString[pWrkrData-&gt;pData-&gt;idx_routing_key_template])
-				: pWrkrData-&gt;pData-&gt;routing_key,
-			&amp;amqp_props, body_bytes);
-
-		for (i=0; i&lt;len; i++)
-			if (mustBeFreed[i]) free(val[i]);
-	}
-	else
-	{
-		/* As CHKiRet could not be used earlier, iRet is directly used again */
-		iRet = publishRabbitMQ(pWrkrData, pWrkrData-&gt;pData-&gt;exchange,
-			(pWrkrData-&gt;pData-&gt;routing_key_template)?
-				cstring_bytes((char*)ppString[pWrkrData-&gt;pData-&gt;idx_routing_key_template])
-				: pWrkrData-&gt;pData-&gt;routing_key,
-			amqp_props_msg, body_bytes);
-	}
-
-ENDdoAction
-
-BEGINtryResume
-CODESTARTtryResume
-	iRet = startAMQPConnection(pWrkrData);
-ENDtryResume
-
-BEGINcreateInstance
-	void *env_var;
-CODESTARTcreateInstance
-	if ((env_var = getenv("OMRABBITMQ_TEST")) != NULL)
-		mode_test = atoi(env_var);
-
-	memset(pData, 0, sizeof(instanceData));
-	pData-&gt;iidx = ++instance_counter;
-	pData-&gt;delivery_mode = 2;
-	pData-&gt;exchange_type = NULL;
-	pData-&gt;durable = 0;
-	pData-&gt;auto_delete = 1;
-ENDcreateInstance
-
-BEGINfreeInstance
-CODESTARTfreeInstance
-	/* this is a cleanup callback. All dynamically-allocated resources
-	 * in instance data must be cleaned up here. Prime examples are
-	 * malloc()ed memory, file &amp; database handles and the like.
-	 */
-	if (pData-&gt;exchange.bytes) free(pData-&gt;exchange.bytes);
-	if (pData-&gt;routing_key.bytes) free(pData-&gt;routing_key.bytes);
-	if (pData-&gt;routing_key_template) free(pData-&gt;routing_key_template);
-	if (pData-&gt;body_template) free(pData-&gt;body_template);
-	if (pData-&gt;expiration.bytes) free(pData-&gt;expiration.bytes);
-	if (pData-&gt;content_type) free(pData-&gt;content_type);
-	if (pData-&gt;vhost) free(pData-&gt;vhost);
-	if (pData-&gt;user) free(pData-&gt;user);
-	if (pData-&gt;password) free(pData-&gt;password);
-	if (pData-&gt;exchange_type) free(pData-&gt;exchange_type);
-	if (pData-&gt;server1.host) free(pData-&gt;server1.host);
-ENDfreeInstance
-
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	/* use this to specify if select features are supported by this
-	 * plugin. If not, the framework will handle that. Currently, only
-	 * RepeatedMsgReduction ("last message repeated n times") is optional.
-	 */
-	if(eFeat == sFEATURERepeatedMsgReduction)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-	/* permits to spit out some debug info */
-	dbgprintf("omrabbitmq instance : %d\n", pData-&gt;iidx);
-	if (pData-&gt;server2.host) {
-		dbgprintf("\thost1='%s' \n", pData-&gt;server1.host);
-		dbgprintf("\tport1=%d\n", pData-&gt;server1.port);
-		dbgprintf("\thost2='%s' \n", pData-&gt;server2.host);
-		dbgprintf("\tport2=%d\n", pData-&gt;server2.port);
-		dbgprintf("\tfailback policy :");
-		dbgprintf("\t\tusual server check interval=%ld s",
-				pData-&gt;recover_policy.return_check_interval);
-		dbgprintf("\t\tquick oscillation limit=%ld s",
-				pData-&gt;recover_policy.quick_oscillation_interval);
-		dbgprintf("\t\tmax number of oscillation=%d s",
-				pData-&gt;recover_policy.quick_oscillation_max);
-		dbgprintf("\t\tgraceful interval after quick oscillation detection=%ld s",
-				pData-&gt;recover_policy.graceful_interval);
-	}else{
-		dbgprintf("\thost='%s' \n", pData-&gt;server1.host);
-		dbgprintf("\tport=%d\n", pData-&gt;server1.port);
-	}
-	dbgprintf("\tvirtual_host='%s'\n", pData-&gt;vhost);
-	dbgprintf("\tuser='%s'\n",  pData-&gt;user == NULL ? "(not configured)" : pData-&gt;user);
-	dbgprintf("\tpassword=(%sconfigured)\n", pData-&gt;password == NULL ? "not " : "");
-
-	dbgprintf("\texchange='%*s'\n", (int)pData-&gt;exchange.len,
-				(char*)pData-&gt;exchange.bytes);
-	dbgprintf("\trouting_key='%*s'\n", (int)pData-&gt;routing_key.len,
-				(char*) pData-&gt;routing_key.bytes);
-	dbgprintf("\trouting_key_template='%s'\n", pData-&gt;routing_key_template);
-	dbgprintf("\tbody_template='%s'\n", pData-&gt;body_template);
-	dbgprintf("\texchange_type='%s'\n", pData-&gt;exchange_type);
-	dbgprintf("\tauto_delete=%d\n", pData-&gt;auto_delete);
-	dbgprintf("\tdurable=%d\n", pData-&gt;durable);
-	dbgprintf("\tpopulate_properties=%s\n", (pData-&gt;populate_properties)?"ON":"OFF");
-	dbgprintf((pData-&gt;delivery_mode == 1) ? "\tdelivery_mode=TRANSIENT\n":
-			"\tdelivery_mode=PERSISTENT\n");
-	if (pData-&gt;expiration.len == 0) {
-		dbgprintf("\texpiration=UNLIMITED\n");
-	}else{
-		dbgprintf("\texpiration=%*s\n",
-			(int)pData-&gt;expiration.len, (char*) pData-&gt;expiration.bytes);
-	}
-ENDdbgPrintInstInfo
-
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	int i;
-	char *host = NULL, *vhost= NULL, *user = NULL, *password = NULL, *recover = NULL;
-	int port = 0;
-	long long expiration = 0;
-CODESTARTnewActInst
-
-	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	CHKiRet(createInstance(&amp;pData));
-
-	/* let read parameters */
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-		if (!pvals[i].bUsed)
-			continue;
-		if (!strcmp(actpblk.descr[i].name, "host")) {
-			host = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if (!strcmp(actpblk.descr[i].name, "recover_policy")) {
-			recover = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if (!strcmp(actpblk.descr[i].name, "port")) {
-			port = (int) pvals[i].val.d.n;
-		} else if (!strcmp(actpblk.descr[i].name, "virtual_host")) {
-			vhost = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if (!strcmp(actpblk.descr[i].name, "user")) {
-			user = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if (!strcmp(actpblk.descr[i].name, "password")) {
-			password = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if (!strcmp(actpblk.descr[i].name, "exchange")) {
-			pData-&gt;exchange = cstring_bytes(es_str2cstr(pvals[i].val.d.estr, NULL));
-		} else if (!strcmp(actpblk.descr[i].name, "routing_key")) {
-			pData-&gt;routing_key = cstring_bytes(es_str2cstr(pvals[i].val.d.estr, NULL));
-		} else if (!strcmp(actpblk.descr[i].name, "routing_key_template")) {
-			pData-&gt;routing_key_template = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if (!strcmp(actpblk.descr[i].name, "populate_properties")) {
-			pData-&gt;populate_properties = (sbool) pvals[i].val.d.n;
-		} else if (!strcmp(actpblk.descr[i].name, "delivery_mode")) {
-			char *temp = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			if (temp){
-			  if (!strcasecmp(temp, "TRANSIENT") || !strcmp(temp, "1")) {
-				pData-&gt;delivery_mode = 1;
-			  } else { if (!strcasecmp(temp, "PERSISTENT") || !strcmp(temp, "2")) {
-				pData-&gt;delivery_mode = 2;
-			  } else {
-				 pData-&gt;delivery_mode = 0;
-			  } }
-			  free(temp);
-			}
-		} else if (!strcmp(actpblk.descr[i].name, "expiration")) {
-		  expiration =  pvals[i].val.d.n;
-			if (expiration &gt; 0) {
-				char buf[40];
-				snprintf(buf, 40, "%lld", expiration);
-				#ifndef __clang_analyzer__
-				pData-&gt;expiration = cstring_bytes(strdup(buf));
-				#endif
-			}
-		} else if (!strcmp(actpblk.descr[i].name, "body_template")) {
-			pData-&gt;body_template = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if (!strcmp(actpblk.descr[i].name, "content_type")) {
-			pData-&gt;content_type = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if (!strcmp(actpblk.descr[i].name, "exchange_type")) {
-			pData-&gt;exchange_type = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if (!strcmp(actpblk.descr[i].name, "auto_delete")) {
-			pData-&gt;auto_delete = (int) pvals[i].val.d.n;
-		} else if (!strcmp(actpblk.descr[i].name, "durable")) {
-			pData-&gt;durable = (int) pvals[i].val.d.n;
-		} else {
-			LogError(0, RS_RET_INVALID_PARAMS,
-				"omrabbitmq module %d: program error, non-handled param '%s'\n",
-				pData-&gt;iidx, actpblk.descr[i].name);
-		}
-	}
-
-	/* let's check config validity */
-
-	if (host == NULL)  {
-		LogError(0, RS_RET_INVALID_PARAMS, "omrabbitmq module %d disabled: parameter "
-					"host must be specified",
-					pData-&gt;iidx);
-		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-	}
-
-	/* first if a template for routing_key is set let verify its existence */
-	if (pData-&gt;routing_key_template &amp;&amp; tplFind(ourConf, (char*)pData-&gt;routing_key_template,
-					strlen((char*)pData-&gt;routing_key_template)) == NULL)
-	{
-		LogError(0, RS_RET_INVALID_PARAMS, "omrabbitmq module %d : template '%s'"
-				" used for routing key does not exist !",
-				pData-&gt;iidx, pData-&gt;routing_key_template);
-		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-	}
-
-	/* an exchange must be defined */
-	if (pData-&gt;exchange.bytes == NULL) {
-		LogError(0, RS_RET_INVALID_PARAMS, "omrabbitmq module %d disabled: parameter "
-					"exchange must be specified",
-					pData-&gt;iidx);
-		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-	}
-
-	/* a static or a template's routing_key must be defined */
-	if (pData-&gt;routing_key.bytes == NULL &amp;&amp; pData-&gt;routing_key_template == NULL) {
-		LogError(0, RS_RET_INVALID_PARAMS, "omrabbitmq module %d disabled: "
-						"one of parameters routing_key or "
-						"routing_key_template must be specified", pData-&gt;iidx);
-		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-	}
-
-	/* a valid delivery mode must be defined : a 0 means that an invalid value
-	 * has been done */
-	if (!pData-&gt;delivery_mode)
-	{
-		LogError(0, RS_RET_CONF_PARAM_INVLD, "omrabbitmq module %d disabled: "
-				"parameter delivery_mode must be "
-				"TRANSIENT or PERSISTENT (default)", pData-&gt;iidx);
-		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-	}
-
-	/* first if a template for message body is set let verify its existence */
-	if (pData-&gt;body_template &amp;&amp; *pData-&gt;body_template &amp;&amp;
-				tplFind(ourConf, (char*)pData-&gt;body_template,
-				        strlen((char*)pData-&gt;body_template)) == NULL)
-	{
-		LogError(0, RS_RET_CONF_PARAM_INVLD, "omrabbitmq module %d : template '%s'"
-				" used for body does not exist !",
-				pData-&gt;iidx, pData-&gt;body_template);
-		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
-	}
-
-	/* Let's define the size of the doAction tab */
-	CODE_STD_STRING_REQUESTnewActInst(1 + ((pData-&gt;routing_key_template) ? 1 : 0) +
-					((pData-&gt;body_template &amp;&amp; *pData-&gt;body_template == '\0') ? 0 : 1));
-
-	/* Set the plain text message props */
-	memset(&amp;pData-&gt;amqp_props_plaintext, 0, sizeof(amqp_basic_properties_t));
-	pData-&gt;amqp_props_plaintext._flags =
-				AMQP_BASIC_DELIVERY_MODE_FLAG | AMQP_BASIC_CONTENT_TYPE_FLAG;
-	pData-&gt;amqp_props_plaintext.delivery_mode = pData-&gt;delivery_mode;
-			/* persistent delivery mode */
-	pData-&gt;amqp_props_plaintext.content_type = amqp_cstring_bytes("plain/text");
-	if (pData-&gt;expiration.len)
-	{
-		pData-&gt;amqp_props_plaintext._flags |= AMQP_BASIC_EXPIRATION_FLAG;
-		pData-&gt;amqp_props_plaintext.expiration = pData-&gt;expiration;
-	}
-
-	memcpy(&amp;pData-&gt;amqp_props_tpl_type, &amp;pData-&gt;amqp_props_plaintext,
-			sizeof(amqp_basic_properties_t));
-
-	/* The first position of doAction tab will contain the internal message */
-	CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
-
-	// RabbitMQ properties initialization
-	if (pData-&gt;routing_key_template)
-	{
-		pData-&gt;idx_routing_key_template = 1;
-		CHKiRet(OMSRsetEntry(*ppOMSR, 1,
-			(uchar*)strdup((const char *)pData-&gt;routing_key_template),
-			OMSR_NO_RQD_TPL_OPTS));
-	}
-
-	/* if pData-&gt;body_template is NULL (not defined) then let's use former
-	 * json format if pData-&gt;body_template is not an empty string then let's
-	 * use it. In this case the content type is defined either
-	 * by the template name or the user defined content_type if set
-	 * otherwise raw data (unformatted) are sent this is done setting
-	 * pData-&gt;idx_body_template to 0 */
-	if (pData-&gt;body_template == NULL)
-	{ /* no template */
-		DBGPRINTF("Body_template is using default StdJSONFmt definition.\n");
-		pData-&gt;idx_body_template = pData-&gt;idx_routing_key_template + 1;
-		CHKiRet(OMSRsetEntry(*ppOMSR, pData-&gt;idx_body_template,
-				(uchar*)strdup(" StdJSONFmt"), OMSR_NO_RQD_TPL_OPTS));
-		pData-&gt;amqp_props_tpl_type.content_type = amqp_cstring_bytes("application/json");
-	}
-	else if (*pData-&gt;body_template)
-	{
-		pData-&gt;idx_body_template = pData-&gt;idx_routing_key_template + 1;
-		CHKiRet(OMSRsetEntry(*ppOMSR, pData-&gt;idx_body_template,
-					(uchar*)strdup((const char *)pData-&gt;body_template),
-					OMSR_NO_RQD_TPL_OPTS));
-		pData-&gt;amqp_props_tpl_type.content_type = amqp_cstring_bytes(
-										(pData-&gt;content_type)
-										 ? pData-&gt;content_type
-										 : (char*)pData-&gt;body_template);
-	}else{
-		pData-&gt;idx_body_template = 0;
-		pData-&gt;amqp_props_tpl_type.content_type = amqp_cstring_bytes(
-						(pData-&gt;content_type)
-						 ? pData-&gt;content_type
-						 :"raw");
-	}
-
-	/* treatment of the server parameter
-	 * first the default port */
-	pData-&gt;server2.port = pData-&gt;server1.port = port ? port : 5672;
-
-	char *temp;
-	int p;
-	pData-&gt;server1.host = host;
-
-	/* Is there more than one server in parameter */
-	if ((pData-&gt;server2.host = strchr(pData-&gt;server1.host,' ')) != NULL)
-	{
-		*pData-&gt;server2.host++ ='\0';
-		/* is there a port with the second server */
-		if ((temp = strchr(pData-&gt;server2.host,':')) != NULL)
-		{
-			*temp++ ='\0';
-			p = atoi(temp);
-			if (p) pData-&gt;server2.port = p;
-		}
-	}
-
-	/* is there a port with the first/unique server */
-	if ((temp = strchr(pData-&gt;server1.host,':')) != NULL)
-	{
-		*temp++ ='\0';
-		p = atoi(temp);
-		if (p) pData-&gt;server1.port = p;
-	}
-
-	pData-&gt;vhost = vhost ? vhost : strdup("/");
-	pData-&gt;user = user ? user : strdup("");
-	pData-&gt;password = password ? password : strdup("");
-
-	init_recover(&amp;pData-&gt;recover_policy, recover);
-
-	if (recover)
-	  free(recover);
-
-	dbgPrintInstInfo(pData);
-
-CODE_STD_FINALIZERnewActInst
-	cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-
-
-NO_LEGACY_CONF_parseSelectorAct
-
-
-BEGINmodExit
-CODESTARTmodExit
-	objRelease(glbl, CORE_COMPONENT);
-	objRelease(datetime, CORE_COMPONENT);
-ENDmodExit
-
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-	memset(pWrkrData, 0, sizeof(wrkrInstanceData_t));
-
-	pWrkrData-&gt;pData = pData;
-
-	pthread_mutex_init(&amp;pWrkrData-&gt;send_mutex, NULL);
-	pthread_cond_init(&amp;pWrkrData-&gt;cond, NULL);
-
-	pWrkrData-&gt;state = RS_RET_SUSPENDED;
-	pWrkrData-&gt;iidx = pData-&gt;iidx;
-	pWrkrData-&gt;widx = ++pData-&gt;nbWrkr;
-
-	memcpy(&amp;(pWrkrData-&gt;recover_policy), &amp;(pData-&gt;recover_policy),
-			sizeof(recover_t));
-
-	if (pData-&gt;server2.host &amp;&amp; *pData-&gt;server2.host) {
-		time_t odd = time(NULL) % 2;
-		memcpy(&amp;(pWrkrData-&gt;serverPrefered.s), (odd) ?
-				&amp;pData-&gt;server1 : &amp;pData-&gt;server2, sizeof(server_t));
-		memcpy(&amp;(pWrkrData-&gt;serverBackup.s), (odd) ?
-				&amp;pData-&gt;server2 : &amp;pData-&gt;server1, sizeof(server_t));
-	}else{
-		memcpy(&amp;(pWrkrData-&gt;serverPrefered.s), &amp;pData-&gt;server1, sizeof(server_t));
-	}
-	pWrkrData-&gt;serverActive = &amp;pWrkrData-&gt;serverPrefered;
-
-	startAMQPConnection(pWrkrData);
-
-ENDcreateWrkrInstance
-
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-
-	if (pWrkrData != NULL) {
-		closeAMQPConnection(pWrkrData);
-
-		pthread_mutex_destroy(&amp;(pWrkrData-&gt;send_mutex));
-		pthread_cond_destroy(&amp;(pWrkrData-&gt;cond));
-	}
-ENDfreeWrkrInstance
-
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-	CODEqueryEtryPt_STD_OMOD_QUERIES
-	CODEqueryEtryPt_STD_OMOD8_QUERIES
-	CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-ENDqueryEtryPt
-
-BEGINmodInit()
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
-CODEmodInit_QueryRegCFSLineHdlr
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-	CHKiRet(objUse(datetime, CORE_COMPONENT));
-ENDmodInit
+1 #include "config.h"
+2 #include &lt;pthread.h&gt;
+3 #include &lt;stdio.h&gt;
+4 #include &lt;stdarg.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;assert.h&gt;
+8 #include &lt;signal.h&gt;
+9 #include &lt;errno.h&gt;
+10 #include &lt;time.h&gt;
+11 #include &lt;sys/time.h&gt;
+12 #include "rsyslog.h"
+13 #include "conf.h"
+14 #include "syslogd-types.h"
+15 #include "srUtils.h"
+16 #include "template.h"
+17 #include "module-template.h"
+18 #include "errmsg.h"
+19 #include "cfsysline.h"
+20 #include "debug.h"
+21 #include "datetime.h"
+22 #include "rsconf.h"
+23 #include &lt;sys/socket.h&gt;
+24 #include "amqp.h"
+25 #include "amqp_framing.h"
+26 #include "amqp_tcp_socket.h"
+27 #if (AMQP_VERSION_MAJOR == 0) &amp;&amp; (AMQP_VERSION_MINOR &lt; 4)
+28 #error "rabbitmq-c version must be &gt;= 0.4.0"
+29 #endif
+30 #define RABBITMQ_CHANNEL 1
+31 MODULE_TYPE_OUTPUT
+32 MODULE_TYPE_NOKEEP
+33 MODULE_CNFNAME("omrabbitmq")
+34 DEF_OMOD_STATIC_DATA
+35 DEFobjCurrIf(glbl)
+36 DEFobjCurrIf(datetime)
+37 static int instance_counter = 0;
+38 static int mode_test = 0;
+39 typedef struct  {
+40 	char *host;                    	int port;                      } server_t;
+41 typedef struct  {
+42 	server_t s;                    	int failures;                  } server_wrk_t;
+43 typedef struct {
+44 	int quick_oscillation_count; } recover_t;
+45 typedef struct _instanceData {
+46 	amqp_bytes_t exchange;                    
+47 	amqp_bytes_t routing_key;                 	uchar *routing_key_template;              	int idx_routing_key_template;             
+48 	sbool populate_properties;                	int delivery_mode;                        	amqp_bytes_t expiration;                  
+49 	uchar *body_template;                     	int idx_body_template;                    
+50 	amqp_basic_properties_t amqp_props_tpl_type; 	char *content_type;                       	amqp_basic_properties_t amqp_props_plaintext;   
+51 	char *exchange_type;                      	int durable;                              	int auto_delete;                          
+52 	int iidx;
+53 	int nbWrkr;
+54 	server_t server1;               	server_t server2;               
+55 	char *vhost;                    	char *user;                     	char *password;                 
+56 	recover_t recover_policy;
+57 } instanceData;
+58 typedef struct wrkrInstanceData {
+59 	amqp_connection_state_t a_conn; 
+60 	int connected;
+61 	int channel_opened;
+62 	pthread_t thread;               	short thread_running;           	pthread_mutex_t send_mutex;     	pthread_cond_t cond;            
+63 	rsRetVal state;                 
+64 	server_wrk_t serverPrefered;              	server_wrk_t serverBackup;                	server_wrk_t *serverActive;               
+65 	instanceData *pData;
+66 	recover_t recover_policy;
+67 	time_t last_failback;
+68 	int iidx;
+69 	int widx;
+70 	int go_on;
+71 } wrkrInstanceData_t;
+72 typedef struct _msg2amqp_props_ {
+73 	propid_t id;
+74 	const char *name;
+75 	amqp_bytes_t *standardprop;
+76 	int flag;
+77 } msg2amqp_props_t;
+78 static struct cnfparamdescr actpdescr[] = {
+79 	{ "host", eCmdHdlrString, 0 },
+80 	{ "port", eCmdHdlrInt, 0 },
+81 	{ "virtual_host", eCmdHdlrGetWord, 0 },
+82 	{ "user", eCmdHdlrGetWord, 0 },
+83 	{ "password", eCmdHdlrGetWord, 0 },
+84 	{ "exchange", eCmdHdlrGetWord, 0 },
+85 	{ "routing_key", eCmdHdlrGetWord, 0 },
+86 	{ "routing_key_template", eCmdHdlrGetWord, 0 },
+87 	{ "delivery_mode", eCmdHdlrGetWord, 0 },
+88 	{ "expiration", eCmdHdlrNonNegInt, 0 },
+89 	{ "populate_properties", eCmdHdlrBinary, 0 },
+90 	{ "body_template", eCmdHdlrGetWord, 0 },
+91 	{ "content_type", eCmdHdlrGetWord, 0 },
+92 	{ "recover_policy", eCmdHdlrString, 0 },
+93 	{ "exchange_type", eCmdHdlrGetWord, 0},
+94 	{ "durable", eCmdHdlrBinary, 0},
+95 	{ "auto_delete", eCmdHdlrBinary, 0},
+96 };
+97 static struct cnfparamblk actpblk =
+98 	{
+99 		CNFPARAMBLK_VERSION,
+100 		sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+101 		actpdescr
+102 	};
+103 static amqp_bytes_t cstring_bytes(const char *str)
+104 {
+105 	return str ? amqp_cstring_bytes(str) : amqp_empty_bytes;
+106 }
+107 static void init_recover(recover_t *fb, char *str)
+108 {
+109 	time_t value[4] = { 0, 0, 0, 0 };
+110 	if (str &amp;&amp; *str){
+111 		int i = -1;
+112 		do {
+113 			value[++i] = strtoul(str, &amp;str, 10);
+114 			if (*str) str++;
+115 		} while (i &lt; 3 &amp;&amp; value[i] &amp;&amp; *str);
+116 	}
+117 	fb-&gt;return_check_interval = (value[0]) ? value[0] : 60;
+118 	fb-&gt;half_return_check_interval = fb-&gt;return_check_interval / 2;
+119 	fb-&gt;quick_oscillation_interval = (value[1]) ? value[1] : (fb-&gt;return_check_interval / 10);
+120 	fb-&gt;quick_oscillation_max = (value[2]) ? (int)(value[2]) : 3;
+121 	fb-&gt;graceful_interval = (value[3]) ? value[3] : (fb-&gt;return_check_interval * 10) -
+122 							fb-&gt;half_return_check_interval;
+123 	fb-&gt;quick_oscillation_count = 0;
+124 }
+125 static unsigned long next_check(recover_t *fb, time_t last_failback)
+126 {
+127 	time_t now = time(NULL);
+128 	srandom(now);
+129 	if (now - last_failback &lt; fb-&gt;quick_oscillation_interval) {
+130 		fb-&gt;quick_oscillation_count++;
+131 		if (fb-&gt;quick_oscillation_count &gt; fb-&gt;quick_oscillation_max) {
+132 			fb-&gt;quick_oscillation_count = 0;
+133 			return fb-&gt;graceful_interval + fb-&gt;return_check_interval * random() / RAND_MAX;
+134 		}
+135 	} else
+136 		fb-&gt;quick_oscillation_count = 0;
+137 	return fb-&gt;half_return_check_interval + fb-&gt;return_check_interval * random() / RAND_MAX;
+138 }
+139 static int amqp_authenticate(wrkrInstanceData_t *self, amqp_connection_state_t a_conn)
+140 {
+141 	amqp_rpc_reply_t ret;
+142 	int frame_size = (glbl.GetMaxLine(runConf)&lt;130000) ? 131072 : (glbl.GetMaxLine(runConf)+1072);
+143 	ret = amqp_login(a_conn, (char const *)self-&gt;pData-&gt;vhost, 1, frame_size, 0,
+144 			AMQP_SASL_METHOD_PLAIN, self-&gt;pData-&gt;user, self-&gt;pData-&gt;password);
+145 	if (ret.reply_type != AMQP_RESPONSE_NORMAL)
+146 	{
+147 		LogError(0, RS_RET_RABBITMQ_LOGIN_ERR, "omrabbitmq module %d/%d: login to AMQP "
+148 				"server %s failed. (%d / %s)",
+149 				self-&gt;iidx, self-&gt;widx, self-&gt;serverActive-&gt;s.host, ret.reply_type,
+150 				amqp_error_string2(ret.library_error));
+151 		return 0;
+152 	}
+153 	amqp_channel_open(a_conn, 1);
+154 	if (amqp_get_rpc_reply(a_conn).reply_type != AMQP_RESPONSE_NORMAL)
+155 	{
+156 		LogError(0, RS_RET_RABBITMQ_CHANNEL_ERR, "omrabbitmq module %d/%d: open channel failed.",
+157 				self-&gt;iidx, self-&gt;widx);
+158 		return 0;
+159 	}
+160 	if (self-&gt;pData-&gt;exchange_type) {
+161 		amqp_table_t props = { 0, NULL };
+162 		#if (AMQP_VERSION_MAJOR == 0) &amp;&amp; (AMQP_VERSION_MINOR &lt; 6)
+163 		amqp_exchange_declare(a_conn, 1, self-&gt;pData-&gt;exchange, cstring_bytes(self-&gt;pData-&gt;exchange_type),
+164 		                      0, self-&gt;pData-&gt;durable, props);
+165 		#else
+166 		amqp_exchange_declare(a_conn, 1, self-&gt;pData-&gt;exchange, cstring_bytes(self-&gt;pData-&gt;exchange_type),
+167 		                      0, self-&gt;pData-&gt;durable, self-&gt;pData-&gt;auto_delete, 0, props);
+168 		#endif
+169 		if (amqp_get_rpc_reply(a_conn).reply_type != AMQP_RESPONSE_NORMAL)
+170 		{
+171 			amqp_channel_close_ok_t chan_cls_ok;
+172 			amqp_channel_close_t *chan_cls =
+173 							(amqp_channel_close_t*)amqp_get_rpc_reply(a_conn).reply.decoded;
+174 			if (amqp_get_rpc_reply(a_conn).reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION) {
+175 				LogError(0, RS_RET_RABBITMQ_CHANNEL_ERR,
+176 						"omrabbitmq module %d/%d: disconnected while exchange declare (%d)",
+177 						self-&gt;iidx, self-&gt;widx, amqp_get_rpc_reply(a_conn).library_error);
+178 				return 0;
+179 			}
+180 			LogError(0, RS_RET_RABBITMQ_CHANNEL_ERR,
+181 			    "omrabbitmq module %d/%d: exchange declare failed %.*s.", self-&gt;iidx, self-&gt;widx,
+182 					(int)chan_cls-&gt;reply_text.len, (char*)chan_cls-&gt;reply_text.bytes);
+183 			chan_cls_ok.dummy = '\0';
+184 			amqp_send_method(a_conn, 1, AMQP_CHANNEL_CLOSE_OK_METHOD, &amp;chan_cls_ok);
+185 			amqp_channel_open(a_conn, 1);
+186 			if (amqp_get_rpc_reply(a_conn).reply_type != AMQP_RESPONSE_NORMAL)
+187 			{
+188 				LogError(0, RS_RET_RABBITMQ_CHANNEL_ERR, "omrabbitmq module %d/%d: "
+189 				    "open channel failed.", self-&gt;iidx, self-&gt;widx);
+190 				return 0;
+191 			}
+192 		}
+193 	}
+194 	amqp_maybe_release_buffers(a_conn);
+195 	return 1;
+196 }
+197 static amqp_connection_state_t tryConnection(wrkrInstanceData_t *self, server_t *server)
+198 {
+199 	int retconn = 0;
+200 	struct timeval delay;
+201 	delay.tv_sec = 1;
+202 	delay.tv_usec = 0;
+203 	amqp_connection_state_t a_conn = amqp_new_connection();
+204 	amqp_socket_t *sockfd = (a_conn) ? amqp_tcp_socket_new(a_conn) : NULL;
+205 	if (sockfd)
+206 	{
+207 		LogError(0, RS_RET_RABBITMQ_CHANNEL_ERR,
+208 		    "omrabbitmq module %d/%d: server %s port %d.", self-&gt;iidx, self-&gt;widx,
+209 		    server-&gt;host, server-&gt;port);
+210 		#if defined(_AIX)
+211 		retconn = amqp_socket_open(sockfd, server-&gt;host, server-&gt;port);
+212 		#else
+213 		retconn = amqp_socket_open_noblock(sockfd, (const char*)server-&gt;host, server-&gt;port, &amp;delay);
+214 		#endif
+215 	}
+216 	if (retconn == AMQP_STATUS_OK &amp;&amp; amqp_authenticate(self, a_conn))
+217 		return a_conn;
+218 	amqp_connection_close(a_conn, 200);
+219 	amqp_destroy_connection(a_conn);
+220 	return NULL;
+221 }
+222 static int manage_connection(wrkrInstanceData_t *self, 	amqp_frame_t *pFrame)
+223 {
+224 	int result;
+225 	pthread_mutex_unlock(&amp;self-&gt;send_mutex);
+226 	do {
+227 		if (self-&gt;serverActive == &amp;self-&gt;serverBackup)
+228 		{
+229 			amqp_connection_state_t new_conn;
+230 			struct timeval delay;
+231 			delay.tv_sec = next_check(&amp;self-&gt;recover_policy, self-&gt;last_failback);
+232 			delay.tv_usec = 0;
+233 			result = amqp_simple_wait_frame_noblock(self-&gt;a_conn, pFrame, &amp;delay);
+234 			if (result == AMQP_STATUS_TIMEOUT &amp;&amp;
+235 					(new_conn = tryConnection(self,
+236 							&amp;(self-&gt;serverPrefered.s)))
+237 					!= NULL) {
+238 				amqp_connection_state_t old_conn = self-&gt;a_conn;
+239 				pthread_mutex_lock(&amp;self-&gt;send_mutex);
+240 				self-&gt;a_conn = new_conn;
+241 				self-&gt;serverActive = &amp;self-&gt;serverPrefered;
+242 				self-&gt;serverActive-&gt;failures = 0;
+243 				pthread_mutex_unlock(&amp;self-&gt;send_mutex);
+244 				DBGPRINTF("omrabbitmq module %d: reconnects to usual server.\n",
+245 							self-&gt;iidx);
+246 				amqp_connection_close(old_conn, 200);
+247 				amqp_destroy_connection(old_conn);
+248 			}
+249 		} else {
+250 			result = amqp_simple_wait_frame(self-&gt;a_conn, pFrame);
+251 		}
+252 	} while(result == AMQP_STATUS_TIMEOUT);
+253 	pthread_mutex_lock(&amp;self-&gt;send_mutex);
+254 	return result;
+255 }
+256 static void send_connection_close(amqp_connection_state_t state) {
+257 	amqp_connection_close_t *req = malloc(sizeof(amqp_connection_close_t));
+258 	memset(req, 0, sizeof(amqp_connection_close_t));
+259 	req-&gt;reply_code = 200;
+260 	req-&gt;reply_text.bytes = (void*)"200";
+261 	req-&gt;reply_text.len = 3;
+262 	req-&gt;class_id = (uint16_t)(AMQP_CONNECTION_CLOSE_METHOD &gt;&gt; 16);
+263 	req-&gt;method_id = (uint16_t)(AMQP_CONNECTION_CLOSE_METHOD &amp; 0xFFFF);
+264 	amqp_send_method(state, 0, AMQP_CONNECTION_CLOSE_METHOD, req);
+265 	free(req);
+266 }
+267 static void send_channel_close(amqp_connection_state_t state, amqp_channel_t ch) {
+268 	amqp_channel_close_t *req = malloc(sizeof(amqp_channel_close_t));
+269 	memset(req, 0, sizeof(amqp_channel_close_t));
+270 	req-&gt;reply_code = 200;
+271 	req-&gt;reply_text.bytes = (void*)"200";
+272 	req-&gt;reply_text.len = 3;
+273 	req-&gt;class_id = (uint16_t)(AMQP_CHANNEL_CLOSE_METHOD &gt;&gt; 16);
+274 	req-&gt;method_id = (uint16_t)(AMQP_CHANNEL_CLOSE_METHOD &amp; 0xFFFF);
+275 	amqp_send_method(state, ch, AMQP_CHANNEL_CLOSE_METHOD, req);
+276 	free(req);
+277 }
+278 static void send_connection_close_ok(amqp_connection_state_t state) {
+279 	amqp_connection_close_ok_t *req = malloc(sizeof(amqp_connection_close_ok_t));
+280 	memset(req, 0, sizeof(amqp_connection_close_ok_t));
+281 	req-&gt;dummy = '\0';
+282 	amqp_send_method(state, 0, AMQP_CONNECTION_CLOSE_OK_METHOD, req);
+283 	free(req);
+284 }
+285 static void send_channel_close_ok(amqp_connection_state_t state, amqp_channel_t ch) {
+286 	amqp_channel_close_ok_t *req = malloc(sizeof(amqp_channel_close_ok_t));
+287 	memset(req, 0, sizeof(amqp_channel_close_ok_t));
+288 	req-&gt;dummy = '\0';
+289 	amqp_send_method(state, ch, AMQP_CHANNEL_CLOSE_OK_METHOD, req);
+290 	free(req);
+291 }
+292 static void* run_connection_routine(void* arg)
+293 {
+294 	wrkrInstanceData_t *self = (wrkrInstanceData_t *) arg;
+295 	amqp_frame_t frm;
+296 	int result;
+297 	self-&gt;connected = 0;
+298 	self-&gt;channel_opened = 0;
+299 	rsRetVal state_out = RS_RET_SUSPENDED;
+300 	dbgSetThrdName((uchar*)"amqp connection");
+301 	pthread_mutex_lock(&amp;self-&gt;send_mutex);
+302 	self-&gt;thread_running = 1;
+303 	self-&gt;state = RS_RET_OK;
+304 	srSleep(0,100);
+305 	DBGPRINTF("omrabbitmq module %d/%d: connection thread started\n", self-&gt;iidx, self-&gt;widx);
+306 	int go_on = self-&gt;go_on;
+307 	while (go_on) 	{
+308 		if (self-&gt;a_conn != NULL)
+309 		{
+310 			amqp_connection_close(self-&gt;a_conn, 200);
+311 			amqp_destroy_connection(self-&gt;a_conn);
+312 		}
+313 		self-&gt;a_conn = NULL;
+314 		if (!self-&gt;go_on)
+315 		{
+316 			go_on = 0;
+317 			state_out = RS_RET_DISABLE_ACTION;
+318 			continue; 		}
+319 		if (self-&gt;serverActive == &amp;self-&gt;serverBackup) {
+320 			self-&gt;serverBackup.failures = 0;
+321 			self-&gt;serverPrefered.failures = 0;
+322 			self-&gt;serverActive = &amp;self-&gt;serverPrefered;
+323 		}
+324 		do { 			if ((self-&gt;a_conn = tryConnection(self, &amp;(self-&gt;serverActive-&gt;s))) != NULL) {
+325 				self-&gt;serverActive-&gt;failures = 0;
+326 			} else {
+327 				struct timeval delay;
+328 				delay.tv_sec = 1;
+329 				delay.tv_usec = 0;
+330 				self-&gt;serverActive-&gt;failures++;
+331 				if (self-&gt;serverActive-&gt;failures == 3) {
+332 					if (!self-&gt;serverBackup.s.host || self-&gt;serverBackup.failures == 3)
+333 					{
+334 						LogError(0, RS_RET_RABBITMQ_CONN_ERR, "omrabbitmq module connection "
+335 								"failed 3 times on each server.");
+336 					}
+337 					if (self-&gt;serverActive == &amp;self-&gt;serverBackup) {
+338 						self-&gt;serverBackup.failures = 0;
+339 						self-&gt;serverPrefered.failures = 0;
+340 						self-&gt;serverActive = &amp;self-&gt;serverPrefered;
+341 					} else {
+342 						if (self-&gt;serverBackup.s.host)
+343 							self-&gt;serverActive = &amp;self-&gt;serverBackup;
+344 						else
+345 							self-&gt;serverPrefered.failures = 0;
+346 					}
+347 					delay.tv_sec = 5;
+348 				}
+349 				select(0,NULL,NULL,NULL,&amp;delay);
+350 			}
+351 		}
+352 		while (self-&gt;a_conn == NULL &amp;&amp; self-&gt;go_on);
+353 		if (!self-&gt;go_on)
+354 		{
+355 			go_on = 0;
+356 			state_out = RS_RET_DISABLE_ACTION;
+357 			continue; 		}
+358 		pthread_cond_signal(&amp;self-&gt;cond);
+359 		self-&gt;connected = 1;
+360 		self-&gt;channel_opened = 1;
+361 		DBGPRINTF("omrabbitmq module %d: connected.\n", self-&gt;iidx);
+362 		self-&gt;state = RS_RET_OK;
+363 		if (self-&gt;serverActive == &amp;self-&gt;serverBackup)
+364 			self-&gt;last_failback = time(NULL);
+365 		while (self-&gt;connected) 		{
+366 			result = manage_connection(self, &amp;frm);
+367 			switch (result)
+368 			{
+369 			case AMQP_STATUS_NO_MEMORY:
+370 				LogError(0, RS_RET_OUT_OF_MEMORY, "omrabbitmq module %d/%d: no memory "
+371 					": aborting module.", self-&gt;iidx, self-&gt;widx);
+372 				go_on = 0; <a name="0"></a>				self-&gt;connected = 0;
+373 				state_out = RS_RET_DISABLE_ACTION;
+374 				break;
+375 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>			case AMQP_STATUS_BAD_AMQP_DATA:
+376 				LogError(0, RS_RET_RABBITMQ_CONN_ERR, "omrabbitmq module %d/%d: bad "
+377 					"data received : reconnect.", self-&gt;iidx, self-&gt;widx);
+378 				self-&gt;connected = 0;
+379 				break;
+380 			case AMQP_STATUS_SOCKET_ERROR:
+381 				LogError(0, RS_RET_RABBITMQ_CONN_ERR, "omrabbitmq module %d/%d: Socket"
+382 					" error : reconnect.", self-&gt;iidx, self-&gt;widx);
+383 				self-&gt;connected = 0;
+384 				break;
+385 			case AMQP_STATUS_CONNECTION_CLOSED:
+386 				LogError(0, RS_RET_OUT_OF_MEMORY, "omrabbitmq module %d/%d: Connection"
+387 					" closed : reconnect.", self-&gt;iidx, self-&gt;widx);
+388 				self-&gt;connected = 0;
+389 				break;
+390 			case AMQP_STATUS_OK:
+391 				if (frm.frame_type == AMQP_FRAME_METHOD)
+392 				{
+393 					amqp_method_number_t id = frm.payload.method.id;</b></font>
+394 					switch (id)
+395 					{
+396 					case AMQP_CONNECTION_CLOSE_OK_METHOD:
+397 						self-&gt;connected = 0;
+398 						go_on = 0;
+399 						break;
+400 					case AMQP_CHANNEL_CLOSE_OK_METHOD:
+401 						send_connection_close(self-&gt;a_conn);
+402 						self-&gt;channel_opened = 0;
+403 						break;
+404 					case AMQP_CHANNEL_CLOSE_METHOD:
+405 						LogMsg(0, RS_RET_OK, LOG_WARNING,"omrabbitmq module %d/%d: "
+406 							"Close Channel Received (%X).", self-&gt;iidx, self-&gt;widx, id);
+407 						send_channel_close_ok(self-&gt;a_conn, frm.channel);
+408 						self-&gt;channel_opened = 0;
+409 						break;
+410 					case AMQP_CONNECTION_CLOSE_METHOD:
+411 						LogMsg(0, RS_RET_OK, LOG_WARNING, "omrabbitmq module %d/%d: "
+412 							"Close Connection Received (%X).", self-&gt;iidx, self-&gt;widx, id);
+413 						send_connection_close_ok(self-&gt;a_conn);
+414 						self-&gt;connected = 0;
+415 						break;
+416 					default :
+417 						LogMsg(0, RS_RET_OK, LOG_WARNING, "omrabbitmq module %d/%d: "
+418 							"Unmanaged amqp method received (%X) : ignored.",
+419 							self-&gt;iidx, self-&gt;widx, id);
+420 					} 				} 				break;
+421 			} 		}
+422 	}
+423 	self-&gt;state = state_out;
+424 	if (self-&gt;a_conn != NULL)
+425 	{
+426 		if (self-&gt;channel_opened)
+427 			amqp_channel_close(self-&gt;a_conn, 1, 200);
+428 		if (self-&gt;connected)
+429 			amqp_connection_close(self-&gt;a_conn, 200);
+430 		amqp_destroy_connection(self-&gt;a_conn);
+431 		self-&gt;a_conn = NULL;
+432 	}
+433 	self-&gt;thread_running = 0;
+434 	pthread_mutex_unlock(&amp;self-&gt;send_mutex);
+435 	pthread_cond_signal(&amp;self-&gt;cond);
+436 	return NULL;
+437 }
+438 static rsRetVal startAMQPConnection(wrkrInstanceData_t *self)
+439 {
+440 	DEFiRet;
+441 	pthread_mutex_lock(&amp;self-&gt;send_mutex);
+442 	self-&gt;go_on = 1;
+443 	if (self-&gt;thread_running == 0)
+444 	{
+445 		if (!pthread_create(&amp;self-&gt;thread, NULL, run_connection_routine, self))
+446 		{
+447 			pthread_cond_wait(&amp;self-&gt;cond,&amp;self-&gt;send_mutex);
+448 			iRet = self-&gt;state;
+449 		}else{
+450 			iRet = RS_RET_DISABLE_ACTION;
+451 		}
+452 	}
+453 	pthread_mutex_unlock(&amp;self-&gt;send_mutex);
+454 	RETiRet;
+455 }
+456 static void closeAMQPConnection(wrkrInstanceData_t *self)
+457 {
+458 	if (!self || !self-&gt;a_conn) return;
+459 	void *ret;
+460 	pthread_mutex_lock(&amp;self-&gt;send_mutex);
+461 	self-&gt;go_on = 0;
+462 	if (self-&gt;a_conn)
+463 	{
+464 		if (self-&gt;channel_opened){
+465 			send_channel_close(self-&gt;a_conn, 0);
+466 		} else {
+467 			send_connection_close(self-&gt;a_conn);
+468 		}
+469 	}
+470 	pthread_mutex_unlock(&amp;self-&gt;send_mutex);
+471 	pthread_join(self-&gt;thread, &amp;ret);
+472 }
+473 static int manage_error(int x, char const *context)
+474 {
+475 	int retVal = 0; 
+476 	if (x &lt; 0) {
+477 		#if (AMQP_VERSION_MINOR &gt;= 4)
+478 		const char *errstr = amqp_error_string2(-x);
+479 		LogError(0, RS_RET_ERR, "omrabbitmq: %s: %s", context, errstr);
+480 		#else
+481 		char *errstr = amqp_error_string(-x);
+482 		LogError(0, RS_RET_ERR, "omrabbitmq: %s: %s", context, errstr);
+483 		free(errstr);
+484 		#endif
+485 		retVal = 1; 	}
+486 	return retVal;
+487 }
+488 static rsRetVal publishRabbitMQ(wrkrInstanceData_t *self, amqp_bytes_t exchange,
+489 		amqp_bytes_t routing_key, amqp_basic_properties_t *p_amqp_props,
+490 		amqp_bytes_t body_bytes)
+491 {
+492 	DEFiRet;
+493 	if (mode_test &gt; 0) {
+494 		struct timeval tv;
+495 		tv.tv_sec = mode_test/1000;
+496 		tv.tv_usec = mode_test%1000 * 1000;
+497 		select(0, NULL, NULL, NULL, &amp;tv);
+498 	}
+499 	pthread_mutex_lock(&amp;self-&gt;send_mutex);
+500 	if (self-&gt;state != RS_RET_OK)
+501 		 ABORT_FINALIZE(self-&gt;state);
+502 	if (!self-&gt;a_conn){
+503 		ABORT_FINALIZE(RS_RET_RABBITMQ_CONN_ERR);
+504 	}
+505 	if (manage_error(amqp_basic_publish(self-&gt;a_conn, 1, exchange, routing_key,
+506 			0, 0, p_amqp_props, body_bytes), "amqp_basic_publish")) {
+507 		FINALIZE;
+508 	}
+509 finalize_it:
+510 	pthread_mutex_unlock(&amp;self-&gt;send_mutex);
+511 	RETiRet;
+512 }
+513 BEGINdoAction
+514 	int iLen;
+515 CODESTARTdoAction
+516 	smsg_t **pMsg = (smsg_t **)pMsgData;
+517 	smsg_t *msg = pMsg[0];
+518 	amqp_bytes_t body_bytes;
+519 	amqp_basic_properties_t *amqp_props_msg;
+520 	if (!pWrkrData-&gt;pData-&gt;idx_body_template)
+521 	{
+522 		getRawMsg(msg, (uchar**)(&amp;body_bytes.bytes), &amp;iLen);
+523 		body_bytes.len = (size_t)iLen;
+524 		amqp_props_msg = &amp;pWrkrData-&gt;pData-&gt;amqp_props_plaintext;
+525 	}
+526 	else
+527 	{
+528 		body_bytes = cstring_bytes((char*)ppString[pWrkrData-&gt;pData-&gt;idx_body_template]);
+529 		amqp_props_msg = &amp;pWrkrData-&gt;pData-&gt;amqp_props_tpl_type;
+530 	}
+531 	if (pWrkrData-&gt;pData-&gt;populate_properties) {
+532 		msgPropDescr_t pProp;
+533 		int i, custom = 0;
+534 		amqp_basic_properties_t amqp_props;
+535 		memcpy(&amp;amqp_props, amqp_props_msg, sizeof(amqp_basic_properties_t));
+536 		msg2amqp_props_t prop_list[] = {
+537 			{ PROP_SYSLOGFACILITY_TEXT, "facility",  NULL, 0 },
+538 			{ PROP_SYSLOGSEVERITY_TEXT, "severity",  NULL, 0 },
+539 			{ PROP_HOSTNAME, "hostname", NULL, 0 },
+540 			{ PROP_FROMHOST, "fromhost", NULL, 0 },
+541 			{ PROP_SYSLOGTAG, NULL, &amp;(amqp_props.app_id), AMQP_BASIC_APP_ID_FLAG }
+542 		};
+543 		int len = sizeof(prop_list)/sizeof(msg2amqp_props_t);
+544 		uchar *val[sizeof(prop_list)/sizeof(msg2amqp_props_t)];
+545 		rs_size_t valLen[sizeof(prop_list)/sizeof(msg2amqp_props_t)];
+546 		unsigned short mustBeFreed[sizeof(prop_list)/sizeof(msg2amqp_props_t)];
+547 		struct amqp_table_entry_t_ tab_entries[sizeof(prop_list)/sizeof(msg2amqp_props_t)];
+548 		amqp_props.headers.entries = tab_entries;
+549 		amqp_props.timestamp = (uint64_t)datetime.syslogTime2time_t(&amp;msg-&gt;tTIMESTAMP);
+550 		amqp_props._flags |= AMQP_BASIC_TIMESTAMP_FLAG;
+551 		for (i=0; i&lt;len; i++)
+552 		{
+553 			pProp.id = prop_list[i].id;
+554 			valLen[i] = 0;
+555 			mustBeFreed[i] = 0;
+556 			val[i] = (uchar*)MsgGetProp(msg, NULL, &amp;pProp, &amp;(valLen[i]), &amp;(mustBeFreed[i]), NULL);
+557 			if (val[i] &amp;&amp; *val[i])
+558 			{
+559 				if (prop_list[i].name)
+560 				{
+561 					tab_entries[custom].key = amqp_cstring_bytes(prop_list[i].name);
+562 					tab_entries[custom].value.kind = AMQP_FIELD_KIND_UTF8;
+563 					tab_entries[custom].value.value.bytes = amqp_cstring_bytes((char*)val[i]);
+564 					amqp_props._flags |= AMQP_BASIC_HEADERS_FLAG;
+565 					custom++;
+566 				} else {
+567 					prop_list[i].standardprop-&gt;bytes = val[i];
+568 					prop_list[i].standardprop-&gt;len = (size_t)valLen[i];
+569 					amqp_props._flags |= prop_list[i].flag;
+570 				}
+571 			}
+572 		}
+573 		amqp_props.headers.num_entries = custom;
+574 		iRet = publishRabbitMQ(pWrkrData, pWrkrData-&gt;pData-&gt;exchange,
+575 			(pWrkrData-&gt;pData-&gt;routing_key_template)?
+576 				cstring_bytes((char*)ppString[pWrkrData-&gt;pData-&gt;idx_routing_key_template])
+577 				: pWrkrData-&gt;pData-&gt;routing_key,
+578 			&amp;amqp_props, body_bytes);
+579 		for (i=0; i&lt;len; i++)
+580 			if (mustBeFreed[i]) free(val[i]);
+581 	}
+582 	else
+583 	{
+584 		iRet = publishRabbitMQ(pWrkrData, pWrkrData-&gt;pData-&gt;exchange,
+585 			(pWrkrData-&gt;pData-&gt;routing_key_template)?
+586 				cstring_bytes((char*)ppString[pWrkrData-&gt;pData-&gt;idx_routing_key_template])
+587 				: pWrkrData-&gt;pData-&gt;routing_key,
+588 			amqp_props_msg, body_bytes);
+589 	}
+590 ENDdoAction
+591 BEGINtryResume
+592 CODESTARTtryResume
+593 	iRet = startAMQPConnection(pWrkrData);
+594 ENDtryResume
+595 BEGINcreateInstance
+596 	void *env_var;
+597 CODESTARTcreateInstance
+598 	if ((env_var = getenv("OMRABBITMQ_TEST")) != NULL)
+599 		mode_test = atoi(env_var);
+600 	memset(pData, 0, sizeof(instanceData));
+601 	pData-&gt;iidx = ++instance_counter;
+602 	pData-&gt;delivery_mode = 2;
+603 	pData-&gt;exchange_type = NULL;
+604 	pData-&gt;durable = 0;
+605 	pData-&gt;auto_delete = 1;
+606 ENDcreateInstance
+607 BEGINfreeInstance
+608 CODESTARTfreeInstance
+609 	if (pData-&gt;exchange.bytes) free(pData-&gt;exchange.bytes);
+610 	if (pData-&gt;routing_key.bytes) free(pData-&gt;routing_key.bytes);
+611 	if (pData-&gt;routing_key_template) free(pData-&gt;routing_key_template);
+612 	if (pData-&gt;body_template) free(pData-&gt;body_template);
+613 	if (pData-&gt;expiration.bytes) free(pData-&gt;expiration.bytes);
+614 	if (pData-&gt;content_type) free(pData-&gt;content_type);
+615 	if (pData-&gt;vhost) free(pData-&gt;vhost);
+616 	if (pData-&gt;user) free(pData-&gt;user);
+617 	if (pData-&gt;password) free(pData-&gt;password);
+618 	if (pData-&gt;exchange_type) free(pData-&gt;exchange_type);
+619 	if (pData-&gt;server1.host) free(pData-&gt;server1.host);
+620 ENDfreeInstance
+621 BEGINisCompatibleWithFeature
+622 CODESTARTisCompatibleWithFeature
+623 	if(eFeat == sFEATURERepeatedMsgReduction)
+624 		iRet = RS_RET_OK;
+625 ENDisCompatibleWithFeature
+626 BEGINdbgPrintInstInfo
+627 CODESTARTdbgPrintInstInfo
+628 	dbgprintf("omrabbitmq instance : %d\n", pData-&gt;iidx);
+629 	if (pData-&gt;server2.host) {
+630 		dbgprintf("\thost1='%s' \n", pData-&gt;server1.host);
+631 		dbgprintf("\tport1=%d\n", pData-&gt;server1.port);
+632 		dbgprintf("\thost2='%s' \n", pData-&gt;server2.host);
+633 		dbgprintf("\tport2=%d\n", pData-&gt;server2.port);
+634 		dbgprintf("\tfailback policy :");
+635 		dbgprintf("\t\tusual server check interval=%ld s",
+636 				pData-&gt;recover_policy.return_check_interval);
+637 		dbgprintf("\t\tquick oscillation limit=%ld s",
+638 				pData-&gt;recover_policy.quick_oscillation_interval);
+639 		dbgprintf("\t\tmax number of oscillation=%d s",
+640 				pData-&gt;recover_policy.quick_oscillation_max);
+641 		dbgprintf("\t\tgraceful interval after quick oscillation detection=%ld s",
+642 				pData-&gt;recover_policy.graceful_interval);
+643 	}else{
+644 		dbgprintf("\thost='%s' \n", pData-&gt;server1.host);
+645 		dbgprintf("\tport=%d\n", pData-&gt;server1.port);
+646 	}
+647 	dbgprintf("\tvirtual_host='%s'\n", pData-&gt;vhost);
+648 	dbgprintf("\tuser='%s'\n",  pData-&gt;user == NULL ? "(not configured)" : pData-&gt;user);
+649 	dbgprintf("\tpassword=(%sconfigured)\n", pData-&gt;password == NULL ? "not " : "");
+650 	dbgprintf("\texchange='%*s'\n", (int)pData-&gt;exchange.len,
+651 				(char*)pData-&gt;exchange.bytes);
+652 	dbgprintf("\trouting_key='%*s'\n", (int)pData-&gt;routing_key.len,
+653 				(char*) pData-&gt;routing_key.bytes);
+654 	dbgprintf("\trouting_key_template='%s'\n", pData-&gt;routing_key_template);
+655 	dbgprintf("\tbody_template='%s'\n", pData-&gt;body_template);
+656 	dbgprintf("\texchange_type='%s'\n", pData-&gt;exchange_type);
+657 	dbgprintf("\tauto_delete=%d\n", pData-&gt;auto_delete);
+658 	dbgprintf("\tdurable=%d\n", pData-&gt;durable);
+659 	dbgprintf("\tpopulate_properties=%s\n", (pData-&gt;populate_properties)?"ON":"OFF");
+660 	dbgprintf((pData-&gt;delivery_mode == 1) ? "\tdelivery_mode=TRANSIENT\n":
+661 			"\tdelivery_mode=PERSISTENT\n");
+662 	if (pData-&gt;expiration.len == 0) {
+663 		dbgprintf("\texpiration=UNLIMITED\n");
+664 	}else{
+665 		dbgprintf("\texpiration=%*s\n",
+666 			(int)pData-&gt;expiration.len, (char*) pData-&gt;expiration.bytes);
+667 	}
+668 ENDdbgPrintInstInfo
+669 BEGINnewActInst
+670 	struct cnfparamvals *pvals;
+671 	int i;
+672 	char *host = NULL, *vhost= NULL, *user = NULL, *password = NULL, *recover = NULL;
+673 	int port = 0;
+674 	long long expiration = 0;
+675 CODESTARTnewActInst
+676 	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
+677 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+678 	}
+679 	CHKiRet(createInstance(&amp;pData));
+680 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+681 		if (!pvals[i].bUsed)
+682 			continue;
+683 		if (!strcmp(actpblk.descr[i].name, "host")) {
+684 			host = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
+685 		} else if (!strcmp(actpblk.descr[i].name, "recover_policy")) {
+686 			recover = es_str2cstr(pvals[i].val.d.estr, NULL);
+687 		} else if (!strcmp(actpblk.descr[i].name, "port")) {
+688 			port = (int) pvals[i].val.d.n;
+689 		} else if (!strcmp(actpblk.descr[i].name, "virtual_host")) {
+690 			vhost = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
+691 		} else if (!strcmp(actpblk.descr[i].name, "user")) {
+692 			user = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
+693 		} else if (!strcmp(actpblk.descr[i].name, "password")) {
+694 			password = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
+695 		} else if (!strcmp(actpblk.descr[i].name, "exchange")) {
+696 			pData-&gt;exchange = cstring_bytes(es_str2cstr(pvals[i].val.d.estr, NULL));
+697 		} else if (!strcmp(actpblk.descr[i].name, "routing_key")) {
+698 			pData-&gt;routing_key = cstring_bytes(es_str2cstr(pvals[i].val.d.estr, NULL));
+699 		} else if (!strcmp(actpblk.descr[i].name, "routing_key_template")) {
+700 			pData-&gt;routing_key_template = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+701 		} else if (!strcmp(actpblk.descr[i].name, "populate_properties")) {
+702 			pData-&gt;populate_properties = (sbool) pvals[i].val.d.n;
+703 		} else if (!strcmp(actpblk.descr[i].name, "delivery_mode")) {
+704 			char *temp = (char*)es_str2cstr(pvals[i].val.d.estr, NULL);
+705 			if (temp){
+706 			  if (!strcasecmp(temp, "TRANSIENT") || !strcmp(temp, "1")) {
+707 				pData-&gt;delivery_mode = 1;
+708 			  } else { if (!strcasecmp(temp, "PERSISTENT") || !strcmp(temp, "2")) {
+709 				pData-&gt;delivery_mode = 2;
+710 			  } else {
+711 				 pData-&gt;delivery_mode = 0;
+712 			  } }
+713 			  free(temp);
+714 			}
+715 		} else if (!strcmp(actpblk.descr[i].name, "expiration")) {
+716 		  expiration =  pvals[i].val.d.n;
+717 			if (expiration &gt; 0) {
+718 				char buf[40];
+719 				snprintf(buf, 40, "%lld", expiration);
+720 				#ifndef __clang_analyzer__
+721 				pData-&gt;expiration = cstring_bytes(strdup(buf));
+722 				#endif
+723 			}
+724 		} else if (!strcmp(actpblk.descr[i].name, "body_template")) {
+725 			pData-&gt;body_template = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+726 		} else if (!strcmp(actpblk.descr[i].name, "content_type")) {
+727 			pData-&gt;content_type = es_str2cstr(pvals[i].val.d.estr, NULL);
+728 		} else if (!strcmp(actpblk.descr[i].name, "exchange_type")) {
+729 			pData-&gt;exchange_type = es_str2cstr(pvals[i].val.d.estr, NULL);
+730 		} else if (!strcmp(actpblk.descr[i].name, "auto_delete")) {
+731 			pData-&gt;auto_delete = (int) pvals[i].val.d.n;
+732 		} else if (!strcmp(actpblk.descr[i].name, "durable")) {
+733 			pData-&gt;durable = (int) pvals[i].val.d.n;
+734 		} else {
+735 			LogError(0, RS_RET_INVALID_PARAMS,
+736 				"omrabbitmq module %d: program error, non-handled param '%s'\n",
+737 				pData-&gt;iidx, actpblk.descr[i].name);
+738 		}
+739 	}
+740 	if (host == NULL)  {
+741 		LogError(0, RS_RET_INVALID_PARAMS, "omrabbitmq module %d disabled: parameter "
+742 					"host must be specified",
+743 					pData-&gt;iidx);
+744 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+745 	}
+746 	if (pData-&gt;routing_key_template &amp;&amp; tplFind(ourConf, (char*)pData-&gt;routing_key_template,
+747 					strlen((char*)pData-&gt;routing_key_template)) == NULL)
+748 	{
+749 		LogError(0, RS_RET_INVALID_PARAMS, "omrabbitmq module %d : template '%s'"
+750 				" used for routing key does not exist !",
+751 				pData-&gt;iidx, pData-&gt;routing_key_template);
+752 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+753 	}
+754 	if (pData-&gt;exchange.bytes == NULL) {
+755 		LogError(0, RS_RET_INVALID_PARAMS, "omrabbitmq module %d disabled: parameter "
+756 					"exchange must be specified",
+757 					pData-&gt;iidx);
+758 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+759 	}
+760 	if (pData-&gt;routing_key.bytes == NULL &amp;&amp; pData-&gt;routing_key_template == NULL) {
+761 		LogError(0, RS_RET_INVALID_PARAMS, "omrabbitmq module %d disabled: "
+762 						"one of parameters routing_key or "
+763 						"routing_key_template must be specified", pData-&gt;iidx);
+764 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+765 	}
+766 	if (!pData-&gt;delivery_mode)
+767 	{
+768 		LogError(0, RS_RET_CONF_PARAM_INVLD, "omrabbitmq module %d disabled: "
+769 				"parameter delivery_mode must be "
+770 				"TRANSIENT or PERSISTENT (default)", pData-&gt;iidx);
+771 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+772 	}
+773 	if (pData-&gt;body_template &amp;&amp; *pData-&gt;body_template &amp;&amp;
+774 				tplFind(ourConf, (char*)pData-&gt;body_template,
+775 				        strlen((char*)pData-&gt;body_template)) == NULL)
+776 	{
+777 		LogError(0, RS_RET_CONF_PARAM_INVLD, "omrabbitmq module %d : template '%s'"
+778 				" used for body does not exist !",
+779 				pData-&gt;iidx, pData-&gt;body_template);
+780 		ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+781 	}
+782 	CODE_STD_STRING_REQUESTnewActInst(1 + ((pData-&gt;routing_key_template) ? 1 : 0) +
+783 					((pData-&gt;body_template &amp;&amp; *pData-&gt;body_template == '\0') ? 0 : 1));
+784 	memset(&amp;pData-&gt;amqp_props_plaintext, 0, sizeof(amqp_basic_properties_t));
+785 	pData-&gt;amqp_props_plaintext._flags =
+786 				AMQP_BASIC_DELIVERY_MODE_FLAG | AMQP_BASIC_CONTENT_TYPE_FLAG;
+787 	pData-&gt;amqp_props_plaintext.delivery_mode = pData-&gt;delivery_mode;
+788 	pData-&gt;amqp_props_plaintext.content_type = amqp_cstring_bytes("plain/text");
+789 	if (pData-&gt;expiration.len)
+790 	{
+791 		pData-&gt;amqp_props_plaintext._flags |= AMQP_BASIC_EXPIRATION_FLAG;
+792 		pData-&gt;amqp_props_plaintext.expiration = pData-&gt;expiration;
+793 	}
+794 	memcpy(&amp;pData-&gt;amqp_props_tpl_type, &amp;pData-&gt;amqp_props_plaintext,
+795 			sizeof(amqp_basic_properties_t));
+796 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
+797 	if (pData-&gt;routing_key_template)
+798 	{
+799 		pData-&gt;idx_routing_key_template = 1;
+800 		CHKiRet(OMSRsetEntry(*ppOMSR, 1,
+801 			(uchar*)strdup((const char *)pData-&gt;routing_key_template),
+802 			OMSR_NO_RQD_TPL_OPTS));
+803 	}
+804 	if (pData-&gt;body_template == NULL)
+805 	{ 		DBGPRINTF("Body_template is using default StdJSONFmt definition.\n");
+806 		pData-&gt;idx_body_template = pData-&gt;idx_routing_key_template + 1;
+807 		CHKiRet(OMSRsetEntry(*ppOMSR, pData-&gt;idx_body_template,
+808 				(uchar*)strdup(" StdJSONFmt"), OMSR_NO_RQD_TPL_OPTS));
+809 		pData-&gt;amqp_props_tpl_type.content_type = amqp_cstring_bytes("application/json");
+810 	}
+811 	else if (*pData-&gt;body_template)
+812 	{
+813 		pData-&gt;idx_body_template = pData-&gt;idx_routing_key_template + 1;
+814 		CHKiRet(OMSRsetEntry(*ppOMSR, pData-&gt;idx_body_template,
+815 					(uchar*)strdup((const char *)pData-&gt;body_template),
+816 					OMSR_NO_RQD_TPL_OPTS));
+817 		pData-&gt;amqp_props_tpl_type.content_type = amqp_cstring_bytes(
+818 										(pData-&gt;content_type)
+819 										 ? pData-&gt;content_type
+820 										 : (char*)pData-&gt;body_template);
+821 	}else{
+822 		pData-&gt;idx_body_template = 0;
+823 		pData-&gt;amqp_props_tpl_type.content_type = amqp_cstring_bytes(
+824 						(pData-&gt;content_type)
+825 						 ? pData-&gt;content_type
+826 						 :"raw");
+827 	}
+828 	pData-&gt;server2.port = pData-&gt;server1.port = port ? port : 5672;
+829 	char *temp;
+830 	int p;
+831 	pData-&gt;server1.host = host;
+832 	if ((pData-&gt;server2.host = strchr(pData-&gt;server1.host,' ')) != NULL)
+833 	{
+834 		*pData-&gt;server2.host++ ='\0';
+835 		if ((temp = strchr(pData-&gt;server2.host,':')) != NULL)
+836 		{
+837 			*temp++ ='\0';
+838 			p = atoi(temp);
+839 			if (p) pData-&gt;server2.port = p;
+840 		}
+841 	}
+842 	if ((temp = strchr(pData-&gt;server1.host,':')) != NULL)
+843 	{
+844 		*temp++ ='\0';
+845 		p = atoi(temp);
+846 		if (p) pData-&gt;server1.port = p;
+847 	}
+848 	pData-&gt;vhost = vhost ? vhost : strdup("/");
+849 	pData-&gt;user = user ? user : strdup("");
+850 	pData-&gt;password = password ? password : strdup("");
+851 	init_recover(&amp;pData-&gt;recover_policy, recover);
+852 	if (recover)
+853 	  free(recover);
+854 	dbgPrintInstInfo(pData);
+855 CODE_STD_FINALIZERnewActInst
+856 	cnfparamvalsDestruct(pvals, &amp;actpblk);
+857 ENDnewActInst
+858 NO_LEGACY_CONF_parseSelectorAct
+859 BEGINmodExit
+860 CODESTARTmodExit
+861 	objRelease(glbl, CORE_COMPONENT);
+862 	objRelease(datetime, CORE_COMPONENT);
+863 ENDmodExit
+864 BEGINcreateWrkrInstance
+865 CODESTARTcreateWrkrInstance
+866 	memset(pWrkrData, 0, sizeof(wrkrInstanceData_t));
+867 	pWrkrData-&gt;pData = pData;
+868 	pthread_mutex_init(&amp;pWrkrData-&gt;send_mutex, NULL);
+869 	pthread_cond_init(&amp;pWrkrData-&gt;cond, NULL);
+870 	pWrkrData-&gt;state = RS_RET_SUSPENDED;
+871 	pWrkrData-&gt;iidx = pData-&gt;iidx;
+872 	pWrkrData-&gt;widx = ++pData-&gt;nbWrkr;
+873 	memcpy(&amp;(pWrkrData-&gt;recover_policy), &amp;(pData-&gt;recover_policy),
+874 			sizeof(recover_t));
+875 	if (pData-&gt;server2.host &amp;&amp; *pData-&gt;server2.host) {
+876 		time_t odd = time(NULL) % 2;
+877 		memcpy(&amp;(pWrkrData-&gt;serverPrefered.s), (odd) ?
+878 				&amp;pData-&gt;server1 : &amp;pData-&gt;server2, sizeof(server_t));
+879 		memcpy(&amp;(pWrkrData-&gt;serverBackup.s), (odd) ?
+880 				&amp;pData-&gt;server2 : &amp;pData-&gt;server1, sizeof(server_t));
+881 	}else{
+882 		memcpy(&amp;(pWrkrData-&gt;serverPrefered.s), &amp;pData-&gt;server1, sizeof(server_t));
+883 	}
+884 	pWrkrData-&gt;serverActive = &amp;pWrkrData-&gt;serverPrefered;
+885 	startAMQPConnection(pWrkrData);
+886 ENDcreateWrkrInstance
+887 BEGINfreeWrkrInstance
+888 CODESTARTfreeWrkrInstance
+889 	if (pWrkrData != NULL) {
+890 		closeAMQPConnection(pWrkrData);
+891 		pthread_mutex_destroy(&amp;(pWrkrData-&gt;send_mutex));
+892 		pthread_cond_destroy(&amp;(pWrkrData-&gt;cond));
+893 	}
+894 ENDfreeWrkrInstance
+895 BEGINqueryEtryPt
+896 CODESTARTqueryEtryPt
+897 	CODEqueryEtryPt_STD_OMOD_QUERIES
+898 	CODEqueryEtryPt_STD_OMOD8_QUERIES
+899 	CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+900 ENDqueryEtryPt
+901 BEGINmodInit()
+902 CODESTARTmodInit
+903 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+904 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+905 	CHKiRet(objUse(datetime, CORE_COMPONENT));
+906 ENDmodInit
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -1346,664 +958,540 @@ ENDmodInit
 </h3>
 <hr/>
 <pre>
-/* a very simplistic tcp receiver for the rsyslog testbench.
- *
- * Author Philippe Duveau
- *
- * This file is contribution of the rsyslog project.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *       http://www.apache.org/licenses/LICENSE-2.0
- *       -or-
- *       see COPYING.ASL20 in the source distribution
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-#include "config.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;sys/types.h&gt;
-#include &lt;sys/stat.h&gt;
-#include &lt;sys/socket.h&gt;
-#include &lt;sys/time.h&gt;
-#include &lt;fcntl.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;arpa/inet.h&gt;
-#include &lt;inttypes.h&gt;
-#include &lt;pthread.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;errno.h&gt;
-#if defined(__FreeBSD__)
-#include &lt;netinet/in.h&gt;
-#endif
-
-#include "rsyslog.h"
-
-
-#include &lt;amqp.h&gt;
-#include &lt;amqp_framing.h&gt;
-
-#define AMQP_STARTING     ((uchar)0x10)
-#define AMQP_STOP         ((uchar)0x00)
-
-#define AMQP_BEHAVIOR_STANDARD	1
-#define AMQP_BEHAVIOR_NOEXCH 	2
-#define AMQP_BEHAVIOR_DECEXCH 	3
-#define AMQP_BEHAVIOR_BADEXCH 	4
-
-uchar connection_start[487] = {
-	 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0xDF, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x09, 0x00, 0x00, 0x01,
-	 0xBA, 0x0C, 0x63, 0x61, 0x70, 0x61, 0x62, 0x69, 0x6C, 0x69, 0x74, 0x69, 0x65, 0x73, 0x46, 0x00,
-	 0x00, 0x00, 0xC7, 0x12, 0x70, 0x75, 0x62, 0x6C, 0x69, 0x73, 0x68, 0x65, 0x72, 0x5F, 0x63, 0x6F,
-	 0x6E, 0x66, 0x69, 0x72, 0x6D, 0x73, 0x74, 0x01, 0x1A, 0x65, 0x78, 0x63, 0x68, 0x61, 0x6E, 0x67,
-	 0x65, 0x5F, 0x65, 0x78, 0x63, 0x68, 0x61, 0x6E, 0x67, 0x65, 0x5F, 0x62, 0x69, 0x6E, 0x64, 0x69,
-	 0x6E, 0x67, 0x73, 0x74, 0x01, 0x0A, 0x62, 0x61, 0x73, 0x69, 0x63, 0x2E, 0x6E, 0x61, 0x63, 0x6B,
-	 0x74, 0x01, 0x16, 0x63, 0x6F, 0x6E, 0x73, 0x75, 0x6D, 0x65, 0x72, 0x5F, 0x63, 0x61, 0x6E, 0x63,
-	 0x65, 0x6C, 0x5F, 0x6E, 0x6F, 0x74, 0x69, 0x66, 0x79, 0x74, 0x01, 0x12, 0x63, 0x6F, 0x6E, 0x6E,
-	 0x65, 0x63, 0x74, 0x69, 0x6F, 0x6E, 0x2E, 0x62, 0x6C, 0x6F, 0x63, 0x6B, 0x65, 0x64, 0x74, 0x01,
-	 0x13, 0x63, 0x6F, 0x6E, 0x73, 0x75, 0x6D, 0x65, 0x72, 0x5F, 0x70, 0x72, 0x69, 0x6F, 0x72, 0x69,
-	 0x74, 0x69, 0x65, 0x73, 0x74, 0x01, 0x1C, 0x61, 0x75, 0x74, 0x68, 0x65, 0x6E, 0x74, 0x69, 0x63,
-	 0x61, 0x74, 0x69, 0x6F, 0x6E, 0x5F, 0x66, 0x61, 0x69, 0x6C, 0x75, 0x72, 0x65, 0x5F, 0x63, 0x6C,
-	 0x6F, 0x73, 0x65, 0x74, 0x01, 0x10, 0x70, 0x65, 0x72, 0x5F, 0x63, 0x6F, 0x6E, 0x73, 0x75, 0x6D,
-	 0x65, 0x72, 0x5F, 0x71, 0x6F, 0x73, 0x74, 0x01, 0x0F, 0x64, 0x69, 0x72, 0x65, 0x63, 0x74, 0x5F,
-	 0x72, 0x65, 0x70, 0x6C, 0x79, 0x5F, 0x74, 0x6F, 0x74, 0x01, 0x0C, 0x63, 0x6C, 0x75, 0x73, 0x74,
-	 0x65, 0x72, 0x5F, 0x6E, 0x61, 0x6D, 0x65, 0x53, 0x00, 0x00, 0x00, 0x0D, 0x72, 0x61, 0x62, 0x62,
-	 0x69, 0x74, 0x40, 0x73, 0x65, 0x72, 0x76, 0x65, 0x72, 0x09, 0x63, 0x6F, 0x70, 0x79, 0x72, 0x69,
-	 0x67, 0x68, 0x74, 0x53, 0x00, 0x00, 0x00, 0x2E, 0x43, 0x6F, 0x70, 0x79, 0x72, 0x69, 0x67, 0x68,
-	 0x74, 0x20, 0x28, 0x43, 0x29, 0x20, 0x32, 0x30, 0x30, 0x37, 0x2D, 0x32, 0x30, 0x31, 0x36, 0x20,
-	 0x50, 0x69, 0x76, 0x6F, 0x74, 0x61, 0x6C, 0x20, 0x53, 0x6F, 0x66, 0x74, 0x77, 0x61, 0x72, 0x65,
-	 0x2C, 0x20, 0x49, 0x6E, 0x63, 0x2E, 0x0B, 0x69, 0x6E, 0x66, 0x6F, 0x72, 0x6D, 0x61, 0x74, 0x69,
-	 0x6F, 0x6E, 0x53, 0x00, 0x00, 0x00, 0x35, 0x4C, 0x69, 0x63, 0x65, 0x6E, 0x73, 0x65, 0x64, 0x20,
-	 0x75, 0x6E, 0x64, 0x65, 0x72, 0x20, 0x74, 0x68, 0x65, 0x20, 0x4D, 0x50, 0x4C, 0x2E, 0x20, 0x20,
-	 0x53, 0x65, 0x65, 0x20, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x77, 0x77, 0x77, 0x2E, 0x72,
-	 0x61, 0x62, 0x62, 0x69, 0x74, 0x6D, 0x71, 0x2E, 0x63, 0x6F, 0x6D, 0x2F, 0x08, 0x70, 0x6C, 0x61,
-	 0x74, 0x66, 0x6F, 0x72, 0x6D, 0x53, 0x00, 0x00, 0x00, 0x0A, 0x45, 0x72, 0x6C, 0x61, 0x6E, 0x67,
-	 0x2F, 0x4F, 0x54, 0x50, 0x07, 0x70, 0x72, 0x6F, 0x64, 0x75, 0x63, 0x74, 0x53, 0x00, 0x00, 0x00,
-	 0x08, 0x52, 0x61, 0x62, 0x62, 0x69, 0x74, 0x4D, 0x51, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F,
-	 0x6E, 0x53, 0x00, 0x00, 0x00, 0x05, 0x33, 0x2E, 0x36, 0x2E, 0x32, 0x00, 0x00, 0x00, 0x0E, 0x41,
-	 0x4D, 0x51, 0x50, 0x4C, 0x41, 0x49, 0x4E, 0x20, 0x50, 0x4C, 0x41, 0x49, 0x4E, 0x00, 0x00, 0x00,
-	 0x05, 0x65, 0x6E, 0x5F, 0x55, 0x53, 0xCE
-};
-
-static uchar connection_tune[20] = {
-	 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x0A, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x02, 0x00,
-	 0x00, 0x00, 0x3C, 0xCE
-};
-
-static uchar connection_open_ok[13] = {
-	 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x0A, 0x00, 0x29, 0x00, 0xCE
-};
-
-static uchar channel_open_ok[16] = {
-	 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x00, 0x14, 0x00, 0x0B, 0x00, 0x00, 0x00, 0x00, 0xCE
-};
-
-static uchar exchange_declare_ok[12] = {
-	 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x28, 0x00, 0x0B, 0xCE
-};
-
-static uchar channel_close_ok[12] = {
-	 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x14, 0x00, 0x29, 0xCE
-};
-
-static uchar connection_close_ok[12] = {
-	 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x0A, 0x00, 0x33, 0xCE
-};
-
-static uchar channel_close_ok_on_badexch[148] = {
-	0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x8C, 0x00, 0x14, 0x00, 0x28, 0x01,
-	0x96, 0x81, 0x50, 0x52, 0x45, 0x43, 0x4F, 0x4E, 0x44, 0x49, 0x54, 0x49,
-	0x4F, 0x4E, 0x5F, 0x46, 0x41, 0x49, 0x4C, 0x45, 0x44, 0x20, 0x2D, 0x20,
-	0x69, 0x6E, 0x65, 0x71, 0x75, 0x69, 0x76, 0x61, 0x6C, 0x65, 0x6E, 0x74,
-	0x20, 0x61, 0x72, 0x67, 0x20, 0x27, 0x64, 0x75, 0x72, 0x61, 0x62, 0x6C,
-	0x65, 0x27, 0x20, 0x66, 0x6F, 0x72, 0x20, 0x65, 0x78, 0x63, 0x68, 0x61,
-	0x6E, 0x67, 0x65, 0x20, 0x27, 0x69, 0x6E, 0x27, 0x20, 0x69, 0x6E, 0x20,
-	0x76, 0x68, 0x6F, 0x73, 0x74, 0x20, 0x27, 0x2F, 0x6D, 0x65, 0x74, 0x72,
-	0x6F, 0x6C, 0x6F, 0x67, 0x69, 0x65, 0x27, 0x3A, 0x20, 0x72, 0x65, 0x63,
-	0x65, 0x69, 0x76, 0x65, 0x64, 0x20, 0x27, 0x66, 0x61, 0x6C, 0x73, 0x65,
-	0x27, 0x20, 0x62, 0x75, 0x74, 0x20, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6E,
-	0x74, 0x20, 0x69, 0x73, 0x20, 0x27, 0x74, 0x72, 0x75, 0x65, 0x27, 0x00,
-	0x28, 0x00, 0x0A, 0xCE
-};
-
-typedef struct {
-	uchar type;
-	ushort ch;
-	uint32_t method;
-	uint16_t header_flags;
-	size_t datalen;
-	size_t framelen;
-	uchar *data;
-} amqp_frame_type_t;
-
-#define DBGPRINTF0(f, ...) if (debug&gt;0) { \
-	struct timeval dbgtv; \
-	gettimeofday(&amp;dbgtv, NULL);\
-	fprintf(stderr, "%02d.%03d " f, (int)(dbgtv.tv_sec % 60), \
-	       (int)(dbgtv.tv_usec/1000), __VA_ARGS__); \
-}
-#define DBGPRINTF1(f, ...) if (debug&gt;0) { \
-	struct timeval dbgtv; \
-	gettimeofday(&amp;dbgtv, NULL);\
-	dbgtv.tv_sec -= dbgtv_base.tv_sec; \
-	dbgtv.tv_usec -= dbgtv_base.tv_usec; \
-	if (dbgtv.tv_usec &lt; 0) { \
-		dbgtv.tv_usec += 1000000; \
-		dbgtv.tv_sec--; \
-	} \
-	fprintf(stderr, "%02d.%03d " f, (int)(dbgtv.tv_sec % 60), \
-	       (int)(dbgtv.tv_usec/1000), __VA_ARGS__); \
-}
-#define DBGPRINTF2(f, ...) if (debug==2) { \
-	struct timeval dbgtv; \
-	gettimeofday(&amp;dbgtv, NULL);\
-	dbgtv.tv_sec -= dbgtv_base.tv_sec; \
-	dbgtv.tv_usec -= dbgtv_base.tv_usec; \
-	if (dbgtv.tv_usec &lt; 0) { \
-		dbgtv.tv_usec += 1000000; \
-		dbgtv.tv_sec--; \
-	} \
-	fprintf(stderr, "%02d.%03d " f, (int)(dbgtv.tv_sec % 60), \
-				 (int)(dbgtv.tv_usec/1000), __VA_ARGS__); \
-}
-
-static struct timeval dbgtv_base;
-static int server_behaviors = 0;
-static int behaviors;
-static int wait_after_accept = 200; /* milliseconds */
-static char *outfile = NULL;
-static int debug = 1;
-
-FILE* fpout = NULL;
-
-static ATTR_NORETURN void
-errout(const char *reason, int server)
-{
-	char txt[256];
-	snprintf(txt,256,"%s server %d", reason, server);
-	perror(txt);
-	if (fpout &amp;&amp; fpout != stdout) { fclose(fpout); fpout = NULL; }
-	if (outfile) unlink(outfile);
-	exit(1);
-}
-
-static ATTR_NORETURN void
-usage(void)
-{
-	fprintf(stderr, "usage: minirmqsrvr -f outfile [-b behaviour] "
-	        "[-t keep_alive_max] [-w delay_after_fail] [-d]\n");
-	exit (1);
-}
-
-/* Those three functions are "endianess" insensitive */
-static uint16_t buf2uint16(uchar*b) {
-	return ((uint16_t)b[0]) &lt;&lt; 8  | ((uint16_t)b[1]);
-}
-
-static uint32_t buf2uint32(uchar*b) {
-	return ((uint32_t)b[0]) &lt;&lt; 24 | ((uint32_t)b[1]) &lt;&lt; 16 | ((uint32_t)b[2]) &lt;&lt; 8  | ((uint32_t)b[3]);
-}
-
-static uint64_t buf2uint64(uchar*b) {
-	return ((uint64_t)b[0]) &lt;&lt; 56 | ((uint64_t)b[1]) &lt;&lt; 48 | ((uint64_t)b[2]) &lt;&lt; 40 | ((uint64_t)b[3]) &lt;&lt; 32
-	     | ((uint64_t)b[4]) &lt;&lt; 24 | ((uint64_t)b[5]) &lt;&lt; 16 | ((uint64_t)b[6]) &lt;&lt; 8  | ((uint64_t)b[7]);
-}
-
-
-static char AMQP091[8] = { 'A', 'M', 'Q', 'P', 0x00, 0x00, 0x09, 0x01 };
-
-static int
-decode_frame_type(uchar *buf, amqp_frame_type_t *frame, size_t nread) {
-	if (nread == 8){
-		if (memcmp(buf, AMQP091, sizeof(AMQP091)))
-			return -1;
-		frame-&gt;framelen = 8;
-		frame-&gt;type = AMQP_STARTING;
-		frame-&gt;ch = 0;
-		return 0;
-	}
-	frame-&gt;type = buf[0];
-	frame-&gt;ch = buf2uint16(buf+1);
-	frame-&gt;datalen = buf2uint32(buf+3);
-	frame-&gt;framelen = frame-&gt;datalen + 8;
-	frame-&gt;method = buf2uint32(buf+7);
-	switch (frame-&gt;type) {
-	case AMQP_FRAME_BODY:
-		frame-&gt;data = buf + 7;
-		break;
-	default:
-		frame-&gt;data = buf + 11;
-	}
-	return 0;
-}
-
-static ssize_t
-amqp_write(int fdc, uchar *buf, size_t blen, unsigned short channel) {
-	buf[1] = (char) (channel &gt;&gt; 8);
-	buf[2] = (char) (channel &amp; 0xFF);
-	return write(fdc, buf, blen);
-}
-
-static uchar *
-amqpFieldUint64(uint64_t *d, uchar *s) {
-	*d = buf2uint64(s);
-	return s + 8;
-}
-
-static uchar *
-amqpFieldUint32(uint32_t *d, uchar *s) {
-	*d = buf2uint32(s);
-	return s + 4;
-}
-
-static uchar *
-amqpFieldUint16(uint16_t *d, uchar *s) {
-	*d = buf2uint16(s);
-	return s + 2;
-}
-
-static uchar *
-amqpFieldLenFprintf(const char *pfx, uchar *s, uint32_t len) {
-	if (fpout)
-		fprintf(fpout, "%s%.*s", pfx, (int)len, (char*)s);
-	return s + len;
-}
-
-static uchar *
-amqpFieldFprintf(const char *pfx, uchar *s) {
-	uint32_t len = *s++;
-	return amqpFieldLenFprintf(pfx, s, len);
-}
-
-static uchar *
-amqpHeaderFprintf(uchar *s, uint32_t *size) {
-	uint32_t len;
-	uchar *p = amqpFieldFprintf(", ", s);
-	p++; /* value type */
-	p = amqpFieldUint32(&amp;len, p);
-	*size -= (p - s) + len;
-	return amqpFieldLenFprintf(":",  p, len);
-}
-
-static void
-amqp_srvr(int port, int srvr, int fds, int piperead, int pipewrite)
-{
-	uchar wrkBuf[8192], *p;
-	size_t nRead = 0, bsize = 0;
-	ssize_t nSent;
-	amqp_frame_type_t frame;
-	uint64_t body_ui64 = 0;
-	uint32_t props_header_size;
-	uint16_t props_flags;
-	int my_behaviour;
-	struct timeval tv;
-	fd_set rfds;
-	int nfds = ((piperead &gt; fds)? piperead : fds) + 1;
-
-	int fdc;
-
-	my_behaviour = behaviors &amp; 0x000F;
-	behaviors = behaviors &gt;&gt; 4; /* for next server */;
-
-	if(listen(fds, 0) != 0) errout("listen", port);
-
-	DBGPRINTF1("Server AMQP %d on port %d started\n", srvr, port);
-
-	tv.tv_sec = 120;
-	tv.tv_usec = 0;
-	FD_ZERO(&amp;rfds);
-	FD_SET(fds, &amp;rfds);
-	if (piperead &gt; 0)
-		FD_SET(piperead, &amp;rfds);
-
-	if (select(nfds,&amp;rfds,NULL,NULL, &amp;tv) == 0) {
-		exit(1);
-	}
-
-	if (piperead &gt; 0 &amp;&amp; FD_ISSET(piperead, &amp;rfds)) {
-		char c;
-		int l = read(piperead, &amp;c, 1);
-		if (l == 1) {
-			my_behaviour = behaviors &amp; 0x000F;
-			if (my_behaviour != 0) {
-				DBGPRINTF1("Server AMQP %d on port %d switch behaviour", srvr, port);
-			} else {
-				DBGPRINTF1("Server AMQP %d on port %d leaving", srvr, port);
-				if (fpout &amp;&amp; fpout != stdout) { fclose(fpout); fpout = NULL; }
-				exit(1);
-			}
-		}
-	}
-
-	fdc = accept(fds, NULL, NULL);
-
-	if (pipewrite &gt; 0)
-		nSent = write(pipewrite, "N", 1);
-
-	close(fds);
-	fds = -1;
-
-	/* this let the os understand that the port is closed */
-	usleep(1000 * wait_after_accept);
-
-	frame.type = AMQP_STARTING;
-
-	while(fdc &gt; 0) {
-		nSent = 0;
-		ssize_t rd = 0;
-		if (nRead &lt; 12) {
-			rd = read(fdc, wrkBuf + nRead, sizeof(wrkBuf) - nRead);
-			if (rd &lt;= 0) {
-				DBGPRINTF1("Server AMQP %d on port %d disconnected\n", srvr, port);
-				close(fdc);
-				fdc = 0;
-				break;
-			}else {
-				nRead += (size_t)rd;
-			}
-		}
-
-		if (decode_frame_type(wrkBuf, &amp;frame, nRead)) {
-			DBGPRINTF1("Server AMQP %d on port %d killed : bad protocol\n", srvr, port);
-			close(fdc);
-			fdc = 0;
-			break;
-		}
-		if (rd &gt; 4)
-			DBGPRINTF2("Server received : %zd\n", rd);
-
-		switch (frame.type) {
-
-		case AMQP_STARTING: /* starting handshake */
-
-			DBGPRINTF1("Server AMQP %d on port %d type %d connected\n", srvr, port, my_behaviour);
-			DBGPRINTF2("Server %d connection.start\n", srvr);
-			nSent = amqp_write(fdc, connection_start, sizeof(connection_start), frame.ch);
-			break;
-
-		case AMQP_FRAME_METHOD:
-
-			DBGPRINTF2("Server %d method : 0x%X\n", srvr, frame.method);
-
-			switch (frame.method) {
-
-			case AMQP_CONNECTION_START_OK_METHOD:
-
-				DBGPRINTF2("Server %d connection.tune\n", srvr);
-				nSent = amqp_write(fdc, connection_tune, sizeof(connection_tune), frame.ch);
-				break;
-
-			case AMQP_CONNECTION_TUNE_OK_METHOD:
-
-				DBGPRINTF2("Client %d connection.tune-ok\n", srvr);
-				nSent = 0;
-				break;
-
-			case AMQP_CONNECTION_OPEN_METHOD:
-
-				nSent = amqp_write(fdc, connection_open_ok,
-				          sizeof(connection_open_ok), frame.ch);
-				DBGPRINTF2("Server %d connection.open\n", srvr);
-				break;
-
-			case AMQP_CHANNEL_OPEN_METHOD:
-
-				nSent = amqp_write(fdc, channel_open_ok,
-				        sizeof(channel_open_ok), frame.ch);
-				DBGPRINTF2("Server %d channel.open\n", srvr);
-				if (my_behaviour == AMQP_BEHAVIOR_NOEXCH) {
-					close(fdc);
-					DBGPRINTF1("Server AMQP %d on port %d stopped\n", srvr, port);
-					fdc = 0;
-					frame.type = 0;
-				}
-				break;
-
-			case AMQP_EXCHANGE_DECLARE_METHOD:
-
-				if (my_behaviour == AMQP_BEHAVIOR_BADEXCH) {
-					nSent = amqp_write(fdc, channel_close_ok_on_badexch,
-					        sizeof(channel_close_ok_on_badexch), frame.ch);
-				}else{
-					nSent = amqp_write(fdc, exchange_declare_ok,
-					        sizeof(exchange_declare_ok), frame.ch);
-				}
-				DBGPRINTF2("Server %d exchange.declare\n", srvr);
-				if (my_behaviour == AMQP_BEHAVIOR_DECEXCH) {
-					close(fdc);
-					DBGPRINTF1("Server AMQP %d on port %d stopped\n", srvr, port);
-					fdc = 0;
-					frame.type = 0;
-				}
-				break;
-
-			case AMQP_CHANNEL_CLOSE_METHOD:
-
-				nSent = amqp_write(fdc, channel_close_ok,
-				           sizeof(channel_close_ok), frame.ch);
-				DBGPRINTF2("Server %d channel.close\n", srvr);
-				break;
-
-			case AMQP_CONNECTION_CLOSE_METHOD:
-
-				nSent = amqp_write(fdc, connection_close_ok,
-				           sizeof(connection_close_ok), frame.ch);
-				DBGPRINTF2("Server %d connection.close\n", srvr);
-				break;
-
-			case AMQP_BASIC_PUBLISH_METHOD:
-
-				p = amqpFieldFprintf("Exchange:", frame.data + 2);
-				amqpFieldFprintf(", routing-key:", p);
-				break;
-
-			default:
-
-				nSent = 0;
-			}
-			break;
-
-		case AMQP_FRAME_HEADER:
-
-			DBGPRINTF2("Server %d HEADERS\n", srvr);
-			p = amqpFieldUint64(&amp;body_ui64, frame.data);
-			bsize = (size_t)body_ui64;
-			p = amqpFieldUint16(&amp;props_flags, p);
-			if (props_flags &amp; AMQP_BASIC_CONTENT_TYPE_FLAG) {
-				p = amqpFieldFprintf(", content-type:", p);
-			}
-			if (props_flags &amp; AMQP_BASIC_HEADERS_FLAG) {
-				p = amqpFieldUint32(&amp;props_header_size, p);
-				while (props_header_size) {
-					p = amqpHeaderFprintf(p, &amp;props_header_size);
-				}
-			}
-			if (props_flags &amp; AMQP_BASIC_DELIVERY_MODE_FLAG) {
-				if (fpout)
-					fprintf(fpout, ", delivery-mode:%s", (*p++)?"transient":"persistent");
-			}
-			if (props_flags &amp; AMQP_BASIC_EXPIRATION_FLAG) {
-				p = amqpFieldFprintf(", expiration:", p);
-			}
-			if (props_flags &amp; AMQP_BASIC_TIMESTAMP_FLAG) {
-				if (fpout)
-					fprintf(fpout, ", timestamp:OK");
-				p += sizeof(uint64_t);
-			}
-			if (props_flags &amp; AMQP_BASIC_APP_ID_FLAG) {
-				amqpFieldFprintf(", app-id:", p);
-			}
-			if (fpout)
-				fprintf(fpout, ", msg:");
-			break;
-
-		case AMQP_FRAME_BODY:
-
-			DBGPRINTF2("Server %d Body size left : %zu, received : %zu\n",
-								 srvr, bsize, frame.datalen);
-			bsize -= frame.datalen;
-			if (fpout) {
-				fprintf(fpout, "%.*s", (int)frame.datalen, frame.data);
-				if (frame.data[frame.datalen-1] != '\n')
-					fprintf(fpout, "\n");
-				fflush(fpout);
-			}
-			break;
-
-		default:
-
-			DBGPRINTF1("Server %d unsupported frame type %d\n", srvr, frame.type);
-			close(fdc);
-			fdc = 0;
-			frame.type = 0;
-			frame.framelen = 0;
-		} /* switch (frame.type) */
-
-		nRead -= frame.framelen;
-		if (nRead&gt;0)
-			memmove(wrkBuf, wrkBuf + frame.framelen, nRead);
-
-		if (nSent &lt; 0) {
-			close(fdc);
-			fdc = 0;
-		}
-	} /* while(fdc) */
-	DBGPRINTF2("Leaving thread %d\n", srvr);
-}
-
-int
-main(int argc, char *argv[])
-{
-	int port[2], fds[2], i, opt, nb_port = 1;
-	int pipeS1toS2[2] = { -1, -1 };
-	int pipeS2toS1[2] = { -1, -1 };
-	int pipeRead[2], pipeWrite[2];
-
-
-	struct sockaddr_in srvAddr[2];
-	unsigned int addrLen = sizeof(struct sockaddr_in), len;
-	pid_t pid[2];
-
-	fpout = stdout;
-<a name="0"></a>
-	while((opt = getopt(argc, argv, "f:b:w:d")) != -1) {
-		switch (opt) {
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		case 'w':
-			wait_after_accept = atoi(optarg);
-			break;
-		case 'd':
-			debug = 2;
-			break;
-		case 'b':
-			server_behaviors = atoi(optarg);
-			break;
-		case 'f':
-			if(strcmp(optarg, "-")) {
-				outfile = optarg;</b></font>
-				fpout = fopen(optarg, "w");
-				if(fpout == NULL){
-					fprintf(stderr, "file %s could not be created\n", outfile);
-					exit(1);
-				}
-			}
-			break;
-		default:
-			fprintf(stderr, "invalid option '%c' or value missing - terminating...\n", opt);
-			usage();
-			break;
-		}
-	}
-
-	switch (server_behaviors) {
-	case 0:
-		behaviors = AMQP_BEHAVIOR_STANDARD;
-		nb_port = 1;
-		break;
-	case 1: /* two standard servers get message successfully */
-		behaviors = AMQP_BEHAVIOR_STANDARD;
-		nb_port = 2;
-		break;
-	case 2:	/* 2 servers first server which disconnect after after open channel : no declare exchange */
-		behaviors = AMQP_BEHAVIOR_NOEXCH | AMQP_BEHAVIOR_STANDARD &lt;&lt; 4;
-		nb_port = 2;
-		break;
-	case 3: /* 2 servers first server which disconnect after declare exchange*/
-		behaviors = AMQP_BEHAVIOR_DECEXCH | AMQP_BEHAVIOR_STANDARD &lt;&lt; 4;
-		nb_port = 2;
-		break;
-	case 4: /* one server with bad exchange declare */
-		behaviors = AMQP_BEHAVIOR_BADEXCH;
-		nb_port = 1;
-		break;
-	default:
-		fprintf(stderr,"Invalid behavior");
-		exit(1);
-	}
-
-	gettimeofday(&amp;dbgtv_base, NULL);
-
-	port[0] = port[1] = -1;
-
-	if (nb_port == 2) {
-		if(pipe(pipeS1toS2) == -1 || pipe(pipeS2toS1) == -1) {
-			fprintf(stderr, "Pipe failed !");
-			exit(1);
-		}
-	}
-
-	pipeRead[0] = pipeS2toS1[0];
-	pipeWrite[0] =  pipeS1toS2[1];
-
-	pipeRead[1] = pipeS1toS2[0];
-	pipeWrite[1] = pipeS2toS1[1];
-
-	for (i = 0; i &lt; nb_port; i++) {
-		fds[i] = socket(AF_INET, SOCK_STREAM, 0);
-		srvAddr[i].sin_family = AF_INET;
-		srvAddr[i].sin_addr.s_addr = INADDR_ANY;
-		srvAddr[i].sin_port = 0;
-		if(bind(fds[i], (struct sockaddr *)&amp;srvAddr[i], addrLen) != 0)
-			errout("bind", 1);
-		len = addrLen;
-		if (getsockname(fds[i], (struct sockaddr *)&amp;srvAddr[i], &amp;len) == -1)
-			errout("bind", i+1);
-		if ((port[i] = ntohs(srvAddr[i].sin_port)) &lt;= 0)
-			errout("get port", i+1);
-	}
-
-	for (i = 0; i &lt; nb_port; i++) {
-		if ((pid[i] = fork()) == -1) {
-			fprintf(stderr, "Fork failed !");
-			exit(1);
-		}
-		if (pid[i] == 0) {
-			/* this is the child */
-			if (fds[1-i] &gt; 0) close(fds[1-i]);
-			amqp_srvr(port[i], i+1, fds[i], pipeRead[i], pipeWrite[i]);
-
-			if (fpout &amp;&amp; fpout != stdout) fclose(fpout);
-
-			DBGPRINTF2("%s\n","Leaving server");
-			return 0;
-		}
-	}
-
-	if (nb_port==2)
-		printf("export AMQPSRVRPID1=%ld AMQPSRVRPID2=%ld PORT_AMQP1=%d PORT_AMQP2=%d",
-				(long)pid[0], (long)pid[1], port[0], port[1]);
-	else
-		printf("export AMQPSRVRPID1=%ld PORT_AMQP1=%d",
-				(long)pid[0], port[0]);
-	return 0;
-}
+1 #include "config.h"
+2 #include &lt;stdio.h&gt;
+3 #include &lt;stdlib.h&gt;
+4 #include &lt;string.h&gt;
+5 #include &lt;sys/types.h&gt;
+6 #include &lt;sys/stat.h&gt;
+7 #include &lt;sys/socket.h&gt;
+8 #include &lt;sys/time.h&gt;
+9 #include &lt;fcntl.h&gt;
+10 #include &lt;unistd.h&gt;
+11 #include &lt;arpa/inet.h&gt;
+12 #include &lt;inttypes.h&gt;
+13 #include &lt;pthread.h&gt;
+14 #include &lt;signal.h&gt;
+15 #include &lt;errno.h&gt;
+16 #if defined(__FreeBSD__)
+17 #include &lt;netinet/in.h&gt;
+18 #endif
+19 #include "rsyslog.h"
+20 #include &lt;amqp.h&gt;
+21 #include &lt;amqp_framing.h&gt;
+22 #define AMQP_STARTING     ((uchar)0x10)
+23 #define AMQP_STOP         ((uchar)0x00)
+24 #define AMQP_BEHAVIOR_STANDARD	1
+25 #define AMQP_BEHAVIOR_NOEXCH 	2
+26 #define AMQP_BEHAVIOR_DECEXCH 	3
+27 #define AMQP_BEHAVIOR_BADEXCH 	4
+28 uchar connection_start[487] = {
+29 	 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0xDF, 0x00, 0x0A, 0x00, 0x0A, 0x00, 0x09, 0x00, 0x00, 0x01,
+30 	 0xBA, 0x0C, 0x63, 0x61, 0x70, 0x61, 0x62, 0x69, 0x6C, 0x69, 0x74, 0x69, 0x65, 0x73, 0x46, 0x00,
+31 	 0x00, 0x00, 0xC7, 0x12, 0x70, 0x75, 0x62, 0x6C, 0x69, 0x73, 0x68, 0x65, 0x72, 0x5F, 0x63, 0x6F,
+32 	 0x6E, 0x66, 0x69, 0x72, 0x6D, 0x73, 0x74, 0x01, 0x1A, 0x65, 0x78, 0x63, 0x68, 0x61, 0x6E, 0x67,
+33 	 0x65, 0x5F, 0x65, 0x78, 0x63, 0x68, 0x61, 0x6E, 0x67, 0x65, 0x5F, 0x62, 0x69, 0x6E, 0x64, 0x69,
+34 	 0x6E, 0x67, 0x73, 0x74, 0x01, 0x0A, 0x62, 0x61, 0x73, 0x69, 0x63, 0x2E, 0x6E, 0x61, 0x63, 0x6B,
+35 	 0x74, 0x01, 0x16, 0x63, 0x6F, 0x6E, 0x73, 0x75, 0x6D, 0x65, 0x72, 0x5F, 0x63, 0x61, 0x6E, 0x63,
+36 	 0x65, 0x6C, 0x5F, 0x6E, 0x6F, 0x74, 0x69, 0x66, 0x79, 0x74, 0x01, 0x12, 0x63, 0x6F, 0x6E, 0x6E,
+37 	 0x65, 0x63, 0x74, 0x69, 0x6F, 0x6E, 0x2E, 0x62, 0x6C, 0x6F, 0x63, 0x6B, 0x65, 0x64, 0x74, 0x01,
+38 	 0x13, 0x63, 0x6F, 0x6E, 0x73, 0x75, 0x6D, 0x65, 0x72, 0x5F, 0x70, 0x72, 0x69, 0x6F, 0x72, 0x69,
+39 	 0x74, 0x69, 0x65, 0x73, 0x74, 0x01, 0x1C, 0x61, 0x75, 0x74, 0x68, 0x65, 0x6E, 0x74, 0x69, 0x63,
+40 	 0x61, 0x74, 0x69, 0x6F, 0x6E, 0x5F, 0x66, 0x61, 0x69, 0x6C, 0x75, 0x72, 0x65, 0x5F, 0x63, 0x6C,
+41 	 0x6F, 0x73, 0x65, 0x74, 0x01, 0x10, 0x70, 0x65, 0x72, 0x5F, 0x63, 0x6F, 0x6E, 0x73, 0x75, 0x6D,
+42 	 0x65, 0x72, 0x5F, 0x71, 0x6F, 0x73, 0x74, 0x01, 0x0F, 0x64, 0x69, 0x72, 0x65, 0x63, 0x74, 0x5F,
+43 	 0x72, 0x65, 0x70, 0x6C, 0x79, 0x5F, 0x74, 0x6F, 0x74, 0x01, 0x0C, 0x63, 0x6C, 0x75, 0x73, 0x74,
+44 	 0x65, 0x72, 0x5F, 0x6E, 0x61, 0x6D, 0x65, 0x53, 0x00, 0x00, 0x00, 0x0D, 0x72, 0x61, 0x62, 0x62,
+45 	 0x69, 0x74, 0x40, 0x73, 0x65, 0x72, 0x76, 0x65, 0x72, 0x09, 0x63, 0x6F, 0x70, 0x79, 0x72, 0x69,
+46 	 0x67, 0x68, 0x74, 0x53, 0x00, 0x00, 0x00, 0x2E, 0x43, 0x6F, 0x70, 0x79, 0x72, 0x69, 0x67, 0x68,
+47 	 0x74, 0x20, 0x28, 0x43, 0x29, 0x20, 0x32, 0x30, 0x30, 0x37, 0x2D, 0x32, 0x30, 0x31, 0x36, 0x20,
+48 	 0x50, 0x69, 0x76, 0x6F, 0x74, 0x61, 0x6C, 0x20, 0x53, 0x6F, 0x66, 0x74, 0x77, 0x61, 0x72, 0x65,
+49 	 0x2C, 0x20, 0x49, 0x6E, 0x63, 0x2E, 0x0B, 0x69, 0x6E, 0x66, 0x6F, 0x72, 0x6D, 0x61, 0x74, 0x69,
+50 	 0x6F, 0x6E, 0x53, 0x00, 0x00, 0x00, 0x35, 0x4C, 0x69, 0x63, 0x65, 0x6E, 0x73, 0x65, 0x64, 0x20,
+51 	 0x75, 0x6E, 0x64, 0x65, 0x72, 0x20, 0x74, 0x68, 0x65, 0x20, 0x4D, 0x50, 0x4C, 0x2E, 0x20, 0x20,
+52 	 0x53, 0x65, 0x65, 0x20, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x77, 0x77, 0x77, 0x2E, 0x72,
+53 	 0x61, 0x62, 0x62, 0x69, 0x74, 0x6D, 0x71, 0x2E, 0x63, 0x6F, 0x6D, 0x2F, 0x08, 0x70, 0x6C, 0x61,
+54 	 0x74, 0x66, 0x6F, 0x72, 0x6D, 0x53, 0x00, 0x00, 0x00, 0x0A, 0x45, 0x72, 0x6C, 0x61, 0x6E, 0x67,
+55 	 0x2F, 0x4F, 0x54, 0x50, 0x07, 0x70, 0x72, 0x6F, 0x64, 0x75, 0x63, 0x74, 0x53, 0x00, 0x00, 0x00,
+56 	 0x08, 0x52, 0x61, 0x62, 0x62, 0x69, 0x74, 0x4D, 0x51, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F,
+57 	 0x6E, 0x53, 0x00, 0x00, 0x00, 0x05, 0x33, 0x2E, 0x36, 0x2E, 0x32, 0x00, 0x00, 0x00, 0x0E, 0x41,
+58 	 0x4D, 0x51, 0x50, 0x4C, 0x41, 0x49, 0x4E, 0x20, 0x50, 0x4C, 0x41, 0x49, 0x4E, 0x00, 0x00, 0x00,
+59 	 0x05, 0x65, 0x6E, 0x5F, 0x55, 0x53, 0xCE
+60 };
+61 static uchar connection_tune[20] = {
+62 	 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x0A, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x02, 0x00,
+63 	 0x00, 0x00, 0x3C, 0xCE
+64 };
+65 static uchar connection_open_ok[13] = {
+66 	 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x0A, 0x00, 0x29, 0x00, 0xCE
+67 };
+68 static uchar channel_open_ok[16] = {
+69 	 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x00, 0x14, 0x00, 0x0B, 0x00, 0x00, 0x00, 0x00, 0xCE
+70 };
+71 static uchar exchange_declare_ok[12] = {
+72 	 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x28, 0x00, 0x0B, 0xCE
+73 };
+74 static uchar channel_close_ok[12] = {
+75 	 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x14, 0x00, 0x29, 0xCE
+76 };
+77 static uchar connection_close_ok[12] = {
+78 	 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x0A, 0x00, 0x33, 0xCE
+79 };
+80 static uchar channel_close_ok_on_badexch[148] = {
+81 	0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x8C, 0x00, 0x14, 0x00, 0x28, 0x01,
+82 	0x96, 0x81, 0x50, 0x52, 0x45, 0x43, 0x4F, 0x4E, 0x44, 0x49, 0x54, 0x49,
+83 	0x4F, 0x4E, 0x5F, 0x46, 0x41, 0x49, 0x4C, 0x45, 0x44, 0x20, 0x2D, 0x20,
+84 	0x69, 0x6E, 0x65, 0x71, 0x75, 0x69, 0x76, 0x61, 0x6C, 0x65, 0x6E, 0x74,
+85 	0x20, 0x61, 0x72, 0x67, 0x20, 0x27, 0x64, 0x75, 0x72, 0x61, 0x62, 0x6C,
+86 	0x65, 0x27, 0x20, 0x66, 0x6F, 0x72, 0x20, 0x65, 0x78, 0x63, 0x68, 0x61,
+87 	0x6E, 0x67, 0x65, 0x20, 0x27, 0x69, 0x6E, 0x27, 0x20, 0x69, 0x6E, 0x20,
+88 	0x76, 0x68, 0x6F, 0x73, 0x74, 0x20, 0x27, 0x2F, 0x6D, 0x65, 0x74, 0x72,
+89 	0x6F, 0x6C, 0x6F, 0x67, 0x69, 0x65, 0x27, 0x3A, 0x20, 0x72, 0x65, 0x63,
+90 	0x65, 0x69, 0x76, 0x65, 0x64, 0x20, 0x27, 0x66, 0x61, 0x6C, 0x73, 0x65,
+91 	0x27, 0x20, 0x62, 0x75, 0x74, 0x20, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6E,
+92 	0x74, 0x20, 0x69, 0x73, 0x20, 0x27, 0x74, 0x72, 0x75, 0x65, 0x27, 0x00,
+93 	0x28, 0x00, 0x0A, 0xCE
+94 };
+95 typedef struct {
+96 	uchar type;
+97 	ushort ch;
+98 	uint32_t method;
+99 	uint16_t header_flags;
+100 	size_t datalen;
+101 	size_t framelen;
+102 	uchar *data;
+103 } amqp_frame_type_t;
+104 #define DBGPRINTF0(f, ...) if (debug&gt;0) { \
+105 	struct timeval dbgtv; \
+106 	gettimeofday(&amp;dbgtv, NULL);\
+107 	fprintf(stderr, "%02d.%03d " f, (int)(dbgtv.tv_sec % 60), \
+108 	       (int)(dbgtv.tv_usec/1000), __VA_ARGS__); \
+109 }
+110 #define DBGPRINTF1(f, ...) if (debug&gt;0) { \
+111 	struct timeval dbgtv; \
+112 	gettimeofday(&amp;dbgtv, NULL);\
+113 	dbgtv.tv_sec -= dbgtv_base.tv_sec; \
+114 	dbgtv.tv_usec -= dbgtv_base.tv_usec; \
+115 	if (dbgtv.tv_usec &lt; 0) { \
+116 		dbgtv.tv_usec += 1000000; \
+117 		dbgtv.tv_sec--; \
+118 	} \
+119 	fprintf(stderr, "%02d.%03d " f, (int)(dbgtv.tv_sec % 60), \
+120 	       (int)(dbgtv.tv_usec/1000), __VA_ARGS__); \
+121 }
+122 #define DBGPRINTF2(f, ...) if (debug==2) { \
+123 	struct timeval dbgtv; \
+124 	gettimeofday(&amp;dbgtv, NULL);\
+125 	dbgtv.tv_sec -= dbgtv_base.tv_sec; \
+126 	dbgtv.tv_usec -= dbgtv_base.tv_usec; \
+127 	if (dbgtv.tv_usec &lt; 0) { \
+128 		dbgtv.tv_usec += 1000000; \
+129 		dbgtv.tv_sec--; \
+130 	} \
+131 	fprintf(stderr, "%02d.%03d " f, (int)(dbgtv.tv_sec % 60), \
+132 				 (int)(dbgtv.tv_usec/1000), __VA_ARGS__); \
+133 }
+134 static struct timeval dbgtv_base;
+135 static int server_behaviors = 0;
+136 static int behaviors;
+137 static int wait_after_accept = 200; static char *outfile = NULL;
+138 static int debug = 1;
+139 FILE* fpout = NULL;
+140 static ATTR_NORETURN void
+141 errout(const char *reason, int server)
+142 {
+143 	char txt[256];
+144 	snprintf(txt,256,"%s server %d", reason, server);
+145 	perror(txt);
+146 	if (fpout &amp;&amp; fpout != stdout) { fclose(fpout); fpout = NULL; }
+147 	if (outfile) unlink(outfile);
+148 	exit(1);
+149 }
+150 static ATTR_NORETURN void
+151 usage(void)
+152 {
+153 	fprintf(stderr, "usage: minirmqsrvr -f outfile [-b behaviour] "
+154 	        "[-t keep_alive_max] [-w delay_after_fail] [-d]\n");
+155 	exit (1);
+156 }
+157 static uint16_t buf2uint16(uchar*b) {
+158 	return ((uint16_t)b[0]) &lt;&lt; 8  | ((uint16_t)b[1]);
+159 }
+160 static uint32_t buf2uint32(uchar*b) {
+161 	return ((uint32_t)b[0]) &lt;&lt; 24 | ((uint32_t)b[1]) &lt;&lt; 16 | ((uint32_t)b[2]) &lt;&lt; 8  | ((uint32_t)b[3]);
+162 }
+163 static uint64_t buf2uint64(uchar*b) {
+164 	return ((uint64_t)b[0]) &lt;&lt; 56 | ((uint64_t)b[1]) &lt;&lt; 48 | ((uint64_t)b[2]) &lt;&lt; 40 | ((uint64_t)b[3]) &lt;&lt; 32
+165 	     | ((uint64_t)b[4]) &lt;&lt; 24 | ((uint64_t)b[5]) &lt;&lt; 16 | ((uint64_t)b[6]) &lt;&lt; 8  | ((uint64_t)b[7]);
+166 }
+167 static char AMQP091[8] = { 'A', 'M', 'Q', 'P', 0x00, 0x00, 0x09, 0x01 };
+168 static int
+169 decode_frame_type(uchar *buf, amqp_frame_type_t *frame, size_t nread) {
+170 	if (nread == 8){
+171 		if (memcmp(buf, AMQP091, sizeof(AMQP091)))
+172 			return -1;
+173 		frame-&gt;framelen = 8;
+174 		frame-&gt;type = AMQP_STARTING;
+175 		frame-&gt;ch = 0;
+176 		return 0;
+177 	}
+178 	frame-&gt;type = buf[0];
+179 	frame-&gt;ch = buf2uint16(buf+1);
+180 	frame-&gt;datalen = buf2uint32(buf+3);
+181 	frame-&gt;framelen = frame-&gt;datalen + 8;
+182 	frame-&gt;method = buf2uint32(buf+7);
+183 	switch (frame-&gt;type) {
+184 	case AMQP_FRAME_BODY:
+185 		frame-&gt;data = buf + 7;
+186 		break;
+187 	default:
+188 		frame-&gt;data = buf + 11;
+189 	}
+190 	return 0;
+191 }
+192 static ssize_t
+193 amqp_write(int fdc, uchar *buf, size_t blen, unsigned short channel) {
+194 	buf[1] = (char) (channel &gt;&gt; 8);
+195 	buf[2] = (char) (channel &amp; 0xFF);
+196 	return write(fdc, buf, blen);
+197 }
+198 static uchar *
+199 amqpFieldUint64(uint64_t *d, uchar *s) {
+200 	*d = buf2uint64(s);
+201 	return s + 8;
+202 }
+203 static uchar *
+204 amqpFieldUint32(uint32_t *d, uchar *s) {
+205 	*d = buf2uint32(s);
+206 	return s + 4;
+207 }
+208 static uchar *
+209 amqpFieldUint16(uint16_t *d, uchar *s) {
+210 	*d = buf2uint16(s);
+211 	return s + 2;
+212 }
+213 static uchar *
+214 amqpFieldLenFprintf(const char *pfx, uchar *s, uint32_t len) {
+215 	if (fpout)
+216 		fprintf(fpout, "%s%.*s", pfx, (int)len, (char*)s);
+217 	return s + len;
+218 }
+219 static uchar *
+220 amqpFieldFprintf(const char *pfx, uchar *s) {
+221 	uint32_t len = *s++;
+222 	return amqpFieldLenFprintf(pfx, s, len);
+223 }
+224 static uchar *
+225 amqpHeaderFprintf(uchar *s, uint32_t *size) {
+226 	uint32_t len;
+227 	uchar *p = amqpFieldFprintf(", ", s);
+228 	p++; 	p = amqpFieldUint32(&amp;len, p);
+229 	*size -= (p - s) + len;
+230 	return amqpFieldLenFprintf(":",  p, len);
+231 }
+232 static void
+233 amqp_srvr(int port, int srvr, int fds, int piperead, int pipewrite)
+234 {
+235 	uchar wrkBuf[8192], *p;
+236 	size_t nRead = 0, bsize = 0;
+237 	ssize_t nSent;
+238 	amqp_frame_type_t frame;
+239 	uint64_t body_ui64 = 0;
+240 	uint32_t props_header_size;
+241 	uint16_t props_flags;
+242 	int my_behaviour;
+243 	struct timeval tv;
+244 	fd_set rfds;
+245 	int nfds = ((piperead &gt; fds)? piperead : fds) + 1;
+246 	int fdc;
+247 	my_behaviour = behaviors &amp; 0x000F;
+248 	behaviors = behaviors &gt;&gt; 4; 
+249 	if(listen(fds, 0) != 0) errout("listen", port);
+250 	DBGPRINTF1("Server AMQP %d on port %d started\n", srvr, port);
+251 	tv.tv_sec = 120;
+252 	tv.tv_usec = 0;
+253 	FD_ZERO(&amp;rfds);
+254 	FD_SET(fds, &amp;rfds);
+255 	if (piperead &gt; 0)
+256 		FD_SET(piperead, &amp;rfds);
+257 	if (select(nfds,&amp;rfds,NULL,NULL, &amp;tv) == 0) {
+258 		exit(1);
+259 	}
+260 	if (piperead &gt; 0 &amp;&amp; FD_ISSET(piperead, &amp;rfds)) {
+261 		char c;
+262 		int l = read(piperead, &amp;c, 1);
+263 		if (l == 1) {
+264 			my_behaviour = behaviors &amp; 0x000F;
+265 			if (my_behaviour != 0) {
+266 				DBGPRINTF1("Server AMQP %d on port %d switch behaviour", srvr, port);
+267 			} else {
+268 				DBGPRINTF1("Server AMQP %d on port %d leaving", srvr, port);
+269 				if (fpout &amp;&amp; fpout != stdout) { fclose(fpout); fpout = NULL; }
+270 				exit(1);
+271 			}
+272 		}
+273 	}
+274 	fdc = accept(fds, NULL, NULL);
+275 	if (pipewrite &gt; 0)
+276 		nSent = write(pipewrite, "N", 1);
+277 	close(fds);
+278 	fds = -1;
+279 	usleep(1000 * wait_after_accept);
+280 	frame.type = AMQP_STARTING;
+281 	while(fdc &gt; 0) {
+282 		nSent = 0;
+283 		ssize_t rd = 0;
+284 		if (nRead &lt; 12) {
+285 			rd = read(fdc, wrkBuf + nRead, sizeof(wrkBuf) - nRead);
+286 			if (rd &lt;= 0) {
+287 				DBGPRINTF1("Server AMQP %d on port %d disconnected\n", srvr, port);
+288 				close(fdc);
+289 				fdc = 0;
+290 				break;
+291 			}else {
+292 				nRead += (size_t)rd;
+293 			}
+294 		}
+295 		if (decode_frame_type(wrkBuf, &amp;frame, nRead)) {
+296 			DBGPRINTF1("Server AMQP %d on port %d killed : bad protocol\n", srvr, port);
+297 			close(fdc);
+298 			fdc = 0;
+299 			break;
+300 		}
+301 		if (rd &gt; 4)
+302 			DBGPRINTF2("Server received : %zd\n", rd);
+303 		switch (frame.type) {
+304 		case AMQP_STARTING: 
+305 			DBGPRINTF1("Server AMQP %d on port %d type %d connected\n", srvr, port, my_behaviour);
+306 			DBGPRINTF2("Server %d connection.start\n", srvr);
+307 			nSent = amqp_write(fdc, connection_start, sizeof(connection_start), frame.ch);
+308 			break;
+309 		case AMQP_FRAME_METHOD:
+310 			DBGPRINTF2("Server %d method : 0x%X\n", srvr, frame.method);
+311 			switch (frame.method) {
+312 			case AMQP_CONNECTION_START_OK_METHOD:
+313 				DBGPRINTF2("Server %d connection.tune\n", srvr);
+314 				nSent = amqp_write(fdc, connection_tune, sizeof(connection_tune), frame.ch);
+315 				break;
+316 			case AMQP_CONNECTION_TUNE_OK_METHOD:
+317 				DBGPRINTF2("Client %d connection.tune-ok\n", srvr);
+318 				nSent = 0;
+319 				break;
+320 			case AMQP_CONNECTION_OPEN_METHOD:
+321 				nSent = amqp_write(fdc, connection_open_ok,
+322 				          sizeof(connection_open_ok), frame.ch);
+323 				DBGPRINTF2("Server %d connection.open\n", srvr);
+324 				break;
+325 			case AMQP_CHANNEL_OPEN_METHOD:
+326 				nSent = amqp_write(fdc, channel_open_ok,
+327 				        sizeof(channel_open_ok), frame.ch);
+328 				DBGPRINTF2("Server %d channel.open\n", srvr);
+329 				if (my_behaviour == AMQP_BEHAVIOR_NOEXCH) {
+330 					close(fdc);
+331 					DBGPRINTF1("Server AMQP %d on port %d stopped\n", srvr, port);
+332 					fdc = 0;
+333 					frame.type = 0;
+334 				}
+335 				break;
+336 			case AMQP_EXCHANGE_DECLARE_METHOD:
+337 				if (my_behaviour == AMQP_BEHAVIOR_BADEXCH) {
+338 					nSent = amqp_write(fdc, channel_close_ok_on_badexch,
+339 					        sizeof(channel_close_ok_on_badexch), frame.ch);
+340 				}else{
+341 					nSent = amqp_write(fdc, exchange_declare_ok,
+342 					        sizeof(exchange_declare_ok), frame.ch);
+343 				}
+344 				DBGPRINTF2("Server %d exchange.declare\n", srvr);
+345 				if (my_behaviour == AMQP_BEHAVIOR_DECEXCH) {
+346 					close(fdc);
+347 					DBGPRINTF1("Server AMQP %d on port %d stopped\n", srvr, port);
+348 					fdc = 0;
+349 					frame.type = 0;
+350 				}
+351 				break;
+352 			case AMQP_CHANNEL_CLOSE_METHOD:
+353 				nSent = amqp_write(fdc, channel_close_ok,
+354 				           sizeof(channel_close_ok), frame.ch);
+355 				DBGPRINTF2("Server %d channel.close\n", srvr);
+356 				break;
+357 			case AMQP_CONNECTION_CLOSE_METHOD:
+358 				nSent = amqp_write(fdc, connection_close_ok,
+359 				           sizeof(connection_close_ok), frame.ch);
+360 				DBGPRINTF2("Server %d connection.close\n", srvr);
+361 				break;
+362 			case AMQP_BASIC_PUBLISH_METHOD:
+363 				p = amqpFieldFprintf("Exchange:", frame.data + 2);
+364 				amqpFieldFprintf(", routing-key:", p);
+365 				break;
+366 			default:
+367 				nSent = 0;
+368 			}
+369 			break;
+370 		case AMQP_FRAME_HEADER:
+371 			DBGPRINTF2("Server %d HEADERS\n", srvr);
+372 			p = amqpFieldUint64(&amp;body_ui64, frame.data);
+373 			bsize = (size_t)body_ui64;
+374 			p = amqpFieldUint16(&amp;props_flags, p);
+375 			if (props_flags &amp; AMQP_BASIC_CONTENT_TYPE_FLAG) {
+376 				p = amqpFieldFprintf(", content-type:", p);
+377 			}
+378 			if (props_flags &amp; AMQP_BASIC_HEADERS_FLAG) {
+379 				p = amqpFieldUint32(&amp;props_header_size, p);
+380 				while (props_header_size) {
+381 					p = amqpHeaderFprintf(p, &amp;props_header_size);
+382 				}
+383 			}
+384 			if (props_flags &amp; AMQP_BASIC_DELIVERY_MODE_FLAG) {
+385 				if (fpout)
+386 					fprintf(fpout, ", delivery-mode:%s", (*p++)?"transient":"persistent");
+387 			}
+388 			if (props_flags &amp; AMQP_BASIC_EXPIRATION_FLAG) {
+389 				p = amqpFieldFprintf(", expiration:", p);
+390 			}
+391 			if (props_flags &amp; AMQP_BASIC_TIMESTAMP_FLAG) {
+392 				if (fpout)
+393 					fprintf(fpout, ", timestamp:OK");
+394 				p += sizeof(uint64_t);
+395 			}
+396 			if (props_flags &amp; AMQP_BASIC_APP_ID_FLAG) {
+397 				amqpFieldFprintf(", app-id:", p);
+398 			}
+399 			if (fpout)
+400 				fprintf(fpout, ", msg:");
+401 			break;
+402 		case AMQP_FRAME_BODY:
+403 			DBGPRINTF2("Server %d Body size left : %zu, received : %zu\n",
+404 								 srvr, bsize, frame.datalen);
+405 			bsize -= frame.datalen;
+406 			if (fpout) {
+407 				fprintf(fpout, "%.*s", (int)frame.datalen, frame.data);
+408 				if (frame.data[frame.datalen-1] != '\n')
+409 					fprintf(fpout, "\n");
+410 				fflush(fpout);
+411 			}
+412 			break;
+413 		default:
+414 			DBGPRINTF1("Server %d unsupported frame type %d\n", srvr, frame.type);
+415 			close(fdc);
+416 			fdc = 0;
+417 			frame.type = 0;
+418 			frame.framelen = 0;
+419 		} 
+420 		nRead -= frame.framelen;
+421 		if (nRead&gt;0)
+422 			memmove(wrkBuf, wrkBuf + frame.framelen, nRead);
+423 		if (nSent &lt; 0) {
+424 			close(fdc);
+425 			fdc = 0;
+426 		}
+427 	} 	DBGPRINTF2("Leaving thread %d\n", srvr);
+428 }
+429 int
+430 main(int argc, char *argv[])
+431 {
+432 	int port[2], fds[2], i, opt, nb_port = 1;
+433 	int pipeS1toS2[2] = { -1, -1 };
+434 	int pipeS2toS1[2] = { -1, -1 };
+435 	int pipeRead[2], pipeWrite[2];
+436 	struct sockaddr_in srvAddr[2];
+437 	unsigned int addrLen = sizeof(struct sockaddr_in), len;
+438 	pid_t pid[2];
+439 	fpout = stdout;
+440 <a name="0"></a>
+441 	while((opt = getopt(argc, argv, "f:b:w:d")) != -1) {
+442 		switch (opt) {
+443 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		case 'w':
+444 			wait_after_accept = atoi(optarg);
+445 			break;
+446 		case 'd':
+447 			debug = 2;
+448 			break;
+449 		case 'b':
+450 			server_behaviors = atoi(optarg);
+451 			break;
+452 		case 'f':
+453 			if(strcmp(optarg, "-")) {
+454 				outfile = optarg;</b></font>
+455 				fpout = fopen(optarg, "w");
+456 				if(fpout == NULL){
+457 					fprintf(stderr, "file %s could not be created\n", outfile);
+458 					exit(1);
+459 				}
+460 			}
+461 			break;
+462 		default:
+463 			fprintf(stderr, "invalid option '%c' or value missing - terminating...\n", opt);
+464 			usage();
+465 			break;
+466 		}
+467 	}
+468 	switch (server_behaviors) {
+469 	case 0:
+470 		behaviors = AMQP_BEHAVIOR_STANDARD;
+471 		nb_port = 1;
+472 		break;
+473 	case 1: 		behaviors = AMQP_BEHAVIOR_STANDARD;
+474 		nb_port = 2;
+475 		break;
+476 	case 2:			behaviors = AMQP_BEHAVIOR_NOEXCH | AMQP_BEHAVIOR_STANDARD &lt;&lt; 4;
+477 		nb_port = 2;
+478 		break;
+479 		behaviors = AMQP_BEHAVIOR_DECEXCH | AMQP_BEHAVIOR_STANDARD &lt;&lt; 4;
+480 		nb_port = 2;
+481 		break;
+482 	case 4: 		behaviors = AMQP_BEHAVIOR_BADEXCH;
+483 		nb_port = 1;
+484 		break;
+485 	default:
+486 		fprintf(stderr,"Invalid behavior");
+487 		exit(1);
+488 	}
+489 	gettimeofday(&amp;dbgtv_base, NULL);
+490 	port[0] = port[1] = -1;
+491 	if (nb_port == 2) {
+492 		if(pipe(pipeS1toS2) == -1 || pipe(pipeS2toS1) == -1) {
+493 			fprintf(stderr, "Pipe failed !");
+494 			exit(1);
+495 		}
+496 	}
+497 	pipeRead[0] = pipeS2toS1[0];
+498 	pipeWrite[0] =  pipeS1toS2[1];
+499 	pipeRead[1] = pipeS1toS2[0];
+500 	pipeWrite[1] = pipeS2toS1[1];
+501 	for (i = 0; i &lt; nb_port; i++) {
+502 		fds[i] = socket(AF_INET, SOCK_STREAM, 0);
+503 		srvAddr[i].sin_family = AF_INET;
+504 		srvAddr[i].sin_addr.s_addr = INADDR_ANY;
+505 		srvAddr[i].sin_port = 0;
+506 		if(bind(fds[i], (struct sockaddr *)&amp;srvAddr[i], addrLen) != 0)
+507 			errout("bind", 1);
+508 		len = addrLen;
+509 		if (getsockname(fds[i], (struct sockaddr *)&amp;srvAddr[i], &amp;len) == -1)
+510 			errout("bind", i+1);
+511 		if ((port[i] = ntohs(srvAddr[i].sin_port)) &lt;= 0)
+512 			errout("get port", i+1);
+513 	}
+514 	for (i = 0; i &lt; nb_port; i++) {
+515 		if ((pid[i] = fork()) == -1) {
+516 			fprintf(stderr, "Fork failed !");
+517 			exit(1);
+518 		}
+519 		if (pid[i] == 0) {
+520 			if (fds[1-i] &gt; 0) close(fds[1-i]);
+521 			amqp_srvr(port[i], i+1, fds[i], pipeRead[i], pipeWrite[i]);
+522 			if (fpout &amp;&amp; fpout != stdout) fclose(fpout);
+523 			DBGPRINTF2("%s\n","Leaving server");
+524 			return 0;
+525 		}
+526 	}
+527 	if (nb_port==2)
+528 		printf("export AMQPSRVRPID1=%ld AMQPSRVRPID2=%ld PORT_AMQP1=%d PORT_AMQP2=%d",
+529 				(long)pid[0], (long)pid[1], port[0], port[1]);
+530 	else
+531 		printf("export AMQPSRVRPID1=%ld PORT_AMQP1=%d",
+532 				(long)pid[0], port[0]);
+533 	return 0;
+534 }
 </pre>
 </div>
 </div>

@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for maplut.c &amp; smartcrop.c</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -41,780 +40,525 @@ Matches for maplut.c &amp; smartcrop.c
 </h3>
 <hr/>
 <pre>
-/* map though a LUT
- *
- * Modified:
- * 18/6/93 JC
- *	- oops! im_incheck() added for LUT image
- * 	- some ANSIfication
- * 15/7/93 JC
- *	- adapted for partial v2
- *	- ANSIfied
- *	- now does complex LUTs too
- * 10/3/94 JC
- *	- more helpful error messages, slight reformatting
- * 24/8/94 JC
- *	- now allows non-uchar image input
- * 7/10/94 JC
- *	- uses im_malloc(), IM_NEW() etc.
- * 13/3/95 JC
- *	- now takes a private copy of LUT, so user can im_close() LUT image
- *	  after im_maplut() without fear of coredumps
- * 23/6/95 JC
- *	- lut may now have many bands if image has just one band
- * 3/3/01 JC
- *	- small speed ups
- * 30/6/04
- *	- heh, 1 band image + 3 band lut + &gt;8bit output has been broken for 9
- *	  years :-)
- * 7/11/07
- * 	- new eval start/end system
- * 25/3/10
- * 	- gtkdoc
- * 	- small cleanups
- * 5/7/13
- * 	- convert to a class
- * 2/10/13
- * 	- add --band arg, replacing im_tone_map()
- */
-
-/*
-
-    This file is part of VIPS.
-    
-    VIPS is free software; you can redistribute it and/or modify
-    it under the terms of the GNU Lesser General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Lesser General Public License for more details.
-
-    You should have received a copy of the GNU Lesser General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
-
- */
-
-/*
-
-    These files are distributed with VIPS - http://www.vips.ecs.soton.ac.uk
-
- */
-
-#ifdef HAVE_CONFIG_H
-#include &lt;config.h&gt;
-#endif /*HAVE_CONFIG_H*/
-#include &lt;vips/intl.h&gt;
-
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-
-#include &lt;vips/vips.h&gt;
-
-typedef struct _VipsMaplut {
-	VipsOperation parent_instance;
-
-	VipsImage *in;
-	VipsImage *out;
-	VipsImage *lut;
-	int band; 
-
-	int fmt;		/* LUT image BandFmt */
-	int nb;			/* Number of bands in lut */
-	int es;			/* VIPS_IMAGE_SIZEOF_ELEMENT() for lut image */
-	int sz;			/* Number of elements in minor dimension */
-	int clp;		/* Value we clip against */
-	VipsPel **table;	/* Lut converted to 2d array */
-	int overflow;		/* Number of overflows for non-uchar lut */
-
-} VipsMaplut;
-
-typedef VipsOperationClass VipsMaplutClass;
-
-G_DEFINE_TYPE( VipsMaplut, vips_maplut, VIPS_TYPE_OPERATION );
-
-static void
-vips_maplut_preeval( VipsImage *image, VipsProgress *progress, 
-	VipsMaplut *maplut )
-{
-	maplut-&gt;overflow = 0;
-}
-
-static void
-vips_maplut_posteval( VipsImage *image, VipsProgress *progress, 
-	VipsMaplut *maplut )
-{
-	if( maplut-&gt;overflow )
-		g_warning( _( "%d overflows detected" ), maplut-&gt;overflow );
-}
-
-/* Our sequence value: the region this sequence is using, and local stats.
- */
-typedef struct {
-	VipsRegion *ir;		/* Input region */
-	int overflow;		/* Number of overflows */
-} VipsMaplutSequence;
-
-/* Our start function.
- */
-static void *
-vips_maplut_start( VipsImage *out, void *a, void *b )
-{
-	VipsImage *in = (VipsImage *) a;
-	VipsMaplutSequence *seq;
-
-	if( !(seq = VIPS_NEW( out, VipsMaplutSequence )) )
-		 return( NULL );
-
-	/* Init!
-	 */
-	seq-&gt;ir = NULL;
-	seq-&gt;overflow = 0;
-
-	if( !(seq-&gt;ir = vips_region_new( in )) ) 
-		return( NULL );
-
-	return( seq );
-}
-
-/* Map through n non-complex luts.
- */
-#define loop( OUT ) { \
-	int b = maplut-&gt;nb; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		for( z = 0; z &lt; b; z++ ) { \
-			VipsPel *p = VIPS_REGION_ADDR( ir, le, y ); \
-			OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
-			OUT *tlut = (OUT *) maplut-&gt;table[z]; \
-			\
-			for( x = z; x &lt; ne; x += b ) \
-				q[x] = tlut[p[x]]; \
-		} \
-	} \
-}
-
-/* Map through n complex luts.
- */
-#define loopc( OUT ) { \
-	int b = in-&gt;Bands; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		for( z = 0; z &lt; b; z++ ) { \
-			VipsPel *p = VIPS_REGION_ADDR( ir, le, y ) + z; \
-			OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ) + z * 2; \
-			OUT *tlut = (OUT *) maplut-&gt;table[z]; \
-			\
-			for( x = 0; x &lt; ne; x += b ) { \
-				int n = p[x] * 2; \
-				\
-				q[0] = tlut[n]; \
-				q[1] = tlut[n + 1]; \
-				q += b * 2; \
-			} \
-		} \
-	} \
-}
-
-#define loopg( IN, OUT ) { \
-	int b = maplut-&gt;nb; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		for( z = 0; z &lt; b; z++ ) { \
-			IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ); \
-			OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
-			OUT *tlut = (OUT *) maplut-&gt;table[z]; \
-			\
-			for( x = z; x &lt; ne; x += b ) { \
-				int index = p[x]; \
-				\
-				if( index &gt; maplut-&gt;clp ) { \
-					index = maplut-&gt;clp; \
-					seq-&gt;overflow++; \
-				} \
-				\
-				q[x] = tlut[index]; \
-			} \
-		} \
-	} \
-}
-
-#define loopcg( IN, OUT ) { \
-	int b = in-&gt;Bands; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		for( z = 0; z &lt; b; z++ ) { \
-			IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ) + z; \
-			OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ) + z * 2; \
-			OUT *tlut = (OUT *) maplut-&gt;table[z]; \
-			\
-			for( x = 0; x &lt; ne; x += b ) { \
-				int index = p[x]; \
-				\
-				if( index &gt; maplut-&gt;clp ) { \
-					index = maplut-&gt;clp; \
-					seq-&gt;overflow++; \
-				} \
-				\
-				q[0] = tlut[index * 2]; \
-				q[1] = tlut[index * 2 + 1]; \
-				\
-				q += b * 2; \
-			} \
-		} \
-	} \
-}
-
-/* Map image through one non-complex lut.
- */
-#define loop1( OUT ) { \
-	OUT *tlut = (OUT *) maplut-&gt;table[0]; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
-		VipsPel *p = VIPS_REGION_ADDR( ir, le, y ); \
-		\
-		for( x = 0; x &lt; ne; x++ ) \
-			q[x] = tlut[p[x]]; \
-	} \
-}
-
-/* Map image through one complex lut.
- */
-#define loop1c( OUT ) { \
-	OUT *tlut = (OUT *) maplut-&gt;table[0]; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
-		VipsPel *p = VIPS_REGION_ADDR( ir, le, y ); \
-		\
-		for( x = 0; x &lt; ne; x++ ) { \
-			int n = p[x] * 2; \
-			\
-			q[0] = tlut[n]; \
-			q[1] = tlut[n + 1]; \
-			q += 2; \
-		} \
-	} \
-}
-
-/* As above, but the input image may be any unsigned integer type. We have to
- * index the lut carefully, and record the number of overflows we detect.
- */
-#define loop1g( IN, OUT ) { \
-	OUT *tlut = (OUT *) maplut-&gt;table[0]; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
-		IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ); \
-		\
-		for( x = 0; x &lt; ne; x++ ) { \
-			int index = p[x]; \
-			\
-			if( index &gt; maplut-&gt;clp ) { \
-				index = maplut-&gt;clp; \
-				seq-&gt;overflow++; \
-			} \
-			\
-			q[x] = tlut[index]; \
-		} \
-	} \
-}
-
-#define loop1cg( IN, OUT ) { \
-	OUT *tlut = (OUT *) maplut-&gt;table[0]; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
-		IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ); \
-		\
-		for( x = 0; x &lt; ne; x++ ) { \
-			int index = p[x]; \
-			\
-			if( index &gt; maplut-&gt;clp ) { \
-				index = maplut-&gt;clp; \
-				seq-&gt;overflow++; \
-			} \
-			\
-			q[0] = tlut[index * 2]; \
-			q[1] = tlut[index * 2 + 1]; \
-			q += 2; \
-		} \
-	} \
-}
-
-/* Map 1-band image through a many-band non-complex lut.
- */
-#define loop1m( OUT ) { \
-	OUT **tlut = (OUT **) maplut-&gt;table; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
-		VipsPel *p = VIPS_REGION_ADDR( ir, le, y ); \
-		\
-		for( i = 0, x = 0; x &lt; np; x++ ) { \
-			int n = p[x]; \
-			\
-			for( z = 0; z &lt; maplut-&gt;nb; z++, i++ ) \
-				q[i] = tlut[z][n]; \
-		} \
-	} \
-}
-
-/* Map 1-band image through many-band complex lut.
- */
-#define loop1cm( OUT ) { \
-	OUT **tlut = (OUT **) maplut-&gt;table; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
-		VipsPel *p = VIPS_REGION_ADDR( ir, le, y ); \
-		\
-		for( x = 0; x &lt; np; x++ ) { \
-			int n = p[x] * 2; \
-			\
-			for( z = 0; z &lt; maplut-&gt;nb; z++ ) { \
-				q[0] = tlut[z][n]; \
-				q[1] = tlut[z][n+1]; \
-				q += 2; \
-			} \
-		} \
-	} \
-}
-
-/* Map 1-band uint or ushort image through a many-band non-complex LUT.
- */
-#define loop1gm( IN, OUT ) { \
-	OUT **tlut = (OUT **) maplut-&gt;table; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ); \
-		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
-		\
-		for( i = 0, x = 0; x &lt; np; x++ ) { \
-			int n = p[x]; \
-			\
-			if( n &gt; maplut-&gt;clp ) { \
-				n = maplut-&gt;clp; \
-				seq-&gt;overflow++; \
-			} \
-			\
-			for( z = 0; z &lt; maplut-&gt;nb; z++, i++ ) \
-				q[i] = tlut[z][n]; \
-		} \
-	} \
-}
-
-/* Map 1-band uint or ushort image through a many-band complex LUT.
- */
-#define loop1cgm( IN, OUT ) { \
-	OUT **tlut = (OUT **) maplut-&gt;table; \
-	\
-	for( y = to; y &lt; bo; y++ ) { \
-		IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ); \
-		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
-		\
-		for( x = 0; x &lt; np; x++ ) { \
-			int n = p[x]; \
-			\
-			if( n &gt; maplut-&gt;clp ) { \
-				n = maplut-&gt;clp; \
-				seq-&gt;overflow++; \
-			} \
-			\
-			for( z = 0; z &lt; maplut-&gt;nb; z++ ) { \
-				q[0] = tlut[z][n * 2]; \
-				q[1] = tlut[z][n * 2 + 1]; \
-				q += 2; \
-			} \
-		} \
-	} \
-}
-
-/* Switch for input types. Has to be uint type!
- */
-#define inner_switch( UCHAR, GEN, OUT ) \
-	switch( ir-&gt;im-&gt;BandFmt ) { \
-	case VIPS_FORMAT_UCHAR:		UCHAR( OUT ); break; \
-	case VIPS_FORMAT_USHORT:	GEN( unsigned short, OUT ); break; \
-	case VIPS_FORMAT_UINT:		GEN( unsigned int, OUT ); break; \
-	default: \
-		g_assert_not_reached(); \
-	}
-
-/* Switch for LUT types. One function for non-complex images, a
- * variant for complex ones. Another pair as well, in case the input is not
- * uchar.
- */
-#define outer_switch( UCHAR_F, UCHAR_FC, GEN_F, GEN_FC ) \
-	switch( maplut-&gt;fmt ) { \
-	case VIPS_FORMAT_UCHAR: \
-		inner_switch( UCHAR_F, GEN_F, unsigned char ); break; \
-	case VIPS_FORMAT_CHAR:\
-		inner_switch( UCHAR_F, GEN_F, char ); break; \
-	case VIPS_FORMAT_USHORT: \
-		inner_switch( UCHAR_F, GEN_F, unsigned short ); break; \
-	case VIPS_FORMAT_SHORT: \
-		inner_switch( UCHAR_F, GEN_F, short ); break; \
-	case VIPS_FORMAT_UINT: \
-		inner_switch( UCHAR_F, GEN_F, unsigned int ); break; \
-	case VIPS_FORMAT_INT: \
-		inner_switch( UCHAR_F, GEN_F, int ); break; \
-	case VIPS_FORMAT_FLOAT: \
-		inner_switch( UCHAR_F, GEN_F, float ); break; \
-	case VIPS_FORMAT_DOUBLE: \
-		inner_switch( UCHAR_F, GEN_F, double ); break; \
-	case VIPS_FORMAT_COMPLEX: \
-		inner_switch( UCHAR_FC, GEN_FC, float ); break; \
-	case VIPS_FORMAT_DPCOMPLEX: \
-		inner_switch( UCHAR_FC, GEN_FC, double ); break; \
-	default: \
-		g_assert_not_reached(); \
-	}
-
-/* Do a map.
- */
-static int 
-vips_maplut_gen( VipsRegion *or, void *vseq, void *a, void *b, 
-	gboolean *stop )
-{
-	VipsMaplutSequence *seq = (VipsMaplutSequence *) vseq;
-	VipsImage *in = (VipsImage *) a;
-	VipsMaplut *maplut = (VipsMaplut *) b;
-	VipsRegion *ir = seq-&gt;ir;
-	VipsRect *r = &amp;or-&gt;valid;
-	int le = r-&gt;left;
-	int to = r-&gt;top;
-	int bo = VIPS_RECT_BOTTOM( r );
-	int np = r-&gt;width;			/* Pels across region */
-	int ne = VIPS_REGION_N_ELEMENTS( or );	/* Number of elements */
-
-	int x, y, z, i;
-
-	if( vips_region_prepare( ir, r ) )
-		return( -1 );
-
-	if( maplut-&gt;nb == 1 )
-		/* One band lut.
-		 */
-		outer_switch( loop1, loop1c, loop1g, loop1cg ) 
-	else 
-		/* Many band lut.
-		 */
-		if( in-&gt;Bands == 1 )
-			/* ... but 1 band input.
-			 */
-			outer_switch( loop1m, loop1cm, loop1gm, loop1cgm ) 
-		else
-			outer_switch( loop, loopc, loopg, loopcg )
-
-	return( 0 );
-}
-
-/* Destroy a sequence value.
- */
-static int
-vips_maplut_stop( void *vseq, void *a, void *b )
-{
-	VipsMaplutSequence *seq = (VipsMaplutSequence *) vseq;
-	VipsMaplut *maplut = (VipsMaplut *) b;
-
-	/* Add to global stats.
-	 */
-	maplut-&gt;overflow += seq-&gt;overflow;
-
-	VIPS_UNREF( seq-&gt;ir );
-
-	return( 0 );
-}
-
-/* Save a bit of typing.
- */
-#define UC VIPS_FORMAT_UCHAR
-#define US VIPS_FORMAT_USHORT
-#define UI VIPS_FORMAT_UINT
-
-/* Type mapping: go to uchar / ushort / uint to make an index. 
- */
-static int bandfmt_maplut[10] = {
-/* UC   C  US   S  UI   I   F   X  D   DX */
-   UC, UC, US, US, UI, UI, UI, UI, UI, UI
-};
-
-/* Repack lut into a set of band arrays. If we're just passing one band of the
- * image through the lut, put the identity function in the other bands. 
- */ 
-#define PACK_TABLE( TYPE ) { \
-	TYPE *data = (TYPE *) lut-&gt;data; \
-	int x, b; \
-	\
-	for( x = 0; x &lt; maplut-&gt;sz; x++ ) \
-		for( b = 0; b &lt; maplut-&gt;nb; b++ ) { \
-			TYPE *q = (TYPE *) maplut-&gt;table[b];  \
-			\
-			if( maplut-&gt;band &gt;= 0 &amp;&amp; \
-				lut-&gt;Bands == 1 ) { \
-				if( b == maplut-&gt;band ) \
-					q[x] = data[x]; \
-				else \
-					q[x] = x; \
-			} \
-			else \
-				q[x] = data[x * lut-&gt;Bands + b]; \
-		} \
-}
-
-#define PACK_TABLEC( TYPE ) { \
-	TYPE *data = (TYPE *) lut-&gt;data; \
-	int x, b; \
-	\
-	for( x = 0; x &lt; maplut-&gt;sz; x++ ) \
-		for( b = 0; b &lt; maplut-&gt;nb; b++ ) { \
-			TYPE *q = (TYPE *) maplut-&gt;table[b];  \
-			\
-			if( maplut-&gt;band &gt;= 0 &amp;&amp; \
-				lut-&gt;Bands == 1 ) { \
-				if( b == maplut-&gt;band ) { \
-					q[2 * x] = data[2 * x]; \
-					q[2 * x + 1] = data[2 * x + 1]; \
-				} \
-				else { \
-					q[2 * x] = x; \
-					q[2 * x + 1] = 0; \
-				} \
-			} \
-			else { \
-				q[2 * x] = data[2 * (x * lut-&gt;Bands + b)]; \
-				q[2 * x + 1] = \
-					data[2 * (x * lut-&gt;Bands + b) + 1]; \
-			} \
-		} \
-}
-
-static int
-vips_maplut_build( VipsObject *object )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( object );
-	VipsMaplut *maplut = (VipsMaplut *) object;
-	VipsImage **t = (VipsImage **) vips_object_local_array( object, 2 );
-
-	VipsImage *in;
-	VipsImage *lut;
-	int i;
-
-	g_object_set( object, "out", vips_image_new(), NULL ); 
-
-	if( VIPS_OBJECT_CLASS( vips_maplut_parent_class )-&gt;build( object ) )
-		return( -1 );
-
-	in = maplut-&gt;in;
-	lut = maplut-&gt;lut;
-
-	if( vips_check_hist( class-&gt;nickname, lut ) ||
-		vips_check_uncoded( class-&gt;nickname, lut ) )
-		return( -1 );
-
-	/* Cast @in to u8/u16/u32 to make the index image.
-	 */
-	if( vips_cast( in, &amp;t[0], bandfmt_maplut[in-&gt;BandFmt], NULL ) )
-		return( -1 );
-	in = t[0];
-
-	if( vips_check_uncoded( class-&gt;nickname, in ) ||
-		vips_check_bands_1orn( class-&gt;nickname, in, lut ) ||
-		vips_image_pio_input( in ) )
-		return( -1 );
-
-	if( vips_image_pipelinev( maplut-&gt;out, 
-		VIPS_DEMAND_STYLE_THINSTRIP, in, lut, NULL ) )
-		return( -1 );
-	maplut-&gt;out-&gt;BandFmt = lut-&gt;BandFmt;
-
-	/* Output has same number of bands as LUT, unless LUT has 1 band, in
-	 * which case output has same number of bands as input.
-	 */
-	if( lut-&gt;Bands != 1 )
-		maplut-&gt;out-&gt;Bands = lut-&gt;Bands;
-
-	/* The Type comes from the image with many bands. A B_W index image,
-	 * for example, needs to become an RGB image when it goes through a
-	 * three-band LUT.
-	 */
-	if( lut-&gt;Bands != 1 )
-		maplut-&gt;out-&gt;Type = lut-&gt;Type;
-
-	g_signal_connect( in, "preeval", 
-		G_CALLBACK( vips_maplut_preeval ), maplut );
-	g_signal_connect( in, "posteval", 
-		G_CALLBACK( vips_maplut_posteval ), maplut );
-
-	/* Make luts. We unpack the LUT image into a 2D C array to speed
-	 * processing.
-	 */
-	if( !(t[1] = vips_image_copy_memory( lut )) )
-		return( -1 );
-	lut = t[1];
-	maplut-&gt;fmt = lut-&gt;BandFmt;
-	maplut-&gt;es = VIPS_IMAGE_SIZEOF_ELEMENT( lut );
-	maplut-&gt;sz = lut-&gt;Xsize * lut-&gt;Ysize;
-	maplut-&gt;clp = maplut-&gt;sz - 1;
-
-	/* If @bands is &gt;= 0, we need to expand the lut to the number of bands
-	 * in the input image. 
-	 */
-	if( maplut-&gt;band &gt;= 0 &amp;&amp; 
-		lut-&gt;Bands == 1 )
-		maplut-&gt;nb = in-&gt;Bands;
-	else
-		maplut-&gt;nb = lut-&gt;Bands;
-
-	/* Attach tables.
-	 */
-	if( !(maplut-&gt;table = VIPS_ARRAY( maplut, maplut-&gt;nb, VipsPel * )) ) 
-                return( -1 );
-	for( i = 0; i &lt; maplut-&gt;nb; i++ )
-		if( !(maplut-&gt;table[i] = VIPS_ARRAY( maplut, 
-			maplut-&gt;sz * maplut-&gt;es, VipsPel )) )
-			return( -1 );
-
-	/* Scan LUT and fill table.
-	 */
-	switch( lut-&gt;BandFmt ) {
-	case VIPS_FORMAT_UCHAR: 
-		PACK_TABLE( unsigned char ); break; 
-	case VIPS_FORMAT_CHAR:
-		PACK_TABLE( char ); break; 
-	case VIPS_FORMAT_USHORT: 
-		PACK_TABLE( unsigned short ); break; 
-	case VIPS_FORMAT_SHORT: 
-		PACK_TABLE( short ); break; 
-	case VIPS_FORMAT_UINT: 
-		PACK_TABLE( unsigned int ); break; 
-	case VIPS_FORMAT_INT: 
-		PACK_TABLE( int ); break; 
-	case VIPS_FORMAT_FLOAT: 
-		PACK_TABLE( float ); break; 
-	case VIPS_FORMAT_DOUBLE: 
-		PACK_TABLE( double ); break; 
-	case VIPS_FORMAT_COMPLEX: 
-		PACK_TABLEC( float ); break; 
-	case VIPS_FORMAT_DPCOMPLEX: 
-		PACK_TABLEC( double ); break; 
-	default: 
-		g_assert_not_reached(); 
-	}
-
-	if( vips_image_generate( maplut-&gt;out,
-		vips_maplut_start, vips_maplut_gen, vips_maplut_stop, 
-		in, maplut ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static void
-vips_maplut_class_init( VipsMaplutClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = VIPS_OBJECT_CLASS( class );
-<a name="0"></a>	VipsOperationClass *operation_class = VIPS_OPERATION_CLASS( class );
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "maplut";
-	object_class-&gt;description = _( "map an image though a lut" );
-	object_class-&gt;build = vips_maplut_build;
-
-	operation_class-&gt;flags = VIPS_OPERATION_SEQUENTIAL;
-
-	VIPS_ARG_IMAGE( class, "in", 1, 
-		_( "Input" ), 
-		_( "Input image" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT,
-		G_STRUCT_OFFSET( VipsMaplut, in ) );
-
-	VIPS_ARG_IMAGE( class, "out", 2, 
-		_( "Output" ), 
-		_( "Output image" ),
-		VIPS_ARGUMENT_REQUIRED_OUTPUT, 
-		G_STRUCT_OFFSET( VipsMaplut, out ) );
-
-	VIPS_ARG_IMAGE( class, "lut", 3, 
-		_( "LUT" ), 
-		_( "Look-up table image" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT,
-		G_STRUCT_OFFSET( VipsMaplut, lut ) );
-
-	VIPS_ARG_INT( class, "band", 4, 
-		_( "band" ), 
-		_( "apply one-band lut to this band of in" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT,
-		G_STRUCT_OFFSET( VipsMaplut, band ),
-		-1, 10000, -1 ); 
-
-}
-
-static void
-vips_maplut_init( VipsMaplut *maplut )
-{
-	maplut-&gt;band = -1;
-}
-
-/**
- * vips_maplut: (method)
- * @in: input image
- * @out: (out): output image
- * @lut: look-up table
- * @...: %NULL-terminated list of optional named arguments
- *
- * Optional arguments:
- *
- * * @band: apply one-band @lut to this band of @in
- *
- * Map an image through another image acting as a LUT (Look Up Table). 
- * The lut may have any type and the output image will be that type.
- * 
- * The input image will be cast to one of the unsigned integer types, that is,
- * VIPS_FORMAT_UCHAR, VIPS_FORMAT_USHORT or VIPS_FORMAT_UINT.
- * 
- * If @lut is too small for the input type (for example, if @in is
- * VIPS_FORMAT_UCHAR but @lut only has 100 elements), the lut is padded out
- * by copying the last element. Overflows are reported at the end of 
- * computation.
- * If @lut is too large, extra values are ignored. 
- * 
- * If @lut has one band and @band is -1 (the default), then all bands of @in 
- * pass through @lut. If @band is &gt;= 0, then just that band of @in passes 
- * through @lut and other bands are just copied. 
- *
- * If @lut
- * has same number of bands as @in, then each band is mapped
- * separately. If @in has one band, then @lut may have many bands and
- * the output will have the same number of bands as @lut.
- *
- * See also: vips_hist_find(), vips_identity().
- *
- * Returns: 0 on success, -1 on error
- */
-int</b></font>
-vips_maplut( VipsImage *in, VipsImage **out, VipsImage *lut, ... )
-{
-	va_list ap;
-	int result;
-
-	va_start( ap, lut );
-	result = vips_call_split( "maplut", ap, in, out, lut );
-	va_end( ap );
-
-	return( result );
-}
-
+1 #ifdef HAVE_CONFIG_H
+2 #include &lt;config.h&gt;
+3 #include &lt;vips/intl.h&gt;
+4 #include &lt;stdio.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;vips/vips.h&gt;
+8 typedef struct _VipsMaplut {
+9 	VipsOperation parent_instance;
+10 	VipsImage *in;
+11 	VipsImage *out;
+12 	VipsImage *lut;
+13 	int band; 
+14 	int fmt;			int nb;				int es;				int sz;				int clp;			VipsPel **table;		int overflow;		
+15 } VipsMaplut;
+16 typedef VipsOperationClass VipsMaplutClass;
+17 G_DEFINE_TYPE( VipsMaplut, vips_maplut, VIPS_TYPE_OPERATION );
+18 static void
+19 vips_maplut_preeval( VipsImage *image, VipsProgress *progress, 
+20 	VipsMaplut *maplut )
+21 {
+22 	maplut-&gt;overflow = 0;
+23 }
+24 static void
+25 vips_maplut_posteval( VipsImage *image, VipsProgress *progress, 
+26 	VipsMaplut *maplut )
+27 {
+28 	if( maplut-&gt;overflow )
+29 		g_warning( _( "%d overflows detected" ), maplut-&gt;overflow );
+30 }
+31 typedef struct {
+32 	VipsRegion *ir;			int overflow;		} VipsMaplutSequence;
+33 static void *
+34 vips_maplut_start( VipsImage *out, void *a, void *b )
+35 {
+36 	VipsImage *in = (VipsImage *) a;
+37 	VipsMaplutSequence *seq;
+38 	if( !(seq = VIPS_NEW( out, VipsMaplutSequence )) )
+39 		 return( NULL );
+40 	seq-&gt;ir = NULL;
+41 	seq-&gt;overflow = 0;
+42 	if( !(seq-&gt;ir = vips_region_new( in )) ) 
+43 		return( NULL );
+44 	return( seq );
+45 }
+46 #define loop( OUT ) { \
+47 	int b = maplut-&gt;nb; \
+48 	\
+49 	for( y = to; y &lt; bo; y++ ) { \
+50 		for( z = 0; z &lt; b; z++ ) { \
+51 			VipsPel *p = VIPS_REGION_ADDR( ir, le, y ); \
+52 			OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
+53 			OUT *tlut = (OUT *) maplut-&gt;table[z]; \
+54 			\
+55 			for( x = z; x &lt; ne; x += b ) \
+56 				q[x] = tlut[p[x]]; \
+57 		} \
+58 	} \
+59 }
+60 #define loopc( OUT ) { \
+61 	int b = in-&gt;Bands; \
+62 	\
+63 	for( y = to; y &lt; bo; y++ ) { \
+64 		for( z = 0; z &lt; b; z++ ) { \
+65 			VipsPel *p = VIPS_REGION_ADDR( ir, le, y ) + z; \
+66 			OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ) + z * 2; \
+67 			OUT *tlut = (OUT *) maplut-&gt;table[z]; \
+68 			\
+69 			for( x = 0; x &lt; ne; x += b ) { \
+70 				int n = p[x] * 2; \
+71 				\
+72 				q[0] = tlut[n]; \
+73 				q[1] = tlut[n + 1]; \
+74 				q += b * 2; \
+75 			} \
+76 		} \
+77 	} \
+78 }
+79 #define loopg( IN, OUT ) { \
+80 	int b = maplut-&gt;nb; \
+81 	\
+82 	for( y = to; y &lt; bo; y++ ) { \
+83 		for( z = 0; z &lt; b; z++ ) { \
+84 			IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ); \
+85 			OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
+86 			OUT *tlut = (OUT *) maplut-&gt;table[z]; \
+87 			\
+88 			for( x = z; x &lt; ne; x += b ) { \
+89 				int index = p[x]; \
+90 				\
+91 				if( index &gt; maplut-&gt;clp ) { \
+92 					index = maplut-&gt;clp; \
+93 					seq-&gt;overflow++; \
+94 				} \
+95 				\
+96 				q[x] = tlut[index]; \
+97 			} \
+98 		} \
+99 	} \
+100 }
+101 #define loopcg( IN, OUT ) { \
+102 	int b = in-&gt;Bands; \
+103 	\
+104 	for( y = to; y &lt; bo; y++ ) { \
+105 		for( z = 0; z &lt; b; z++ ) { \
+106 			IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ) + z; \
+107 			OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ) + z * 2; \
+108 			OUT *tlut = (OUT *) maplut-&gt;table[z]; \
+109 			\
+110 			for( x = 0; x &lt; ne; x += b ) { \
+111 				int index = p[x]; \
+112 				\
+113 				if( index &gt; maplut-&gt;clp ) { \
+114 					index = maplut-&gt;clp; \
+115 					seq-&gt;overflow++; \
+116 				} \
+117 				\
+118 				q[0] = tlut[index * 2]; \
+119 				q[1] = tlut[index * 2 + 1]; \
+120 				\
+121 				q += b * 2; \
+122 			} \
+123 		} \
+124 	} \
+125 }
+126 #define loop1( OUT ) { \
+127 	OUT *tlut = (OUT *) maplut-&gt;table[0]; \
+128 	\
+129 	for( y = to; y &lt; bo; y++ ) { \
+130 		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
+131 		VipsPel *p = VIPS_REGION_ADDR( ir, le, y ); \
+132 		\
+133 		for( x = 0; x &lt; ne; x++ ) \
+134 			q[x] = tlut[p[x]]; \
+135 	} \
+136 }
+137 #define loop1c( OUT ) { \
+138 	OUT *tlut = (OUT *) maplut-&gt;table[0]; \
+139 	\
+140 	for( y = to; y &lt; bo; y++ ) { \
+141 		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
+142 		VipsPel *p = VIPS_REGION_ADDR( ir, le, y ); \
+143 		\
+144 		for( x = 0; x &lt; ne; x++ ) { \
+145 			int n = p[x] * 2; \
+146 			\
+147 			q[0] = tlut[n]; \
+148 			q[1] = tlut[n + 1]; \
+149 			q += 2; \
+150 		} \
+151 	} \
+152 }
+153 #define loop1g( IN, OUT ) { \
+154 	OUT *tlut = (OUT *) maplut-&gt;table[0]; \
+155 	\
+156 	for( y = to; y &lt; bo; y++ ) { \
+157 		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
+158 		IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ); \
+159 		\
+160 		for( x = 0; x &lt; ne; x++ ) { \
+161 			int index = p[x]; \
+162 			\
+163 			if( index &gt; maplut-&gt;clp ) { \
+164 				index = maplut-&gt;clp; \
+165 				seq-&gt;overflow++; \
+166 			} \
+167 			\
+168 			q[x] = tlut[index]; \
+169 		} \
+170 	} \
+171 }
+172 #define loop1cg( IN, OUT ) { \
+173 	OUT *tlut = (OUT *) maplut-&gt;table[0]; \
+174 	\
+175 	for( y = to; y &lt; bo; y++ ) { \
+176 		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
+177 		IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ); \
+178 		\
+179 		for( x = 0; x &lt; ne; x++ ) { \
+180 			int index = p[x]; \
+181 			\
+182 			if( index &gt; maplut-&gt;clp ) { \
+183 				index = maplut-&gt;clp; \
+184 				seq-&gt;overflow++; \
+185 			} \
+186 			\
+187 			q[0] = tlut[index * 2]; \
+188 			q[1] = tlut[index * 2 + 1]; \
+189 			q += 2; \
+190 		} \
+191 	} \
+192 }
+193 #define loop1m( OUT ) { \
+194 	OUT **tlut = (OUT **) maplut-&gt;table; \
+195 	\
+196 	for( y = to; y &lt; bo; y++ ) { \
+197 		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
+198 		VipsPel *p = VIPS_REGION_ADDR( ir, le, y ); \
+199 		\
+200 		for( i = 0, x = 0; x &lt; np; x++ ) { \
+201 			int n = p[x]; \
+202 			\
+203 			for( z = 0; z &lt; maplut-&gt;nb; z++, i++ ) \
+204 				q[i] = tlut[z][n]; \
+205 		} \
+206 	} \
+207 }
+208 #define loop1cm( OUT ) { \
+209 	OUT **tlut = (OUT **) maplut-&gt;table; \
+210 	\
+211 	for( y = to; y &lt; bo; y++ ) { \
+212 		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
+213 		VipsPel *p = VIPS_REGION_ADDR( ir, le, y ); \
+214 		\
+215 		for( x = 0; x &lt; np; x++ ) { \
+216 			int n = p[x] * 2; \
+217 			\
+218 			for( z = 0; z &lt; maplut-&gt;nb; z++ ) { \
+219 				q[0] = tlut[z][n]; \
+220 				q[1] = tlut[z][n+1]; \
+221 				q += 2; \
+222 			} \
+223 		} \
+224 	} \
+225 }
+226 #define loop1gm( IN, OUT ) { \
+227 	OUT **tlut = (OUT **) maplut-&gt;table; \
+228 	\
+229 	for( y = to; y &lt; bo; y++ ) { \
+230 		IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ); \
+231 		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
+232 		\
+233 		for( i = 0, x = 0; x &lt; np; x++ ) { \
+234 			int n = p[x]; \
+235 			\
+236 			if( n &gt; maplut-&gt;clp ) { \
+237 				n = maplut-&gt;clp; \
+238 				seq-&gt;overflow++; \
+239 			} \
+240 			\
+241 			for( z = 0; z &lt; maplut-&gt;nb; z++, i++ ) \
+242 				q[i] = tlut[z][n]; \
+243 		} \
+244 	} \
+245 }
+246 #define loop1cgm( IN, OUT ) { \
+247 	OUT **tlut = (OUT **) maplut-&gt;table; \
+248 	\
+249 	for( y = to; y &lt; bo; y++ ) { \
+250 		IN *p = (IN *) VIPS_REGION_ADDR( ir, le, y ); \
+251 		OUT *q = (OUT *) VIPS_REGION_ADDR( or, le, y ); \
+252 		\
+253 		for( x = 0; x &lt; np; x++ ) { \
+254 			int n = p[x]; \
+255 			\
+256 			if( n &gt; maplut-&gt;clp ) { \
+257 				n = maplut-&gt;clp; \
+258 				seq-&gt;overflow++; \
+259 			} \
+260 			\
+261 			for( z = 0; z &lt; maplut-&gt;nb; z++ ) { \
+262 				q[0] = tlut[z][n * 2]; \
+263 				q[1] = tlut[z][n * 2 + 1]; \
+264 				q += 2; \
+265 			} \
+266 		} \
+267 	} \
+268 }
+269 #define inner_switch( UCHAR, GEN, OUT ) \
+270 	switch( ir-&gt;im-&gt;BandFmt ) { \
+271 	case VIPS_FORMAT_UCHAR:		UCHAR( OUT ); break; \
+272 	case VIPS_FORMAT_USHORT:	GEN( unsigned short, OUT ); break; \
+273 	case VIPS_FORMAT_UINT:		GEN( unsigned int, OUT ); break; \
+274 	default: \
+275 		g_assert_not_reached(); \
+276 	}
+277 #define outer_switch( UCHAR_F, UCHAR_FC, GEN_F, GEN_FC ) \
+278 	switch( maplut-&gt;fmt ) { \
+279 	case VIPS_FORMAT_UCHAR: \
+280 		inner_switch( UCHAR_F, GEN_F, unsigned char ); break; \
+281 	case VIPS_FORMAT_CHAR:\
+282 		inner_switch( UCHAR_F, GEN_F, char ); break; \
+283 	case VIPS_FORMAT_USHORT: \
+284 		inner_switch( UCHAR_F, GEN_F, unsigned short ); break; \
+285 	case VIPS_FORMAT_SHORT: \
+286 		inner_switch( UCHAR_F, GEN_F, short ); break; \
+287 	case VIPS_FORMAT_UINT: \
+288 		inner_switch( UCHAR_F, GEN_F, unsigned int ); break; \
+289 	case VIPS_FORMAT_INT: \
+290 		inner_switch( UCHAR_F, GEN_F, int ); break; \
+291 	case VIPS_FORMAT_FLOAT: \
+292 		inner_switch( UCHAR_F, GEN_F, float ); break; \
+293 	case VIPS_FORMAT_DOUBLE: \
+294 		inner_switch( UCHAR_F, GEN_F, double ); break; \
+295 	case VIPS_FORMAT_COMPLEX: \
+296 		inner_switch( UCHAR_FC, GEN_FC, float ); break; \
+297 	case VIPS_FORMAT_DPCOMPLEX: \
+298 		inner_switch( UCHAR_FC, GEN_FC, double ); break; \
+299 	default: \
+300 		g_assert_not_reached(); \
+301 	}
+302 static int 
+303 vips_maplut_gen( VipsRegion *or, void *vseq, void *a, void *b, 
+304 	gboolean *stop )
+305 {
+306 	VipsMaplutSequence *seq = (VipsMaplutSequence *) vseq;
+307 	VipsImage *in = (VipsImage *) a;
+308 	VipsMaplut *maplut = (VipsMaplut *) b;
+309 	VipsRegion *ir = seq-&gt;ir;
+310 	VipsRect *r = &amp;or-&gt;valid;
+311 	int le = r-&gt;left;
+312 	int to = r-&gt;top;
+313 	int bo = VIPS_RECT_BOTTOM( r );
+314 	int np = r-&gt;width;				int ne = VIPS_REGION_N_ELEMENTS( or );	
+315 	int x, y, z, i;
+316 	if( vips_region_prepare( ir, r ) )
+317 		return( -1 );
+318 	if( maplut-&gt;nb == 1 )
+319 		outer_switch( loop1, loop1c, loop1g, loop1cg ) 
+320 	else 
+321 		if( in-&gt;Bands == 1 )
+322 			outer_switch( loop1m, loop1cm, loop1gm, loop1cgm ) 
+323 		else
+324 			outer_switch( loop, loopc, loopg, loopcg )
+325 	return( 0 );
+326 }
+327 static int
+328 vips_maplut_stop( void *vseq, void *a, void *b )
+329 {
+330 	VipsMaplutSequence *seq = (VipsMaplutSequence *) vseq;
+331 	VipsMaplut *maplut = (VipsMaplut *) b;
+332 	maplut-&gt;overflow += seq-&gt;overflow;
+333 	VIPS_UNREF( seq-&gt;ir );
+334 	return( 0 );
+335 }
+336 #define UC VIPS_FORMAT_UCHAR
+337 #define US VIPS_FORMAT_USHORT
+338 #define UI VIPS_FORMAT_UINT
+339 static int bandfmt_maplut[10] = {
+340    UC, UC, US, US, UI, UI, UI, UI, UI, UI
+341 };
+342 #define PACK_TABLE( TYPE ) { \
+343 	TYPE *data = (TYPE *) lut-&gt;data; \
+344 	int x, b; \
+345 	\
+346 	for( x = 0; x &lt; maplut-&gt;sz; x++ ) \
+347 		for( b = 0; b &lt; maplut-&gt;nb; b++ ) { \
+348 			TYPE *q = (TYPE *) maplut-&gt;table[b];  \
+349 			\
+350 			if( maplut-&gt;band &gt;= 0 &amp;&amp; \
+351 				lut-&gt;Bands == 1 ) { \
+352 				if( b == maplut-&gt;band ) \
+353 					q[x] = data[x]; \
+354 				else \
+355 					q[x] = x; \
+356 			} \
+357 			else \
+358 				q[x] = data[x * lut-&gt;Bands + b]; \
+359 		} \
+360 }
+361 #define PACK_TABLEC( TYPE ) { \
+362 	TYPE *data = (TYPE *) lut-&gt;data; \
+363 	int x, b; \
+364 	\
+365 	for( x = 0; x &lt; maplut-&gt;sz; x++ ) \
+366 		for( b = 0; b &lt; maplut-&gt;nb; b++ ) { \
+367 			TYPE *q = (TYPE *) maplut-&gt;table[b];  \
+368 			\
+369 			if( maplut-&gt;band &gt;= 0 &amp;&amp; \
+370 				lut-&gt;Bands == 1 ) { \
+371 				if( b == maplut-&gt;band ) { \
+372 					q[2 * x] = data[2 * x]; \
+373 					q[2 * x + 1] = data[2 * x + 1]; \
+374 				} \
+375 				else { \
+376 					q[2 * x] = x; \
+377 					q[2 * x + 1] = 0; \
+378 				} \
+379 			} \
+380 			else { \
+381 				q[2 * x] = data[2 * (x * lut-&gt;Bands + b)]; \
+382 				q[2 * x + 1] = \
+383 					data[2 * (x * lut-&gt;Bands + b) + 1]; \
+384 			} \
+385 		} \
+386 }
+387 static int
+388 vips_maplut_build( VipsObject *object )
+389 {
+390 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( object );
+391 	VipsMaplut *maplut = (VipsMaplut *) object;
+392 	VipsImage **t = (VipsImage **) vips_object_local_array( object, 2 );
+393 	VipsImage *in;
+394 	VipsImage *lut;
+395 	int i;
+396 	g_object_set( object, "out", vips_image_new(), NULL ); 
+397 	if( VIPS_OBJECT_CLASS( vips_maplut_parent_class )-&gt;build( object ) )
+398 		return( -1 );
+399 	in = maplut-&gt;in;
+400 	lut = maplut-&gt;lut;
+401 	if( vips_check_hist( class-&gt;nickname, lut ) ||
+402 		vips_check_uncoded( class-&gt;nickname, lut ) )
+403 		return( -1 );
+404 	if( vips_cast( in, &amp;t[0], bandfmt_maplut[in-&gt;BandFmt], NULL ) )
+405 		return( -1 );
+406 	in = t[0];
+407 	if( vips_check_uncoded( class-&gt;nickname, in ) ||
+408 		vips_check_bands_1orn( class-&gt;nickname, in, lut ) ||
+409 		vips_image_pio_input( in ) )
+410 		return( -1 );
+411 	if( vips_image_pipelinev( maplut-&gt;out, 
+412 		VIPS_DEMAND_STYLE_THINSTRIP, in, lut, NULL ) )
+413 		return( -1 );
+414 	maplut-&gt;out-&gt;BandFmt = lut-&gt;BandFmt;
+415 	if( lut-&gt;Bands != 1 )
+416 		maplut-&gt;out-&gt;Bands = lut-&gt;Bands;
+417 	if( lut-&gt;Bands != 1 )
+418 		maplut-&gt;out-&gt;Type = lut-&gt;Type;
+419 	g_signal_connect( in, "preeval", 
+420 		G_CALLBACK( vips_maplut_preeval ), maplut );
+421 	g_signal_connect( in, "posteval", 
+422 		G_CALLBACK( vips_maplut_posteval ), maplut );
+423 	if( !(t[1] = vips_image_copy_memory( lut )) )
+424 		return( -1 );
+425 	lut = t[1];
+426 	maplut-&gt;fmt = lut-&gt;BandFmt;
+427 	maplut-&gt;es = VIPS_IMAGE_SIZEOF_ELEMENT( lut );
+428 	maplut-&gt;sz = lut-&gt;Xsize * lut-&gt;Ysize;
+429 	maplut-&gt;clp = maplut-&gt;sz - 1;
+430 	if( maplut-&gt;band &gt;= 0 &amp;&amp; 
+431 		lut-&gt;Bands == 1 )
+432 		maplut-&gt;nb = in-&gt;Bands;
+433 	else
+434 		maplut-&gt;nb = lut-&gt;Bands;
+435 	if( !(maplut-&gt;table = VIPS_ARRAY( maplut, maplut-&gt;nb, VipsPel * )) ) 
+436                 return( -1 );
+437 	for( i = 0; i &lt; maplut-&gt;nb; i++ )
+438 		if( !(maplut-&gt;table[i] = VIPS_ARRAY( maplut, 
+439 			maplut-&gt;sz * maplut-&gt;es, VipsPel )) )
+440 			return( -1 );
+441 	switch( lut-&gt;BandFmt ) {
+442 	case VIPS_FORMAT_UCHAR: 
+443 		PACK_TABLE( unsigned char ); break; 
+444 	case VIPS_FORMAT_CHAR:
+445 		PACK_TABLE( char ); break; 
+446 	case VIPS_FORMAT_USHORT: 
+447 		PACK_TABLE( unsigned short ); break; 
+448 	case VIPS_FORMAT_SHORT: 
+449 		PACK_TABLE( short ); break; 
+450 	case VIPS_FORMAT_UINT: 
+451 		PACK_TABLE( unsigned int ); break; 
+452 	case VIPS_FORMAT_INT: 
+453 		PACK_TABLE( int ); break; 
+454 	case VIPS_FORMAT_FLOAT: 
+455 		PACK_TABLE( float ); break; 
+456 	case VIPS_FORMAT_DOUBLE: 
+457 		PACK_TABLE( double ); break; 
+458 	case VIPS_FORMAT_COMPLEX: 
+459 		PACK_TABLEC( float ); break; 
+460 	case VIPS_FORMAT_DPCOMPLEX: 
+461 		PACK_TABLEC( double ); break; 
+462 	default: 
+463 		g_assert_not_reached(); 
+464 	}
+465 	if( vips_image_generate( maplut-&gt;out,
+466 		vips_maplut_start, vips_maplut_gen, vips_maplut_stop, 
+467 		in, maplut ) )
+468 		return( -1 );
+469 	return( 0 );
+470 }
+471 static void
+472 vips_maplut_class_init( VipsMaplutClass *class )
+473 {
+474 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+475 	VipsObjectClass *object_class = VIPS_OBJECT_CLASS( class );
+476 <a name="0"></a>	VipsOperationClass *operation_class = VIPS_OPERATION_CLASS( class );
+477 	gobject_class-&gt;set_property = vips_object_set_property;
+478 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	gobject_class-&gt;get_property = vips_object_get_property;
+479 	object_class-&gt;nickname = "maplut";
+480 	object_class-&gt;description = _( "map an image though a lut" );
+481 	object_class-&gt;build = vips_maplut_build;
+482 	operation_class-&gt;flags = VIPS_OPERATION_SEQUENTIAL;
+483 	VIPS_ARG_IMAGE( class, "in", 1, 
+484 		_( "Input" ), 
+485 		_( "Input image" ),
+486 		VIPS_ARGUMENT_REQUIRED_INPUT,
+487 		G_STRUCT_OFFSET( VipsMaplut, in ) );
+488 	VIPS_ARG_IMAGE( class, "out", 2, 
+489 		_( "Output" ), 
+490 		_( "Output image" ),
+491 		VIPS_ARGUMENT_REQUIRED_OUTPUT, 
+492 		G_STRUCT_OFFSET( VipsMaplut, out ) );
+493 	VIPS_ARG_IMAGE( class, "lut", 3, 
+494 		_( "LUT" ), 
+495 		_( "Look-up table image" ),
+496 		VIPS_ARGUMENT_REQUIRED_INPUT,
+497 		G_STRUCT_OFFSET( VipsMaplut, lut ) );
+498 	VIPS_ARG_INT( class, "band", 4, 
+499 		_( "band" ), 
+500 		_( "apply one-band lut to this band of in" ),
+501 		VIPS_ARGUMENT_OPTIONAL_INPUT,
+502 		G_STRUCT_OFFSET( VipsMaplut, band ),
+503 		-1, 10000, -1 ); 
+504 }
+505 static void
+506 vips_maplut_init( VipsMaplut *maplut )
+507 {
+508 	maplut-&gt;band = -1;
+509 }
+510 int</b></font>
+511 vips_maplut( VipsImage *in, VipsImage **out, VipsImage *lut, ... )
+512 {
+513 	va_list ap;
+514 	int result;
+515 	va_start( ap, lut );
+516 	result = vips_call_split( "maplut", ap, in, out, lut );
+517 	va_end( ap );
+518 	return( result );
+519 }
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -827,486 +571,289 @@ vips_maplut( VipsImage *in, VipsImage **out, VipsImage *lut, ... )
 </h3>
 <hr/>
 <pre>
-/* crop an image down to a specified size by removing boring parts
- *
- * Adapted from sharp's smartcrop feature, with kind permission.
- *
- * 1/3/17
- * 	- first version, from sharp
- * 14/3/17
- * 	- revised attention smartcrop
- * 8/6/17
- * 	- revised again
- * 15/9/18 lovell
- * 	- move shrink to start of processing
- * 22/9/18 jcupitt
- * 	- add low and high
- * 19/3/20 jcupitt
- * 	- add all
- */
-
-/*
-
-    This file is part of VIPS.
-    
-    VIPS is free software; you can redistribute it and/or modify
-    it under the terms of the GNU Lesser General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Lesser General Public License for more details.
-
-    You should have received a copy of the GNU Lesser General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
-
- */
-
-/*
-
-    These files are distributed with VIPS - http://www.vips.ecs.soton.ac.uk
-
- */
-
-/*
-#define VIPS_DEBUG
- */
-
-#ifdef HAVE_CONFIG_H
-#include &lt;config.h&gt;
-#endif /*HAVE_CONFIG_H*/
-#include &lt;vips/intl.h&gt;
-
-#include &lt;stdio.h&gt;
-#include &lt;string.h&gt;
-#include &lt;stdlib.h&gt;
-
-#include &lt;vips/vips.h&gt;
-#include &lt;vips/debug.h&gt;
-
-#include "pconversion.h"
-
-#include "bandary.h"
-
-typedef struct _VipsSmartcrop {
-	VipsConversion parent_instance;
-
-	VipsImage *in;
-	int width;
-	int height;
-	VipsInteresting interesting;
-
-} VipsSmartcrop;
-
-typedef VipsConversionClass VipsSmartcropClass;
-
-G_DEFINE_TYPE( VipsSmartcrop, vips_smartcrop, VIPS_TYPE_CONVERSION );
-
-static int
-vips_smartcrop_score( VipsSmartcrop *smartcrop, VipsImage *in, 
-	int left, int top, int width, int height, double *score )
-{
-	VipsImage **t = (VipsImage **) 
-		vips_object_local_array( VIPS_OBJECT( smartcrop ), 2 );
-
-	if( vips_extract_area( in, &amp;t[0], left, top, width, height, NULL ) ||
-		vips_hist_find( t[0], &amp;t[1], NULL ) ||
-		vips_hist_entropy( t[1], score, NULL ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-/* Entropy-style smartcrop. Repeatedly discard low interest areas. This should
- * be faster for very large images. 
- */
-static int
-vips_smartcrop_entropy( VipsSmartcrop *smartcrop, 
-	VipsImage *in, int *left, int *top )
-{
-	int max_slice_size;
-	int width;
-	int height;
-
-	*left = 0;
-	*top = 0;
-	width = in-&gt;Xsize;
-	height = in-&gt;Ysize;
-
-	/* How much do we trim by each iteration? Aim for 8 steps in the axis
-	 * that needs trimming most.
-	 */
-	max_slice_size = VIPS_MAX( 
-		ceil( (width - smartcrop-&gt;width) / 8.0 ),
-		ceil( (height - smartcrop-&gt;height) / 8.0 ) );
-
-	/* Repeatedly take a slice off width and height until we 
-	 * reach the target.
-	 */
-	while( width &gt; smartcrop-&gt;width || 
-		height &gt; smartcrop-&gt;height ) {
-		const int slice_width = 
-			VIPS_MIN( width - smartcrop-&gt;width, max_slice_size );
-		const int slice_height = 
-			VIPS_MIN( height - smartcrop-&gt;height, max_slice_size );
-
-		if( slice_width &gt; 0 ) { 
-			double left_score;
-			double right_score;
-
-			if( vips_smartcrop_score( smartcrop, in, 
-				*left, *top, 
-				slice_width, height, &amp;left_score ) )
-				return( -1 );
-
-			if( vips_smartcrop_score( smartcrop, in, 
-				*left + width - slice_width, *top, 
-				slice_width, height, &amp;right_score ) )
-				return( -1 ); 
-
-			width -= slice_width;
-			if( left_score &lt; right_score ) 
-				*left += slice_width;
-		}
-
-		if( slice_height &gt; 0 ) { 
-			double top_score;
-			double bottom_score;
-
-			if( vips_smartcrop_score( smartcrop, in, 
-				*left, *top, 
-				width, slice_height, &amp;top_score ) )
-				return( -1 );
-
-			if( vips_smartcrop_score( smartcrop, in, 
-				*left, *top + height - slice_height, 
-				width, slice_height, &amp;bottom_score ) )
-				return( -1 ); 
-
-			height -= slice_height;
-			if( top_score &lt; bottom_score ) 
-				*top += slice_height;
-		}
-	}
-
-	return( 0 );
-}
-
-/* Calculate sqrt(b1^2 + b2^2 ...)
- */
-static int
-pythagoras( VipsSmartcrop *smartcrop, VipsImage *in, VipsImage **out )
-{
-	VipsImage **t = (VipsImage **) 
-		vips_object_local_array( VIPS_OBJECT( smartcrop ), 
-			2 * in-&gt;Bands + 1 );
-
-	int i;
-
-	for( i = 0; i &lt; in-&gt;Bands; i++ ) 
-		if( vips_extract_band( in, &amp;t[i], i, NULL ) )
-			return( -1 );
-
-	for( i = 0; i &lt; in-&gt;Bands; i++ ) 
-		if( vips_multiply( t[i], t[i], &amp;t[i + in-&gt;Bands], NULL ) )
-			return( -1 );
-
-	if( vips_sum( &amp;t[in-&gt;Bands], &amp;t[2 * in-&gt;Bands], in-&gt;Bands, NULL ) ||
-		vips_pow_const1( t[2 * in-&gt;Bands], out, 0.5, NULL ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static int
-vips_smartcrop_attention( VipsSmartcrop *smartcrop, 
-	VipsImage *in, int *left, int *top )
-{
-	/* From smartcrop.js.
-	 */
-	static double skin_vector[] = {-0.78, -0.57, -0.44};
-	static double ones[] = {1.0, 1.0, 1.0};
-
-	VipsImage **t = (VipsImage **) 
-		vips_object_local_array( VIPS_OBJECT( smartcrop ), 24 );
-
-	double hscale;
-	double vscale;
-	double sigma;
-	double max;
-	int x_pos;
-	int y_pos;
-
-	/* The size we shrink to gives the precision with which we can place
-	 * the crop
-	 */
-	hscale = 32.0 / in-&gt;Xsize;
-	vscale = 32.0 / in-&gt;Ysize;
-	sigma = VIPS_MAX( sqrt( pow( smartcrop-&gt;width * hscale, 2 ) +
-		pow( smartcrop-&gt;height * vscale, 2 ) ) / 10, 1.0 );
-	if ( vips_resize( in, &amp;t[17], hscale,
-		"vscale", vscale,
-		NULL ) )
-		return( -1 );
-
-	/* Simple edge detect.
-	 */
-	if( !(t[21] = vips_image_new_matrixv( 3, 3,
-		 0.0, -1.0,  0.0, 
-		-1.0,  4.0, -1.0, 
-		 0.0, -1.0,  0.0 )) )
-		return( -1 );
-
-	/* Convert to XYZ and just use the first three bands.
-	 */
-	if( vips_colourspace( t[17], &amp;t[0], VIPS_INTERPRETATION_XYZ, NULL ) ||
-		vips_extract_band( t[0], &amp;t[1], 0, "n", 3, NULL ) )
-		return( -1 );
-
-	/* Edge detect on Y. 
-	 */
-	if( vips_extract_band( t[1], &amp;t[2], 1, NULL ) ||
-		vips_conv( t[2], &amp;t[3], t[21], 
-			"precision", VIPS_PRECISION_INTEGER,
-			NULL ) ||
-		vips_linear1( t[3], &amp;t[4], 5.0, 0.0, NULL ) ||
-		vips_abs( t[4], &amp;t[14], NULL ) )
-		return( -1 );
-
-	/* Look for skin colours. Taken from smartcrop.js.
-	 */
-	if( 
-		/* Normalise to magnitude of colour in XYZ.
-		 */
-		pythagoras( smartcrop, t[1], &amp;t[5] ) ||
-		vips_divide( t[1], t[5], &amp;t[6], NULL ) ||
-
-		/* Distance from skin point.
-		 */
-		vips_linear( t[6], &amp;t[7], ones, skin_vector, 3, NULL ) ||
-		pythagoras( smartcrop, t[7], &amp;t[8] ) ||
-
-		/* Rescale to 100 - 0 score.
-		 */
-		vips_linear1( t[8], &amp;t[9], -100.0, 100.0, NULL ) ||
-
-		/* Ignore dark areas.
-		 */
-		vips_more_const1( t[2], &amp;t[10], 5.0, NULL ) ||
-		!(t[11] = vips_image_new_from_image1( t[10], 0.0 )) ||
-		vips_ifthenelse( t[10], t[9], t[11], &amp;t[15], NULL ) )
-		return( -1 );
-
-	/* Look for saturated areas.
-	 */
-	if( vips_colourspace( t[1], &amp;t[12], 
-		VIPS_INTERPRETATION_LAB, NULL ) ||
-		vips_extract_band( t[12], &amp;t[13], 1, NULL ) ||
-		vips_ifthenelse( t[10], t[13], t[11], &amp;t[16], NULL ) )
-		return( -1 );
-
-	/* Sum, blur and find maxpos.
-	 *
-	 * The amount of blur is related to the size of the crop
-	 * area: how large an area we want to consider for the scoring
-	 * function.
-	 */
-
-	if( vips_sum( &amp;t[14], &amp;t[18], 3, NULL ) ||
-		vips_gaussblur( t[18], &amp;t[19], sigma, NULL ) ||
-		vips_max( t[19], &amp;max, "x", &amp;x_pos, "y", &amp;y_pos, NULL ) )
-		return( -1 ); 
-
-	/* Centre the crop over the max.
-	 */
-	*left = VIPS_CLIP( 0, 
-		x_pos / hscale - smartcrop-&gt;width / 2, 
-		in-&gt;Xsize - smartcrop-&gt;width );
-	*top = VIPS_CLIP( 0, 
-		y_pos / vscale - smartcrop-&gt;height / 2, 
-		in-&gt;Ysize - smartcrop-&gt;height ); 
-
-	return( 0 ); 
-}
-
-static int
-vips_smartcrop_build( VipsObject *object )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( object );
-	VipsConversion *conversion = VIPS_CONVERSION( object );
-	VipsSmartcrop *smartcrop = (VipsSmartcrop *) object;
-	VipsImage **t = (VipsImage **) vips_object_local_array( object, 2 );
-
-	VipsImage *in;
-	int left;
-	int top;
-
-	if( VIPS_OBJECT_CLASS( vips_smartcrop_parent_class )-&gt;
-		build( object ) )
-		return( -1 );
-
-	if( smartcrop-&gt;width &gt; smartcrop-&gt;in-&gt;Xsize ||
-		smartcrop-&gt;height &gt; smartcrop-&gt;in-&gt;Ysize ||
-		smartcrop-&gt;width &lt;= 0 || smartcrop-&gt;height &lt;= 0 ) {
-		vips_error( class-&gt;nickname, "%s", _( "bad extract area" ) );
-		return( -1 );
-	}
-
-	in = smartcrop-&gt;in;
-
-	/* If there's an alpha, we have to premultiply before searching for
-	 * content. There could be stuff in transparent areas which we don't
-	 * want to consider. 
-	 */
-	if( vips_image_hasalpha( in ) ) { 
-		if( vips_premultiply( in, &amp;t[0], NULL ) ) 
-			return( -1 );
-		in = t[0];
-	}
-
-	switch( smartcrop-&gt;interesting ) {
-	case VIPS_INTERESTING_NONE:
-	case VIPS_INTERESTING_LOW:
-		left = 0;
-		top = 0;
-		break;
-
-	case VIPS_INTERESTING_CENTRE:
-		left = (in-&gt;Xsize - smartcrop-&gt;width) / 2;
-		top = (in-&gt;Ysize - smartcrop-&gt;height) / 2;
-		break;
-
-	case VIPS_INTERESTING_ENTROPY:
-		if( vips_smartcrop_entropy( smartcrop, in, &amp;left, &amp;top ) )
-			return( -1 );
-		break;
-
-	case VIPS_INTERESTING_ATTENTION:
-		if( vips_smartcrop_attention( smartcrop, in, &amp;left, &amp;top ) )
-			return( -1 );
-		break;
-
-	case VIPS_INTERESTING_HIGH:
-		left = in-&gt;Xsize - smartcrop-&gt;width;
-		top = in-&gt;Ysize - smartcrop-&gt;height;
-		break;
-
-	case VIPS_INTERESTING_ALL:
-		left = 0;
-		top = 0;
-		smartcrop-&gt;width = in-&gt;Xsize;
-		smartcrop-&gt;height = in-&gt;Ysize;
-		break;
-
-	default:
-		g_assert_not_reached();
-
-		/* Stop a compiler warning.
-		 */
-		left = 0;
-		top = 0;
-		break;
-	}
-
-	if( vips_extract_area( smartcrop-&gt;in, &amp;t[1], 
-			left, top, 
-			smartcrop-&gt;width, smartcrop-&gt;height, NULL ) ||
-		vips_image_write( t[1], conversion-&gt;out ) )
-		return( -1 ); 
-
-	return( 0 );
-}
-
-static void
-vips_smartcrop_class_init( VipsSmartcropClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *vobject_class = VIPS_OBJECT_CLASS( class );
-<a name="0"></a>
-	VIPS_DEBUG_MSG( "vips_smartcrop_class_init\n" );
-
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	vobject_class-&gt;nickname = "smartcrop";
-	vobject_class-&gt;description = _( "extract an area from an image" );
-	vobject_class-&gt;build = vips_smartcrop_build;
-
-	VIPS_ARG_IMAGE( class, "input", 0, 
-		_( "Input" ), 
-		_( "Input image" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT,
-		G_STRUCT_OFFSET( VipsSmartcrop, in ) );
-
-	VIPS_ARG_INT( class, "width", 4, 
-		_( "Width" ), 
-		_( "Width of extract area" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT,
-		G_STRUCT_OFFSET( VipsSmartcrop, width ),
-		1, VIPS_MAX_COORD, 1 );
-
-	VIPS_ARG_INT( class, "height", 5, 
-		_( "Height" ), 
-		_( "Height of extract area" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT,
-		G_STRUCT_OFFSET( VipsSmartcrop, height ),
-		1, VIPS_MAX_COORD, 1 );
-
-	VIPS_ARG_ENUM( class, "interesting", 6, 
-		_( "Interesting" ), 
-		_( "How to measure interestingness" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT,
-		G_STRUCT_OFFSET( VipsSmartcrop, interesting ),
-		VIPS_TYPE_INTERESTING, VIPS_INTERESTING_ATTENTION );
-
-}
-
-static void
-vips_smartcrop_init( VipsSmartcrop *smartcrop )
-{
-	smartcrop-&gt;interesting = VIPS_INTERESTING_ATTENTION;
-}
-
-/**
- * vips_smartcrop: (method)
- * @in: input image
- * @out: (out): output image
- * @width: width of area to extract
- * @height: height of area to extract
- * @...: %NULL-terminated list of optional named arguments
- *
- * Optional arguments:
- *
- * * @interesting: #VipsInteresting to use to find interesting areas (default: #VIPS_INTERESTING_ATTENTION)
- *
- * Crop an image down to a specified width and height by removing boring parts. 
- *
- * Use @interesting to pick the method vips uses to decide which bits of the
- * image should be kept.
- *
- * You can test xoffset / yoffset on @out to find the location of the crop
- * within the input image.
- *
- * See also: vips_extract_area().
- * 
- * Returns: 0 on success, -1 on error.
- */
-int</b></font>
-vips_smartcrop( VipsImage *in, VipsImage **out, int width, int height, ... )
-{
-	va_list ap;
-	int result;
-
-	va_start( ap, height );
-	result = vips_call_split( "smartcrop", ap, in, out, width, height );
-	va_end( ap );
-
-	return( result );
-}
+1 #ifdef HAVE_CONFIG_H
+2 #include &lt;config.h&gt;
+3 #include &lt;vips/intl.h&gt;
+4 #include &lt;stdio.h&gt;
+5 #include &lt;string.h&gt;
+6 #include &lt;stdlib.h&gt;
+7 #include &lt;vips/vips.h&gt;
+8 #include &lt;vips/debug.h&gt;
+9 #include "pconversion.h"
+10 #include "bandary.h"
+11 typedef struct _VipsSmartcrop {
+12 	VipsConversion parent_instance;
+13 	VipsImage *in;
+14 	int width;
+15 	int height;
+16 	VipsInteresting interesting;
+17 } VipsSmartcrop;
+18 typedef VipsConversionClass VipsSmartcropClass;
+19 G_DEFINE_TYPE( VipsSmartcrop, vips_smartcrop, VIPS_TYPE_CONVERSION );
+20 static int
+21 vips_smartcrop_score( VipsSmartcrop *smartcrop, VipsImage *in, 
+22 	int left, int top, int width, int height, double *score )
+23 {
+24 	VipsImage **t = (VipsImage **) 
+25 		vips_object_local_array( VIPS_OBJECT( smartcrop ), 2 );
+26 	if( vips_extract_area( in, &amp;t[0], left, top, width, height, NULL ) ||
+27 		vips_hist_find( t[0], &amp;t[1], NULL ) ||
+28 		vips_hist_entropy( t[1], score, NULL ) )
+29 		return( -1 );
+30 	return( 0 );
+31 }
+32 static int
+33 vips_smartcrop_entropy( VipsSmartcrop *smartcrop, 
+34 	VipsImage *in, int *left, int *top )
+35 {
+36 	int max_slice_size;
+37 	int width;
+38 	int height;
+39 	*left = 0;
+40 	*top = 0;
+41 	width = in-&gt;Xsize;
+42 	height = in-&gt;Ysize;
+43 	max_slice_size = VIPS_MAX( 
+44 		ceil( (width - smartcrop-&gt;width) / 8.0 ),
+45 		ceil( (height - smartcrop-&gt;height) / 8.0 ) );
+46 	while( width &gt; smartcrop-&gt;width || 
+47 		height &gt; smartcrop-&gt;height ) {
+48 		const int slice_width = 
+49 			VIPS_MIN( width - smartcrop-&gt;width, max_slice_size );
+50 		const int slice_height = 
+51 			VIPS_MIN( height - smartcrop-&gt;height, max_slice_size );
+52 		if( slice_width &gt; 0 ) { 
+53 			double left_score;
+54 			double right_score;
+55 			if( vips_smartcrop_score( smartcrop, in, 
+56 				*left, *top, 
+57 				slice_width, height, &amp;left_score ) )
+58 				return( -1 );
+59 			if( vips_smartcrop_score( smartcrop, in, 
+60 				*left + width - slice_width, *top, 
+61 				slice_width, height, &amp;right_score ) )
+62 				return( -1 ); 
+63 			width -= slice_width;
+64 			if( left_score &lt; right_score ) 
+65 				*left += slice_width;
+66 		}
+67 		if( slice_height &gt; 0 ) { 
+68 			double top_score;
+69 			double bottom_score;
+70 			if( vips_smartcrop_score( smartcrop, in, 
+71 				*left, *top, 
+72 				width, slice_height, &amp;top_score ) )
+73 				return( -1 );
+74 			if( vips_smartcrop_score( smartcrop, in, 
+75 				*left, *top + height - slice_height, 
+76 				width, slice_height, &amp;bottom_score ) )
+77 				return( -1 ); 
+78 			height -= slice_height;
+79 			if( top_score &lt; bottom_score ) 
+80 				*top += slice_height;
+81 		}
+82 	}
+83 	return( 0 );
+84 }
+85 static int
+86 pythagoras( VipsSmartcrop *smartcrop, VipsImage *in, VipsImage **out )
+87 {
+88 	VipsImage **t = (VipsImage **) 
+89 		vips_object_local_array( VIPS_OBJECT( smartcrop ), 
+90 			2 * in-&gt;Bands + 1 );
+91 	int i;
+92 	for( i = 0; i &lt; in-&gt;Bands; i++ ) 
+93 		if( vips_extract_band( in, &amp;t[i], i, NULL ) )
+94 			return( -1 );
+95 	for( i = 0; i &lt; in-&gt;Bands; i++ ) 
+96 		if( vips_multiply( t[i], t[i], &amp;t[i + in-&gt;Bands], NULL ) )
+97 			return( -1 );
+98 	if( vips_sum( &amp;t[in-&gt;Bands], &amp;t[2 * in-&gt;Bands], in-&gt;Bands, NULL ) ||
+99 		vips_pow_const1( t[2 * in-&gt;Bands], out, 0.5, NULL ) )
+100 		return( -1 );
+101 	return( 0 );
+102 }
+103 static int
+104 vips_smartcrop_attention( VipsSmartcrop *smartcrop, 
+105 	VipsImage *in, int *left, int *top )
+106 {
+107 	static double skin_vector[] = {-0.78, -0.57, -0.44};
+108 	static double ones[] = {1.0, 1.0, 1.0};
+109 	VipsImage **t = (VipsImage **) 
+110 		vips_object_local_array( VIPS_OBJECT( smartcrop ), 24 );
+111 	double hscale;
+112 	double vscale;
+113 	double sigma;
+114 	double max;
+115 	int x_pos;
+116 	int y_pos;
+117 	hscale = 32.0 / in-&gt;Xsize;
+118 	vscale = 32.0 / in-&gt;Ysize;
+119 	sigma = VIPS_MAX( sqrt( pow( smartcrop-&gt;width * hscale, 2 ) +
+120 		pow( smartcrop-&gt;height * vscale, 2 ) ) / 10, 1.0 );
+121 	if ( vips_resize( in, &amp;t[17], hscale,
+122 		"vscale", vscale,
+123 		NULL ) )
+124 		return( -1 );
+125 	if( !(t[21] = vips_image_new_matrixv( 3, 3,
+126 		 0.0, -1.0,  0.0, 
+127 		-1.0,  4.0, -1.0, 
+128 		 0.0, -1.0,  0.0 )) )
+129 		return( -1 );
+130 	if( vips_colourspace( t[17], &amp;t[0], VIPS_INTERPRETATION_XYZ, NULL ) ||
+131 		vips_extract_band( t[0], &amp;t[1], 0, "n", 3, NULL ) )
+132 		return( -1 );
+133 	if( vips_extract_band( t[1], &amp;t[2], 1, NULL ) ||
+134 		vips_conv( t[2], &amp;t[3], t[21], 
+135 			"precision", VIPS_PRECISION_INTEGER,
+136 			NULL ) ||
+137 		vips_linear1( t[3], &amp;t[4], 5.0, 0.0, NULL ) ||
+138 		vips_abs( t[4], &amp;t[14], NULL ) )
+139 		return( -1 );
+140 	if( 
+141 		pythagoras( smartcrop, t[1], &amp;t[5] ) ||
+142 		vips_divide( t[1], t[5], &amp;t[6], NULL ) ||
+143 		vips_linear( t[6], &amp;t[7], ones, skin_vector, 3, NULL ) ||
+144 		pythagoras( smartcrop, t[7], &amp;t[8] ) ||
+145 		vips_linear1( t[8], &amp;t[9], -100.0, 100.0, NULL ) ||
+146 		vips_more_const1( t[2], &amp;t[10], 5.0, NULL ) ||
+147 		!(t[11] = vips_image_new_from_image1( t[10], 0.0 )) ||
+148 		vips_ifthenelse( t[10], t[9], t[11], &amp;t[15], NULL ) )
+149 		return( -1 );
+150 	if( vips_colourspace( t[1], &amp;t[12], 
+151 		VIPS_INTERPRETATION_LAB, NULL ) ||
+152 		vips_extract_band( t[12], &amp;t[13], 1, NULL ) ||
+153 		vips_ifthenelse( t[10], t[13], t[11], &amp;t[16], NULL ) )
+154 		return( -1 );
+155 	if( vips_sum( &amp;t[14], &amp;t[18], 3, NULL ) ||
+156 		vips_gaussblur( t[18], &amp;t[19], sigma, NULL ) ||
+157 		vips_max( t[19], &amp;max, "x", &amp;x_pos, "y", &amp;y_pos, NULL ) )
+158 		return( -1 ); 
+159 	*left = VIPS_CLIP( 0, 
+160 		x_pos / hscale - smartcrop-&gt;width / 2, 
+161 		in-&gt;Xsize - smartcrop-&gt;width );
+162 	*top = VIPS_CLIP( 0, 
+163 		y_pos / vscale - smartcrop-&gt;height / 2, 
+164 		in-&gt;Ysize - smartcrop-&gt;height ); 
+165 	return( 0 ); 
+166 }
+167 static int
+168 vips_smartcrop_build( VipsObject *object )
+169 {
+170 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( object );
+171 	VipsConversion *conversion = VIPS_CONVERSION( object );
+172 	VipsSmartcrop *smartcrop = (VipsSmartcrop *) object;
+173 	VipsImage **t = (VipsImage **) vips_object_local_array( object, 2 );
+174 	VipsImage *in;
+175 	int left;
+176 	int top;
+177 	if( VIPS_OBJECT_CLASS( vips_smartcrop_parent_class )-&gt;
+178 		build( object ) )
+179 		return( -1 );
+180 	if( smartcrop-&gt;width &gt; smartcrop-&gt;in-&gt;Xsize ||
+181 		smartcrop-&gt;height &gt; smartcrop-&gt;in-&gt;Ysize ||
+182 		smartcrop-&gt;width &lt;= 0 || smartcrop-&gt;height &lt;= 0 ) {
+183 		vips_error( class-&gt;nickname, "%s", _( "bad extract area" ) );
+184 		return( -1 );
+185 	}
+186 	in = smartcrop-&gt;in;
+187 	if( vips_image_hasalpha( in ) ) { 
+188 		if( vips_premultiply( in, &amp;t[0], NULL ) ) 
+189 			return( -1 );
+190 		in = t[0];
+191 	}
+192 	switch( smartcrop-&gt;interesting ) {
+193 	case VIPS_INTERESTING_NONE:
+194 	case VIPS_INTERESTING_LOW:
+195 		left = 0;
+196 		top = 0;
+197 		break;
+198 	case VIPS_INTERESTING_CENTRE:
+199 		left = (in-&gt;Xsize - smartcrop-&gt;width) / 2;
+200 		top = (in-&gt;Ysize - smartcrop-&gt;height) / 2;
+201 		break;
+202 	case VIPS_INTERESTING_ENTROPY:
+203 		if( vips_smartcrop_entropy( smartcrop, in, &amp;left, &amp;top ) )
+204 			return( -1 );
+205 		break;
+206 	case VIPS_INTERESTING_ATTENTION:
+207 		if( vips_smartcrop_attention( smartcrop, in, &amp;left, &amp;top ) )
+208 			return( -1 );
+209 		break;
+210 	case VIPS_INTERESTING_HIGH:
+211 		left = in-&gt;Xsize - smartcrop-&gt;width;
+212 		top = in-&gt;Ysize - smartcrop-&gt;height;
+213 		break;
+214 	case VIPS_INTERESTING_ALL:
+215 		left = 0;
+216 		top = 0;
+217 		smartcrop-&gt;width = in-&gt;Xsize;
+218 		smartcrop-&gt;height = in-&gt;Ysize;
+219 		break;
+220 	default:
+221 		g_assert_not_reached();
+222 		left = 0;
+223 		top = 0;
+224 		break;
+225 	}
+226 	if( vips_extract_area( smartcrop-&gt;in, &amp;t[1], 
+227 			left, top, 
+228 			smartcrop-&gt;width, smartcrop-&gt;height, NULL ) ||
+229 		vips_image_write( t[1], conversion-&gt;out ) )
+230 		return( -1 ); 
+231 	return( 0 );
+232 }
+233 static void
+234 vips_smartcrop_class_init( VipsSmartcropClass *class )
+235 {
+236 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+237 	VipsObjectClass *vobject_class = VIPS_OBJECT_CLASS( class );
+238 <a name="0"></a>
+239 	VIPS_DEBUG_MSG( "vips_smartcrop_class_init\n" );
+240 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	gobject_class-&gt;set_property = vips_object_set_property;
+241 	gobject_class-&gt;get_property = vips_object_get_property;
+242 	vobject_class-&gt;nickname = "smartcrop";
+243 	vobject_class-&gt;description = _( "extract an area from an image" );
+244 	vobject_class-&gt;build = vips_smartcrop_build;
+245 	VIPS_ARG_IMAGE( class, "input", 0, 
+246 		_( "Input" ), 
+247 		_( "Input image" ),
+248 		VIPS_ARGUMENT_REQUIRED_INPUT,
+249 		G_STRUCT_OFFSET( VipsSmartcrop, in ) );
+250 	VIPS_ARG_INT( class, "width", 4, 
+251 		_( "Width" ), 
+252 		_( "Width of extract area" ),
+253 		VIPS_ARGUMENT_REQUIRED_INPUT,
+254 		G_STRUCT_OFFSET( VipsSmartcrop, width ),
+255 		1, VIPS_MAX_COORD, 1 );
+256 	VIPS_ARG_INT( class, "height", 5, 
+257 		_( "Height" ), 
+258 		_( "Height of extract area" ),
+259 		VIPS_ARGUMENT_REQUIRED_INPUT,
+260 		G_STRUCT_OFFSET( VipsSmartcrop, height ),
+261 		1, VIPS_MAX_COORD, 1 );
+262 	VIPS_ARG_ENUM( class, "interesting", 6, 
+263 		_( "Interesting" ), 
+264 		_( "How to measure interestingness" ),
+265 		VIPS_ARGUMENT_OPTIONAL_INPUT,
+266 		G_STRUCT_OFFSET( VipsSmartcrop, interesting ),
+267 		VIPS_TYPE_INTERESTING, VIPS_INTERESTING_ATTENTION );
+268 }
+269 static void
+270 vips_smartcrop_init( VipsSmartcrop *smartcrop )
+271 {
+272 	smartcrop-&gt;interesting = VIPS_INTERESTING_ATTENTION;
+273 }
+274 int</b></font>
+275 vips_smartcrop( VipsImage *in, VipsImage **out, int width, int height, ... )
+276 {
+277 	va_list ap;
+278 	int result;
+279 	va_start( ap, height );
+280 	result = vips_call_split( "smartcrop", ap, in, out, width, height );
+281 	va_end( ap );
+282 	return( result );
+283 }
 </pre>
 </div>
 </div>

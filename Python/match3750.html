@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for labelarray.py &amp; hdf5_daily_bars.py</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -41,844 +40,664 @@ Matches for labelarray.py &amp; hdf5_daily_bars.py
 </h3>
 <hr/>
 <pre>
-<a name="0"></a>"""
-An ndarray subclass for working with arrays of strings.
-"""
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>from functools import partial, total_ordering
-from operator import eq, ne
-import re
-
-import numpy as np
-from numpy import ndarray
-import pandas as pd
-from toolz import compose
-
-from zipline.utils.compat import unicode
-from zipline.utils.functional import instance
-from zipline.utils.preprocess import preprocess
-from zipline.utils.sentinel import sentinel
-from</b></font> zipline.utils.input_validation import (
-    coerce,
-    expect_kinds,
-    expect_types,
-    optional,
-)
-from zipline.utils.numpy_utils import (
-    bool_dtype,
-    unsigned_int_dtype_with_size_in_bytes,
-    is_object,
-    object_dtype,
-)
-from zipline.utils.pandas_utils import ignore_pandas_nan_categorical_warning
-
-from ._factorize import (
-    factorize_strings,
-    factorize_strings_known_categories,
-    smallest_uint_that_can_hold,
-)
-
-
-def compare_arrays(left, right):
-    "Eq check with a short-circuit for identical objects."
-    return (
-        left is right
-        or ((left.shape == right.shape) and (left == right).all())
-    )
-
-
-def _make_unsupported_method(name):
-    def method(*args, **kwargs):
-        raise NotImplementedError(
-            "Method %s is not supported on LabelArrays." % name
-        )
-    method.__name__ = name
-    method.__doc__ = "Unsupported LabelArray Method: %s" % name
-    return method
-
-
-class MissingValueMismatch(ValueError):
-    """
-    Error raised on attempt to perform operations between LabelArrays with
-    mismatched missing_values.
-    """
-    def __init__(self, left, right):
-        super(MissingValueMismatch, self).__init__(
-            "LabelArray missing_values don't match:"
-            " left={}, right={}".format(left, right)
-        )
-
-
-class CategoryMismatch(ValueError):
-    """
-    Error raised on attempt to perform operations between LabelArrays with
-    mismatched category arrays.
-    """
-    def __init__(self, left, right):
-        (mismatches,) = np.where(left != right)
-        assert len(mismatches), "Not actually a mismatch!"
-        super(CategoryMismatch, self).__init__(
-            "LabelArray categories don't match:\n"
-            "Mismatched Indices: {mismatches}\n"
-            "Left: {left}\n"
-            "Right: {right}".format(
-                mismatches=mismatches,
-                left=left[mismatches],
-                right=right[mismatches],
-            )
-        )
-
-
-_NotPassed = sentinel('_NotPassed')
-
-
-class LabelArray(ndarray):
-    """
-    An ndarray subclass for working with arrays of strings.
-
-    Factorizes the input array into integers, but overloads equality on strings
-    to check against the factor label.
-
-    Parameters
-    ----------
-    values : array-like
-        Array of values that can be passed to np.asarray with dtype=object.
-    missing_value : str
-        Scalar value to treat as 'missing' for operations on ``self``.
-    categories : list[str], optional
-        List of values to use as categories.  If not supplied, categories will
-        be inferred as the unique set of entries in ``values``.
-    sort : bool, optional
-        Whether to sort categories.  If sort is False and categories is
-        supplied, they are left in the order provided.  If sort is False and
-        categories is None, categories will be constructed in a random order.
-
-    Attributes
-    ----------
-    categories : ndarray[str]
-        An array containing the unique labels of self.
-    reverse_categories : dict[str -&gt; int]
-        Reverse lookup table for ``categories``. Stores the index in
-        ``categories`` at which each entry each unique entry is found.
-    missing_value : str or None
-        A sentinel missing value with NaN semantics for comparisons.
-
-    Notes
-    -----
-    Consumers should be cautious when passing instances of LabelArray to numpy
-    functions.  We attempt to disallow as many meaningless operations as
-    possible, but since a LabelArray is just an ndarray of ints with some
-    additional metadata, many numpy functions (for example, trigonometric) will
-    happily accept a LabelArray and treat its values as though they were
-    integers.
-
-    In a future change, we may be able to disallow more numerical operations by
-    creating a wrapper dtype which doesn't register an implementation for most
-    numpy ufuncs. Until that change is made, consumers of LabelArray should
-    assume that it is undefined behavior to pass a LabelArray to any numpy
-    ufunc that operates on semantically-numerical data.
-
-    See Also
-    --------
-    https://docs.scipy.org/doc/numpy-1.11.0/user/basics.subclassing.html
-    """
-    SUPPORTED_SCALAR_TYPES = (bytes, unicode, type(None))
-    SUPPORTED_NON_NONE_SCALAR_TYPES = (bytes, unicode)
-
-    @preprocess(
-        values=coerce(list, partial(np.asarray, dtype=object)),
-        # Coerce ``list`` to ``list`` to make a copy. Code internally may call
-        # ``categories.insert(0, missing_value)`` which will mutate this list
-        # in place.
-        categories=coerce((list, np.ndarray, set), list),
-    )
-    @expect_types(
-        values=np.ndarray,
-        missing_value=SUPPORTED_SCALAR_TYPES,
-        categories=optional(list),
-    )
-    @expect_kinds(values=("O", "S", "U"))
-    def __new__(cls,
-                values,
-                missing_value,
-                categories=None,
-                sort=True):
-
-        # Numpy's fixed-width string types aren't very efficient. Working with
-        # object arrays is faster than bytes or unicode arrays in almost all
-        # cases.
-        if not is_object(values):
-            values = values.astype(object)
-
-        if values.flags.f_contiguous:
-            ravel_order = 'F'
-        else:
-            ravel_order = 'C'
-
-        if categories is None:
-            codes, categories, reverse_categories = factorize_strings(
-                values.ravel(ravel_order),
-                missing_value=missing_value,
-                sort=sort,
-            )
-        else:
-            codes, categories, reverse_categories = (
-                factorize_strings_known_categories(
-                    values.ravel(ravel_order),
-                    categories=categories,
-                    missing_value=missing_value,
-                    sort=sort,
-                )
-            )
-        categories.setflags(write=False)
-
-        return cls.from_codes_and_metadata(
-            codes=codes.reshape(values.shape, order=ravel_order),
-            categories=categories,
-            reverse_categories=reverse_categories,
-            missing_value=missing_value,
-        )
-
-    @classmethod
-    def from_codes_and_metadata(cls,
-                                codes,
-                                categories,
-                                reverse_categories,
-                                missing_value):
-        """
-        Rehydrate a LabelArray from the codes and metadata.
-
-        Parameters
-        ----------
-        codes : np.ndarray[integral]
-            The codes for the label array.
-        categories : np.ndarray[object]
-            The unique string categories.
-        reverse_categories : dict[str, int]
-            The mapping from category to its code-index.
-        missing_value : any
-            The value used to represent missing data.
-        """
-        ret = codes.view(type=cls, dtype=np.void)
-        ret._categories = categories
-        ret._reverse_categories = reverse_categories
-        ret._missing_value = missing_value
-        return ret
-
-    @classmethod
-    def from_categorical(cls, categorical, missing_value=None):
-        """
-        Create a LabelArray from a pandas categorical.
-
-        Parameters
-        ----------
-        categorical : pd.Categorical
-            The categorical object to convert.
-        missing_value : bytes, unicode, or None, optional
-            The missing value to use for this LabelArray.
-
-        Returns
-        -------
-        la : LabelArray
-            The LabelArray representation of this categorical.
-        """
-        return LabelArray(
-            categorical,
-            missing_value,
-            categorical.categories,
-        )
-
-    @property
-    def categories(self):
-        # This is a property because it should be immutable.
-        return self._categories
-
-    @property
-    def reverse_categories(self):
-        # This is a property because it should be immutable.
-        return self._reverse_categories
-
-    @property
-    def missing_value(self):
-        # This is a property because it should be immutable.
-        return self._missing_value
-
-    @property
-    def missing_value_code(self):
-        return self.reverse_categories[self.missing_value]
-
-    def has_label(self, value):
-        return value in self.reverse_categories
-
-    def __array_finalize__(self, obj):
-        """
-        Called by Numpy after array construction.
-
-        There are three cases where this can happen:
-
-        1. Someone tries to directly construct a new array by doing::
-
-            &gt;&gt;&gt; ndarray.__new__(LabelArray, ...)  # doctest: +SKIP
-
-           In this case, obj will be None.  We treat this as an error case and
-           fail.
-
-        2. Someone (most likely our own __new__) does::
-
-           &gt;&gt;&gt; other_array.view(type=LabelArray)  # doctest: +SKIP
-
-           In this case, `self` will be the new LabelArray instance, and
-           ``obj` will be the array on which ``view`` is being called.
-
-           The caller of ``obj.view`` is responsible for setting category
-           metadata on ``self`` after we exit.
-
-        3. Someone creates a new LabelArray by slicing an existing one.
-
-           In this case, ``obj`` will be the original LabelArray.  We're
-           responsible for copying over the parent array's category metadata.
-        """
-        if obj is None:
-            raise TypeError(
-                "Direct construction of LabelArrays is not supported."
-            )
-
-        # See docstring for an explanation of when these will or will not be
-        # set.
-        self._categories = getattr(obj, 'categories', None)
-        self._reverse_categories = getattr(obj, 'reverse_categories', None)
-        self._missing_value = getattr(obj, 'missing_value', None)
-
-    def as_int_array(self):
-        """
-        Convert self into a regular ndarray of ints.
-
-        This is an O(1) operation. It does not copy the underlying data.
-        """
-        return self.view(
-            type=ndarray,
-            dtype=unsigned_int_dtype_with_size_in_bytes(self.itemsize),
-        )
-
-    def as_string_array(self):
-        """
-        Convert self back into an array of strings.
-
-        This is an O(N) operation.
-        """
-        return self.categories[self.as_int_array()]
-
-    def as_categorical(self):
-        """
-        Coerce self into a pandas categorical.
-
-        This is only defined on 1D arrays, since that's all pandas supports.
-        """
-        if len(self.shape) &gt; 1:
-            raise ValueError("Can't convert a 2D array to a categorical.")
-
-        with ignore_pandas_nan_categorical_warning():
-            return pd.Categorical.from_codes(
-                self.as_int_array(),
-                # We need to make a copy because pandas &gt;= 0.17 fails if this
-                # buffer isn't writeable.
-                self.categories.copy(),
-                ordered=False,
-            )
-
-    def as_categorical_frame(self, index, columns, name=None):
-        """
-        Coerce self into a pandas DataFrame of Categoricals.
-        """
-        if len(self.shape) != 2:
-            raise ValueError(
-                "Can't convert a non-2D LabelArray into a DataFrame."
-            )
-
-        expected_shape = (len(index), len(columns))
-        if expected_shape != self.shape:
-            raise ValueError(
-                "Can't construct a DataFrame with provided indices:\n\n"
-                "LabelArray shape is {actual}, but index and columns imply "
-                "that shape should be {expected}.".format(
-                    actual=self.shape,
-                    expected=expected_shape,
-                )
-            )
-
-        return pd.Series(
-            index=pd.MultiIndex.from_product([index, columns]),
-            data=self.ravel().as_categorical(),
-            name=name,
-        ).unstack()
-
-    def __setitem__(self, indexer, value):
-        self_categories = self.categories
-
-        if isinstance(value, self.SUPPORTED_SCALAR_TYPES):
-            value_code = self.reverse_categories.get(value, None)
-            if value_code is None:
-                raise ValueError("%r is not in LabelArray categories." % value)
-            self.as_int_array()[indexer] = value_code
-        elif isinstance(value, LabelArray):
-            value_categories = value.categories
-            if compare_arrays(self_categories, value_categories):
-                return super(LabelArray, self).__setitem__(indexer, value)
-            elif (self.missing_value == value.missing_value and
-                  set(value.categories) &lt;= set(self.categories)):
-                rhs = LabelArray.from_codes_and_metadata(
-                    *factorize_strings_known_categories(
-                        value.as_string_array().ravel(),
-                        list(self.categories),
-                        self.missing_value,
-                        False,
-                    ),
-                    missing_value=self.missing_value
-                ).reshape(value.shape)
-                super(LabelArray, self).__setitem__(indexer, rhs)
-            else:
-                raise CategoryMismatch(self_categories, value_categories)
-        else:
-            raise NotImplementedError(
-                "Setting into a LabelArray with a value of "
-                "type {type} is not yet supported.".format(
-                    type=type(value).__name__,
-                ),
-            )
-
-    def set_scalar(self, indexer, value):
-        """
-        Set scalar value into the array.
-
-        Parameters
-        ----------
-        indexer : any
-            The indexer to set the value at.
-        value : str
-            The value to assign at the given locations.
-
-        Raises
-        ------
-        ValueError
-            Raised when ``value`` is not a value element of this this label
-            array.
-        """
-        try:
-            value_code = self.reverse_categories[value]
-        except KeyError:
-            raise ValueError("%r is not in LabelArray categories." % value)
-
-        self.as_int_array()[indexer] = value_code
-
-    def __setslice__(self, i, j, sequence):
-        """
-        This method was deprecated in Python 2.0. It predates slice objects,
-        but Python 2.7.11 still uses it if you implement it, which ndarray
-        does.  In newer Pythons, __setitem__ is always called, but we need to
-        manuallly forward in py2.
-        """
-        self.__setitem__(slice(i, j), sequence)
-
-    def __getitem__(self, indexer):
-        result = super(LabelArray, self).__getitem__(indexer)
-        if result.ndim:
-            # Result is still a LabelArray, so we can just return it.
-            return result
-
-        # Result is a scalar value, which will be an instance of np.void.
-        # Map it back to one of our category entries.
-        index = result.view(
-            unsigned_int_dtype_with_size_in_bytes(self.itemsize),
-        )
-        return self.categories[index]
-
-    def is_missing(self):
-        """
-        Like isnan, but checks for locations where we store missing values.
-        """
-        return (
-            self.as_int_array() == self.reverse_categories[self.missing_value]
-        )
-
-    def not_missing(self):
-        """
-        Like ~isnan, but checks for locations where we store missing values.
-        """
-        return (
-            self.as_int_array() != self.reverse_categories[self.missing_value]
-        )
-
-    def _equality_check(op):
-        """
-        Shared code for __eq__ and __ne__, parameterized on the actual
-        comparison operator to use.
-        """
-        def method(self, other):
-
-            if isinstance(other, LabelArray):
-                self_mv = self.missing_value
-                other_mv = other.missing_value
-                if self_mv != other_mv:
-                    raise MissingValueMismatch(self_mv, other_mv)
-
-                self_categories = self.categories
-                other_categories = other.categories
-                if not compare_arrays(self_categories, other_categories):
-                    raise CategoryMismatch(self_categories, other_categories)
-
-                return (
-                    op(self.as_int_array(), other.as_int_array())
-                    &amp; self.not_missing()
-                    &amp; other.not_missing()
-                )
-
-            elif isinstance(other, ndarray):
-                # Compare to ndarrays as though we were an array of strings.
-                # This is fairly expensive, and should generally be avoided.
-                return op(self.as_string_array(), other) &amp; self.not_missing()
-
-            elif isinstance(other, self.SUPPORTED_SCALAR_TYPES):
-                i = self._reverse_categories.get(other, -1)
-                return op(self.as_int_array(), i) &amp; self.not_missing()
-
-            return op(super(LabelArray, self), other)
-        return method
-
-    __eq__ = _equality_check(eq)
-    __ne__ = _equality_check(ne)
-    del _equality_check
-
-    def view(self, dtype=_NotPassed, type=_NotPassed):
-        if type is _NotPassed and dtype not in (_NotPassed, self.dtype):
-            raise TypeError("Can't view LabelArray as another dtype.")
-
-        # The text signature on ndarray.view makes it look like the default
-        # values for dtype and type are `None`, but passing None explicitly has
-        # different semantics than not passing an arg at all, so we reconstruct
-        # the kwargs dict here to simulate the args not being passed at all.
-        kwargs = {}
-        if dtype is not _NotPassed:
-            kwargs['dtype'] = dtype
-        if type is not _NotPassed:
-            kwargs['type'] = type
-        return super(LabelArray, self).view(**kwargs)
-
-    def astype(self,
-               dtype,
-               order='K',
-               casting='unsafe',
-               subok=True,
-               copy=True):
-        if dtype == self.dtype:
-            if not subok:
-                array = self.view(type=np.ndarray)
-            else:
-                array = self
-
-            if copy:
-                return array.copy()
-            return array
-
-        if dtype == object_dtype:
-            return self.as_string_array()
-
-        if dtype.kind == 'S':
-            return self.as_string_array().astype(
-                dtype,
-                order=order,
-                casting=casting,
-                subok=subok,
-                copy=copy,
-            )
-
-        raise TypeError(
-            '%s can only be converted into object, string, or void,'
-            ' got: %r' % (
-                type(self).__name__,
-                dtype,
-            ),
-        )
-
-    # In general, we support resizing, slicing, and reshaping methods, but not
-    # numeric methods.
-    SUPPORTED_NDARRAY_METHODS = frozenset([
-        'astype',
-        'base',
-        'compress',
-        'copy',
-        'data',
-        'diagonal',
-        'dtype',
-        'flat',
-        'flatten',
-        'item',
-        'itemset',
-        'itemsize',
-        'nbytes',
-        'ndim',
-        'ravel',
-        'repeat',
-        'reshape',
-        'resize',
-        'setflags',
-        'shape',
-        'size',
-        'squeeze',
-        'strides',
-        'swapaxes',
-        'take',
-        'trace',
-        'transpose',
-        'view'
-    ])
-    PUBLIC_NDARRAY_METHODS = frozenset([
-        s for s in dir(ndarray) if not s.startswith('_')
-    ])
-
-    # Generate failing wrappers for all unsupported methods.
-    locals().update(
-        {
-            method: _make_unsupported_method(method)
-            for method in PUBLIC_NDARRAY_METHODS - SUPPORTED_NDARRAY_METHODS
-        }
-    )
-
-    def __repr__(self):
-        repr_lines = repr(self.as_string_array()).splitlines()
-        repr_lines[0] = repr_lines[0].replace('array(', 'LabelArray(', 1)
-        repr_lines[-1] = repr_lines[-1].rsplit(',', 1)[0] + ')'
-        # The extra spaces here account for the difference in length between
-        # 'array(' and 'LabelArray('.
-        return '\n     '.join(repr_lines)
-
-    def empty_like(self, shape):
-        """
-        Make an empty LabelArray with the same categories as ``self``, filled
-        with ``self.missing_value``.
-        """
-        return type(self).from_codes_and_metadata(
-            codes=np.full(
-                shape,
-                self.reverse_categories[self.missing_value],
-                dtype=unsigned_int_dtype_with_size_in_bytes(self.itemsize),
-            ),
-            categories=self.categories,
-            reverse_categories=self.reverse_categories,
-            missing_value=self.missing_value,
-        )
-
-    def map_predicate(self, f):
-        """
-        Map a function from str -&gt; bool element-wise over ``self``.
-
-        ``f`` will be applied exactly once to each non-missing unique value in
-        ``self``. Missing values will always return False.
-        """
-        # Functions passed to this are of type str -&gt; bool.  Don't ever call
-        # them on None, which is the only non-str value we ever store in
-        # categories.
-        if self.missing_value is None:
-            def f_to_use(x):
-                return False if x is None else f(x)
-        else:
-            f_to_use = f
-
-        # Call f on each unique value in our categories.
-        results = np.vectorize(f_to_use, otypes=[bool_dtype])(self.categories)
-
-        # missing_value should produce False no matter what
-        results[self.reverse_categories[self.missing_value]] = False
-
-        # unpack the results form each unique value into their corresponding
-        # locations in our indices.
-        return results[self.as_int_array()]
-
-    def map(self, f):
-        """
-        Map a function from str -&gt; str element-wise over ``self``.
-
-        ``f`` will be applied exactly once to each non-missing unique value in
-        ``self``. Missing values will always map to ``self.missing_value``.
-        """
-        # f() should only return None if None is our missing value.
-        if self.missing_value is None:
-            allowed_outtypes = self.SUPPORTED_SCALAR_TYPES
-        else:
-            allowed_outtypes = self.SUPPORTED_NON_NONE_SCALAR_TYPES
-
-        def f_to_use(x,
-                     missing_value=self.missing_value,
-                     otypes=allowed_outtypes):
-
-            # Don't call f on the missing value; those locations don't exist
-            # semantically. We return _sortable_sentinel rather than None
-            # because the np.unique call below sorts the categories array,
-            # which raises an error on Python 3 because None and str aren't
-            # comparable.
-            if x == missing_value:
-                return _sortable_sentinel
-
-            ret = f(x)
-
-            if not isinstance(ret, otypes):
-                raise TypeError(
-                    "LabelArray.map expected function {f} to return a string"
-                    " or None, but got {type} instead.\n"
-                    "Value was {value}.".format(
-                        f=f.__name__,
-                        type=type(ret).__name__,
-                        value=ret,
-                    )
-                )
-
-            if ret == missing_value:
-                return _sortable_sentinel
-
-            return ret
-
-        new_categories_with_duplicates = (
-            np.vectorize(f_to_use, otypes=[object])(self.categories)
-        )
-
-        # If f() maps multiple inputs to the same output, then we can end up
-        # with the same code duplicated multiple times. Compress the categories
-        # by running them through np.unique, and then use the reverse lookup
-        # table to compress codes as well.
-        new_categories, bloated_inverse_index = np.unique(
-            new_categories_with_duplicates,
-            return_inverse=True
-        )
-
-        if new_categories[0] is _sortable_sentinel:
-            # f_to_use return _sortable_sentinel for locations that should be
-            # missing values in our output. Since np.unique returns the uniques
-            # in sorted order, and since _sortable_sentinel sorts before any
-            # string, we only need to check the first array entry.
-            new_categories[0] = self.missing_value
-
-        # `reverse_index` will always be a 64 bit integer even if we can hold a
-        # smaller array.
-        reverse_index = bloated_inverse_index.astype(
-            smallest_uint_that_can_hold(len(new_categories))
-        )
-        new_codes = np.take(reverse_index, self.as_int_array())
-
-        return self.from_codes_and_metadata(
-            new_codes,
-            new_categories,
-            dict(zip(new_categories, range(len(new_categories)))),
-            missing_value=self.missing_value,
-        )
-
-    def startswith(self, prefix):
-        """
-        Element-wise startswith.
-
-        Parameters
-        ----------
-        prefix : str
-
-        Returns
-        -------
-        matches : np.ndarray[bool]
-            An array with the same shape as self indicating whether each
-            element of self started with ``prefix``.
-        """
-        return self.map_predicate(lambda elem: elem.startswith(prefix))
-
-    def endswith(self, suffix):
-        """
-        Elementwise endswith.
-
-        Parameters
-        ----------
-        suffix : str
-
-        Returns
-        -------
-        matches : np.ndarray[bool]
-            An array with the same shape as self indicating whether each
-            element of self ended with ``suffix``
-        """
-        return self.map_predicate(lambda elem: elem.endswith(suffix))
-
-    def has_substring(self, substring):
-        """
-        Elementwise contains.
-
-        Parameters
-        ----------
-        substring : str
-
-        Returns
-        -------
-        matches : np.ndarray[bool]
-            An array with the same shape as self indicating whether each
-            element of self ended with ``suffix``.
-        """
-        return self.map_predicate(lambda elem: substring in elem)
-
-    @preprocess(pattern=coerce(from_=(bytes, unicode), to=re.compile))
-    def matches(self, pattern):
-        """
-        Elementwise regex match.
-
-        Parameters
-        ----------
-        pattern : str or compiled regex
-
-        Returns
-        -------
-        matches : np.ndarray[bool]
-            An array with the same shape as self indicating whether each
-            element of self was matched by ``pattern``.
-        """
-        return self.map_predicate(compose(bool, pattern.match))
-
-    # These types all implement an O(N) __contains__, so pre-emptively
-    # coerce to `set`.
-    @preprocess(container=coerce((list, tuple, np.ndarray), set))
-    def element_of(self, container):
-        """
-        Check if each element of self is an of ``container``.
-
-        Parameters
-        ----------
-        container : object
-            An object implementing a __contains__ to call on each element of
-            ``self``.
-
-        Returns
-        -------
-        is_contained : np.ndarray[bool]
-            An array with the same shape as self indicating whether each
-            element of self was an element of ``container``.
-        """
-        return self.map_predicate(container.__contains__)
-
-
-@instance  # This makes _sortable_sentinel a singleton instance.
-@total_ordering
-class _sortable_sentinel(object):
-    """Dummy object that sorts before any other python object.
-    """
-    def __eq__(self, other):
-        return self is other
-
-    def __lt__(self, other):
-        return True
-
-
-@expect_types(trues=LabelArray, falses=LabelArray)
-def labelarray_where(cond, trues, falses):
-    """LabelArray-aware implementation of np.where.
-    """
-    if trues.missing_value != falses.missing_value:
-        raise ValueError(
-            "Can't compute where on arrays with different missing values."
-        )
-
-    strs = np.where(cond, trues.as_string_array(), falses.as_string_array())
-    return LabelArray(strs, missing_value=trues.missing_value)
+1 An ndarray subclass for working with arrays of strings.
+2 """
+3 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>from functools import partial, total_ordering
+4 from operator import eq, ne
+5 import re
+6 import numpy as np
+7 from numpy import ndarray
+8 import pandas as pd
+9 from toolz import compose
+10 from zipline.utils.compat import unicode
+11 from zipline.utils.functional import instance
+12 from zipline.utils.preprocess import preprocess
+13 from zipline.utils.sentinel import sentinel
+14 from</b></font> zipline.utils.input_validation import (
+15     coerce,
+16     expect_kinds,
+17     expect_types,
+18     optional,
+19 )
+20 from zipline.utils.numpy_utils import (
+21     bool_dtype,
+22     unsigned_int_dtype_with_size_in_bytes,
+23     is_object,
+24     object_dtype,
+25 )
+26 from zipline.utils.pandas_utils import ignore_pandas_nan_categorical_warning
+27 from ._factorize import (
+28     factorize_strings,
+29     factorize_strings_known_categories,
+30     smallest_uint_that_can_hold,
+31 )
+32 def compare_arrays(left, right):
+33     "Eq check with a short-circuit for identical objects."
+34     return (
+35         left is right
+36         or ((left.shape == right.shape) and (left == right).all())
+37     )
+38 def _make_unsupported_method(name):
+39     def method(*args, **kwargs):
+40         raise NotImplementedError(
+41             "Method %s is not supported on LabelArrays." % name
+42         )
+43     method.__name__ = name
+44     method.__doc__ = "Unsupported LabelArray Method: %s" % name
+45     return method
+46 class MissingValueMismatch(ValueError):
+47     """
+48     Error raised on attempt to perform operations between LabelArrays with
+49     mismatched missing_values.
+50     """
+51     def __init__(self, left, right):
+52         super(MissingValueMismatch, self).__init__(
+53             "LabelArray missing_values don't match:"
+54             " left={}, right={}".format(left, right)
+55         )
+56 class CategoryMismatch(ValueError):
+57     """
+58     Error raised on attempt to perform operations between LabelArrays with
+59     mismatched category arrays.
+60     """
+61     def __init__(self, left, right):
+62         (mismatches,) = np.where(left != right)
+63         assert len(mismatches), "Not actually a mismatch!"
+64         super(CategoryMismatch, self).__init__(
+65             "LabelArray categories don't match:\n"
+66             "Mismatched Indices: {mismatches}\n"
+67             "Left: {left}\n"
+68             "Right: {right}".format(
+69                 mismatches=mismatches,
+70                 left=left[mismatches],
+71                 right=right[mismatches],
+72             )
+73         )
+74 _NotPassed = sentinel('_NotPassed')
+75 class LabelArray(ndarray):
+76     """
+77     An ndarray subclass for working with arrays of strings.
+78     Factorizes the input array into integers, but overloads equality on strings
+79     to check against the factor label.
+80     Parameters
+81     ----------
+82     values : array-like
+83         Array of values that can be passed to np.asarray with dtype=object.
+84     missing_value : str
+85         Scalar value to treat as 'missing' for operations on ``self``.
+86     categories : list[str], optional
+87         List of values to use as categories.  If not supplied, categories will
+88         be inferred as the unique set of entries in ``values``.
+89     sort : bool, optional
+90         Whether to sort categories.  If sort is False and categories is
+91         supplied, they are left in the order provided.  If sort is False and
+92         categories is None, categories will be constructed in a random order.
+93     Attributes
+94     ----------
+95     categories : ndarray[str]
+96         An array containing the unique labels of self.
+97     reverse_categories : dict[str -&gt; int]
+98         Reverse lookup table for ``categories``. Stores the index in
+99         ``categories`` at which each entry each unique entry is found.
+100     missing_value : str or None
+101         A sentinel missing value with NaN semantics for comparisons.
+102     Notes
+103     -----
+104     Consumers should be cautious when passing instances of LabelArray to numpy
+105     functions.  We attempt to disallow as many meaningless operations as
+106     possible, but since a LabelArray is just an ndarray of ints with some
+107     additional metadata, many numpy functions (for example, trigonometric) will
+108     happily accept a LabelArray and treat its values as though they were
+109     integers.
+110     In a future change, we may be able to disallow more numerical operations by
+111     creating a wrapper dtype which doesn't register an implementation for most
+112     numpy ufuncs. Until that change is made, consumers of LabelArray should
+113     assume that it is undefined behavior to pass a LabelArray to any numpy
+114     ufunc that operates on semantically-numerical data.
+115     See Also
+116     --------
+117     https://docs.scipy.org/doc/numpy-1.11.0/user/basics.subclassing.html
+118     """
+119     SUPPORTED_SCALAR_TYPES = (bytes, unicode, type(None))
+120     SUPPORTED_NON_NONE_SCALAR_TYPES = (bytes, unicode)
+121     @preprocess(
+122         values=coerce(list, partial(np.asarray, dtype=object)),
+123         categories=coerce((list, np.ndarray, set), list),
+124     )
+125     @expect_types(
+126         values=np.ndarray,
+127         missing_value=SUPPORTED_SCALAR_TYPES,
+128         categories=optional(list),
+129     )
+130     @expect_kinds(values=("O", "S", "U"))
+131     def __new__(cls,
+132                 values,
+133                 missing_value,
+134                 categories=None,
+135                 sort=True):
+136         if not is_object(values):
+137             values = values.astype(object)
+138         if values.flags.f_contiguous:
+139             ravel_order = 'F'
+140         else:
+141             ravel_order = 'C'
+142         if categories is None:
+143             codes, categories, reverse_categories = factorize_strings(
+144                 values.ravel(ravel_order),
+145                 missing_value=missing_value,
+146                 sort=sort,
+147             )
+148         else:
+149             codes, categories, reverse_categories = (
+150                 factorize_strings_known_categories(
+151                     values.ravel(ravel_order),
+152                     categories=categories,
+153                     missing_value=missing_value,
+154                     sort=sort,
+155                 )
+156             )
+157         categories.setflags(write=False)
+158         return cls.from_codes_and_metadata(
+159             codes=codes.reshape(values.shape, order=ravel_order),
+160             categories=categories,
+161             reverse_categories=reverse_categories,
+162             missing_value=missing_value,
+163         )
+164     @classmethod
+165     def from_codes_and_metadata(cls,
+166                                 codes,
+167                                 categories,
+168                                 reverse_categories,
+169                                 missing_value):
+170         """
+171         Rehydrate a LabelArray from the codes and metadata.
+172         Parameters
+173         ----------
+174         codes : np.ndarray[integral]
+175             The codes for the label array.
+176         categories : np.ndarray[object]
+177             The unique string categories.
+178         reverse_categories : dict[str, int]
+179             The mapping from category to its code-index.
+180         missing_value : any
+181             The value used to represent missing data.
+182         """
+183         ret = codes.view(type=cls, dtype=np.void)
+184         ret._categories = categories
+185         ret._reverse_categories = reverse_categories
+186         ret._missing_value = missing_value
+187         return ret
+188     @classmethod
+189     def from_categorical(cls, categorical, missing_value=None):
+190         """
+191         Create a LabelArray from a pandas categorical.
+192         Parameters
+193         ----------
+194         categorical : pd.Categorical
+195             The categorical object to convert.
+196         missing_value : bytes, unicode, or None, optional
+197             The missing value to use for this LabelArray.
+198         Returns
+199         -------
+200         la : LabelArray
+201             The LabelArray representation of this categorical.
+202         """
+203         return LabelArray(
+204             categorical,
+205             missing_value,
+206             categorical.categories,
+207         )
+208     @property
+209     def categories(self):
+210         return self._categories
+211     @property
+212     def reverse_categories(self):
+213         return self._reverse_categories
+214     @property
+215     def missing_value(self):
+216         return self._missing_value
+217     @property
+218     def missing_value_code(self):
+219         return self.reverse_categories[self.missing_value]
+220     def has_label(self, value):
+221         return value in self.reverse_categories
+222     def __array_finalize__(self, obj):
+223         """
+224         Called by Numpy after array construction.
+225         There are three cases where this can happen:
+226         1. Someone tries to directly construct a new array by doing::
+227             &gt;&gt;&gt; ndarray.__new__(LabelArray, ...)  # doctest: +SKIP
+228            In this case, obj will be None.  We treat this as an error case and
+229            fail.
+230         2. Someone (most likely our own __new__) does::
+231            &gt;&gt;&gt; other_array.view(type=LabelArray)  # doctest: +SKIP
+232            In this case, `self` will be the new LabelArray instance, and
+233            ``obj` will be the array on which ``view`` is being called.
+234            The caller of ``obj.view`` is responsible for setting category
+235            metadata on ``self`` after we exit.
+236         3. Someone creates a new LabelArray by slicing an existing one.
+237            In this case, ``obj`` will be the original LabelArray.  We're
+238            responsible for copying over the parent array's category metadata.
+239         """
+240         if obj is None:
+241             raise TypeError(
+242                 "Direct construction of LabelArrays is not supported."
+243             )
+244         self._categories = getattr(obj, 'categories', None)
+245         self._reverse_categories = getattr(obj, 'reverse_categories', None)
+246         self._missing_value = getattr(obj, 'missing_value', None)
+247     def as_int_array(self):
+248         """
+249         Convert self into a regular ndarray of ints.
+250         This is an O(1) operation. It does not copy the underlying data.
+251         """
+252         return self.view(
+253             type=ndarray,
+254             dtype=unsigned_int_dtype_with_size_in_bytes(self.itemsize),
+255         )
+256     def as_string_array(self):
+257         """
+258         Convert self back into an array of strings.
+259         This is an O(N) operation.
+260         """
+261         return self.categories[self.as_int_array()]
+262     def as_categorical(self):
+263         """
+264         Coerce self into a pandas categorical.
+265         This is only defined on 1D arrays, since that's all pandas supports.
+266         """
+267         if len(self.shape) &gt; 1:
+268             raise ValueError("Can't convert a 2D array to a categorical.")
+269         with ignore_pandas_nan_categorical_warning():
+270             return pd.Categorical.from_codes(
+271                 self.as_int_array(),
+272                 self.categories.copy(),
+273                 ordered=False,
+274             )
+275     def as_categorical_frame(self, index, columns, name=None):
+276         """
+277         Coerce self into a pandas DataFrame of Categoricals.
+278         """
+279         if len(self.shape) != 2:
+280             raise ValueError(
+281                 "Can't convert a non-2D LabelArray into a DataFrame."
+282             )
+283         expected_shape = (len(index), len(columns))
+284         if expected_shape != self.shape:
+285             raise ValueError(
+286                 "Can't construct a DataFrame with provided indices:\n\n"
+287                 "LabelArray shape is {actual}, but index and columns imply "
+288                 "that shape should be {expected}.".format(
+289                     actual=self.shape,
+290                     expected=expected_shape,
+291                 )
+292             )
+293         return pd.Series(
+294             index=pd.MultiIndex.from_product([index, columns]),
+295             data=self.ravel().as_categorical(),
+296             name=name,
+297         ).unstack()
+298     def __setitem__(self, indexer, value):
+299         self_categories = self.categories
+300         if isinstance(value, self.SUPPORTED_SCALAR_TYPES):
+301             value_code = self.reverse_categories.get(value, None)
+302             if value_code is None:
+303                 raise ValueError("%r is not in LabelArray categories." % value)
+304             self.as_int_array()[indexer] = value_code
+305         elif isinstance(value, LabelArray):
+306             value_categories = value.categories
+307             if compare_arrays(self_categories, value_categories):
+308                 return super(LabelArray, self).__setitem__(indexer, value)
+309             elif (self.missing_value == value.missing_value and
+310                   set(value.categories) &lt;= set(self.categories)):
+311                 rhs = LabelArray.from_codes_and_metadata(
+312                     *factorize_strings_known_categories(
+313                         value.as_string_array().ravel(),
+314                         list(self.categories),
+315                         self.missing_value,
+316                         False,
+317                     ),
+318                     missing_value=self.missing_value
+319                 ).reshape(value.shape)
+320                 super(LabelArray, self).__setitem__(indexer, rhs)
+321             else:
+322                 raise CategoryMismatch(self_categories, value_categories)
+323         else:
+324             raise NotImplementedError(
+325                 "Setting into a LabelArray with a value of "
+326                 "type {type} is not yet supported.".format(
+327                     type=type(value).__name__,
+328                 ),
+329             )
+330     def set_scalar(self, indexer, value):
+331         """
+332         Set scalar value into the array.
+333         Parameters
+334         ----------
+335         indexer : any
+336             The indexer to set the value at.
+337         value : str
+338             The value to assign at the given locations.
+339         Raises
+340         ------
+341         ValueError
+342             Raised when ``value`` is not a value element of this this label
+343             array.
+344         """
+345         try:
+346             value_code = self.reverse_categories[value]
+347         except KeyError:
+348             raise ValueError("%r is not in LabelArray categories." % value)
+349         self.as_int_array()[indexer] = value_code
+350     def __setslice__(self, i, j, sequence):
+351         """
+352         This method was deprecated in Python 2.0. It predates slice objects,
+353         but Python 2.7.11 still uses it if you implement it, which ndarray
+354         does.  In newer Pythons, __setitem__ is always called, but we need to
+355         manuallly forward in py2.
+356         """
+357         self.__setitem__(slice(i, j), sequence)
+358     def __getitem__(self, indexer):
+359         result = super(LabelArray, self).__getitem__(indexer)
+360         if result.ndim:
+361             return result
+362         index = result.view(
+363             unsigned_int_dtype_with_size_in_bytes(self.itemsize),
+364         )
+365         return self.categories[index]
+366     def is_missing(self):
+367         """
+368         Like isnan, but checks for locations where we store missing values.
+369         """
+370         return (
+371             self.as_int_array() == self.reverse_categories[self.missing_value]
+372         )
+373     def not_missing(self):
+374         """
+375         Like ~isnan, but checks for locations where we store missing values.
+376         """
+377         return (
+378             self.as_int_array() != self.reverse_categories[self.missing_value]
+379         )
+380     def _equality_check(op):
+381         """
+382         Shared code for __eq__ and __ne__, parameterized on the actual
+383         comparison operator to use.
+384         """
+385         def method(self, other):
+386             if isinstance(other, LabelArray):
+387                 self_mv = self.missing_value
+388                 other_mv = other.missing_value
+389                 if self_mv != other_mv:
+390                     raise MissingValueMismatch(self_mv, other_mv)
+391                 self_categories = self.categories
+392                 other_categories = other.categories
+393                 if not compare_arrays(self_categories, other_categories):
+394                     raise CategoryMismatch(self_categories, other_categories)
+395                 return (
+396                     op(self.as_int_array(), other.as_int_array())
+397                     &amp; self.not_missing()
+398                     &amp; other.not_missing()
+399                 )
+400             elif isinstance(other, ndarray):
+401                 return op(self.as_string_array(), other) &amp; self.not_missing()
+402             elif isinstance(other, self.SUPPORTED_SCALAR_TYPES):
+403                 i = self._reverse_categories.get(other, -1)
+404                 return op(self.as_int_array(), i) &amp; self.not_missing()
+405             return op(super(LabelArray, self), other)
+406         return method
+407     __eq__ = _equality_check(eq)
+408     __ne__ = _equality_check(ne)
+409     del _equality_check
+410     def view(self, dtype=_NotPassed, type=_NotPassed):
+411         if type is _NotPassed and dtype not in (_NotPassed, self.dtype):
+412             raise TypeError("Can't view LabelArray as another dtype.")
+413         kwargs = {}
+414         if dtype is not _NotPassed:
+415             kwargs['dtype'] = dtype
+416         if type is not _NotPassed:
+417             kwargs['type'] = type
+418         return super(LabelArray, self).view(**kwargs)
+419     def astype(self,
+420                dtype,
+421                order='K',
+422                casting='unsafe',
+423                subok=True,
+424                copy=True):
+425         if dtype == self.dtype:
+426             if not subok:
+427                 array = self.view(type=np.ndarray)
+428             else:
+429                 array = self
+430             if copy:
+431                 return array.copy()
+432             return array
+433         if dtype == object_dtype:
+434             return self.as_string_array()
+435         if dtype.kind == 'S':
+436             return self.as_string_array().astype(
+437                 dtype,
+438                 order=order,
+439                 casting=casting,
+440                 subok=subok,
+441                 copy=copy,
+442             )
+443         raise TypeError(
+444             '%s can only be converted into object, string, or void,'
+445             ' got: %r' % (
+446                 type(self).__name__,
+447                 dtype,
+448             ),
+449         )
+450     SUPPORTED_NDARRAY_METHODS = frozenset([
+451         'astype',
+452         'base',
+453         'compress',
+454         'copy',
+455         'data',
+456         'diagonal',
+457         'dtype',
+458         'flat',
+459         'flatten',
+460         'item',
+461         'itemset',
+462         'itemsize',
+463         'nbytes',
+464         'ndim',
+465         'ravel',
+466         'repeat',
+467         'reshape',
+468         'resize',
+469         'setflags',
+470         'shape',
+471         'size',
+472         'squeeze',
+473         'strides',
+474         'swapaxes',
+475         'take',
+476         'trace',
+477         'transpose',
+478         'view'
+479     ])
+480     PUBLIC_NDARRAY_METHODS = frozenset([
+481         s for s in dir(ndarray) if not s.startswith('_')
+482     ])
+483     locals().update(
+484         {
+485             method: _make_unsupported_method(method)
+486             for method in PUBLIC_NDARRAY_METHODS - SUPPORTED_NDARRAY_METHODS
+487         }
+488     )
+489     def __repr__(self):
+490         repr_lines = repr(self.as_string_array()).splitlines()
+491         repr_lines[0] = repr_lines[0].replace('array(', 'LabelArray(', 1)
+492         repr_lines[-1] = repr_lines[-1].rsplit(',', 1)[0] + ')'
+493         return '\n     '.join(repr_lines)
+494     def empty_like(self, shape):
+495         """
+496         Make an empty LabelArray with the same categories as ``self``, filled
+497         with ``self.missing_value``.
+498         """
+499         return type(self).from_codes_and_metadata(
+500             codes=np.full(
+501                 shape,
+502                 self.reverse_categories[self.missing_value],
+503                 dtype=unsigned_int_dtype_with_size_in_bytes(self.itemsize),
+504             ),
+505             categories=self.categories,
+506             reverse_categories=self.reverse_categories,
+507             missing_value=self.missing_value,
+508         )
+509     def map_predicate(self, f):
+510         """
+511         Map a function from str -&gt; bool element-wise over ``self``.
+512         ``f`` will be applied exactly once to each non-missing unique value in
+513         ``self``. Missing values will always return False.
+514         """
+515         if self.missing_value is None:
+516             def f_to_use(x):
+517                 return False if x is None else f(x)
+518         else:
+519             f_to_use = f
+520         results = np.vectorize(f_to_use, otypes=[bool_dtype])(self.categories)
+521         results[self.reverse_categories[self.missing_value]] = False
+522         return results[self.as_int_array()]
+523     def map(self, f):
+524         """
+525         Map a function from str -&gt; str element-wise over ``self``.
+526         ``f`` will be applied exactly once to each non-missing unique value in
+527         ``self``. Missing values will always map to ``self.missing_value``.
+528         """
+529         if self.missing_value is None:
+530             allowed_outtypes = self.SUPPORTED_SCALAR_TYPES
+531         else:
+532             allowed_outtypes = self.SUPPORTED_NON_NONE_SCALAR_TYPES
+533         def f_to_use(x,
+534                      missing_value=self.missing_value,
+535                      otypes=allowed_outtypes):
+536             if x == missing_value:
+537                 return _sortable_sentinel
+538             ret = f(x)
+539             if not isinstance(ret, otypes):
+540                 raise TypeError(
+541                     "LabelArray.map expected function {f} to return a string"
+542                     " or None, but got {type} instead.\n"
+543                     "Value was {value}.".format(
+544                         f=f.__name__,
+545                         type=type(ret).__name__,
+546                         value=ret,
+547                     )
+548                 )
+549             if ret == missing_value:
+550                 return _sortable_sentinel
+551             return ret
+552         new_categories_with_duplicates = (
+553             np.vectorize(f_to_use, otypes=[object])(self.categories)
+554         )
+555         new_categories, bloated_inverse_index = np.unique(
+556             new_categories_with_duplicates,
+557             return_inverse=True
+558         )
+559         if new_categories[0] is _sortable_sentinel:
+560             new_categories[0] = self.missing_value
+561         reverse_index = bloated_inverse_index.astype(
+562             smallest_uint_that_can_hold(len(new_categories))
+563         )
+564         new_codes = np.take(reverse_index, self.as_int_array())
+565         return self.from_codes_and_metadata(
+566             new_codes,
+567             new_categories,
+568             dict(zip(new_categories, range(len(new_categories)))),
+569             missing_value=self.missing_value,
+570         )
+571     def startswith(self, prefix):
+572         """
+573         Element-wise startswith.
+574         Parameters
+575         ----------
+576         prefix : str
+577         Returns
+578         -------
+579         matches : np.ndarray[bool]
+580             An array with the same shape as self indicating whether each
+581             element of self started with ``prefix``.
+582         """
+583         return self.map_predicate(lambda elem: elem.startswith(prefix))
+584     def endswith(self, suffix):
+585         """
+586         Elementwise endswith.
+587         Parameters
+588         ----------
+589         suffix : str
+590         Returns
+591         -------
+592         matches : np.ndarray[bool]
+593             An array with the same shape as self indicating whether each
+594             element of self ended with ``suffix``
+595         """
+596         return self.map_predicate(lambda elem: elem.endswith(suffix))
+597     def has_substring(self, substring):
+598         """
+599         Elementwise contains.
+600         Parameters
+601         ----------
+602         substring : str
+603         Returns
+604         -------
+605         matches : np.ndarray[bool]
+606             An array with the same shape as self indicating whether each
+607             element of self ended with ``suffix``.
+608         """
+609         return self.map_predicate(lambda elem: substring in elem)
+610     @preprocess(pattern=coerce(from_=(bytes, unicode), to=re.compile))
+611     def matches(self, pattern):
+612         """
+613         Elementwise regex match.
+614         Parameters
+615         ----------
+616         pattern : str or compiled regex
+617         Returns
+618         -------
+619         matches : np.ndarray[bool]
+620             An array with the same shape as self indicating whether each
+621             element of self was matched by ``pattern``.
+622         """
+623         return self.map_predicate(compose(bool, pattern.match))
+624     @preprocess(container=coerce((list, tuple, np.ndarray), set))
+625     def element_of(self, container):
+626         """
+627         Check if each element of self is an of ``container``.
+628         Parameters
+629         ----------
+630         container : object
+631             An object implementing a __contains__ to call on each element of
+632             ``self``.
+633         Returns
+634         -------
+635         is_contained : np.ndarray[bool]
+636             An array with the same shape as self indicating whether each
+637             element of self was an element of ``container``.
+638         """
+639         return self.map_predicate(container.__contains__)
+640 @instance  # This makes _sortable_sentinel a singleton instance.
+641 @total_ordering
+642 class _sortable_sentinel(object):
+643     """Dummy object that sorts before any other python object.
+644     """
+645     def __eq__(self, other):
+646         return self is other
+647     def __lt__(self, other):
+648         return True
+649 @expect_types(trues=LabelArray, falses=LabelArray)
+650 def labelarray_where(cond, trues, falses):
+651     """LabelArray-aware implementation of np.where.
+652     """
+653     if trues.missing_value != falses.missing_value:
+654         raise ValueError(
+655             "Can't compute where on arrays with different missing values."
+656         )
+657     strs = np.where(cond, trues.as_string_array(), falses.as_string_array())
+658     return LabelArray(strs, missing_value=trues.missing_value)
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -891,1108 +710,876 @@ def labelarray_where(cond, trues, falses):
 </h3>
 <hr/>
 <pre>
-"""
-HDF5 Pricing File Format
-------------------------
-At the top level, the file is keyed by country (to support regional
-files containing multiple countries).
-
-Within each country, there are 4 subgroups:
-
-``/data``
-^^^^^^^^^
-Each field (OHLCV) is stored in a dataset as a 2D array, with a row per
-sid and a column per session. This differs from the more standard
-orientation of dates x sids, because it allows each compressed block to
-contain contiguous values for the same sid, which allows for better
-compression.
-
-.. code-block:: none
-
-   /data
-     /open
-     /high
-     /low
-     /close
-     /volume
-
-``/index``
-^^^^^^^^^^
-Contains two datasets, the index of sids (aligned to the rows of the
-OHLCV 2D arrays) and index of sessions (aligned to the columns of the
-OHLCV 2D arrays) to use for lookups.
-
-.. code-block:: none
-
-   /index
-     /sid
-     /day
-
-``/lifetimes``
-^^^^^^^^^^^^^^
-Contains two datasets, start_date and end_date, defining the lifetime
-for each asset, aligned to the sids index.
-
-.. code-block:: none
-
-   /lifetimes
-     /start_date
-     /end_date
-
-``/currency``
-^^^^^^^^^^^^^
-
-Contains a single dataset, ``code``, aligned to the sids index, which contains
-the listing currency of each sid.
-
-Example
-^^^^^^^
-Sample layout of the full file with multiple countries.
-
-.. code-block:: none
-
-   |- /US
-   |  |- /data
-   |  |  |- /open
-   |  |  |- /high
-   |  |  |- /low
-   |  |  |- /close
-   |  |  |- /volume
-   |  |
-   |  |- /index
-   |  |  |- /sid
-   |  |  |- /day
-   |  |
-   |  |- /lifetimes
-   |  |  |- /start_date
-   |  |  |- /end_date
-   |  |
-   |  |- /currency
-   |     |- /code
-   |
-   |- /CA
-      |- /data
-      |  |- /open
-      |  |- /high
-      |  |- /low
-      |  |- /close
-      |  |- /volume
-      |
-      |- /index
-      |  |- /sid
-      |  |- /day
-      |
-      |- /lifetimes
-      |  |- /start_date
-      |  |- /end_date
-      |
-      |- /currency
-         |- /code
-<a name="0"></a>"""
-
-
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>from functools import partial
-
-import h5py
-import logbook
-import numpy as np
-import pandas as pd
-from six import iteritems, raise_from, viewkeys
-from six.moves import reduce
-
-from zipline.data.bar_reader import (
-    NoDataAfterDate,
-    NoDataBeforeDate,
-    NoDataForSid,
-    NoDataOnDate,
-)
-from zipline.data.session_bars import CurrencyAwareSessionBarReader
-from zipline.utils.memoize import lazyval
-from zipline.utils.numpy_utils import bytes_array_to_native_str_object_array
-from</b></font> zipline.utils.pandas_utils import check_indexes_all_same
-
-
-log = logbook.Logger('HDF5DailyBars')
-
-VERSION = 0
-
-
-DATA = 'data'
-INDEX = 'index'
-LIFETIMES = 'lifetimes'
-CURRENCY = 'currency'
-CODE = 'code'
-
-SCALING_FACTOR = 'scaling_factor'
-
-OPEN = 'open'
-HIGH = 'high'
-LOW = 'low'
-CLOSE = 'close'
-VOLUME = 'volume'
-
-FIELDS = (OPEN, HIGH, LOW, CLOSE, VOLUME)
-
-DAY = 'day'
-SID = 'sid'
-
-START_DATE = 'start_date'
-END_DATE = 'end_date'
-
-
-# XXX is reserved for "transactions involving no currency".
-MISSING_CURRENCY = 'XXX'
-
-
-DEFAULT_SCALING_FACTORS = {
-    # Retain 3 decimal places for prices.
-    OPEN: 1000,
-    HIGH: 1000,
-    LOW: 1000,
-    CLOSE: 1000,
-    # Volume is expected to be a whole integer.
-    VOLUME: 1,
-}
-
-
-def coerce_to_uint32(a, scaling_factor):
-    """
-    Returns a copy of the array as uint32, applying a scaling factor to
-    maintain precision if supplied.
-    """
-    return (a * scaling_factor).round().astype('uint32')
-
-
-def days_and_sids_for_frames(frames):
-    """
-    Returns the date index and sid columns shared by a list of dataframes,
-    ensuring they all match.
-
-    Parameters
-    ----------
-    frames : list[pd.DataFrame]
-        A list of dataframes indexed by day, with a column per sid.
-
-    Returns
-    -------
-    days : np.array[datetime64[ns]]
-        The days in these dataframes.
-    sids : np.array[int64]
-        The sids in these dataframes.
-
-    Raises
-    ------
-    ValueError
-        If the dataframes passed are not all indexed by the same days
-        and sids.
-    """
-    if not frames:
-        days = np.array([], dtype='datetime64[ns]')
-        sids = np.array([], dtype='int64')
-        return days, sids
-
-    # Ensure the indices and columns all match.
-    check_indexes_all_same(
-        [frame.index for frame in frames],
-        message='Frames have mismatched days.',
-    )
-    check_indexes_all_same(
-        [frame.columns for frame in frames],
-        message='Frames have mismatched sids.',
-    )
-
-    return frames[0].index.values, frames[0].columns.values
-
-
-class HDF5DailyBarWriter(object):
-    """
-    Class capable of writing daily OHLCV data to disk in a format that
-    can be read efficiently by HDF5DailyBarReader.
-
-    Parameters
-    ----------
-    filename : str
-        The location at which we should write our output.
-    date_chunk_size : int
-        The number of days per chunk in the HDF5 file. If this is
-        greater than the number of days in the data, the chunksize will
-        match the actual number of days.
-
-    See Also
-    --------
-    zipline.data.hdf5_daily_bars.HDF5DailyBarReader
-    """
-    def __init__(self, filename, date_chunk_size):
-        self._filename = filename
-        self._date_chunk_size = date_chunk_size
-
-    def h5_file(self, mode):
-        return h5py.File(self._filename, mode)
-
-    def write(self,
-              country_code,
-              frames,
-              currency_codes=None,
-              scaling_factors=None):
-        """
-        Write the OHLCV data for one country to the HDF5 file.
-
-        Parameters
-        ----------
-        country_code : str
-            The ISO 3166 alpha-2 country code for this country.
-        frames : dict[str, pd.DataFrame]
-            A dict mapping each OHLCV field to a dataframe with a row
-            for each date and a column for each sid. The dataframes need
-            to have the same index and columns.
-        currency_codes : pd.Series, optional
-            Series mapping sids to 3-digit currency code values for those sids'
-            listing currencies. If not passed, missing currencies will be
-            written.
-        scaling_factors : dict[str, float], optional
-            A dict mapping each OHLCV field to a scaling factor, which
-            is applied (as a multiplier) to the values of field to
-            efficiently store them as uint32, while maintaining desired
-            precision. These factors are written to the file as metadata,
-            which is consumed by the reader to adjust back to the original
-            float values. Default is None, in which case
-            DEFAULT_SCALING_FACTORS is used.
-        """
-        if scaling_factors is None:
-            scaling_factors = DEFAULT_SCALING_FACTORS
-
-        # Note that this functions validates that all of the frames
-        # share the same days and sids.
-        days, sids = days_and_sids_for_frames(list(frames.values()))
-
-        # XXX: We should make this required once we're using it everywhere.
-        if currency_codes is None:
-            currency_codes = pd.Series(index=sids, data=MISSING_CURRENCY)
-
-        # Currency codes should match dataframe columns.
-        check_sids_arrays_match(
-            sids,
-            currency_codes.index.values,
-            message="currency_codes sids do not match data sids:",
-        )
-
-        # Write start and end dates for each sid.
-        start_date_ixs, end_date_ixs = compute_asset_lifetimes(frames)
-
-        if len(sids):
-            chunks = (len(sids), min(self._date_chunk_size, len(days)))
-        else:
-            # h5py crashes if we provide chunks for empty data.
-            chunks = None
-
-        with self.h5_file(mode='a') as h5_file:
-            # ensure that the file version has been written
-            h5_file.attrs['version'] = VERSION
-
-            country_group = h5_file.create_group(country_code)
-
-            self._write_index_group(country_group, days, sids)
-            self._write_lifetimes_group(
-                country_group,
-                start_date_ixs,
-                end_date_ixs,
-            )
-            self._write_currency_group(country_group, currency_codes)
-            self._write_data_group(
-                country_group,
-                frames,
-                scaling_factors,
-                chunks,
-            )
-
-    def write_from_sid_df_pairs(self,
-                                country_code,
-                                data,
-                                currency_codes=None,
-                                scaling_factors=None):
-        """
-        Parameters
-        ----------
-        country_code : str
-            The ISO 3166 alpha-2 country code for this country.
-        data : iterable[tuple[int, pandas.DataFrame]]
-            The data chunks to write. Each chunk should be a tuple of
-            sid and the data for that asset.
-        currency_codes : pd.Series, optional
-            Series mapping sids to 3-digit currency code values for those sids'
-            listing currencies. If not passed, missing currencies will be
-            written.
-        scaling_factors : dict[str, float], optional
-            A dict mapping each OHLCV field to a scaling factor, which
-            is applied (as a multiplier) to the values of field to
-            efficiently store them as uint32, while maintaining desired
-            precision. These factors are written to the file as metadata,
-            which is consumed by the reader to adjust back to the original
-            float values. Default is None, in which case
-            DEFAULT_SCALING_FACTORS is used.
-        """
-        data = list(data)
-        if not data:
-            empty_frame = pd.DataFrame(
-                data=None,
-                index=np.array([], dtype='datetime64[ns]'),
-                columns=np.array([], dtype='int64'),
-            )
-            return self.write(
-                country_code,
-                {f: empty_frame.copy() for f in FIELDS},
-                scaling_factors,
-            )
-
-        sids, frames = zip(*data)
-        ohlcv_frame = pd.concat(frames)
-
-        # Repeat each sid for each row in its corresponding frame.
-        sid_ix = np.repeat(sids, [len(f) for f in frames])
-
-        # Add id to the index, so the frame is indexed by (date, id).
-        ohlcv_frame.set_index(sid_ix, append=True, inplace=True)
-
-        frames = {
-            field: ohlcv_frame[field].unstack()
-            for field in FIELDS
-        }
-
-        return self.write(
-            country_code=country_code,
-            frames=frames,
-            scaling_factors=scaling_factors,
-            currency_codes=currency_codes
-        )
-
-    def _write_index_group(self, country_group, days, sids):
-        """Write /country/index.
-        """
-        index_group = country_group.create_group(INDEX)
-        self._log_writing_dataset(index_group)
-
-        index_group.create_dataset(SID, data=sids)
-
-        # h5py does not support datetimes, so they need to be stored
-        # as integers.
-        index_group.create_dataset(DAY, data=days.astype(np.int64))
-
-    def _write_lifetimes_group(self,
-                               country_group,
-                               start_date_ixs,
-                               end_date_ixs):
-        """Write /country/lifetimes
-        """
-        lifetimes_group = country_group.create_group(LIFETIMES)
-        self._log_writing_dataset(lifetimes_group)
-
-        lifetimes_group.create_dataset(START_DATE, data=start_date_ixs)
-        lifetimes_group.create_dataset(END_DATE, data=end_date_ixs)
-
-    def _write_currency_group(self, country_group, currencies):
-        """Write /country/currency
-        """
-        currency_group = country_group.create_group(CURRENCY)
-        self._log_writing_dataset(currency_group)
-
-        currency_group.create_dataset(
-            CODE,
-            data=currencies.values.astype(dtype='S3'),
-        )
-
-    def _write_data_group(self,
-                          country_group,
-                          frames,
-                          scaling_factors,
-                          chunks):
-        """Write /country/data
-        """
-        data_group = country_group.create_group(DATA)
-        self._log_writing_dataset(data_group)
-
-        for field in FIELDS:
-            frame = frames[field]
-
-            # Sort rows by increasing sid, and columns by increasing date.
-            frame.sort_index(inplace=True)
-            frame.sort_index(axis='columns', inplace=True)
-
-            data = coerce_to_uint32(
-                frame.T.fillna(0).values,
-                scaling_factors[field],
-            )
-
-            dataset = data_group.create_dataset(
-                field,
-                compression='lzf',
-                shuffle=True,
-                data=data,
-                chunks=chunks,
-            )
-            self._log_writing_dataset(dataset)
-
-            dataset.attrs[SCALING_FACTOR] = scaling_factors[field]
-
-            log.debug(
-                'Writing dataset {} to file {}',
-                dataset.name, self._filename
-            )
-
-    def _log_writing_dataset(self, dataset):
-        log.debug("Writing {} to file {}", dataset.name, self._filename)
-
-
-def compute_asset_lifetimes(frames):
-    """
-    Parameters
-    ----------
-    frames : dict[str, pd.DataFrame]
-        A dict mapping each OHLCV field to a dataframe with a row for
-        each date and a column for each sid, as passed to write().
-
-    Returns
-    -------
-    start_date_ixs : np.array[int64]
-        The index of the first date with non-nan values, for each sid.
-    end_date_ixs : np.array[int64]
-        The index of the last date with non-nan values, for each sid.
-    """
-    # Build a 2D array (dates x sids), where an entry is True if all
-    # fields are nan for the given day and sid.
-    is_null_matrix = np.logical_and.reduce(
-        [frames[field].isnull().values for field in FIELDS],
-    )
-    if not is_null_matrix.size:
-        empty = np.array([], dtype='int64')
-        return empty, empty.copy()
-
-    # Offset of the first null from the start of the input.
-    start_date_ixs = is_null_matrix.argmin(axis=0)
-    # Offset of the last null from the **end** of the input.
-    end_offsets = is_null_matrix[::-1].argmin(axis=0)
-    # Offset of the last null from the start of the input
-    end_date_ixs = is_null_matrix.shape[0] - end_offsets - 1
-
-    return start_date_ixs, end_date_ixs
-
-
-def convert_price_with_scaling_factor(a, scaling_factor):
-    conversion_factor = (1.0 / scaling_factor)
-
-    zeroes = (a == 0)
-    return np.where(zeroes, np.nan, a.astype('float64')) * conversion_factor
-
-
-class HDF5DailyBarReader(CurrencyAwareSessionBarReader):
-    """
-    Parameters
-    ---------
-    country_group : h5py.Group
-        The group for a single country in an HDF5 daily pricing file.
-    """
-    def __init__(self, country_group):
-        self._country_group = country_group
-
-        self._postprocessors = {
-            OPEN: partial(convert_price_with_scaling_factor,
-                          scaling_factor=self._read_scaling_factor(OPEN)),
-            HIGH: partial(convert_price_with_scaling_factor,
-                          scaling_factor=self._read_scaling_factor(HIGH)),
-            LOW: partial(convert_price_with_scaling_factor,
-                         scaling_factor=self._read_scaling_factor(LOW)),
-            CLOSE: partial(convert_price_with_scaling_factor,
-                           scaling_factor=self._read_scaling_factor(CLOSE)),
-            VOLUME: lambda a: a,
-        }
-
-    @classmethod
-    def from_file(cls, h5_file, country_code):
-        """
-        Construct from an h5py.File and a country code.
-
-        Parameters
-        ----------
-        h5_file : h5py.File
-            An HDF5 daily pricing file.
-        country_code : str
-            The ISO 3166 alpha-2 country code for the country to read.
-        """
-        if h5_file.attrs['version'] != VERSION:
-            raise ValueError(
-                'mismatched version: file is of version %s, expected %s' % (
-                    h5_file.attrs['version'],
-                    VERSION,
-                ),
-            )
-
-        return cls(h5_file[country_code])
-
-    @classmethod
-    def from_path(cls, path, country_code):
-        """
-        Construct from a file path and a country code.
-
-        Parameters
-        ----------
-        path : str
-            The path to an HDF5 daily pricing file.
-        country_code : str
-            The ISO 3166 alpha-2 country code for the country to read.
-        """
-        return cls.from_file(h5py.File(path), country_code)
-
-    def _read_scaling_factor(self, field):
-        return self._country_group[DATA][field].attrs[SCALING_FACTOR]
-
-    def load_raw_arrays(self,
-                        columns,
-                        start_date,
-                        end_date,
-                        assets):
-        """
-        Parameters
-        ----------
-        columns : list of str
-           'open', 'high', 'low', 'close', or 'volume'
-        start_date: Timestamp
-           Beginning of the window range.
-        end_date: Timestamp
-           End of the window range.
-        assets : list of int
-           The asset identifiers in the window.
-
-        Returns
-        -------
-        list of np.ndarray
-            A list with an entry per field of ndarrays with shape
-            (minutes in range, sids) with a dtype of float64, containing the
-            values for the respective field over start and end dt range.
-        """
-        self._validate_timestamp(start_date)
-        self._validate_timestamp(end_date)
-
-        start = start_date.asm8
-        end = end_date.asm8
-        date_slice = self._compute_date_range_slice(start, end)
-        n_dates = date_slice.stop - date_slice.start
-
-        # Create a buffer into which we'll read data from the h5 file.
-        # Allocate an extra row of space that will always contain null values.
-        # We'll use that space to provide "data" for entries in ``assets`` that
-        # are unknown to us.
-        full_buf = np.zeros((len(self.sids) + 1, n_dates), dtype=np.uint32)
-        # We'll only read values into this portion of the read buf.
-        mutable_buf = full_buf[:-1]
-
-        # Indexer that converts an array aligned to self.sids (which is what we
-        # pull from the h5 file) into an array aligned to ``assets``.
-        #
-        # Unknown assets will have an index of -1, which means they'll always
-        # pull from the last row of the read buffer. We allocated an extra
-        # empty row above so that these lookups will cause us to fill our
-        # output buffer with "null" values.
-        sid_selector = self._make_sid_selector(assets)
-
-        out = []
-        for column in columns:
-            # Zero the buffer to prepare to receive new data.
-            mutable_buf.fill(0)
-
-            dataset = self._country_group[DATA][column]
-
-            # Fill the mutable portion of our buffer with data from the file.
-            dataset.read_direct(
-                mutable_buf,
-                np.s_[:, date_slice],
-            )
-
-            # Select data from the **full buffer**. Unknown assets will pull
-            # from the last row, which is always empty.
-            out.append(self._postprocessors[column](full_buf[sid_selector].T))
-
-        return out
-
-    def _make_sid_selector(self, assets):
-        """
-        Build an indexer mapping ``self.sids`` to ``assets``.
-
-        Parameters
-        ----------
-        assets : list[int]
-            List of assets requested by a caller of ``load_raw_arrays``.
-
-        Returns
-        -------
-        index : np.array[int64]
-            Index array containing the index in ``self.sids`` for each location
-            in ``assets``. Entries in ``assets`` for which we don't have a sid
-            will contain -1. It is caller's responsibility to handle these
-            values correctly.
-        """
-        assets = np.array(assets)
-        sid_selector = self.sids.searchsorted(assets)
-        unknown = np.in1d(assets, self.sids, invert=True)
-        sid_selector[unknown] = -1
-        return sid_selector
-
-    def _compute_date_range_slice(self, start_date, end_date):
-        # Get the index of the start of dates for ``start_date``.
-        start_ix = self.dates.searchsorted(start_date)
-
-        # Get the index of the start of the first date **after** end_date.
-        end_ix = self.dates.searchsorted(end_date, side='right')
-
-        return slice(start_ix, end_ix)
-
-    def _validate_assets(self, assets):
-        """Validate that asset identifiers are contained in the daily bars.
-
-        Parameters
-        ----------
-        assets : array-like[int]
-           The asset identifiers to validate.
-
-        Raises
-        ------
-        NoDataForSid
-            If one or more of the provided asset identifiers are not
-            contained in the daily bars.
-        """
-        missing_sids = np.setdiff1d(assets, self.sids)
-
-        if len(missing_sids):
-            raise NoDataForSid(
-                'Assets not contained in daily pricing file: {}'.format(
-                    missing_sids
-                )
-            )
-
-    def _validate_timestamp(self, ts):
-        if ts.asm8 not in self.dates:
-            raise NoDataOnDate(ts)
-
-    @lazyval
-    def dates(self):
-        return self._country_group[INDEX][DAY][:].astype('datetime64[ns]')
-
-    @lazyval
-    def sids(self):
-        return self._country_group[INDEX][SID][:].astype('int64', copy=False)
-
-    @lazyval
-    def asset_start_dates(self):
-        return self.dates[self._country_group[LIFETIMES][START_DATE][:]]
-
-    @lazyval
-    def asset_end_dates(self):
-        return self.dates[self._country_group[LIFETIMES][END_DATE][:]]
-
-    @lazyval
-    def _currency_codes(self):
-        bytes_array = self._country_group[CURRENCY][CODE][:]
-        return bytes_array_to_native_str_object_array(bytes_array)
-
-    def currency_codes(self, sids):
-        """Get currencies in which prices are quoted for the requested sids.
-
-        Parameters
-        ----------
-        sids : np.array[int64]
-            Array of sids for which currencies are needed.
-
-        Returns
-        -------
-        currency_codes : np.array[object]
-            Array of currency codes for listing currencies of ``sids``.
-        """
-        # Find the index of requested sids in our stored sids.
-        ixs = self.sids.searchsorted(sids, side='left')
-
-        result = self._currency_codes[ixs]
-
-        # searchsorted returns the index of the next lowest sid if the lookup
-        # fails. Fill these sids with the special "missing" sentinel.
-        not_found = (self.sids[ixs] != sids)
-
-        result[not_found] = None
-
-        return result
-
-    @property
-    def last_available_dt(self):
-        """
-        Returns
-        -------
-        dt : pd.Timestamp
-            The last session for which the reader can provide data.
-        """
-        return pd.Timestamp(self.dates[-1], tz='UTC')
-
-    @property
-    def trading_calendar(self):
-        """
-        Returns the zipline.utils.calendar.trading_calendar used to read
-        the data.  Can be None (if the writer didn't specify it).
-        """
-        raise NotImplementedError(
-            'HDF5 pricing does not yet support trading calendars.'
-        )
-
-    @property
-    def first_trading_day(self):
-        """
-        Returns
-        -------
-        dt : pd.Timestamp
-            The first trading day (session) for which the reader can provide
-            data.
-        """
-        return pd.Timestamp(self.dates[0], tz='UTC')
-
-    @lazyval
-    def sessions(self):
-        """
-        Returns
-        -------
-        sessions : DatetimeIndex
-           All session labels (unioning the range for all assets) which the
-           reader can provide.
-        """
-        return pd.to_datetime(self.dates, utc=True)
-
-    def get_value(self, sid, dt, field):
-        """
-        Retrieve the value at the given coordinates.
-
-        Parameters
-        ----------
-        sid : int
-            The asset identifier.
-        dt : pd.Timestamp
-            The timestamp for the desired data point.
-        field : string
-            The OHLVC name for the desired data point.
-
-        Returns
-        -------
-        value : float|int
-            The value at the given coordinates, ``float`` for OHLC, ``int``
-            for 'volume'.
-
-        Raises
-        ------
-        NoDataOnDate
-            If the given dt is not a valid market minute (in minute mode) or
-            session (in daily mode) according to this reader's tradingcalendar.
-        """
-        self._validate_assets([sid])
-        self._validate_timestamp(dt)
-
-        sid_ix = self.sids.searchsorted(sid)
-        dt_ix = self.dates.searchsorted(dt.asm8)
-
-        value = self._postprocessors[field](
-            self._country_group[DATA][field][sid_ix, dt_ix]
-        )
-
-        # When the value is nan, this dt may be outside the asset's lifetime.
-        # If that's the case, the proper NoDataOnDate exception is raised.
-        # Otherwise (when there's just a hole in the middle of the data), the
-        # nan is returned.
-        if np.isnan(value):
-            if dt.asm8 &lt; self.asset_start_dates[sid_ix]:
-                raise NoDataBeforeDate()
-
-            if dt.asm8 &gt; self.asset_end_dates[sid_ix]:
-                raise NoDataAfterDate()
-
-        return value
-
-    def get_last_traded_dt(self, asset, dt):
-        """
-        Get the latest day on or before ``dt`` in which ``asset`` traded.
-
-        If there are no trades on or before ``dt``, returns ``pd.NaT``.
-
-        Parameters
-        ----------
-        asset : zipline.asset.Asset
-            The asset for which to get the last traded day.
-        dt : pd.Timestamp
-            The dt at which to start searching for the last traded day.
-
-        Returns
-        -------
-        last_traded : pd.Timestamp
-            The day of the last trade for the given asset, using the
-            input dt as a vantage point.
-        """
-        sid_ix = self.sids.searchsorted(asset.sid)
-        # Used to get a slice of all dates up to and including ``dt``.
-        dt_limit_ix = self.dates.searchsorted(dt.asm8, side='right')
-
-        # Get the indices of all dates with nonzero volume.
-        nonzero_volume_ixs = np.ravel(
-            np.nonzero(self._country_group[DATA][VOLUME][sid_ix, :dt_limit_ix])
-        )
-
-        if len(nonzero_volume_ixs) == 0:
-            return pd.NaT
-
-        return pd.Timestamp(self.dates[nonzero_volume_ixs][-1], tz='UTC')
-
-
-class MultiCountryDailyBarReader(CurrencyAwareSessionBarReader):
-    """
-    Parameters
-    ---------
-    readers : dict[str -&gt; SessionBarReader]
-        A dict mapping country codes to SessionBarReader instances to
-        service each country.
-    """
-    def __init__(self, readers):
-        self._readers = readers
-        self._country_map = pd.concat([
-            pd.Series(index=reader.sids, data=country_code)
-            for country_code, reader in iteritems(readers)
-        ])
-
-    @classmethod
-    def from_file(cls, h5_file):
-        """
-        Construct from an h5py.File.
-
-        Parameters
-        ----------
-        h5_file : h5py.File
-            An HDF5 daily pricing file.
-        """
-        return cls({
-            country: HDF5DailyBarReader.from_file(h5_file, country)
-            for country in h5_file.keys()
-        })
-
-    @classmethod
-    def from_path(cls, path):
-        """
-        Construct from a file path.
-
-        Parameters
-        ----------
-        path : str
-            Path to an HDF5 daily pricing file.
-        """
-        return cls.from_file(h5py.File(path))
-
-    @property
-    def countries(self):
-        """A set-like object of the country codes supplied by this reader.
-        """
-        return viewkeys(self._readers)
-
-    def _country_code_for_assets(self, assets):
-        country_codes = self._country_map.get(assets)
-
-        # In some versions of pandas (observed in 0.22), Series.get()
-        # returns None if none of the labels are in the index.
-        if country_codes is not None:
-            unique_country_codes = country_codes.dropna().unique()
-            num_countries = len(unique_country_codes)
-        else:
-            num_countries = 0
-
-        if num_countries == 0:
-            raise ValueError('At least one valid asset id is required.')
-        elif num_countries &gt; 1:
-            raise NotImplementedError(
-                (
-                    'Assets were requested from multiple countries ({}),'
-                    ' but multi-country reads are not yet supported.'
-                ).format(list(unique_country_codes))
-            )
-
-        return np.asscalar(unique_country_codes)
-
-    def load_raw_arrays(self,
-                        columns,
-                        start_date,
-                        end_date,
-                        assets):
-        """
-        Parameters
-        ----------
-        columns : list of str
-           'open', 'high', 'low', 'close', or 'volume'
-        start_date: Timestamp
-           Beginning of the window range.
-        end_date: Timestamp
-           End of the window range.
-        assets : list of int
-           The asset identifiers in the window.
-
-        Returns
-        -------
-        list of np.ndarray
-            A list with an entry per field of ndarrays with shape
-            (minutes in range, sids) with a dtype of float64, containing the
-            values for the respective field over start and end dt range.
-        """
-        country_code = self._country_code_for_assets(assets)
-
-        return self._readers[country_code].load_raw_arrays(
-            columns,
-            start_date,
-            end_date,
-            assets,
-        )
-
-    @property
-    def last_available_dt(self):
-        """
-        Returns
-        -------
-        dt : pd.Timestamp
-            The last session for which the reader can provide data.
-        """
-        return max(
-            reader.last_available_dt for reader in self._readers.values()
-        )
-
-    @property
-    def trading_calendar(self):
-        """
-        Returns the zipline.utils.calendar.trading_calendar used to read
-        the data.  Can be None (if the writer didn't specify it).
-        """
-        raise NotImplementedError(
-            'HDF5 pricing does not yet support trading calendars.'
-        )
-
-    @property
-    def first_trading_day(self):
-        """
-        Returns
-        -------
-        dt : pd.Timestamp
-            The first trading day (session) for which the reader can provide
-            data.
-        """
-        return min(
-            reader.first_trading_day for reader in self._readers.values()
-        )
-
-    @property
-    def sessions(self):
-        """
-        Returns
-        -------
-        sessions : DatetimeIndex
-           All session labels (unioning the range for all assets) which the
-           reader can provide.
-        """
-        return pd.to_datetime(
-            reduce(
-                np.union1d,
-                (reader.dates for reader in self._readers.values()),
-            ),
-            utc=True,
-        )
-
-    def get_value(self, sid, dt, field):
-        """
-        Retrieve the value at the given coordinates.
-
-        Parameters
-        ----------
-        sid : int
-            The asset identifier.
-        dt : pd.Timestamp
-            The timestamp for the desired data point.
-        field : string
-            The OHLVC name for the desired data point.
-
-        Returns
-        -------
-        value : float|int
-            The value at the given coordinates, ``float`` for OHLC, ``int``
-            for 'volume'.
-
-        Raises
-        ------
-        NoDataOnDate
-            If the given dt is not a valid market minute (in minute mode) or
-            session (in daily mode) according to this reader's tradingcalendar.
-        NoDataForSid
-            If the given sid is not valid.
-        """
-        try:
-            country_code = self._country_code_for_assets([sid])
-        except ValueError as exc:
-            raise_from(
-                NoDataForSid(
-                    'Asset not contained in daily pricing file: {}'.format(sid)
-                ),
-                exc
-            )
-        return self._readers[country_code].get_value(sid, dt, field)
-
-    def get_last_traded_dt(self, asset, dt):
-        """
-        Get the latest day on or before ``dt`` in which ``asset`` traded.
-
-        If there are no trades on or before ``dt``, returns ``pd.NaT``.
-
-        Parameters
-        ----------
-        asset : zipline.asset.Asset
-            The asset for which to get the last traded day.
-        dt : pd.Timestamp
-            The dt at which to start searching for the last traded day.
-
-        Returns
-        -------
-        last_traded : pd.Timestamp
-            The day of the last trade for the given asset, using the
-            input dt as a vantage point.
-        """
-        country_code = self._country_code_for_assets([asset.sid])
-        return self._readers[country_code].get_last_traded_dt(asset, dt)
-
-    def currency_codes(self, sids):
-        """Get currencies in which prices are quoted for the requested sids.
-
-        Assumes that a sid's prices are always quoted in a single currency.
-
-        Parameters
-        ----------
-        sids : np.array[int64]
-            Array of sids for which currencies are needed.
-
-        Returns
-        -------
-        currency_codes : np.array[S3]
-            Array of currency codes for listing currencies of ``sids``.
-        """
-        country_code = self._country_code_for_assets(sids)
-        return self._readers[country_code].currency_codes(sids)
-
-
-def check_sids_arrays_match(left, right, message):
-    """Check that two 1d arrays of sids are equal
-    """
-    if len(left) != len(right):
-        raise ValueError(
-            "{}:\nlen(left) ({}) != len(right) ({})".format(
-                message, len(left), len(right)
-            )
-        )
-
-    diff = (left != right)
-    if diff.any():
-        (bad_locs,) = np.where(diff)
-        raise ValueError(
-            "{}:\n Indices with differences: {}".format(message, bad_locs)
-        )
+1 """
+2 HDF5 Pricing File Format
+3 ------------------------
+4 At the top level, the file is keyed by country (to support regional
+5 files containing multiple countries).
+6 Within each country, there are 4 subgroups:
+7 ``/data``
+8 ^^^^^^^^^
+9 Each field (OHLCV) is stored in a dataset as a 2D array, with a row per
+10 sid and a column per session. This differs from the more standard
+11 orientation of dates x sids, because it allows each compressed block to
+12 contain contiguous values for the same sid, which allows for better
+13 compression.
+14 .. code-block:: none
+15    /data
+16      /open
+17      /high
+18      /low
+19      /close
+20      /volume
+21 ``/index``
+22 ^^^^^^^^^^
+23 Contains two datasets, the index of sids (aligned to the rows of the
+24 OHLCV 2D arrays) and index of sessions (aligned to the columns of the
+25 OHLCV 2D arrays) to use for lookups.
+26 .. code-block:: none
+27    /index
+28      /sid
+29      /day
+30 ``/lifetimes``
+31 ^^^^^^^^^^^^^^
+32 Contains two datasets, start_date and end_date, defining the lifetime
+33 for each asset, aligned to the sids index.
+34 .. code-block:: none
+35    /lifetimes
+36      /start_date
+37      /end_date
+38 ``/currency``
+39 ^^^^^^^^^^^^^
+40 Contains a single dataset, ``code``, aligned to the sids index, which contains
+41 the listing currency of each sid.
+42 Example
+43 ^^^^^^^
+44 Sample layout of the full file with multiple countries.
+45 .. code-block:: none
+46    |- /US
+47    |  |- /data
+48    |  |  |- /open
+49    |  |  |- /high
+50    |  |  |- /low
+51    |  |  |- /close
+52    |  |  |- /volume
+53    |  |
+54    |  |- /index
+55    |  |  |- /sid
+56    |  |  |- /day
+57    |  |
+58    |  |- /lifetimes
+59    |  |  |- /start_date
+60    |  |  |- /end_date
+61    |  |
+62    |  |- /currency
+63    |     |- /code
+64    |
+65    |- /CA
+66       |- /data
+67       |  |- /open
+68       |  |- /high
+69       |  |- /low
+70       |  |- /close
+71       |  |- /volume
+72       |
+73       |- /index
+74       |  |- /sid
+75       |  |- /day
+76       |
+77       |- /lifetimes
+78       |  |- /start_date
+79       |  |- /end_date
+80       |
+81       |- /currency
+82          |- /code
+83 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>from functools import partial
+84 import h5py
+85 import logbook
+86 import numpy as np
+87 import pandas as pd
+88 from six import iteritems, raise_from, viewkeys
+89 from six.moves import reduce
+90 from zipline.data.bar_reader import (
+91     NoDataAfterDate,
+92     NoDataBeforeDate,
+93     NoDataForSid,
+94     NoDataOnDate,
+95 )
+96 from zipline.data.session_bars import CurrencyAwareSessionBarReader
+97 from zipline.utils.memoize import lazyval
+98 from zipline.utils.numpy_utils import bytes_array_to_native_str_object_array
+99 from</b></font> zipline.utils.pandas_utils import check_indexes_all_same
+100 log = logbook.Logger('HDF5DailyBars')
+101 VERSION = 0
+102 DATA = 'data'
+103 INDEX = 'index'
+104 LIFETIMES = 'lifetimes'
+105 CURRENCY = 'currency'
+106 CODE = 'code'
+107 SCALING_FACTOR = 'scaling_factor'
+108 OPEN = 'open'
+109 HIGH = 'high'
+110 LOW = 'low'
+111 CLOSE = 'close'
+112 VOLUME = 'volume'
+113 FIELDS = (OPEN, HIGH, LOW, CLOSE, VOLUME)
+114 DAY = 'day'
+115 SID = 'sid'
+116 START_DATE = 'start_date'
+117 END_DATE = 'end_date'
+118 MISSING_CURRENCY = 'XXX'
+119 DEFAULT_SCALING_FACTORS = {
+120     OPEN: 1000,
+121     HIGH: 1000,
+122     LOW: 1000,
+123     CLOSE: 1000,
+124     VOLUME: 1,
+125 }
+126 def coerce_to_uint32(a, scaling_factor):
+127     """
+128     Returns a copy of the array as uint32, applying a scaling factor to
+129     maintain precision if supplied.
+130     """
+131     return (a * scaling_factor).round().astype('uint32')
+132 def days_and_sids_for_frames(frames):
+133     """
+134     Returns the date index and sid columns shared by a list of dataframes,
+135     ensuring they all match.
+136     Parameters
+137     ----------
+138     frames : list[pd.DataFrame]
+139         A list of dataframes indexed by day, with a column per sid.
+140     Returns
+141     -------
+142     days : np.array[datetime64[ns]]
+143         The days in these dataframes.
+144     sids : np.array[int64]
+145         The sids in these dataframes.
+146     Raises
+147     ------
+148     ValueError
+149         If the dataframes passed are not all indexed by the same days
+150         and sids.
+151     """
+152     if not frames:
+153         days = np.array([], dtype='datetime64[ns]')
+154         sids = np.array([], dtype='int64')
+155         return days, sids
+156     check_indexes_all_same(
+157         [frame.index for frame in frames],
+158         message='Frames have mismatched days.',
+159     )
+160     check_indexes_all_same(
+161         [frame.columns for frame in frames],
+162         message='Frames have mismatched sids.',
+163     )
+164     return frames[0].index.values, frames[0].columns.values
+165 class HDF5DailyBarWriter(object):
+166     """
+167     Class capable of writing daily OHLCV data to disk in a format that
+168     can be read efficiently by HDF5DailyBarReader.
+169     Parameters
+170     ----------
+171     filename : str
+172         The location at which we should write our output.
+173     date_chunk_size : int
+174         The number of days per chunk in the HDF5 file. If this is
+175         greater than the number of days in the data, the chunksize will
+176         match the actual number of days.
+177     See Also
+178     --------
+179     zipline.data.hdf5_daily_bars.HDF5DailyBarReader
+180     """
+181     def __init__(self, filename, date_chunk_size):
+182         self._filename = filename
+183         self._date_chunk_size = date_chunk_size
+184     def h5_file(self, mode):
+185         return h5py.File(self._filename, mode)
+186     def write(self,
+187               country_code,
+188               frames,
+189               currency_codes=None,
+190               scaling_factors=None):
+191         """
+192         Write the OHLCV data for one country to the HDF5 file.
+193         Parameters
+194         ----------
+195         country_code : str
+196             The ISO 3166 alpha-2 country code for this country.
+197         frames : dict[str, pd.DataFrame]
+198             A dict mapping each OHLCV field to a dataframe with a row
+199             for each date and a column for each sid. The dataframes need
+200             to have the same index and columns.
+201         currency_codes : pd.Series, optional
+202             Series mapping sids to 3-digit currency code values for those sids'
+203             listing currencies. If not passed, missing currencies will be
+204             written.
+205         scaling_factors : dict[str, float], optional
+206             A dict mapping each OHLCV field to a scaling factor, which
+207             is applied (as a multiplier) to the values of field to
+208             efficiently store them as uint32, while maintaining desired
+209             precision. These factors are written to the file as metadata,
+210             which is consumed by the reader to adjust back to the original
+211             float values. Default is None, in which case
+212             DEFAULT_SCALING_FACTORS is used.
+213         """
+214         if scaling_factors is None:
+215             scaling_factors = DEFAULT_SCALING_FACTORS
+216         days, sids = days_and_sids_for_frames(list(frames.values()))
+217         if currency_codes is None:
+218             currency_codes = pd.Series(index=sids, data=MISSING_CURRENCY)
+219         check_sids_arrays_match(
+220             sids,
+221             currency_codes.index.values,
+222             message="currency_codes sids do not match data sids:",
+223         )
+224         start_date_ixs, end_date_ixs = compute_asset_lifetimes(frames)
+225         if len(sids):
+226             chunks = (len(sids), min(self._date_chunk_size, len(days)))
+227         else:
+228             chunks = None
+229         with self.h5_file(mode='a') as h5_file:
+230             h5_file.attrs['version'] = VERSION
+231             country_group = h5_file.create_group(country_code)
+232             self._write_index_group(country_group, days, sids)
+233             self._write_lifetimes_group(
+234                 country_group,
+235                 start_date_ixs,
+236                 end_date_ixs,
+237             )
+238             self._write_currency_group(country_group, currency_codes)
+239             self._write_data_group(
+240                 country_group,
+241                 frames,
+242                 scaling_factors,
+243                 chunks,
+244             )
+245     def write_from_sid_df_pairs(self,
+246                                 country_code,
+247                                 data,
+248                                 currency_codes=None,
+249                                 scaling_factors=None):
+250         """
+251         Parameters
+252         ----------
+253         country_code : str
+254             The ISO 3166 alpha-2 country code for this country.
+255         data : iterable[tuple[int, pandas.DataFrame]]
+256             The data chunks to write. Each chunk should be a tuple of
+257             sid and the data for that asset.
+258         currency_codes : pd.Series, optional
+259             Series mapping sids to 3-digit currency code values for those sids'
+260             listing currencies. If not passed, missing currencies will be
+261             written.
+262         scaling_factors : dict[str, float], optional
+263             A dict mapping each OHLCV field to a scaling factor, which
+264             is applied (as a multiplier) to the values of field to
+265             efficiently store them as uint32, while maintaining desired
+266             precision. These factors are written to the file as metadata,
+267             which is consumed by the reader to adjust back to the original
+268             float values. Default is None, in which case
+269             DEFAULT_SCALING_FACTORS is used.
+270         """
+271         data = list(data)
+272         if not data:
+273             empty_frame = pd.DataFrame(
+274                 data=None,
+275                 index=np.array([], dtype='datetime64[ns]'),
+276                 columns=np.array([], dtype='int64'),
+277             )
+278             return self.write(
+279                 country_code,
+280                 {f: empty_frame.copy() for f in FIELDS},
+281                 scaling_factors,
+282             )
+283         sids, frames = zip(*data)
+284         ohlcv_frame = pd.concat(frames)
+285         sid_ix = np.repeat(sids, [len(f) for f in frames])
+286         ohlcv_frame.set_index(sid_ix, append=True, inplace=True)
+287         frames = {
+288             field: ohlcv_frame[field].unstack()
+289             for field in FIELDS
+290         }
+291         return self.write(
+292             country_code=country_code,
+293             frames=frames,
+294             scaling_factors=scaling_factors,
+295             currency_codes=currency_codes
+296         )
+297     def _write_index_group(self, country_group, days, sids):
+298         """Write /country/index.
+299         """
+300         index_group = country_group.create_group(INDEX)
+301         self._log_writing_dataset(index_group)
+302         index_group.create_dataset(SID, data=sids)
+303         index_group.create_dataset(DAY, data=days.astype(np.int64))
+304     def _write_lifetimes_group(self,
+305                                country_group,
+306                                start_date_ixs,
+307                                end_date_ixs):
+308         """Write /country/lifetimes
+309         """
+310         lifetimes_group = country_group.create_group(LIFETIMES)
+311         self._log_writing_dataset(lifetimes_group)
+312         lifetimes_group.create_dataset(START_DATE, data=start_date_ixs)
+313         lifetimes_group.create_dataset(END_DATE, data=end_date_ixs)
+314     def _write_currency_group(self, country_group, currencies):
+315         """Write /country/currency
+316         """
+317         currency_group = country_group.create_group(CURRENCY)
+318         self._log_writing_dataset(currency_group)
+319         currency_group.create_dataset(
+320             CODE,
+321             data=currencies.values.astype(dtype='S3'),
+322         )
+323     def _write_data_group(self,
+324                           country_group,
+325                           frames,
+326                           scaling_factors,
+327                           chunks):
+328         """Write /country/data
+329         """
+330         data_group = country_group.create_group(DATA)
+331         self._log_writing_dataset(data_group)
+332         for field in FIELDS:
+333             frame = frames[field]
+334             frame.sort_index(inplace=True)
+335             frame.sort_index(axis='columns', inplace=True)
+336             data = coerce_to_uint32(
+337                 frame.T.fillna(0).values,
+338                 scaling_factors[field],
+339             )
+340             dataset = data_group.create_dataset(
+341                 field,
+342                 compression='lzf',
+343                 shuffle=True,
+344                 data=data,
+345                 chunks=chunks,
+346             )
+347             self._log_writing_dataset(dataset)
+348             dataset.attrs[SCALING_FACTOR] = scaling_factors[field]
+349             log.debug(
+350                 'Writing dataset {} to file {}',
+351                 dataset.name, self._filename
+352             )
+353     def _log_writing_dataset(self, dataset):
+354         log.debug("Writing {} to file {}", dataset.name, self._filename)
+355 def compute_asset_lifetimes(frames):
+356     """
+357     Parameters
+358     ----------
+359     frames : dict[str, pd.DataFrame]
+360         A dict mapping each OHLCV field to a dataframe with a row for
+361         each date and a column for each sid, as passed to write().
+362     Returns
+363     -------
+364     start_date_ixs : np.array[int64]
+365         The index of the first date with non-nan values, for each sid.
+366     end_date_ixs : np.array[int64]
+367         The index of the last date with non-nan values, for each sid.
+368     """
+369     is_null_matrix = np.logical_and.reduce(
+370         [frames[field].isnull().values for field in FIELDS],
+371     )
+372     if not is_null_matrix.size:
+373         empty = np.array([], dtype='int64')
+374         return empty, empty.copy()
+375     start_date_ixs = is_null_matrix.argmin(axis=0)
+376     end_offsets = is_null_matrix[::-1].argmin(axis=0)
+377     end_date_ixs = is_null_matrix.shape[0] - end_offsets - 1
+378     return start_date_ixs, end_date_ixs
+379 def convert_price_with_scaling_factor(a, scaling_factor):
+380     conversion_factor = (1.0 / scaling_factor)
+381     zeroes = (a == 0)
+382     return np.where(zeroes, np.nan, a.astype('float64')) * conversion_factor
+383 class HDF5DailyBarReader(CurrencyAwareSessionBarReader):
+384     """
+385     Parameters
+386     ---------
+387     country_group : h5py.Group
+388         The group for a single country in an HDF5 daily pricing file.
+389     """
+390     def __init__(self, country_group):
+391         self._country_group = country_group
+392         self._postprocessors = {
+393             OPEN: partial(convert_price_with_scaling_factor,
+394                           scaling_factor=self._read_scaling_factor(OPEN)),
+395             HIGH: partial(convert_price_with_scaling_factor,
+396                           scaling_factor=self._read_scaling_factor(HIGH)),
+397             LOW: partial(convert_price_with_scaling_factor,
+398                          scaling_factor=self._read_scaling_factor(LOW)),
+399             CLOSE: partial(convert_price_with_scaling_factor,
+400                            scaling_factor=self._read_scaling_factor(CLOSE)),
+401             VOLUME: lambda a: a,
+402         }
+403     @classmethod
+404     def from_file(cls, h5_file, country_code):
+405         """
+406         Construct from an h5py.File and a country code.
+407         Parameters
+408         ----------
+409         h5_file : h5py.File
+410             An HDF5 daily pricing file.
+411         country_code : str
+412             The ISO 3166 alpha-2 country code for the country to read.
+413         """
+414         if h5_file.attrs['version'] != VERSION:
+415             raise ValueError(
+416                 'mismatched version: file is of version %s, expected %s' % (
+417                     h5_file.attrs['version'],
+418                     VERSION,
+419                 ),
+420             )
+421         return cls(h5_file[country_code])
+422     @classmethod
+423     def from_path(cls, path, country_code):
+424         """
+425         Construct from a file path and a country code.
+426         Parameters
+427         ----------
+428         path : str
+429             The path to an HDF5 daily pricing file.
+430         country_code : str
+431             The ISO 3166 alpha-2 country code for the country to read.
+432         """
+433         return cls.from_file(h5py.File(path), country_code)
+434     def _read_scaling_factor(self, field):
+435         return self._country_group[DATA][field].attrs[SCALING_FACTOR]
+436     def load_raw_arrays(self,
+437                         columns,
+438                         start_date,
+439                         end_date,
+440                         assets):
+441         """
+442         Parameters
+443         ----------
+444         columns : list of str
+445            'open', 'high', 'low', 'close', or 'volume'
+446         start_date: Timestamp
+447            Beginning of the window range.
+448         end_date: Timestamp
+449            End of the window range.
+450         assets : list of int
+451            The asset identifiers in the window.
+452         Returns
+453         -------
+454         list of np.ndarray
+455             A list with an entry per field of ndarrays with shape
+456             (minutes in range, sids) with a dtype of float64, containing the
+457             values for the respective field over start and end dt range.
+458         """
+459         self._validate_timestamp(start_date)
+460         self._validate_timestamp(end_date)
+461         start = start_date.asm8
+462         end = end_date.asm8
+463         date_slice = self._compute_date_range_slice(start, end)
+464         n_dates = date_slice.stop - date_slice.start
+465         full_buf = np.zeros((len(self.sids) + 1, n_dates), dtype=np.uint32)
+466         mutable_buf = full_buf[:-1]
+467         sid_selector = self._make_sid_selector(assets)
+468         out = []
+469         for column in columns:
+470             mutable_buf.fill(0)
+471             dataset = self._country_group[DATA][column]
+472             dataset.read_direct(
+473                 mutable_buf,
+474                 np.s_[:, date_slice],
+475             )
+476             out.append(self._postprocessors[column](full_buf[sid_selector].T))
+477         return out
+478     def _make_sid_selector(self, assets):
+479         """
+480         Build an indexer mapping ``self.sids`` to ``assets``.
+481         Parameters
+482         ----------
+483         assets : list[int]
+484             List of assets requested by a caller of ``load_raw_arrays``.
+485         Returns
+486         -------
+487         index : np.array[int64]
+488             Index array containing the index in ``self.sids`` for each location
+489             in ``assets``. Entries in ``assets`` for which we don't have a sid
+490             will contain -1. It is caller's responsibility to handle these
+491             values correctly.
+492         """
+493         assets = np.array(assets)
+494         sid_selector = self.sids.searchsorted(assets)
+495         unknown = np.in1d(assets, self.sids, invert=True)
+496         sid_selector[unknown] = -1
+497         return sid_selector
+498     def _compute_date_range_slice(self, start_date, end_date):
+499         start_ix = self.dates.searchsorted(start_date)
+500         end_ix = self.dates.searchsorted(end_date, side='right')
+501         return slice(start_ix, end_ix)
+502     def _validate_assets(self, assets):
+503         """Validate that asset identifiers are contained in the daily bars.
+504         Parameters
+505         ----------
+506         assets : array-like[int]
+507            The asset identifiers to validate.
+508         Raises
+509         ------
+510         NoDataForSid
+511             If one or more of the provided asset identifiers are not
+512             contained in the daily bars.
+513         """
+514         missing_sids = np.setdiff1d(assets, self.sids)
+515         if len(missing_sids):
+516             raise NoDataForSid(
+517                 'Assets not contained in daily pricing file: {}'.format(
+518                     missing_sids
+519                 )
+520             )
+521     def _validate_timestamp(self, ts):
+522         if ts.asm8 not in self.dates:
+523             raise NoDataOnDate(ts)
+524     @lazyval
+525     def dates(self):
+526         return self._country_group[INDEX][DAY][:].astype('datetime64[ns]')
+527     @lazyval
+528     def sids(self):
+529         return self._country_group[INDEX][SID][:].astype('int64', copy=False)
+530     @lazyval
+531     def asset_start_dates(self):
+532         return self.dates[self._country_group[LIFETIMES][START_DATE][:]]
+533     @lazyval
+534     def asset_end_dates(self):
+535         return self.dates[self._country_group[LIFETIMES][END_DATE][:]]
+536     @lazyval
+537     def _currency_codes(self):
+538         bytes_array = self._country_group[CURRENCY][CODE][:]
+539         return bytes_array_to_native_str_object_array(bytes_array)
+540     def currency_codes(self, sids):
+541         """Get currencies in which prices are quoted for the requested sids.
+542         Parameters
+543         ----------
+544         sids : np.array[int64]
+545             Array of sids for which currencies are needed.
+546         Returns
+547         -------
+548         currency_codes : np.array[object]
+549             Array of currency codes for listing currencies of ``sids``.
+550         """
+551         ixs = self.sids.searchsorted(sids, side='left')
+552         result = self._currency_codes[ixs]
+553         not_found = (self.sids[ixs] != sids)
+554         result[not_found] = None
+555         return result
+556     @property
+557     def last_available_dt(self):
+558         """
+559         Returns
+560         -------
+561         dt : pd.Timestamp
+562             The last session for which the reader can provide data.
+563         """
+564         return pd.Timestamp(self.dates[-1], tz='UTC')
+565     @property
+566     def trading_calendar(self):
+567         """
+568         Returns the zipline.utils.calendar.trading_calendar used to read
+569         the data.  Can be None (if the writer didn't specify it).
+570         """
+571         raise NotImplementedError(
+572             'HDF5 pricing does not yet support trading calendars.'
+573         )
+574     @property
+575     def first_trading_day(self):
+576         """
+577         Returns
+578         -------
+579         dt : pd.Timestamp
+580             The first trading day (session) for which the reader can provide
+581             data.
+582         """
+583         return pd.Timestamp(self.dates[0], tz='UTC')
+584     @lazyval
+585     def sessions(self):
+586         """
+587         Returns
+588         -------
+589         sessions : DatetimeIndex
+590            All session labels (unioning the range for all assets) which the
+591            reader can provide.
+592         """
+593         return pd.to_datetime(self.dates, utc=True)
+594     def get_value(self, sid, dt, field):
+595         """
+596         Retrieve the value at the given coordinates.
+597         Parameters
+598         ----------
+599         sid : int
+600             The asset identifier.
+601         dt : pd.Timestamp
+602             The timestamp for the desired data point.
+603         field : string
+604             The OHLVC name for the desired data point.
+605         Returns
+606         -------
+607         value : float|int
+608             The value at the given coordinates, ``float`` for OHLC, ``int``
+609             for 'volume'.
+610         Raises
+611         ------
+612         NoDataOnDate
+613             If the given dt is not a valid market minute (in minute mode) or
+614             session (in daily mode) according to this reader's tradingcalendar.
+615         """
+616         self._validate_assets([sid])
+617         self._validate_timestamp(dt)
+618         sid_ix = self.sids.searchsorted(sid)
+619         dt_ix = self.dates.searchsorted(dt.asm8)
+620         value = self._postprocessors[field](
+621             self._country_group[DATA][field][sid_ix, dt_ix]
+622         )
+623         if np.isnan(value):
+624             if dt.asm8 &lt; self.asset_start_dates[sid_ix]:
+625                 raise NoDataBeforeDate()
+626             if dt.asm8 &gt; self.asset_end_dates[sid_ix]:
+627                 raise NoDataAfterDate()
+628         return value
+629     def get_last_traded_dt(self, asset, dt):
+630         """
+631         Get the latest day on or before ``dt`` in which ``asset`` traded.
+632         If there are no trades on or before ``dt``, returns ``pd.NaT``.
+633         Parameters
+634         ----------
+635         asset : zipline.asset.Asset
+636             The asset for which to get the last traded day.
+637         dt : pd.Timestamp
+638             The dt at which to start searching for the last traded day.
+639         Returns
+640         -------
+641         last_traded : pd.Timestamp
+642             The day of the last trade for the given asset, using the
+643             input dt as a vantage point.
+644         """
+645         sid_ix = self.sids.searchsorted(asset.sid)
+646         dt_limit_ix = self.dates.searchsorted(dt.asm8, side='right')
+647         nonzero_volume_ixs = np.ravel(
+648             np.nonzero(self._country_group[DATA][VOLUME][sid_ix, :dt_limit_ix])
+649         )
+650         if len(nonzero_volume_ixs) == 0:
+651             return pd.NaT
+652         return pd.Timestamp(self.dates[nonzero_volume_ixs][-1], tz='UTC')
+653 class MultiCountryDailyBarReader(CurrencyAwareSessionBarReader):
+654     """
+655     Parameters
+656     ---------
+657     readers : dict[str -&gt; SessionBarReader]
+658         A dict mapping country codes to SessionBarReader instances to
+659         service each country.
+660     """
+661     def __init__(self, readers):
+662         self._readers = readers
+663         self._country_map = pd.concat([
+664             pd.Series(index=reader.sids, data=country_code)
+665             for country_code, reader in iteritems(readers)
+666         ])
+667     @classmethod
+668     def from_file(cls, h5_file):
+669         """
+670         Construct from an h5py.File.
+671         Parameters
+672         ----------
+673         h5_file : h5py.File
+674             An HDF5 daily pricing file.
+675         """
+676         return cls({
+677             country: HDF5DailyBarReader.from_file(h5_file, country)
+678             for country in h5_file.keys()
+679         })
+680     @classmethod
+681     def from_path(cls, path):
+682         """
+683         Construct from a file path.
+684         Parameters
+685         ----------
+686         path : str
+687             Path to an HDF5 daily pricing file.
+688         """
+689         return cls.from_file(h5py.File(path))
+690     @property
+691     def countries(self):
+692         """A set-like object of the country codes supplied by this reader.
+693         """
+694         return viewkeys(self._readers)
+695     def _country_code_for_assets(self, assets):
+696         country_codes = self._country_map.get(assets)
+697         if country_codes is not None:
+698             unique_country_codes = country_codes.dropna().unique()
+699             num_countries = len(unique_country_codes)
+700         else:
+701             num_countries = 0
+702         if num_countries == 0:
+703             raise ValueError('At least one valid asset id is required.')
+704         elif num_countries &gt; 1:
+705             raise NotImplementedError(
+706                 (
+707                     'Assets were requested from multiple countries ({}),'
+708                     ' but multi-country reads are not yet supported.'
+709                 ).format(list(unique_country_codes))
+710             )
+711         return np.asscalar(unique_country_codes)
+712     def load_raw_arrays(self,
+713                         columns,
+714                         start_date,
+715                         end_date,
+716                         assets):
+717         """
+718         Parameters
+719         ----------
+720         columns : list of str
+721            'open', 'high', 'low', 'close', or 'volume'
+722         start_date: Timestamp
+723            Beginning of the window range.
+724         end_date: Timestamp
+725            End of the window range.
+726         assets : list of int
+727            The asset identifiers in the window.
+728         Returns
+729         -------
+730         list of np.ndarray
+731             A list with an entry per field of ndarrays with shape
+732             (minutes in range, sids) with a dtype of float64, containing the
+733             values for the respective field over start and end dt range.
+734         """
+735         country_code = self._country_code_for_assets(assets)
+736         return self._readers[country_code].load_raw_arrays(
+737             columns,
+738             start_date,
+739             end_date,
+740             assets,
+741         )
+742     @property
+743     def last_available_dt(self):
+744         """
+745         Returns
+746         -------
+747         dt : pd.Timestamp
+748             The last session for which the reader can provide data.
+749         """
+750         return max(
+751             reader.last_available_dt for reader in self._readers.values()
+752         )
+753     @property
+754     def trading_calendar(self):
+755         """
+756         Returns the zipline.utils.calendar.trading_calendar used to read
+757         the data.  Can be None (if the writer didn't specify it).
+758         """
+759         raise NotImplementedError(
+760             'HDF5 pricing does not yet support trading calendars.'
+761         )
+762     @property
+763     def first_trading_day(self):
+764         """
+765         Returns
+766         -------
+767         dt : pd.Timestamp
+768             The first trading day (session) for which the reader can provide
+769             data.
+770         """
+771         return min(
+772             reader.first_trading_day for reader in self._readers.values()
+773         )
+774     @property
+775     def sessions(self):
+776         """
+777         Returns
+778         -------
+779         sessions : DatetimeIndex
+780            All session labels (unioning the range for all assets) which the
+781            reader can provide.
+782         """
+783         return pd.to_datetime(
+784             reduce(
+785                 np.union1d,
+786                 (reader.dates for reader in self._readers.values()),
+787             ),
+788             utc=True,
+789         )
+790     def get_value(self, sid, dt, field):
+791         """
+792         Retrieve the value at the given coordinates.
+793         Parameters
+794         ----------
+795         sid : int
+796             The asset identifier.
+797         dt : pd.Timestamp
+798             The timestamp for the desired data point.
+799         field : string
+800             The OHLVC name for the desired data point.
+801         Returns
+802         -------
+803         value : float|int
+804             The value at the given coordinates, ``float`` for OHLC, ``int``
+805             for 'volume'.
+806         Raises
+807         ------
+808         NoDataOnDate
+809             If the given dt is not a valid market minute (in minute mode) or
+810             session (in daily mode) according to this reader's tradingcalendar.
+811         NoDataForSid
+812             If the given sid is not valid.
+813         """
+814         try:
+815             country_code = self._country_code_for_assets([sid])
+816         except ValueError as exc:
+817             raise_from(
+818                 NoDataForSid(
+819                     'Asset not contained in daily pricing file: {}'.format(sid)
+820                 ),
+821                 exc
+822             )
+823         return self._readers[country_code].get_value(sid, dt, field)
+824     def get_last_traded_dt(self, asset, dt):
+825         """
+826         Get the latest day on or before ``dt`` in which ``asset`` traded.
+827         If there are no trades on or before ``dt``, returns ``pd.NaT``.
+828         Parameters
+829         ----------
+830         asset : zipline.asset.Asset
+831             The asset for which to get the last traded day.
+832         dt : pd.Timestamp
+833             The dt at which to start searching for the last traded day.
+834         Returns
+835         -------
+836         last_traded : pd.Timestamp
+837             The day of the last trade for the given asset, using the
+838             input dt as a vantage point.
+839         """
+840         country_code = self._country_code_for_assets([asset.sid])
+841         return self._readers[country_code].get_last_traded_dt(asset, dt)
+842     def currency_codes(self, sids):
+843         """Get currencies in which prices are quoted for the requested sids.
+844         Assumes that a sid's prices are always quoted in a single currency.
+845         Parameters
+846         ----------
+847         sids : np.array[int64]
+848             Array of sids for which currencies are needed.
+849         Returns
+850         -------
+851         currency_codes : np.array[S3]
+852             Array of currency codes for listing currencies of ``sids``.
+853         """
+854         country_code = self._country_code_for_assets(sids)
+855         return self._readers[country_code].currency_codes(sids)
+856 def check_sids_arrays_match(left, right, message):
+857     """Check that two 1d arrays of sids are equal
+858     """
+859     if len(left) != len(right):
+860         raise ValueError(
+861             "{}:\nlen(left) ({}) != len(right) ({})".format(
+862                 message, len(left), len(right)
+863             )
+864         )
+865     diff = (left != right)
+866     if diff.any():
+867         (bad_locs,) = np.where(diff)
+868         raise ValueError(
+869             "{}:\n Indices with differences: {}".format(message, bad_locs)
+870         )
 </pre>
 </div>
 </div>

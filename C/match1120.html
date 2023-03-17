@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for omclickhouse.c &amp; imhttp.c</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -45,1036 +44,815 @@ Matches for omclickhouse.c &amp; imhttp.c
 </h3>
 <hr/>
 <pre>
-/* omclickhouse.c
- * This is the https://clickhouse.yandex/ output module.
- *
- * Copyright 2018 Pascal Withopf and Adiscon GmbH.
- *
- * This file is part of rsyslog.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *       http://www.apache.org/licenses/LICENSE-2.0
- *       -or-
- *       see COPYING.ASL20 in the source distribution
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-#include "config.h"
-#include "rsyslog.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;memory.h&gt;
-#include &lt;string.h&gt;
-#include &lt;curl/curl.h&gt;
-#include &lt;curl/easy.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;signal.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;time.h&gt;
-#include &lt;sys/types.h&gt;
-#include &lt;sys/stat.h&gt;
-#include &lt;fcntl.h&gt;
-#if defined(__FreeBSD__)
-#include &lt;unistd.h&gt;
-#endif
-#include &lt;json.h&gt;
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "template.h"
-#include "module-template.h"
-#include "errmsg.h"
-#include "statsobj.h"
-#include "cfsysline.h"
-#include "unicode-helper.h"
-#include "obj-types.h"
-#include "ratelimit.h"
-#include "ruleset.h"
-
-#ifndef O_LARGEFILE
-#  define O_LARGEFILE 0
-#endif
-
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("omclickhouse")
-
-/* internal structures */
-DEF_OMOD_STATIC_DATA
-DEFobjCurrIf(statsobj)
-DEFobjCurrIf(prop)
-DEFobjCurrIf(ruleset)
-
-statsobj_t *indexStats;
-STATSCOUNTER_DEF(indexSubmit, mutIndexSubmit)
-STATSCOUNTER_DEF(indexHTTPFail, mutIndexHTTPFail)
-STATSCOUNTER_DEF(indexHTTPReqFail, mutIndexHTTPReqFail)
-STATSCOUNTER_DEF(indexFail, mutIndexFail)
-STATSCOUNTER_DEF(indexSuccess, mutIndexSuccess)
-
-
-
-typedef struct curl_slist HEADER;
-typedef struct instanceConf_s {
-	uchar *serverBaseUrl;
-	int port;
-	uchar *user;
-	uchar *pwd;
-	long healthCheckTimeout;
-	long timeout;
-	uchar *authBuf;
-	uchar *tplName;
-	sbool useHttps;
-	sbool allowUnsignedCerts;
-	sbool skipVerifyHost;
-	int fdErrFile;
-	uchar *errorFile;
-	sbool bulkmode;
-	size_t maxbytes;
-	uchar *caCertFile;
-	uchar *myCertFile;
-	uchar *myPrivKeyFile;
-	struct instanceConf_s *next;
-} instanceData;
-
-struct modConfData_s {
-	rsconf_t *pConf;		/* our overall config object */
-	instanceConf_t *root, *tail;
-};
-static modConfData_t *loadModConf = NULL;	/* modConf ptr to use for the current load process */
-
-typedef struct wrkrInstanceData {
-	PTR_ASSERT_DEF
-	instanceData *pData;
-	CURL	*curlPostHandle;	/* libcurl session handle for posting data to the server */
-	HEADER	*curlHeader;	/* json POST request info */
-	CURL	*curlCheckConnHandle;	/* libcurl session handle for checking the server connection */
-	int replyLen;
-	char *reply;
-	uchar *restURL;
-	struct {
-		es_str_t *data;
-		int nmemb;	/* number of messages in batch (for statistics counting) */
-	} batch;
-	sbool insertErrorSent;  /* needed for insert error message */
-} wrkrInstanceData_t;
-
-/* tables for interfacing with the v6 config system */
-/* action (instance) parameters */
-static struct cnfparamdescr actpdescr[] = {
-	{ "server", eCmdHdlrGetWord, 0 },
-	{ "port", eCmdHdlrInt, 0 },
-	{ "user", eCmdHdlrGetWord, 0 },
-<a name="0"></a>	{ "pwd", eCmdHdlrGetWord, 0 },
-	{ "healthchecktimeout", eCmdHdlrInt, 0 },
-	{ "timeout", eCmdHdlrInt, 0 },
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "template", eCmdHdlrGetWord, 0 },
-	{ "usehttps", eCmdHdlrBinary, 0 },
-	{ "allowunsignedcerts", eCmdHdlrBinary, 0 },
-	{ "skipverifyhost", eCmdHdlrBinary, 0 },
-	{ "errorfile", eCmdHdlrGetWord, 0 },
-	{ "bulkmode", eCmdHdlrBinary, 0 },
-	{ "maxbytes", eCmdHdlrSize, 0 },
-	{ "tls.cacert", eCmdHdlrString, 0 },
-	{ "tls.mycert", eCmdHdlrString, 0 },
-	{ "tls.myprivkey", eCmdHdlrString, 0 }
-};
-static struct cnfparamblk actpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	  actpdescr
-	};
-
-static rsRetVal curlSetup(wrkrInstanceData_t *pWrkrData);</b></font>
-
-<a name="3"></a>BEGINcreateInstance
-CODESTARTcreateInstance
-	pData-&gt;fdErrFile = -1;
-<font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	pData-&gt;caCertFile = NULL;
-	pData-&gt;myCertFile = NULL;
-	pData-&gt;myPrivKeyFile = NULL;
-ENDcreateInstance
-
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-	pWrkrData-&gt;curlHeader = NULL;
-	pWrkrData-&gt;curlPostHandle = NULL;
-	pWrkrData-&gt;curlCheckConnHandle = NULL;
-	pWrkrData-&gt;restURL = NULL;</b></font>
-	if(pData-&gt;bulkmode) {
-		if((pWrkrData-&gt;batch.data = es_newStr(1024)) == NULL) {
-			LogError(0, RS_RET_OUT_OF_MEMORY,
-				"omclickhouse: error creating batch string "
-			        "turned off bulk mode\n");
-			pData-&gt;bulkmode = 0; /* at least it works */
-		}
-	}
-	pWrkrData-&gt;insertErrorSent = 0;
-
-	iRet = curlSetup(pWrkrData);
-ENDcreateWrkrInstance
-
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURERepeatedMsgReduction)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-
-BEGINfreeInstance
-CODESTARTfreeInstance
-	free(pData-&gt;serverBaseUrl);
-	free(pData-&gt;user);
-	free(pData-&gt;pwd);
-	free(pData-&gt;authBuf);
-	if(pData-&gt;fdErrFile != -1)
-		close(pData-&gt;fdErrFile);
-	free(pData-&gt;errorFile);
-	free(pData-&gt;tplName);
-	free(pData-&gt;caCertFile);
-	free(pData-&gt;myCertFile);
-	free(pData-&gt;myPrivKeyFile);
-ENDfreeInstance
-
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-	if(pWrkrData-&gt;curlHeader != NULL) {
-		curl_slist_free_all(pWrkrData-&gt;curlHeader);
-		pWrkrData-&gt;curlHeader = NULL;
-	}
-	if(pWrkrData-&gt;curlCheckConnHandle != NULL) {
-		curl_easy_cleanup(pWrkrData-&gt;curlCheckConnHandle);
-		pWrkrData-&gt;curlCheckConnHandle = NULL;
-	}
-	if(pWrkrData-&gt;curlPostHandle != NULL) {
-		curl_easy_cleanup(pWrkrData-&gt;curlPostHandle);
-		pWrkrData-&gt;curlPostHandle = NULL;
-	}
-	if (pWrkrData-&gt;restURL != NULL) {
-		free(pWrkrData-&gt;restURL);
-		pWrkrData-&gt;restURL = NULL;
-	}
-	es_deleteStr(pWrkrData-&gt;batch.data);
-ENDfreeWrkrInstance
-
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-	dbgprintf("omclickhouse\n");
-	dbgprintf("\tserver='%s'\n", pData-&gt;serverBaseUrl);
-	dbgprintf("\tport='%d'\n", pData-&gt;port);
-	dbgprintf("\tuser='%s'\n", pData-&gt;user);
-	dbgprintf("\tpwd='%s'\n", pData-&gt;pwd);
-	dbgprintf("\thealthCheckTimeout=%lu\n", pData-&gt;healthCheckTimeout);
-	dbgprintf("\ttimeout=%lu\n", pData-&gt;timeout);
-	dbgprintf("\ttemplate='%s'\n", pData-&gt;tplName);
-	dbgprintf("\tusehttps='%d'\n", pData-&gt;useHttps);
-	dbgprintf("\tallowunsignedcerts='%d'\n", pData-&gt;allowUnsignedCerts);
-	dbgprintf("\tskipverifyhost='%d'\n", pData-&gt;skipVerifyHost);
-	dbgprintf("\terrorFile='%s'\n", pData-&gt;errorFile);
-	dbgprintf("\tbulkmode='%d'\n", pData-&gt;bulkmode);
-	dbgprintf("\tmaxbytes='%zu'\n", pData-&gt;maxbytes);
-	dbgprintf("\ttls.cacert='%s'\n", pData-&gt;caCertFile);
-	dbgprintf("\ttls.mycert='%s'\n", pData-&gt;myCertFile);
-	dbgprintf("\ttls.myprivkey='%s'\n", pData-&gt;myPrivKeyFile);
-ENDdbgPrintInstInfo
-
-
-/* checks if connection to clickhouse can be established
- */
-static rsRetVal ATTR_NONNULL()
-checkConn(wrkrInstanceData_t *const pWrkrData)
-{
-	CURL *curl;
-	CURLcode res;
-	char errbuf[CURL_ERROR_SIZE] = "";
-	const char* healthCheckMessage ="SELECT 1";
-	DEFiRet;
-
-	pWrkrData-&gt;reply = NULL;
-	pWrkrData-&gt;replyLen = 0;
-	curl = pWrkrData-&gt;curlCheckConnHandle;
-	
-
-	curl_easy_setopt(curl, CURLOPT_URL, pWrkrData-&gt;restURL);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, healthCheckMessage);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(healthCheckMessage));
-	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-	res = curl_easy_perform(curl);
-
-	if (res == CURLE_OK) {
-		DBGPRINTF("omclickhouse: checkConn completed with success\n");
-		ABORT_FINALIZE(RS_RET_OK);
-	}
-
-	DBGPRINTF("omclickhouse: checkConn failed: %s\n",
-		curl_easy_strerror(res));
-
-	LogMsg(0, RS_RET_SUSPENDED, LOG_WARNING,
-		"omclickhouse: checkConn failed.");
-	ABORT_FINALIZE(RS_RET_SUSPENDED);
-
-finalize_it:
-	free(pWrkrData-&gt;reply);
-	pWrkrData-&gt;reply = NULL; /* don't leave dangling pointer */
-	RETiRet;
-}
-
-
-BEGINtryResume
-CODESTARTtryResume
-	dbgprintf("omclickhouse: tryResume called\n");
-	iRet = checkConn(pWrkrData);
-ENDtryResume
-
-
-/*
- * Dumps entire bulk request and response in error log
- */
-static rsRetVal
-getDataErrorDefault(wrkrInstanceData_t *pWrkrData, char *reply, uchar *reqmsg, char **rendered)
-{
-	DEFiRet;
-	fjson_object *req=NULL;
-	fjson_object *errRoot=NULL;
-
-	if((req=fjson_object_new_object()) == NULL) ABORT_FINALIZE(RS_RET_ERR);
-	fjson_object_object_add(req, "url", fjson_object_new_string((char*)pWrkrData-&gt;restURL));
-	fjson_object_object_add(req, "postdata", fjson_object_new_string((char*)reqmsg));
-
-	if((errRoot=fjson_object_new_object()) == NULL) ABORT_FINALIZE(RS_RET_ERR);
-	fjson_object_object_add(errRoot, "request", req);
-	fjson_object_object_add(errRoot, "reply", fjson_object_new_string(reply));
-	*rendered = strdup((char*)fjson_object_to_json_string(errRoot));
-
-	req=NULL;
-	fjson_object_put(errRoot);
-
-	finalize_it:
-		fjson_object_put(req);
-		RETiRet;
-}
-
-
-/* write data error request/replies to separate error file
- * Note: we open the file but never close it before exit. If it
- * needs to be closed, HUP must be sent.
- */
-static rsRetVal ATTR_NONNULL()
-writeDataError(wrkrInstanceData_t *const pWrkrData, uchar *const reqmsg)
-{
-	DEFiRet;
-	instanceData *pData = pWrkrData-&gt;pData;
-	char *rendered = pWrkrData-&gt;reply;
-	size_t toWrite;
-	ssize_t wrRet;
-
-	if(pData-&gt;errorFile == NULL) {
-		dbgprintf("omclickhouse: no local error logger defined - "
-		          "ignoring ClickHouse error information\n");
-		FINALIZE;
-	}
-
-
-	if(pData-&gt;fdErrFile == -1) {
-		pData-&gt;fdErrFile = open((char*)pData-&gt;errorFile,
-					O_WRONLY|O_CREAT|O_APPEND|O_LARGEFILE|O_CLOEXEC,
-					S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP);
-		if(pData-&gt;fdErrFile == -1) {
-			LogError(errno, RS_RET_ERR, "omclickhouse: error opening error file %s",
-				pData-&gt;errorFile);
-			ABORT_FINALIZE(RS_RET_ERR);
-		}
-	}
-
-	if(getDataErrorDefault(pWrkrData, pWrkrData-&gt;reply, reqmsg, &amp;rendered) != RS_RET_OK) {
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-
-	/* we do not do real error-handling on the err file, as this finally complicates
-	 * things way to much.
-	 */
-	dbgprintf("omclickhouse: message sent: '%s'\n", reqmsg);
-	dbgprintf("omclickhouse: error record: '%s'\n", rendered);
-	toWrite = strlen(rendered) + 1;
-	/* Note: we overwrite the '\0' terminator with '\n' -- so we avoid
-	 * caling malloc() -- write() does NOT need '\0'!
-	 */
-	rendered[toWrite-1] = '\n'; /* NO LONGER A STRING! */
-	wrRet = write(pData-&gt;fdErrFile, rendered, toWrite);
-	if(wrRet != (ssize_t) toWrite) {
-		LogError(errno, RS_RET_IO_ERROR,
-			"omclickhouse: error writing error file %s, write returned %lld",
-			pData-&gt;errorFile, (long long) wrRet);
-	}
-
-finalize_it:
-	RETiRet;
-}
-
-
-static rsRetVal
-checkResult(wrkrInstanceData_t *pWrkrData, uchar *reqmsg)
-{
-	DEFiRet;
-
-	if(strstr(pWrkrData-&gt;reply, " = DB::Exception") != NULL) {
-		dbgprintf("omclickhouse: action failed with error: %s\n", pWrkrData-&gt;reply);
-		iRet = RS_RET_DATAFAIL;
-	}
-
-	if(iRet == RS_RET_DATAFAIL) {
-		STATSCOUNTER_INC(indexFail, mutIndexFail);
-		writeDataError(pWrkrData, reqmsg);
-		iRet = RS_RET_OK; /* we have handled the problem! */
-	}
-
-
-	if(iRet != RS_RET_OK) {
-		STATSCOUNTER_INC(indexFail, mutIndexFail);
-	}
-	RETiRet;
-}
-
-static rsRetVal ATTR_NONNULL(1)
-setPostURL(wrkrInstanceData_t *const pWrkrData)
-{
-	char* baseUrl;
-	es_str_t *url;
-	DEFiRet;
-	instanceData *const pData = pWrkrData-&gt;pData;
-
-	baseUrl = (char*)pData-&gt;serverBaseUrl;
-	url = es_newStrFromCStr(baseUrl, strlen(baseUrl));
-	if (url == NULL) {
-		LogError(0, RS_RET_OUT_OF_MEMORY,
-			"omclickhouse: error allocating new estr for POST url.");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-
-	if(pWrkrData-&gt;restURL != NULL)
-		free(pWrkrData-&gt;restURL);
-
-	pWrkrData-&gt;restURL = (uchar*)es_str2cstr(url, NULL);
-	curl_easy_setopt(pWrkrData-&gt;curlPostHandle, CURLOPT_URL, pWrkrData-&gt;restURL);
-	dbgprintf("omclickhouse: using REST URL: '%s'\n", pWrkrData-&gt;restURL);
-
-finalize_it:
-	if (url != NULL)
-		es_deleteStr(url);
-	RETiRet;
-}
-
-
-/* this method computes the next data set to be added to the batch
- * returns the expected size of adding the next message into the
- * batched request to clickhouse
- */
-static size_t
-computeBulkMessage(const wrkrInstanceData_t *const pWrkrData,
-	const uchar *const message, char **newMessage)
-{
-	size_t r = 0;
-	char *v;
-	if (pWrkrData-&gt;batch.nmemb != 0
-	&amp;&amp; (v = strstr((const char *)message, "VALUES")) != NULL
-	&amp;&amp; (v = strchr(v, '(')) != NULL
-	) {
-		*newMessage = v;
-		r = strlen(*newMessage);
-	} else {
-		*newMessage = (char*)message;
-		r = strlen(*newMessage);
-	}
-	dbgprintf("omclickhouse: computeBulkMessage: new message part: %s\n", *newMessage);
-
-	return r;
-}
-
-
-/* This method builds the batch, that will be submitted.
- */
-static rsRetVal
-buildBatch(wrkrInstanceData_t *pWrkrData, char *message)
-{
-	DEFiRet;
-	int length = strlen(message);
-	int r;
-
-	r = es_addBuf(&amp;pWrkrData-&gt;batch.data, message, length);
-	if(r != 0) {
-		LogError(0, RS_RET_ERR, "omclickhouse: growing batch failed with code %d", r);
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	++pWrkrData-&gt;batch.nmemb;
-	iRet = RS_RET_OK;
-
-finalize_it:
-	RETiRet;
-}
-
-
-static void ATTR_NONNULL()
-initializeBatch(wrkrInstanceData_t *pWrkrData)
-{
-	es_emptyStr(pWrkrData-&gt;batch.data);
-	pWrkrData-&gt;batch.nmemb = 0;
-}
-
-
-static rsRetVal ATTR_NONNULL(1, 2)
-curlPost(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, const int nmsgs)
-{
-	CURLcode code;
-	CURL *const curl = pWrkrData-&gt;curlPostHandle;
-	char errbuf[CURL_ERROR_SIZE] = "";
-	DEFiRet;
-
-	if(!strstr((char*)message, "INSERT INTO") &amp;&amp; !pWrkrData-&gt;insertErrorSent) {
-		indexHTTPFail += nmsgs;
-		LogError(0, RS_RET_ERR, "omclickhouse: Message is no Insert query: "
-				"Message suspended: %s", (char*)message);
-		pWrkrData-&gt;insertErrorSent = 1;
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-
-	pWrkrData-&gt;reply = NULL;
-	pWrkrData-&gt;replyLen = 0;
-
-	CHKiRet(setPostURL(pWrkrData));
-
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, (char *)message);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, msglen);
-	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-	code = curl_easy_perform(curl);
-	dbgprintf("curl returned %lld\n", (long long) code);
-	if (code != CURLE_OK &amp;&amp; code != CURLE_HTTP_RETURNED_ERROR) {
-		STATSCOUNTER_INC(indexHTTPReqFail, mutIndexHTTPReqFail);
-		indexHTTPFail += nmsgs;
-		LogError(0, RS_RET_SUSPENDED,
-			"omclickhouse: we are suspending ourselfs due "
-			"to server failure %lld: %s", (long long) code, errbuf);
-		ABORT_FINALIZE(RS_RET_SUSPENDED);
-	}
-
-	if(pWrkrData-&gt;reply == NULL) {
-		dbgprintf("omclickhouse: pWrkrData reply==NULL, replyLen = '%d'\n",
-			pWrkrData-&gt;replyLen);
-		STATSCOUNTER_INC(indexSuccess, mutIndexSuccess);
-	} else {
-		dbgprintf("omclickhouse: pWrkrData replyLen = '%d'\n", pWrkrData-&gt;replyLen);
-		if(pWrkrData-&gt;replyLen &gt; 0) {
-			pWrkrData-&gt;reply[pWrkrData-&gt;replyLen] = '\0';
-			/* Append 0 Byte if replyLen is above 0 - byte has been reserved in malloc */
-		}
-		dbgprintf("omclickhouse: pWrkrData reply: '%s'\n", pWrkrData-&gt;reply);
-		CHKiRet(checkResult(pWrkrData, message));
-	}
-
-finalize_it:
-	free(pWrkrData-&gt;reply);
-	pWrkrData-&gt;reply = NULL; /* don't leave dangling pointer */
-	RETiRet;
-}
-
-
-static rsRetVal
-submitBatch(wrkrInstanceData_t *pWrkrData)
-{
-	char *cstr = NULL;
-	DEFiRet;
-
-	cstr = es_str2cstr(pWrkrData-&gt;batch.data, NULL);
-	dbgprintf("omclickhouse: submitBatch, batch: '%s'\n", cstr);
-
-	CHKiRet(curlPost(pWrkrData, (uchar*) cstr, strlen(cstr), pWrkrData-&gt;batch.nmemb));
-
-finalize_it:
-	free(cstr);
-	RETiRet;
-}
-
-
-BEGINbeginTransaction
-CODESTARTbeginTransaction
-	if(!pWrkrData-&gt;pData-&gt;bulkmode) {
-		FINALIZE;
-	}
-
-	initializeBatch(pWrkrData);
-finalize_it:
-ENDbeginTransaction
-
-
-BEGINdoAction
-	char *batchPart = NULL;
-CODESTARTdoAction
-	dbgprintf("CODESTARTdoAction: entered\n");
-	STATSCOUNTER_INC(indexSubmit, mutIndexSubmit);
-
-	if(pWrkrData-&gt;pData-&gt;bulkmode) {
-		const size_t nBytes = computeBulkMessage(pWrkrData, ppString[0], &amp;batchPart);
-		dbgprintf("pascal: doAction: message: %s\n", batchPart);
-
-		/* If max bytes is set and this next message will put us over the limit,
-		* submit the current buffer and reset */
-		if(pWrkrData-&gt;pData-&gt;maxbytes &gt; 0
-			&amp;&amp; es_strlen(pWrkrData-&gt;batch.data) + nBytes &gt; pWrkrData-&gt;pData-&gt;maxbytes) {
-
-			dbgprintf("omclickhouse: maxbytes limit reached, submitting partial "
-				"batch of %d elements.\n", pWrkrData-&gt;batch.nmemb);
-			CHKiRet(submitBatch(pWrkrData));
-			initializeBatch(pWrkrData);
-			batchPart = (char*)ppString[0];
-		}
-
-		CHKiRet(buildBatch(pWrkrData, batchPart));
-
-		iRet = pWrkrData-&gt;batch.nmemb == 1 ? RS_RET_PREVIOUS_COMMITTED : RS_RET_DEFER_COMMIT;
-	} else {
-		CHKiRet(curlPost(pWrkrData, ppString[0], strlen((char*)ppString[0]), 1));
-	}
-finalize_it:
-ENDdoAction
-
-
-BEGINendTransaction
-CODESTARTendTransaction
-/* End Transaction only if batch data is not empty */
-	if (pWrkrData-&gt;batch.data != NULL &amp;&amp; pWrkrData-&gt;batch.nmemb &gt; 0) {
-		CHKiRet(submitBatch(pWrkrData));
-	} else {
-		dbgprintf("omclickhouse: endTransaction, pWrkrData-&gt;batch.data is NULL, "
-			"nothing to send. \n");
-	}
-finalize_it:
-ENDendTransaction
-
-static void ATTR_NONNULL()
-setInstParamDefaults(instanceData *const pData)
-{
-	pData-&gt;serverBaseUrl = NULL;
-	pData-&gt;port = 8123;
-	pData-&gt;user = NULL;
-	pData-&gt;pwd = NULL;
-	pData-&gt;healthCheckTimeout = 3500;
-	pData-&gt;timeout = 0;
-	pData-&gt;authBuf = NULL;
-	pData-&gt;tplName = NULL;
-	pData-&gt;useHttps = 1;
-	pData-&gt;allowUnsignedCerts = 1;
-	pData-&gt;skipVerifyHost = 0;
-	pData-&gt;errorFile = NULL;
-	pData-&gt;bulkmode = 1;
-	pData-&gt;maxbytes = 104857600; //100MB
-	pData-&gt;caCertFile = NULL;
-	pData-&gt;myCertFile = NULL;
-	pData-&gt;myPrivKeyFile = NULL;
-}
-
-/* POST result string ... useful for debugging */
-static size_t
-curlResult(void *ptr, size_t size, size_t nmemb, void *userdata)
-{
-	char *p = (char *)ptr;
-	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*) userdata;
-	char *buf;
-	size_t newlen;
-	newlen = pWrkrData-&gt;replyLen + size*nmemb;
-	if((buf = realloc(pWrkrData-&gt;reply, newlen + 1)) == NULL) {
-		LogError(errno, RS_RET_ERR, "omclickhouse: realloc failed in curlResult");
-		return 0; /* abort due to failure */
-	}
-	memcpy(buf+pWrkrData-&gt;replyLen, p, size*nmemb);
-	pWrkrData-&gt;replyLen = newlen;
-	pWrkrData-&gt;reply = buf;
-	return size*nmemb;
-}
-
-static void ATTR_NONNULL()
-curlSetupCommon(wrkrInstanceData_t *const pWrkrData, CURL *const handle)
-{
-	curl_easy_setopt(handle, CURLOPT_HTTPHEADER, pWrkrData-&gt;curlHeader);
-	curl_easy_setopt(handle, CURLOPT_NOSIGNAL, TRUE);
-	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curlResult);
-	curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
-	if(pWrkrData-&gt;pData-&gt;allowUnsignedCerts)
-		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, FALSE);
-	if(pWrkrData-&gt;pData-&gt;skipVerifyHost)
-		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, FALSE);
-	if(pWrkrData-&gt;pData-&gt;authBuf != NULL) {
-		curl_easy_setopt(handle, CURLOPT_USERPWD, pWrkrData-&gt;pData-&gt;authBuf);
-		curl_easy_setopt(handle, CURLOPT_PROXYAUTH, CURLAUTH_ANY);
-	}
-
-	if(pWrkrData-&gt;pData-&gt;caCertFile) {
-		curl_easy_setopt(handle, CURLOPT_CAINFO, pWrkrData-&gt;pData-&gt;caCertFile);
-	}
-	if(pWrkrData-&gt;pData-&gt;myCertFile) {
-		curl_easy_setopt(handle, CURLOPT_SSLCERT, pWrkrData-&gt;pData-&gt;myCertFile);
-	}
-	if(pWrkrData-&gt;pData-&gt;myPrivKeyFile) {
-		curl_easy_setopt(handle, CURLOPT_SSLKEY, pWrkrData-&gt;pData-&gt;myPrivKeyFile);
-	}
-	/* uncomment for in-dept debuggung:
-	curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE); */
-}
-
-
-static void ATTR_NONNULL()
-curlCheckConnSetup(wrkrInstanceData_t *const pWrkrData)
-{
-	curlSetupCommon(pWrkrData, pWrkrData-&gt;curlCheckConnHandle);
-	curl_easy_setopt(pWrkrData-&gt;curlCheckConnHandle,
-		CURLOPT_TIMEOUT_MS, pWrkrData-&gt;pData-&gt;healthCheckTimeout);
-}
-
-
-static void ATTR_NONNULL(1)
-curlPostSetup(wrkrInstanceData_t *const pWrkrData)
-{
-	curlSetupCommon(pWrkrData, pWrkrData-&gt;curlPostHandle);
-	curl_easy_setopt(pWrkrData-&gt;curlPostHandle, CURLOPT_POST, 1);
-	if(pWrkrData-&gt;pData-&gt;timeout) {
-		curl_easy_setopt(pWrkrData-&gt;curlPostHandle,
-			CURLOPT_TIMEOUT_MS, pWrkrData-&gt;pData-&gt;timeout);
-	}
-}
-
-#define CONTENT_JSON "Content-Type: application/json; charset=utf-8"
-
-static rsRetVal ATTR_NONNULL()
-curlSetup(wrkrInstanceData_t *const pWrkrData)
-{
-	DEFiRet;
-	pWrkrData-&gt;curlHeader = curl_slist_append(NULL, CONTENT_JSON);
-	CHKmalloc(pWrkrData-&gt;curlPostHandle = curl_easy_init());
-	curlPostSetup(pWrkrData);
-
-	CHKmalloc(pWrkrData-&gt;curlCheckConnHandle = curl_easy_init());
-	curlCheckConnSetup(pWrkrData);
-
-finalize_it:
-	if(iRet != RS_RET_OK &amp;&amp; pWrkrData-&gt;curlPostHandle != NULL) {
-		curl_easy_cleanup(pWrkrData-&gt;curlPostHandle);
-		pWrkrData-&gt;curlPostHandle = NULL;
-	}
-	RETiRet;
-}
-
-static rsRetVal
-computeAuthHeader(char* user, char* pwd, uchar** authBuf)
-{
-	DEFiRet;
-	int r;
-
-	es_str_t* auth = es_newStr(1024);
-	if (auth == NULL) {
-		LogError(0, RS_RET_OUT_OF_MEMORY,
-			"omclickhouse: failed to allocate es_str auth for auth header construction");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-
-	r = es_addBuf(&amp;auth, user, strlen(user));
-	if(r == 0)
-		r = es_addChar(&amp;auth, ':');
-	if(r == 0 &amp;&amp; pwd != NULL)
-		r = es_addBuf(&amp;auth, pwd, strlen(pwd));
-	if(r == 0)
-		*authBuf = (uchar*) es_str2cstr(auth, NULL);
-
-	if (r != 0 || *authBuf == NULL) {
-		LogError(0, RS_RET_ERR, "omclickhouse: failed to build auth header\n");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-
-finalize_it:
-	if (auth != NULL)
-		es_deleteStr(auth);
-	RETiRet;
-}
-
-/* Build basic URL part, which includes hostname, port, user, pwd as follows:
- * http://user:pwd@hostname:port/ based on a server param
- * Newly creates a cstr for this purpose.
- */
-static rsRetVal
-computeBaseUrl(const char* server, const int port, const sbool useHttps, instanceData *pData)
-{
-#	define SCHEME_HTTPS "https://"
-#	define SCHEME_HTTP "http://"
-
-	char portBuf[64];
-	int r = 0;
-	const char *host = server;
-	DEFiRet;
-
-	assert(server[strlen(server)-1] != '/');
-
-	es_str_t *urlBuf = es_newStr(256);
-	if (urlBuf == NULL) {
-		LogError(0, RS_RET_OUT_OF_MEMORY,
-		"omclickhouse: failed to allocate es_str urlBuf in computeBaseUrl");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-
-	/* Find where the hostname/ip of the server starts. If the scheme is not specified
-	  in the uri, start the buffer with a scheme corresponding to the useHttps parameter.
-	*/
-	if(strcasestr(server, SCHEME_HTTP)) {
-		host = server + strlen(SCHEME_HTTP);
-	} else if(strcasestr(server, SCHEME_HTTPS)) {
-		host = server + strlen(SCHEME_HTTPS);
-	} else {
-		r = useHttps ? es_addBuf(&amp;urlBuf, SCHEME_HTTPS, sizeof(SCHEME_HTTPS)-1) :
-			es_addBuf(&amp;urlBuf, SCHEME_HTTP, sizeof(SCHEME_HTTP)-1);
-	}
-	if (r == 0)
-		r = es_addBuf(&amp;urlBuf, (char *)server, strlen(server));
-	if (r == 0 &amp;&amp; !strchr(host, ':')) {
-		snprintf(portBuf, sizeof(portBuf), ":%d", port);
-		r = es_addBuf(&amp;urlBuf, portBuf, strlen(portBuf));
-	}
-	if (r == 0)
-		r = es_addChar(&amp;urlBuf, '/');
-	if (r == 0)
-		pData-&gt;serverBaseUrl = (uchar*) es_str2cstr(urlBuf, NULL);
-
-	if (r != 0 || pData-&gt;serverBaseUrl == NULL) {
-		LogError(0, RS_RET_ERR, "omclickhouse: error occurred computing baseUrl from "
-			"server %s", server);
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-finalize_it:
-	if (urlBuf) {
-		es_deleteStr(urlBuf);
-	}
-	RETiRet;
-}
-
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	uchar *server = NULL;
-	int i;
-<a name="2"></a>	FILE *fp;
-	char errStr[1024];
-CODESTARTnewActInst
-<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	CHKiRet(createInstance(&amp;pData));
-	setInstParamDefaults(pData);
-
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(actpblk.descr[i].name, "server")) {
-<a name="1"></a>			server = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "port")) {
-			pData-&gt;port = (int) pvals[i].val.d.n;</b></font>
-<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		} else if(!strcmp(actpblk.descr[i].name, "user")) {
-			pData-&gt;user = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "pwd")) {
-			pData-&gt;pwd = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "healthchecktimeout")) {
-			pData-&gt;healthCheckTimeout = (long) pvals[i].val.d.n;</b></font>
-		} else if(!strcmp(actpblk.descr[i].name, "timeout")) {
-			pData-&gt;timeout = (long) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "template")) {
-			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "usehttps")) {
-			pData-&gt;useHttps = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "allowunsignedcerts")) {
-			pData-&gt;allowUnsignedCerts = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "skipverifyhost")) {
-			pData-&gt;skipVerifyHost = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "errorfile")) {
-			pData-&gt;errorFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "bulkmode")) {
-			pData-&gt;bulkmode = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "maxbytes")) {
-			pData-&gt;maxbytes = (size_t) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "tls.cacert")) {
-			pData-&gt;caCertFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			fp = fopen((const char*)pData-&gt;caCertFile, "r");
-			if(fp == NULL) {
-				rs_strerror_r(errno, errStr, sizeof(errStr));
-				LogError(0, RS_RET_NO_FILE_ACCESS,
-					"error: omclickhouse: 'tls.cacert' file %s couldn't be accessed: %s\n",
-						pData-&gt;caCertFile, errStr);
-			} else {
-				fclose(fp);
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "tls.mycert")) {
-			pData-&gt;myCertFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			fp = fopen((const char*)pData-&gt;myCertFile, "r");
-			if(fp == NULL) {
-				rs_strerror_r(errno, errStr, sizeof(errStr));
-				LogError(0, RS_RET_NO_FILE_ACCESS,
-					"error: omclickhouse: 'tls.mycert' file %s couldn't be accessed: %s\n",
-						pData-&gt;myCertFile, errStr);
-			} else {
-				fclose(fp);
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "tls.myprivkey")) {
-			pData-&gt;myPrivKeyFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			fp = fopen((const char*)pData-&gt;myPrivKeyFile, "r");
-			if(fp == NULL) {
-				rs_strerror_r(errno, errStr, sizeof(errStr));
-				LogError(0, RS_RET_NO_FILE_ACCESS,
-					"error: omclickhouse: 'tls.myprivkey' file %s couldn't be accessed: %s\n",
-						pData-&gt;myPrivKeyFile, errStr);
-			} else {
-				fclose(fp);
-			}
-		} else {
-			LogError(0, RS_RET_INTERNAL_ERROR, "omclickhouse: program error, "
-				"non-handled param '%s'", actpblk.descr[i].name);
-		}
-	}
-
-
-	if(pData-&gt;user == NULL &amp;&amp; pData-&gt;pwd != NULL) {
-		LogMsg(0, RS_RET_OK, LOG_WARNING, "omclickhouse: No user was specified "
-				"but a password was given.");
-	}
-
-	if(pData-&gt;user != NULL)
-		CHKiRet(computeAuthHeader((char*) pData-&gt;user, (char*) pData-&gt;pwd, &amp;pData-&gt;authBuf));
-
-	CODE_STD_STRING_REQUESTnewActInst(1)
-	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup((pData-&gt;tplName == NULL) ?
-		" StdClickHouseFmt" : (char*)pData-&gt;tplName), OMSR_RQD_TPL_OPT_SQL));
-
-	if(server != NULL) {
-		CHKiRet(computeBaseUrl((const char*)server, pData-&gt;port, pData-&gt;useHttps, pData));
-	} else {
-		LogMsg(0, RS_RET_OK, LOG_WARNING,
-			"omclickhouse: No servers specified, using localhost");
-		CHKiRet(computeBaseUrl("localhost", pData-&gt;port, pData-&gt;useHttps,
-					pData));
-<a name="4"></a>	}
-
-	/* node created, let's add to list of instance configs for the module */
-<font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if(loadModConf-&gt;tail == NULL) {
-		loadModConf-&gt;tail = loadModConf-&gt;root = pData;
-	} else {
-		loadModConf-&gt;tail-&gt;next = pData;
-		loadModConf-&gt;tail = pData;
-	}
-
-CODE_STD_FINALIZERnewActInst
-	free(server);
-	cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-
-
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	loadModConf = pModConf;</b></font>
-	pModConf-&gt;pConf = pConf;
-	pModConf-&gt;root = pModConf-&gt;tail = NULL;
-ENDbeginCnfLoad
-
-
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-	loadModConf = NULL; /* done loading */
-ENDendCnfLoad
-
-
-BEGINcheckCnf
-CODESTARTcheckCnf
-ENDcheckCnf
-
-
-BEGINactivateCnf
-CODESTARTactivateCnf
-ENDactivateCnf
-
-
-BEGINfreeCnf
-CODESTARTfreeCnf
-ENDfreeCnf
-
-
-BEGINdoHUP
-CODESTARTdoHUP
-	if(pData-&gt;fdErrFile != -1) {
-		close(pData-&gt;fdErrFile);
-		pData-&gt;fdErrFile = -1;
-	}
-ENDdoHUP
-
-
-BEGINmodExit
-CODESTARTmodExit
-	curl_global_cleanup();
-	statsobj.Destruct(&amp;indexStats);
-	objRelease(statsobj, CORE_COMPONENT);
-	objRelease(prop, CORE_COMPONENT);
-	objRelease(ruleset, CORE_COMPONENT);
-ENDmodExit
-
-NO_LEGACY_CONF_parseSelectorAct
-
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_OMOD_QUERIES
-CODEqueryEtryPt_STD_OMOD8_QUERIES
-CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
-CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-CODEqueryEtryPt_doHUP
-CODEqueryEtryPt_TXIF_OMOD_QUERIES /* we support the transactional interface! */
-CODEqueryEtryPt_STD_CONF2_QUERIES
-ENDqueryEtryPt
-
-
-BEGINmodInit()
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
-CODEmodInit_QueryRegCFSLineHdlr
-	CHKiRet(objUse(statsobj, CORE_COMPONENT));
-	CHKiRet(objUse(prop, CORE_COMPONENT));
-	CHKiRet(objUse(ruleset, CORE_COMPONENT));
-
-	if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
-		LogError(0, RS_RET_OBJ_CREATION_FAILED, "CURL fail. -indexing disabled");
-		ABORT_FINALIZE(RS_RET_OBJ_CREATION_FAILED);
-	}
-
-	/* support statistics gathering */
-	CHKiRet(statsobj.Construct(&amp;indexStats));
-	CHKiRet(statsobj.SetName(indexStats, (uchar *)"omclickhouse"));
-	CHKiRet(statsobj.SetOrigin(indexStats, (uchar *)"omclickhouse"));
-	STATSCOUNTER_INIT(indexSubmit, mutIndexSubmit);
-	CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"submitted",
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;indexSubmit));
-	STATSCOUNTER_INIT(indexHTTPFail, mutIndexHTTPFail);
-	CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"failed.http",
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;indexHTTPFail));
-	STATSCOUNTER_INIT(indexHTTPReqFail, mutIndexHTTPReqFail);
-	CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"failed.httprequests",
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;indexHTTPReqFail));
-	STATSCOUNTER_INIT(indexFail, mutIndexFail);
-	CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"failed.clickhouse",
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;indexFail));
-	STATSCOUNTER_INIT(indexSuccess, mutIndexSuccess);
-	CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"response.success",
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;indexSuccess));
-	CHKiRet(statsobj.ConstructFinalize(indexStats));
-
-ENDmodInit
-
-/* vi:set ai:
- */
+1 #include "config.h"
+2 #include "rsyslog.h"
+3 #include &lt;stdio.h&gt;
+4 #include &lt;stdarg.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;memory.h&gt;
+7 #include &lt;string.h&gt;
+8 #include &lt;curl/curl.h&gt;
+9 #include &lt;curl/easy.h&gt;
+10 #include &lt;assert.h&gt;
+11 #include &lt;signal.h&gt;
+12 #include &lt;errno.h&gt;
+13 #include &lt;time.h&gt;
+14 #include &lt;sys/types.h&gt;
+15 #include &lt;sys/stat.h&gt;
+16 #include &lt;fcntl.h&gt;
+17 #if defined(__FreeBSD__)
+18 #include &lt;unistd.h&gt;
+19 #endif
+20 #include &lt;json.h&gt;
+21 #include "conf.h"
+22 #include "syslogd-types.h"
+23 #include "srUtils.h"
+24 #include "template.h"
+25 #include "module-template.h"
+26 #include "errmsg.h"
+27 #include "statsobj.h"
+28 #include "cfsysline.h"
+29 #include "unicode-helper.h"
+30 #include "obj-types.h"
+31 #include "ratelimit.h"
+32 #include "ruleset.h"
+33 #ifndef O_LARGEFILE
+34 #  define O_LARGEFILE 0
+35 #endif
+36 MODULE_TYPE_OUTPUT
+37 MODULE_TYPE_NOKEEP
+38 MODULE_CNFNAME("omclickhouse")
+39 DEF_OMOD_STATIC_DATA
+40 DEFobjCurrIf(statsobj)
+41 DEFobjCurrIf(prop)
+42 DEFobjCurrIf(ruleset)
+43 statsobj_t *indexStats;
+44 STATSCOUNTER_DEF(indexSubmit, mutIndexSubmit)
+45 STATSCOUNTER_DEF(indexHTTPFail, mutIndexHTTPFail)
+46 STATSCOUNTER_DEF(indexHTTPReqFail, mutIndexHTTPReqFail)
+47 STATSCOUNTER_DEF(indexFail, mutIndexFail)
+48 STATSCOUNTER_DEF(indexSuccess, mutIndexSuccess)
+49 typedef struct curl_slist HEADER;
+50 typedef struct instanceConf_s {
+51 	uchar *serverBaseUrl;
+52 	int port;
+53 	uchar *user;
+54 	uchar *pwd;
+55 	long healthCheckTimeout;
+56 	long timeout;
+57 	uchar *authBuf;
+58 	uchar *tplName;
+59 	sbool useHttps;
+60 	sbool allowUnsignedCerts;
+61 	sbool skipVerifyHost;
+62 	int fdErrFile;
+63 	uchar *errorFile;
+64 	sbool bulkmode;
+65 	size_t maxbytes;
+66 	uchar *caCertFile;
+67 	uchar *myCertFile;
+68 	uchar *myPrivKeyFile;
+69 	struct instanceConf_s *next;
+70 } instanceData;
+71 struct modConfData_s {
+72 	rsconf_t *pConf;			instanceConf_t *root, *tail;
+73 };
+74 static modConfData_t *loadModConf = NULL;	
+75 typedef struct wrkrInstanceData {
+76 	PTR_ASSERT_DEF
+77 	instanceData *pData;
+78 	CURL	*curlPostHandle;		HEADER	*curlHeader;		CURL	*curlCheckConnHandle;		int replyLen;
+79 	char *reply;
+80 	uchar *restURL;
+81 	struct {
+82 		es_str_t *data;
+83 		int nmemb;		} batch;
+84 	sbool insertErrorSent;  } wrkrInstanceData_t;
+85 static struct cnfparamdescr actpdescr[] = {
+86 	{ "server", eCmdHdlrGetWord, 0 },
+87 	{ "port", eCmdHdlrInt, 0 },
+88 	{ "user", eCmdHdlrGetWord, 0 },
+89 <a name="0"></a>	{ "pwd", eCmdHdlrGetWord, 0 },
+90 	{ "healthchecktimeout", eCmdHdlrInt, 0 },
+91 	{ "timeout", eCmdHdlrInt, 0 },
+92 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "template", eCmdHdlrGetWord, 0 },
+93 	{ "usehttps", eCmdHdlrBinary, 0 },
+94 	{ "allowunsignedcerts", eCmdHdlrBinary, 0 },
+95 	{ "skipverifyhost", eCmdHdlrBinary, 0 },
+96 	{ "errorfile", eCmdHdlrGetWord, 0 },
+97 	{ "bulkmode", eCmdHdlrBinary, 0 },
+98 	{ "maxbytes", eCmdHdlrSize, 0 },
+99 	{ "tls.cacert", eCmdHdlrString, 0 },
+100 	{ "tls.mycert", eCmdHdlrString, 0 },
+101 	{ "tls.myprivkey", eCmdHdlrString, 0 }
+102 };
+103 static struct cnfparamblk actpblk =
+104 	{ CNFPARAMBLK_VERSION,
+105 	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+106 	  actpdescr
+107 	};
+108 static rsRetVal curlSetup(wrkrInstanceData_t *pWrkrData);</b></font>
+109 <a name="3"></a>BEGINcreateInstance
+110 CODESTARTcreateInstance
+111 	pData-&gt;fdErrFile = -1;
+112 <font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	pData-&gt;caCertFile = NULL;
+113 	pData-&gt;myCertFile = NULL;
+114 	pData-&gt;myPrivKeyFile = NULL;
+115 ENDcreateInstance
+116 BEGINcreateWrkrInstance
+117 CODESTARTcreateWrkrInstance
+118 	pWrkrData-&gt;curlHeader = NULL;
+119 	pWrkrData-&gt;curlPostHandle = NULL;
+120 	pWrkrData-&gt;curlCheckConnHandle = NULL;
+121 	pWrkrData-&gt;restURL = NULL;</b></font>
+122 	if(pData-&gt;bulkmode) {
+123 		if((pWrkrData-&gt;batch.data = es_newStr(1024)) == NULL) {
+124 			LogError(0, RS_RET_OUT_OF_MEMORY,
+125 				"omclickhouse: error creating batch string "
+126 			        "turned off bulk mode\n");
+127 			pData-&gt;bulkmode = 0; 		}
+128 	}
+129 	pWrkrData-&gt;insertErrorSent = 0;
+130 	iRet = curlSetup(pWrkrData);
+131 ENDcreateWrkrInstance
+132 BEGINisCompatibleWithFeature
+133 CODESTARTisCompatibleWithFeature
+134 	if(eFeat == sFEATURERepeatedMsgReduction)
+135 		iRet = RS_RET_OK;
+136 ENDisCompatibleWithFeature
+137 BEGINfreeInstance
+138 CODESTARTfreeInstance
+139 	free(pData-&gt;serverBaseUrl);
+140 	free(pData-&gt;user);
+141 	free(pData-&gt;pwd);
+142 	free(pData-&gt;authBuf);
+143 	if(pData-&gt;fdErrFile != -1)
+144 		close(pData-&gt;fdErrFile);
+145 	free(pData-&gt;errorFile);
+146 	free(pData-&gt;tplName);
+147 	free(pData-&gt;caCertFile);
+148 	free(pData-&gt;myCertFile);
+149 	free(pData-&gt;myPrivKeyFile);
+150 ENDfreeInstance
+151 BEGINfreeWrkrInstance
+152 CODESTARTfreeWrkrInstance
+153 	if(pWrkrData-&gt;curlHeader != NULL) {
+154 		curl_slist_free_all(pWrkrData-&gt;curlHeader);
+155 		pWrkrData-&gt;curlHeader = NULL;
+156 	}
+157 	if(pWrkrData-&gt;curlCheckConnHandle != NULL) {
+158 		curl_easy_cleanup(pWrkrData-&gt;curlCheckConnHandle);
+159 		pWrkrData-&gt;curlCheckConnHandle = NULL;
+160 	}
+161 	if(pWrkrData-&gt;curlPostHandle != NULL) {
+162 		curl_easy_cleanup(pWrkrData-&gt;curlPostHandle);
+163 		pWrkrData-&gt;curlPostHandle = NULL;
+164 	}
+165 	if (pWrkrData-&gt;restURL != NULL) {
+166 		free(pWrkrData-&gt;restURL);
+167 		pWrkrData-&gt;restURL = NULL;
+168 	}
+169 	es_deleteStr(pWrkrData-&gt;batch.data);
+170 ENDfreeWrkrInstance
+171 BEGINdbgPrintInstInfo
+172 CODESTARTdbgPrintInstInfo
+173 	dbgprintf("omclickhouse\n");
+174 	dbgprintf("\tserver='%s'\n", pData-&gt;serverBaseUrl);
+175 	dbgprintf("\tport='%d'\n", pData-&gt;port);
+176 	dbgprintf("\tuser='%s'\n", pData-&gt;user);
+177 	dbgprintf("\tpwd='%s'\n", pData-&gt;pwd);
+178 	dbgprintf("\thealthCheckTimeout=%lu\n", pData-&gt;healthCheckTimeout);
+179 	dbgprintf("\ttimeout=%lu\n", pData-&gt;timeout);
+180 	dbgprintf("\ttemplate='%s'\n", pData-&gt;tplName);
+181 	dbgprintf("\tusehttps='%d'\n", pData-&gt;useHttps);
+182 	dbgprintf("\tallowunsignedcerts='%d'\n", pData-&gt;allowUnsignedCerts);
+183 	dbgprintf("\tskipverifyhost='%d'\n", pData-&gt;skipVerifyHost);
+184 	dbgprintf("\terrorFile='%s'\n", pData-&gt;errorFile);
+185 	dbgprintf("\tbulkmode='%d'\n", pData-&gt;bulkmode);
+186 	dbgprintf("\tmaxbytes='%zu'\n", pData-&gt;maxbytes);
+187 	dbgprintf("\ttls.cacert='%s'\n", pData-&gt;caCertFile);
+188 	dbgprintf("\ttls.mycert='%s'\n", pData-&gt;myCertFile);
+189 	dbgprintf("\ttls.myprivkey='%s'\n", pData-&gt;myPrivKeyFile);
+190 ENDdbgPrintInstInfo
+191 static rsRetVal ATTR_NONNULL()
+192 checkConn(wrkrInstanceData_t *const pWrkrData)
+193 {
+194 	CURL *curl;
+195 	CURLcode res;
+196 	char errbuf[CURL_ERROR_SIZE] = "";
+197 	const char* healthCheckMessage ="SELECT 1";
+198 	DEFiRet;
+199 	pWrkrData-&gt;reply = NULL;
+200 	pWrkrData-&gt;replyLen = 0;
+201 	curl = pWrkrData-&gt;curlCheckConnHandle;
+202 	curl_easy_setopt(curl, CURLOPT_URL, pWrkrData-&gt;restURL);
+203 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, healthCheckMessage);
+204 	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(healthCheckMessage));
+205 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+206 	res = curl_easy_perform(curl);
+207 	if (res == CURLE_OK) {
+208 		DBGPRINTF("omclickhouse: checkConn completed with success\n");
+209 		ABORT_FINALIZE(RS_RET_OK);
+210 	}
+211 	DBGPRINTF("omclickhouse: checkConn failed: %s\n",
+212 		curl_easy_strerror(res));
+213 	LogMsg(0, RS_RET_SUSPENDED, LOG_WARNING,
+214 		"omclickhouse: checkConn failed.");
+215 	ABORT_FINALIZE(RS_RET_SUSPENDED);
+216 finalize_it:
+217 	free(pWrkrData-&gt;reply);
+218 	pWrkrData-&gt;reply = NULL; 	RETiRet;
+219 }
+220 BEGINtryResume
+221 CODESTARTtryResume
+222 	dbgprintf("omclickhouse: tryResume called\n");
+223 	iRet = checkConn(pWrkrData);
+224 ENDtryResume
+225 static rsRetVal
+226 getDataErrorDefault(wrkrInstanceData_t *pWrkrData, char *reply, uchar *reqmsg, char **rendered)
+227 {
+228 	DEFiRet;
+229 	fjson_object *req=NULL;
+230 	fjson_object *errRoot=NULL;
+231 	if((req=fjson_object_new_object()) == NULL) ABORT_FINALIZE(RS_RET_ERR);
+232 	fjson_object_object_add(req, "url", fjson_object_new_string((char*)pWrkrData-&gt;restURL));
+233 	fjson_object_object_add(req, "postdata", fjson_object_new_string((char*)reqmsg));
+234 	if((errRoot=fjson_object_new_object()) == NULL) ABORT_FINALIZE(RS_RET_ERR);
+235 	fjson_object_object_add(errRoot, "request", req);
+236 	fjson_object_object_add(errRoot, "reply", fjson_object_new_string(reply));
+237 	*rendered = strdup((char*)fjson_object_to_json_string(errRoot));
+238 	req=NULL;
+239 	fjson_object_put(errRoot);
+240 	finalize_it:
+241 		fjson_object_put(req);
+242 		RETiRet;
+243 }
+244 static rsRetVal ATTR_NONNULL()
+245 writeDataError(wrkrInstanceData_t *const pWrkrData, uchar *const reqmsg)
+246 {
+247 	DEFiRet;
+248 	instanceData *pData = pWrkrData-&gt;pData;
+249 	char *rendered = pWrkrData-&gt;reply;
+250 	size_t toWrite;
+251 	ssize_t wrRet;
+252 	if(pData-&gt;errorFile == NULL) {
+253 		dbgprintf("omclickhouse: no local error logger defined - "
+254 		          "ignoring ClickHouse error information\n");
+255 		FINALIZE;
+256 	}
+257 	if(pData-&gt;fdErrFile == -1) {
+258 		pData-&gt;fdErrFile = open((char*)pData-&gt;errorFile,
+259 					O_WRONLY|O_CREAT|O_APPEND|O_LARGEFILE|O_CLOEXEC,
+260 					S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP);
+261 		if(pData-&gt;fdErrFile == -1) {
+262 			LogError(errno, RS_RET_ERR, "omclickhouse: error opening error file %s",
+263 				pData-&gt;errorFile);
+264 			ABORT_FINALIZE(RS_RET_ERR);
+265 		}
+266 	}
+267 	if(getDataErrorDefault(pWrkrData, pWrkrData-&gt;reply, reqmsg, &amp;rendered) != RS_RET_OK) {
+268 		ABORT_FINALIZE(RS_RET_ERR);
+269 	}
+270 	dbgprintf("omclickhouse: message sent: '%s'\n", reqmsg);
+271 	dbgprintf("omclickhouse: error record: '%s'\n", rendered);
+272 	toWrite = strlen(rendered) + 1;
+273 	rendered[toWrite-1] = '\n'; 	wrRet = write(pData-&gt;fdErrFile, rendered, toWrite);
+274 	if(wrRet != (ssize_t) toWrite) {
+275 		LogError(errno, RS_RET_IO_ERROR,
+276 			"omclickhouse: error writing error file %s, write returned %lld",
+277 			pData-&gt;errorFile, (long long) wrRet);
+278 	}
+279 finalize_it:
+280 	RETiRet;
+281 }
+282 static rsRetVal
+283 checkResult(wrkrInstanceData_t *pWrkrData, uchar *reqmsg)
+284 {
+285 	DEFiRet;
+286 	if(strstr(pWrkrData-&gt;reply, " = DB::Exception") != NULL) {
+287 		dbgprintf("omclickhouse: action failed with error: %s\n", pWrkrData-&gt;reply);
+288 		iRet = RS_RET_DATAFAIL;
+289 	}
+290 	if(iRet == RS_RET_DATAFAIL) {
+291 		STATSCOUNTER_INC(indexFail, mutIndexFail);
+292 		writeDataError(pWrkrData, reqmsg);
+293 		iRet = RS_RET_OK; 	}
+294 	if(iRet != RS_RET_OK) {
+295 		STATSCOUNTER_INC(indexFail, mutIndexFail);
+296 	}
+297 	RETiRet;
+298 }
+299 static rsRetVal ATTR_NONNULL(1)
+300 setPostURL(wrkrInstanceData_t *const pWrkrData)
+301 {
+302 	char* baseUrl;
+303 	es_str_t *url;
+304 	DEFiRet;
+305 	instanceData *const pData = pWrkrData-&gt;pData;
+306 	baseUrl = (char*)pData-&gt;serverBaseUrl;
+307 	url = es_newStrFromCStr(baseUrl, strlen(baseUrl));
+308 	if (url == NULL) {
+309 		LogError(0, RS_RET_OUT_OF_MEMORY,
+310 			"omclickhouse: error allocating new estr for POST url.");
+311 		ABORT_FINALIZE(RS_RET_ERR);
+312 	}
+313 	if(pWrkrData-&gt;restURL != NULL)
+314 		free(pWrkrData-&gt;restURL);
+315 	pWrkrData-&gt;restURL = (uchar*)es_str2cstr(url, NULL);
+316 	curl_easy_setopt(pWrkrData-&gt;curlPostHandle, CURLOPT_URL, pWrkrData-&gt;restURL);
+317 	dbgprintf("omclickhouse: using REST URL: '%s'\n", pWrkrData-&gt;restURL);
+318 finalize_it:
+319 	if (url != NULL)
+320 		es_deleteStr(url);
+321 	RETiRet;
+322 }
+323 static size_t
+324 computeBulkMessage(const wrkrInstanceData_t *const pWrkrData,
+325 	const uchar *const message, char **newMessage)
+326 {
+327 	size_t r = 0;
+328 	char *v;
+329 	if (pWrkrData-&gt;batch.nmemb != 0
+330 	&amp;&amp; (v = strstr((const char *)message, "VALUES")) != NULL
+331 	&amp;&amp; (v = strchr(v, '(')) != NULL
+332 	) {
+333 		*newMessage = v;
+334 		r = strlen(*newMessage);
+335 	} else {
+336 		*newMessage = (char*)message;
+337 		r = strlen(*newMessage);
+338 	}
+339 	dbgprintf("omclickhouse: computeBulkMessage: new message part: %s\n", *newMessage);
+340 	return r;
+341 }
+342 static rsRetVal
+343 buildBatch(wrkrInstanceData_t *pWrkrData, char *message)
+344 {
+345 	DEFiRet;
+346 	int length = strlen(message);
+347 	int r;
+348 	r = es_addBuf(&amp;pWrkrData-&gt;batch.data, message, length);
+349 	if(r != 0) {
+350 		LogError(0, RS_RET_ERR, "omclickhouse: growing batch failed with code %d", r);
+351 		ABORT_FINALIZE(RS_RET_ERR);
+352 	}
+353 	++pWrkrData-&gt;batch.nmemb;
+354 	iRet = RS_RET_OK;
+355 finalize_it:
+356 	RETiRet;
+357 }
+358 static void ATTR_NONNULL()
+359 initializeBatch(wrkrInstanceData_t *pWrkrData)
+360 {
+361 	es_emptyStr(pWrkrData-&gt;batch.data);
+362 	pWrkrData-&gt;batch.nmemb = 0;
+363 }
+364 static rsRetVal ATTR_NONNULL(1, 2)
+365 curlPost(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, const int nmsgs)
+366 {
+367 	CURLcode code;
+368 	CURL *const curl = pWrkrData-&gt;curlPostHandle;
+369 	char errbuf[CURL_ERROR_SIZE] = "";
+370 	DEFiRet;
+371 	if(!strstr((char*)message, "INSERT INTO") &amp;&amp; !pWrkrData-&gt;insertErrorSent) {
+372 		indexHTTPFail += nmsgs;
+373 		LogError(0, RS_RET_ERR, "omclickhouse: Message is no Insert query: "
+374 				"Message suspended: %s", (char*)message);
+375 		pWrkrData-&gt;insertErrorSent = 1;
+376 		ABORT_FINALIZE(RS_RET_ERR);
+377 	}
+378 	pWrkrData-&gt;reply = NULL;
+379 	pWrkrData-&gt;replyLen = 0;
+380 	CHKiRet(setPostURL(pWrkrData));
+381 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, (char *)message);
+382 	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, msglen);
+383 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+384 	code = curl_easy_perform(curl);
+385 	dbgprintf("curl returned %lld\n", (long long) code);
+386 	if (code != CURLE_OK &amp;&amp; code != CURLE_HTTP_RETURNED_ERROR) {
+387 		STATSCOUNTER_INC(indexHTTPReqFail, mutIndexHTTPReqFail);
+388 		indexHTTPFail += nmsgs;
+389 		LogError(0, RS_RET_SUSPENDED,
+390 			"omclickhouse: we are suspending ourselfs due "
+391 			"to server failure %lld: %s", (long long) code, errbuf);
+392 		ABORT_FINALIZE(RS_RET_SUSPENDED);
+393 	}
+394 	if(pWrkrData-&gt;reply == NULL) {
+395 		dbgprintf("omclickhouse: pWrkrData reply==NULL, replyLen = '%d'\n",
+396 			pWrkrData-&gt;replyLen);
+397 		STATSCOUNTER_INC(indexSuccess, mutIndexSuccess);
+398 	} else {
+399 		dbgprintf("omclickhouse: pWrkrData replyLen = '%d'\n", pWrkrData-&gt;replyLen);
+400 		if(pWrkrData-&gt;replyLen &gt; 0) {
+401 			pWrkrData-&gt;reply[pWrkrData-&gt;replyLen] = '\0';
+402 		}
+403 		dbgprintf("omclickhouse: pWrkrData reply: '%s'\n", pWrkrData-&gt;reply);
+404 		CHKiRet(checkResult(pWrkrData, message));
+405 	}
+406 finalize_it:
+407 	free(pWrkrData-&gt;reply);
+408 	pWrkrData-&gt;reply = NULL; 	RETiRet;
+409 }
+410 static rsRetVal
+411 submitBatch(wrkrInstanceData_t *pWrkrData)
+412 {
+413 	char *cstr = NULL;
+414 	DEFiRet;
+415 	cstr = es_str2cstr(pWrkrData-&gt;batch.data, NULL);
+416 	dbgprintf("omclickhouse: submitBatch, batch: '%s'\n", cstr);
+417 	CHKiRet(curlPost(pWrkrData, (uchar*) cstr, strlen(cstr), pWrkrData-&gt;batch.nmemb));
+418 finalize_it:
+419 	free(cstr);
+420 	RETiRet;
+421 }
+422 BEGINbeginTransaction
+423 CODESTARTbeginTransaction
+424 	if(!pWrkrData-&gt;pData-&gt;bulkmode) {
+425 		FINALIZE;
+426 	}
+427 	initializeBatch(pWrkrData);
+428 finalize_it:
+429 ENDbeginTransaction
+430 BEGINdoAction
+431 	char *batchPart = NULL;
+432 CODESTARTdoAction
+433 	dbgprintf("CODESTARTdoAction: entered\n");
+434 	STATSCOUNTER_INC(indexSubmit, mutIndexSubmit);
+435 	if(pWrkrData-&gt;pData-&gt;bulkmode) {
+436 		const size_t nBytes = computeBulkMessage(pWrkrData, ppString[0], &amp;batchPart);
+437 		dbgprintf("pascal: doAction: message: %s\n", batchPart);
+438 		if(pWrkrData-&gt;pData-&gt;maxbytes &gt; 0
+439 			&amp;&amp; es_strlen(pWrkrData-&gt;batch.data) + nBytes &gt; pWrkrData-&gt;pData-&gt;maxbytes) {
+440 			dbgprintf("omclickhouse: maxbytes limit reached, submitting partial "
+441 				"batch of %d elements.\n", pWrkrData-&gt;batch.nmemb);
+442 			CHKiRet(submitBatch(pWrkrData));
+443 			initializeBatch(pWrkrData);
+444 			batchPart = (char*)ppString[0];
+445 		}
+446 		CHKiRet(buildBatch(pWrkrData, batchPart));
+447 		iRet = pWrkrData-&gt;batch.nmemb == 1 ? RS_RET_PREVIOUS_COMMITTED : RS_RET_DEFER_COMMIT;
+448 	} else {
+449 		CHKiRet(curlPost(pWrkrData, ppString[0], strlen((char*)ppString[0]), 1));
+450 	}
+451 finalize_it:
+452 ENDdoAction
+453 BEGINendTransaction
+454 CODESTARTendTransaction
+455 	if (pWrkrData-&gt;batch.data != NULL &amp;&amp; pWrkrData-&gt;batch.nmemb &gt; 0) {
+456 		CHKiRet(submitBatch(pWrkrData));
+457 	} else {
+458 		dbgprintf("omclickhouse: endTransaction, pWrkrData-&gt;batch.data is NULL, "
+459 			"nothing to send. \n");
+460 	}
+461 finalize_it:
+462 ENDendTransaction
+463 static void ATTR_NONNULL()
+464 setInstParamDefaults(instanceData *const pData)
+465 {
+466 	pData-&gt;serverBaseUrl = NULL;
+467 	pData-&gt;port = 8123;
+468 	pData-&gt;user = NULL;
+469 	pData-&gt;pwd = NULL;
+470 	pData-&gt;healthCheckTimeout = 3500;
+471 	pData-&gt;timeout = 0;
+472 	pData-&gt;authBuf = NULL;
+473 	pData-&gt;tplName = NULL;
+474 	pData-&gt;useHttps = 1;
+475 	pData-&gt;allowUnsignedCerts = 1;
+476 	pData-&gt;skipVerifyHost = 0;
+477 	pData-&gt;errorFile = NULL;
+478 	pData-&gt;bulkmode = 1;
+479 	pData-&gt;maxbytes = 104857600; //100MB
+480 	pData-&gt;caCertFile = NULL;
+481 	pData-&gt;myCertFile = NULL;
+482 	pData-&gt;myPrivKeyFile = NULL;
+483 }
+484 static size_t
+485 curlResult(void *ptr, size_t size, size_t nmemb, void *userdata)
+486 {
+487 	char *p = (char *)ptr;
+488 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*) userdata;
+489 	char *buf;
+490 	size_t newlen;
+491 	newlen = pWrkrData-&gt;replyLen + size*nmemb;
+492 	if((buf = realloc(pWrkrData-&gt;reply, newlen + 1)) == NULL) {
+493 		LogError(errno, RS_RET_ERR, "omclickhouse: realloc failed in curlResult");
+494 		return 0; 	}
+495 	memcpy(buf+pWrkrData-&gt;replyLen, p, size*nmemb);
+496 	pWrkrData-&gt;replyLen = newlen;
+497 	pWrkrData-&gt;reply = buf;
+498 	return size*nmemb;
+499 }
+500 static void ATTR_NONNULL()
+501 curlSetupCommon(wrkrInstanceData_t *const pWrkrData, CURL *const handle)
+502 {
+503 	curl_easy_setopt(handle, CURLOPT_HTTPHEADER, pWrkrData-&gt;curlHeader);
+504 	curl_easy_setopt(handle, CURLOPT_NOSIGNAL, TRUE);
+505 	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curlResult);
+506 	curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
+507 	if(pWrkrData-&gt;pData-&gt;allowUnsignedCerts)
+508 		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, FALSE);
+509 	if(pWrkrData-&gt;pData-&gt;skipVerifyHost)
+510 		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, FALSE);
+511 	if(pWrkrData-&gt;pData-&gt;authBuf != NULL) {
+512 		curl_easy_setopt(handle, CURLOPT_USERPWD, pWrkrData-&gt;pData-&gt;authBuf);
+513 		curl_easy_setopt(handle, CURLOPT_PROXYAUTH, CURLAUTH_ANY);
+514 	}
+515 	if(pWrkrData-&gt;pData-&gt;caCertFile) {
+516 		curl_easy_setopt(handle, CURLOPT_CAINFO, pWrkrData-&gt;pData-&gt;caCertFile);
+517 	}
+518 	if(pWrkrData-&gt;pData-&gt;myCertFile) {
+519 		curl_easy_setopt(handle, CURLOPT_SSLCERT, pWrkrData-&gt;pData-&gt;myCertFile);
+520 	}
+521 	if(pWrkrData-&gt;pData-&gt;myPrivKeyFile) {
+522 		curl_easy_setopt(handle, CURLOPT_SSLKEY, pWrkrData-&gt;pData-&gt;myPrivKeyFile);
+523 	}
+524 }
+525 static void ATTR_NONNULL()
+526 curlCheckConnSetup(wrkrInstanceData_t *const pWrkrData)
+527 {
+528 	curlSetupCommon(pWrkrData, pWrkrData-&gt;curlCheckConnHandle);
+529 	curl_easy_setopt(pWrkrData-&gt;curlCheckConnHandle,
+530 		CURLOPT_TIMEOUT_MS, pWrkrData-&gt;pData-&gt;healthCheckTimeout);
+531 }
+532 static void ATTR_NONNULL(1)
+533 curlPostSetup(wrkrInstanceData_t *const pWrkrData)
+534 {
+535 	curlSetupCommon(pWrkrData, pWrkrData-&gt;curlPostHandle);
+536 	curl_easy_setopt(pWrkrData-&gt;curlPostHandle, CURLOPT_POST, 1);
+537 	if(pWrkrData-&gt;pData-&gt;timeout) {
+538 		curl_easy_setopt(pWrkrData-&gt;curlPostHandle,
+539 			CURLOPT_TIMEOUT_MS, pWrkrData-&gt;pData-&gt;timeout);
+540 	}
+541 }
+542 #define CONTENT_JSON "Content-Type: application/json; charset=utf-8"
+543 static rsRetVal ATTR_NONNULL()
+544 curlSetup(wrkrInstanceData_t *const pWrkrData)
+545 {
+546 	DEFiRet;
+547 	pWrkrData-&gt;curlHeader = curl_slist_append(NULL, CONTENT_JSON);
+548 	CHKmalloc(pWrkrData-&gt;curlPostHandle = curl_easy_init());
+549 	curlPostSetup(pWrkrData);
+550 	CHKmalloc(pWrkrData-&gt;curlCheckConnHandle = curl_easy_init());
+551 	curlCheckConnSetup(pWrkrData);
+552 finalize_it:
+553 	if(iRet != RS_RET_OK &amp;&amp; pWrkrData-&gt;curlPostHandle != NULL) {
+554 		curl_easy_cleanup(pWrkrData-&gt;curlPostHandle);
+555 		pWrkrData-&gt;curlPostHandle = NULL;
+556 	}
+557 	RETiRet;
+558 }
+559 static rsRetVal
+560 computeAuthHeader(char* user, char* pwd, uchar** authBuf)
+561 {
+562 	DEFiRet;
+563 	int r;
+564 	es_str_t* auth = es_newStr(1024);
+565 	if (auth == NULL) {
+566 		LogError(0, RS_RET_OUT_OF_MEMORY,
+567 			"omclickhouse: failed to allocate es_str auth for auth header construction");
+568 		ABORT_FINALIZE(RS_RET_ERR);
+569 	}
+570 	r = es_addBuf(&amp;auth, user, strlen(user));
+571 	if(r == 0)
+572 		r = es_addChar(&amp;auth, ':');
+573 	if(r == 0 &amp;&amp; pwd != NULL)
+574 		r = es_addBuf(&amp;auth, pwd, strlen(pwd));
+575 	if(r == 0)
+576 		*authBuf = (uchar*) es_str2cstr(auth, NULL);
+577 	if (r != 0 || *authBuf == NULL) {
+578 		LogError(0, RS_RET_ERR, "omclickhouse: failed to build auth header\n");
+579 		ABORT_FINALIZE(RS_RET_ERR);
+580 	}
+581 finalize_it:
+582 	if (auth != NULL)
+583 		es_deleteStr(auth);
+584 	RETiRet;
+585 }
+586 static rsRetVal
+587 computeBaseUrl(const char* server, const int port, const sbool useHttps, instanceData *pData)
+588 {
+589 #	define SCHEME_HTTPS "https://"
+590 #	define SCHEME_HTTP "http://"
+591 	char portBuf[64];
+592 	int r = 0;
+593 	const char *host = server;
+594 	DEFiRet;
+595 	assert(server[strlen(server)-1] != '/');
+596 	es_str_t *urlBuf = es_newStr(256);
+597 	if (urlBuf == NULL) {
+598 		LogError(0, RS_RET_OUT_OF_MEMORY,
+599 		"omclickhouse: failed to allocate es_str urlBuf in computeBaseUrl");
+600 		ABORT_FINALIZE(RS_RET_ERR);
+601 	}
+602 	if(strcasestr(server, SCHEME_HTTP)) {
+603 		host = server + strlen(SCHEME_HTTP);
+604 	} else if(strcasestr(server, SCHEME_HTTPS)) {
+605 		host = server + strlen(SCHEME_HTTPS);
+606 	} else {
+607 		r = useHttps ? es_addBuf(&amp;urlBuf, SCHEME_HTTPS, sizeof(SCHEME_HTTPS)-1) :
+608 			es_addBuf(&amp;urlBuf, SCHEME_HTTP, sizeof(SCHEME_HTTP)-1);
+609 	}
+610 	if (r == 0)
+611 		r = es_addBuf(&amp;urlBuf, (char *)server, strlen(server));
+612 	if (r == 0 &amp;&amp; !strchr(host, ':')) {
+613 		snprintf(portBuf, sizeof(portBuf), ":%d", port);
+614 		r = es_addBuf(&amp;urlBuf, portBuf, strlen(portBuf));
+615 	}
+616 	if (r == 0)
+617 		r = es_addChar(&amp;urlBuf, '/');
+618 	if (r == 0)
+619 		pData-&gt;serverBaseUrl = (uchar*) es_str2cstr(urlBuf, NULL);
+620 	if (r != 0 || pData-&gt;serverBaseUrl == NULL) {
+621 		LogError(0, RS_RET_ERR, "omclickhouse: error occurred computing baseUrl from "
+622 			"server %s", server);
+623 		ABORT_FINALIZE(RS_RET_ERR);
+624 	}
+625 finalize_it:
+626 	if (urlBuf) {
+627 		es_deleteStr(urlBuf);
+628 	}
+629 	RETiRet;
+630 }
+631 BEGINnewActInst
+632 	struct cnfparamvals *pvals;
+633 	uchar *server = NULL;
+634 	int i;
+635 <a name="2"></a>	FILE *fp;
+636 	char errStr[1024];
+637 CODESTARTnewActInst
+638 <font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
+639 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+640 	}
+641 	CHKiRet(createInstance(&amp;pData));
+642 	setInstParamDefaults(pData);
+643 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+644 		if(!pvals[i].bUsed)
+645 			continue;
+646 		if(!strcmp(actpblk.descr[i].name, "server")) {
+647 <a name="1"></a>			server = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+648 		} else if(!strcmp(actpblk.descr[i].name, "port")) {
+649 			pData-&gt;port = (int) pvals[i].val.d.n;</b></font>
+650 <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		} else if(!strcmp(actpblk.descr[i].name, "user")) {
+651 			pData-&gt;user = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+652 		} else if(!strcmp(actpblk.descr[i].name, "pwd")) {
+653 			pData-&gt;pwd = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+654 		} else if(!strcmp(actpblk.descr[i].name, "healthchecktimeout")) {
+655 			pData-&gt;healthCheckTimeout = (long) pvals[i].val.d.n;</b></font>
+656 		} else if(!strcmp(actpblk.descr[i].name, "timeout")) {
+657 			pData-&gt;timeout = (long) pvals[i].val.d.n;
+658 		} else if(!strcmp(actpblk.descr[i].name, "template")) {
+659 			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+660 		} else if(!strcmp(actpblk.descr[i].name, "usehttps")) {
+661 			pData-&gt;useHttps = pvals[i].val.d.n;
+662 		} else if(!strcmp(actpblk.descr[i].name, "allowunsignedcerts")) {
+663 			pData-&gt;allowUnsignedCerts = pvals[i].val.d.n;
+664 		} else if(!strcmp(actpblk.descr[i].name, "skipverifyhost")) {
+665 			pData-&gt;skipVerifyHost = pvals[i].val.d.n;
+666 		} else if(!strcmp(actpblk.descr[i].name, "errorfile")) {
+667 			pData-&gt;errorFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+668 		} else if(!strcmp(actpblk.descr[i].name, "bulkmode")) {
+669 			pData-&gt;bulkmode = pvals[i].val.d.n;
+670 		} else if(!strcmp(actpblk.descr[i].name, "maxbytes")) {
+671 			pData-&gt;maxbytes = (size_t) pvals[i].val.d.n;
+672 		} else if(!strcmp(actpblk.descr[i].name, "tls.cacert")) {
+673 			pData-&gt;caCertFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+674 			fp = fopen((const char*)pData-&gt;caCertFile, "r");
+675 			if(fp == NULL) {
+676 				rs_strerror_r(errno, errStr, sizeof(errStr));
+677 				LogError(0, RS_RET_NO_FILE_ACCESS,
+678 					"error: omclickhouse: 'tls.cacert' file %s couldn't be accessed: %s\n",
+679 						pData-&gt;caCertFile, errStr);
+680 			} else {
+681 				fclose(fp);
+682 			}
+683 		} else if(!strcmp(actpblk.descr[i].name, "tls.mycert")) {
+684 			pData-&gt;myCertFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+685 			fp = fopen((const char*)pData-&gt;myCertFile, "r");
+686 			if(fp == NULL) {
+687 				rs_strerror_r(errno, errStr, sizeof(errStr));
+688 				LogError(0, RS_RET_NO_FILE_ACCESS,
+689 					"error: omclickhouse: 'tls.mycert' file %s couldn't be accessed: %s\n",
+690 						pData-&gt;myCertFile, errStr);
+691 			} else {
+692 				fclose(fp);
+693 			}
+694 		} else if(!strcmp(actpblk.descr[i].name, "tls.myprivkey")) {
+695 			pData-&gt;myPrivKeyFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+696 			fp = fopen((const char*)pData-&gt;myPrivKeyFile, "r");
+697 			if(fp == NULL) {
+698 				rs_strerror_r(errno, errStr, sizeof(errStr));
+699 				LogError(0, RS_RET_NO_FILE_ACCESS,
+700 					"error: omclickhouse: 'tls.myprivkey' file %s couldn't be accessed: %s\n",
+701 						pData-&gt;myPrivKeyFile, errStr);
+702 			} else {
+703 				fclose(fp);
+704 			}
+705 		} else {
+706 			LogError(0, RS_RET_INTERNAL_ERROR, "omclickhouse: program error, "
+707 				"non-handled param '%s'", actpblk.descr[i].name);
+708 		}
+709 	}
+710 	if(pData-&gt;user == NULL &amp;&amp; pData-&gt;pwd != NULL) {
+711 		LogMsg(0, RS_RET_OK, LOG_WARNING, "omclickhouse: No user was specified "
+712 				"but a password was given.");
+713 	}
+714 	if(pData-&gt;user != NULL)
+715 		CHKiRet(computeAuthHeader((char*) pData-&gt;user, (char*) pData-&gt;pwd, &amp;pData-&gt;authBuf));
+716 	CODE_STD_STRING_REQUESTnewActInst(1)
+717 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*)strdup((pData-&gt;tplName == NULL) ?
+718 		" StdClickHouseFmt" : (char*)pData-&gt;tplName), OMSR_RQD_TPL_OPT_SQL));
+719 	if(server != NULL) {
+720 		CHKiRet(computeBaseUrl((const char*)server, pData-&gt;port, pData-&gt;useHttps, pData));
+721 	} else {
+722 		LogMsg(0, RS_RET_OK, LOG_WARNING,
+723 			"omclickhouse: No servers specified, using localhost");
+724 		CHKiRet(computeBaseUrl("localhost", pData-&gt;port, pData-&gt;useHttps,
+725 					pData));
+726 <a name="4"></a>	}
+727 <font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if(loadModConf-&gt;tail == NULL) {
+728 		loadModConf-&gt;tail = loadModConf-&gt;root = pData;
+729 	} else {
+730 		loadModConf-&gt;tail-&gt;next = pData;
+731 		loadModConf-&gt;tail = pData;
+732 	}
+733 CODE_STD_FINALIZERnewActInst
+734 	free(server);
+735 	cnfparamvalsDestruct(pvals, &amp;actpblk);
+736 ENDnewActInst
+737 BEGINbeginCnfLoad
+738 CODESTARTbeginCnfLoad
+739 	loadModConf = pModConf;</b></font>
+740 	pModConf-&gt;pConf = pConf;
+741 	pModConf-&gt;root = pModConf-&gt;tail = NULL;
+742 ENDbeginCnfLoad
+743 BEGINendCnfLoad
+744 CODESTARTendCnfLoad
+745 	loadModConf = NULL; ENDendCnfLoad
+746 BEGINcheckCnf
+747 CODESTARTcheckCnf
+748 ENDcheckCnf
+749 BEGINactivateCnf
+750 CODESTARTactivateCnf
+751 ENDactivateCnf
+752 BEGINfreeCnf
+753 CODESTARTfreeCnf
+754 ENDfreeCnf
+755 BEGINdoHUP
+756 CODESTARTdoHUP
+757 	if(pData-&gt;fdErrFile != -1) {
+758 		close(pData-&gt;fdErrFile);
+759 		pData-&gt;fdErrFile = -1;
+760 	}
+761 ENDdoHUP
+762 BEGINmodExit
+763 CODESTARTmodExit
+764 	curl_global_cleanup();
+765 	statsobj.Destruct(&amp;indexStats);
+766 	objRelease(statsobj, CORE_COMPONENT);
+767 	objRelease(prop, CORE_COMPONENT);
+768 	objRelease(ruleset, CORE_COMPONENT);
+769 ENDmodExit
+770 NO_LEGACY_CONF_parseSelectorAct
+771 BEGINqueryEtryPt
+772 CODESTARTqueryEtryPt
+773 CODEqueryEtryPt_STD_OMOD_QUERIES
+774 CODEqueryEtryPt_STD_OMOD8_QUERIES
+775 CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
+776 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+777 CODEqueryEtryPt_doHUP
+778 CODEqueryEtryPt_TXIF_OMOD_QUERIES CODEqueryEtryPt_STD_CONF2_QUERIES
+779 ENDqueryEtryPt
+780 BEGINmodInit()
+781 CODESTARTmodInit
+782 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+783 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
+784 	CHKiRet(objUse(prop, CORE_COMPONENT));
+785 	CHKiRet(objUse(ruleset, CORE_COMPONENT));
+786 	if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
+787 		LogError(0, RS_RET_OBJ_CREATION_FAILED, "CURL fail. -indexing disabled");
+788 		ABORT_FINALIZE(RS_RET_OBJ_CREATION_FAILED);
+789 	}
+790 	CHKiRet(statsobj.Construct(&amp;indexStats));
+791 	CHKiRet(statsobj.SetName(indexStats, (uchar *)"omclickhouse"));
+792 	CHKiRet(statsobj.SetOrigin(indexStats, (uchar *)"omclickhouse"));
+793 	STATSCOUNTER_INIT(indexSubmit, mutIndexSubmit);
+794 	CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"submitted",
+795 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;indexSubmit));
+796 	STATSCOUNTER_INIT(indexHTTPFail, mutIndexHTTPFail);
+797 	CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"failed.http",
+798 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;indexHTTPFail));
+799 	STATSCOUNTER_INIT(indexHTTPReqFail, mutIndexHTTPReqFail);
+800 	CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"failed.httprequests",
+801 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;indexHTTPReqFail));
+802 	STATSCOUNTER_INIT(indexFail, mutIndexFail);
+803 	CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"failed.clickhouse",
+804 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;indexFail));
+805 	STATSCOUNTER_INIT(indexSuccess, mutIndexSuccess);
+806 	CHKiRet(statsobj.AddCounter(indexStats, (uchar *)"response.success",
+807 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;indexSuccess));
+808 	CHKiRet(statsobj.ConstructFinalize(indexStats));
+809 ENDmodInit
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -1087,1332 +865,1074 @@ ENDmodInit
 </h3>
 <hr/>
 <pre>
-/* imhttp.c
- * This is an input module for receiving http input.
- *
- * This file is contribution of rsyslog.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *       http://www.apache.org/licenses/LICENSE-2.0
- *       -or-
- *       see COPYING.ASL20 in the source distribution
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-
-#include "config.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;string.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;ctype.h&gt;
-#include &lt;netinet/in.h&gt;
-#include &lt;netdb.h&gt;
-#include &lt;sys/types.h&gt;
-#include &lt;sys/socket.h&gt;
-#include "rsyslog.h"
-#include "cfsysline.h"		/* access to config file objects */
-#include "module-template.h"
-#include "ruleset.h"
-#include "unicode-helper.h"
-#include "rsyslog.h"
-#include "errmsg.h"
-#include "statsobj.h"
-#include "ratelimit.h"
-#include "dirty.h"
-
-#include "civetweb.h"
-#include &lt;apr_base64.h&gt;
-#include &lt;apr_md5.h&gt;
-
-MODULE_TYPE_INPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("imhttp")
-
-/* static data */
-DEF_OMOD_STATIC_DATA
-DEFobjCurrIf(glbl)
-DEFobjCurrIf(prop)
-DEFobjCurrIf(ruleset)
-DEFobjCurrIf(statsobj)
-
-#define CIVETWEB_OPTION_NAME_PORTS         "listening_ports"
-#define CIVETWEB_OPTION_NAME_DOCUMENT_ROOT "document_root"
-#define MAX_READ_BUFFER_SIZE  16384
-#define INIT_SCRATCH_BUF_SIZE 4096
-/* General purpose buffer size. */
-#define IMHTTP_MAX_BUF_LEN (8192)
-
-struct option {
-	const char *name;
-	const char *val;
-};
-
-struct auth_s {
-	char workbuf[IMHTTP_MAX_BUF_LEN];
-	char* pworkbuf;
-	size_t workbuf_len;
-	char* pszUser;
-	char* pszPasswd;
-};
-
-struct data_parse_s {
-	sbool  content_compressed;
-	sbool bzInitDone; /* did we do an init of zstrm already? */
-	z_stream zstrm;	/* zip stream to use for tcp compression */
-	// Currently only used for octet specific parsing
-	enum {
-		eAtStrtFram,
-		eInOctetCnt,
-		eInMsg,
-	} inputState;
-	size_t iOctetsRemain;	/* Number of Octets remaining in message */
-	enum {
-		TCP_FRAMING_OCTET_STUFFING,
-		TCP_FRAMING_OCTET_COUNTING
-	} framingMode;
-};
-
-struct modConfData_s {
-	rsconf_t *pConf;  /* our overall config object */
-	instanceConf_t *root, *tail;
-	struct option ports;
-	struct option docroot;
-	struct option *options;
-	int nOptions;
-};
-
-struct instanceConf_s {
-	struct instanceConf_s *next;
-	uchar *pszBindRuleset;    /* name of ruleset to bind to */
-	uchar *pszEndpoint;       /* endpoint to configure */
-	uchar *pszBasicAuthFile;       /* file containing basic auth users/pass */
-	ruleset_t *pBindRuleset;  /* ruleset to bind listener to (use system default if unspecified) */
-	ratelimit_t *ratelimiter;
-	unsigned int ratelimitInterval;
-	unsigned int ratelimitBurst;
-	uchar *pszInputName;	  /* value for inputname property, NULL is OK and handled by core engine */
-	prop_t *pInputName;
-	sbool flowControl;
-	sbool bDisableLFDelim;
-	sbool bSuppOctetFram;
-	sbool bAddMetadata;
-};
-
-struct conn_wrkr_s {
-	struct data_parse_s parseState;
-	uchar* pMsg;						/* msg scratch buffer */
-	size_t iMsg;						/* index of next char to store in msg */
-	uchar zipBuf[64*1024];
-	multi_submit_t multiSub;
-	smsg_t *pMsgs[CONF_NUM_MULTISUB];
-	char *pReadBuf;
-	size_t readBufSize;
-	prop_t *propRemoteAddr;
-	const struct mg_request_info *pri; /* do not free me - used to hold a reference only */
-	char *pScratchBuf;
-	size_t scratchBufSize;
-};
-
-static modConfData_t *loadModConf = NULL;/* modConf ptr to use for the current load process */
-static modConfData_t *runModConf = NULL;/* modConf ptr to use for the current load process */
-static prop_t *pInputName = NULL;
-
-//static size_t s_iMaxLine = 16; /* get maximum size we currently support */
-static size_t s_iMaxLine = 16384; /* get maximum size we currently support */
-
-/* module-global parameters */
-static struct cnfparamdescr modpdescr[] = {
-	{ "ports", eCmdHdlrString, 0 },
-	{ "documentroot", eCmdHdlrString, 0 },
-	{ "liboptions", eCmdHdlrArray, 0 },
-};
-
-static struct cnfparamblk modpblk = {
-	CNFPARAMBLK_VERSION,
-	sizeof(modpdescr)/sizeof(struct cnfparamdescr),
-	modpdescr
-<a name="0"></a>};
-
-static struct cnfparamdescr inppdescr[] = {
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "endpoint", eCmdHdlrString, 0},
-	{ "basicauthfile", eCmdHdlrString, 0},
-	{ "ruleset", eCmdHdlrString, 0 },
-	{ "flowcontrol", eCmdHdlrBinary, 0 },
-	{ "disablelfdelimiter", eCmdHdlrBinary, 0 },
-	{ "supportoctetcountedframing", eCmdHdlrBinary, 0 },
-	{ "name", eCmdHdlrString, 0 },
-	{ "ratelimit.interval", eCmdHdlrInt, 0 },
-	{ "ratelimit.burst", eCmdHdlrInt, 0 },
-	{ "addmetadata", eCmdHdlrBinary, 0 }
-};
-
-#include "im-helper.h" /* must be included AFTER the type definitions! */
-
-static struct cnfparamblk inppblk = {
-	CNFPARAMBLK_VERSION,
-	sizeof(inppdescr)/sizeof(struct cnfparamdescr),
-	inppdescr
-};
-
-static struct {</b></font>
-	statsobj_t *stats;
-	STATSCOUNTER_DEF(ctrSubmitted, mutCtrSubmitted)
-	STATSCOUNTER_DEF(ctrFailed, mutCtrFailed);
-	STATSCOUNTER_DEF(ctrDiscarded, mutCtrDiscarded);
-} statsCounter;
-
-#include "im-helper.h" /* must be included AFTER the type definitions! */
-
-#define min(a, b) \
-	({ __typeof__ (a) _a = (a); \
-	__typeof__ (b) _b = (b); \
-	_a &lt; _b ? _a : _b; })
-
-#define	EXIT_FAILURE	1
-#define	EXIT_SUCCESS	0
-#define EXIT_URI "/exit"
-volatile int exitNow = 0;
-
-struct mg_callbacks callbacks;
-
-typedef struct httpserv_s {
-	struct mg_context *ctx;
-	struct mg_callbacks callbacks;
-	const char **civetweb_options;
-	size_t civetweb_options_count;
-} httpserv_t;
-
-static httpserv_t *s_httpserv;
-
-/* FORWARD DECLARATIONS */
-static rsRetVal processData(const instanceConf_t *const inst,
-	struct conn_wrkr_s *connWrkr, const char* buf, size_t len);
-
-static rsRetVal
-createInstance(instanceConf_t **pinst)
-{
-<a name="3"></a>	instanceConf_t *inst;
-	DEFiRet;
-	CHKmalloc(inst = calloc(1, sizeof(instanceConf_t)));
-<font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	inst-&gt;next = NULL;
-	inst-&gt;pszBindRuleset = NULL;
-	inst-&gt;pBindRuleset = NULL;
-	inst-&gt;pszEndpoint = NULL;
-	inst-&gt;pszBasicAuthFile = NULL;
-	inst-&gt;ratelimiter = NULL;
-	inst-&gt;pszInputName = NULL;</b></font>
-	inst-&gt;pInputName = NULL;
-	inst-&gt;ratelimitBurst = 10000; /* arbitrary high limit */
-	inst-&gt;ratelimitInterval = 0; /* off */
-	inst-&gt;flowControl = 1;
-	inst-&gt;bDisableLFDelim = 0;
-	inst-&gt;bSuppOctetFram = 0;
-	inst-&gt;bAddMetadata = 0;
-<a name="4"></a>	// construct statsobj
-
-	/* node created, let's add to config */
-<font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if(loadModConf-&gt;tail == NULL) {
-		loadModConf-&gt;tail = loadModConf-&gt;root = inst;
-	} else {
-		loadModConf-&gt;tail-&gt;next = inst;
-		loadModConf-&gt;tail = inst;
-	}
-
-	*pinst = inst;</b></font>
-finalize_it:
-	RETiRet;
-}
-
-static rsRetVal
-processCivetwebOptions(char *const param,
-	const char **const name,
-	const char **const paramval)
-{
-	DEFiRet;
-	char *val = strstr(param, "=");
-	if(val == NULL) {
-		LogError(0, RS_RET_PARAM_ERROR, "missing equal sign in "
-				"parameter '%s'", param);
-		ABORT_FINALIZE(RS_RET_PARAM_ERROR);
-	}
-	*val = '\0'; /* terminates name */
-	++val; /* now points to begin of value */
-	CHKmalloc(*name = strdup(param));
-	CHKmalloc(*paramval = strdup(val));
-
-finalize_it:
-	RETiRet;
-}
-
-static sbool valid_civetweb_option(const struct mg_option *valid_opts, const char* option)
-{
-	const struct mg_option *pvalid_opts = valid_opts;
-	for (; pvalid_opts != NULL &amp;&amp; pvalid_opts-&gt;name != NULL; pvalid_opts++) {
-		if (strcmp(pvalid_opts-&gt;name, option) == 0) {
-			return TRUE;
-		}
-	}
-	return FALSE;
-}
-
-#if 0
-static int
-log_message(__attribute__((unused)) const struct mg_connection *conn, const char *message)
-{
-	puts(message);
-	return 1;
-}
-#endif
-/*
-	*   thread_type:
-	*     0 indicates the master thread
-	*     1 indicates a worker thread handling client connections
-	*     2 indicates an internal helper thread (timer thread)
-*/
-static void*
-init_thread(__attribute__((unused)) const struct mg_context *ctx, int thread_type)
-{
-	DEFiRet;
-	struct conn_wrkr_s *data = NULL;
-	if (thread_type == 1) {
-		CHKmalloc(data = calloc(1, sizeof(struct conn_wrkr_s)));
-		data-&gt;pMsg = NULL;
-		data-&gt;iMsg = 0;
-		data-&gt;parseState.bzInitDone = 0;
-		data-&gt;parseState.content_compressed = 0;
-		data-&gt;parseState.inputState = eAtStrtFram;
-		data-&gt;parseState.iOctetsRemain = 0;
-		data-&gt;multiSub.maxElem = CONF_NUM_MULTISUB;
-		data-&gt;multiSub.ppMsgs = data-&gt;pMsgs;
-		data-&gt;multiSub.nElem = 0;
-		data-&gt;pReadBuf = malloc(MAX_READ_BUFFER_SIZE);
-		data-&gt;readBufSize = MAX_READ_BUFFER_SIZE;
-
-		data-&gt;parseState.bzInitDone = 0;
-		data-&gt;parseState.content_compressed = 0;
-		data-&gt;parseState.inputState = eAtStrtFram;
-		data-&gt;parseState.iOctetsRemain = 0;
-
-		CHKmalloc(data-&gt;pMsg = calloc(1, 1 + s_iMaxLine));
-		data-&gt;iMsg = 0;
-		data-&gt;propRemoteAddr = NULL;
-		data-&gt;pScratchBuf = NULL;
-		data-&gt;scratchBufSize = 0;
-	}
-
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		free(data);
-		return NULL;
-	}
-	return data;
-}
-
-static void
-exit_thread(__attribute__((unused)) const struct mg_context *ctx,
-	__attribute__((unused)) int thread_type, void *thread_pointer)
-{
-	if (thread_type == 1) {
-		struct conn_wrkr_s *data = (struct conn_wrkr_s *) thread_pointer;
-		if (data-&gt;propRemoteAddr) {
-			prop.Destruct(&amp;data-&gt;propRemoteAddr);
-		}
-		if (data-&gt;scratchBufSize) {
-			free(data-&gt;pScratchBuf);
-		}
-		free(data-&gt;pReadBuf);
-		free(data-&gt;pMsg);
-		free(data);
-	}
-}
-
-static rsRetVal
-msgAddMetadataFromHttpHeader(smsg_t *const __restrict__ pMsg, struct conn_wrkr_s *connWrkr)
-{
-	struct json_object *json = NULL;
-	DEFiRet;
-	const struct mg_request_info *ri = connWrkr-&gt;pri;
-	#define MAX_HTTP_HEADERS 64	/* hard limit */
-	int count = min(ri-&gt;num_headers, MAX_HTTP_HEADERS);
-
-	CHKmalloc(json = json_object_new_object());
-	for (int i = 0 ; i &lt; count ; i++ ) {
-		struct json_object *const jval = json_object_new_string(ri-&gt;http_headers[i].value);
-		CHKmalloc(jval);
-		/* truncate header names bigger than INIT_SCRATCH_BUF_SIZE */
-		strncpy(connWrkr-&gt;pScratchBuf, ri-&gt;http_headers[i].name, connWrkr-&gt;scratchBufSize - 1);
-		/* make header lowercase */
-		char* pname = connWrkr-&gt;pScratchBuf;
-		while (pname &amp;&amp; *pname != '\0') {
-			*pname = tolower(*pname);
-			pname++;
-		}
-		json_object_object_add(json, (const char *const)connWrkr-&gt;pScratchBuf, jval);
-	}
-	CHKiRet(msgAddJSON(pMsg, (uchar*)"!metadata!httpheaders", json, 0, 0));
-
-finalize_it:
-	if (iRet != RS_RET_OK &amp;&amp; json) {
-		json_object_put(json);
-	}
-	RETiRet;
-}
-
-static rsRetVal
-msgAddMetadataFromHttpQueryParams(smsg_t *const __restrict__ pMsg, struct conn_wrkr_s *connWrkr)
-{
-	struct json_object *json = NULL;
-	DEFiRet;
-	const struct mg_request_info *ri = connWrkr-&gt;pri;
-
-	if (ri &amp;&amp; ri-&gt;query_string) {
-		strncpy(connWrkr-&gt;pScratchBuf, ri-&gt;query_string, connWrkr-&gt;scratchBufSize - 1);
-		char *pquery_str = connWrkr-&gt;pScratchBuf;
-		if (pquery_str) {
-			CHKmalloc(json = json_object_new_object());
-
-			char* saveptr = NULL;
-			char *kv_pair = strtok_r(pquery_str, "&amp;;", &amp;saveptr);
-
-			for ( ; kv_pair != NULL; kv_pair = strtok_r(NULL, "&amp;;", &amp;saveptr)) {
-				char *saveptr2 = NULL;
-				char *key = strtok_r(kv_pair, "=", &amp;saveptr2);
-				if (key) {
-					char *value = strtok_r(NULL, "=", &amp;saveptr2);
-					struct json_object *const jval = json_object_new_string(value);
-					CHKmalloc(jval);
-					json_object_object_add(json, (const char *)key, jval);
-				}
-			}
-			CHKiRet(msgAddJSON(pMsg, (uchar*)"!metadata!queryparams", json, 0, 0));
-		}
-	}
-finalize_it:
-	if (iRet != RS_RET_OK &amp;&amp; json) {
-		json_object_put(json);
-	}
-	RETiRet;
-}
-
-static rsRetVal
-doSubmitMsg(const instanceConf_t *const __restrict__ inst,
-	struct conn_wrkr_s *connWrkr, const uchar* msg, size_t len)
-{
-	smsg_t *pMsg;
-	DEFiRet;
-
-	assert(len &lt;= s_iMaxLine);
-	if (len == 0) {
-		DBGPRINTF("discarding zero-sized message\n");
-		FINALIZE;
-	}
-
-	CHKiRet(msgConstruct(&amp;pMsg));
-	MsgSetFlowControlType(pMsg, inst-&gt;flowControl
-			            ? eFLOWCTL_LIGHT_DELAY : eFLOWCTL_NO_DELAY);
-	if (inst-&gt;pInputName) {
-		MsgSetInputName(pMsg, inst-&gt;pInputName);
-	} else {
-		MsgSetInputName(pMsg, pInputName);
-	}
-	MsgSetRawMsg(pMsg, (const char*)msg, len);
-	MsgSetMSGoffs(pMsg, 0);	/* we do not have a header... */
-	if (connWrkr-&gt;propRemoteAddr) {
-		MsgSetRcvFromIP(pMsg, connWrkr-&gt;propRemoteAddr);
-	}
-	if (inst) {
-		MsgSetRuleset(pMsg, inst-&gt;pBindRuleset);
-	}
-	// TODO: make these flags configurable.
-	pMsg-&gt;msgFlags = NEEDS_PARSING | PARSE_HOSTNAME;
-
-	if (inst-&gt;bAddMetadata) {
-		CHKiRet(msgAddMetadataFromHttpHeader(pMsg, connWrkr));
-		CHKiRet(msgAddMetadataFromHttpQueryParams(pMsg, connWrkr));
-	}
-
-	ratelimitAddMsg(inst-&gt;ratelimiter, &amp;connWrkr-&gt;multiSub, pMsg);
-	STATSCOUNTER_INC(statsCounter.ctrSubmitted, statsCounter.mutCtrSubmitted);
-finalize_it:
-	connWrkr-&gt;iMsg = 0;
-	if (iRet != RS_RET_OK) {
-		STATSCOUNTER_INC(statsCounter.ctrDiscarded, statsCounter.mutCtrDiscarded);
-	}
-	RETiRet;
-}
-
-
-static rsRetVal
-processOctetMsgLen(const instanceConf_t *const inst, struct conn_wrkr_s *connWrkr, char ch)
-{
-	DEFiRet;
-	if (connWrkr-&gt;parseState.inputState == eAtStrtFram) {
-		if (inst-&gt;bSuppOctetFram &amp;&amp; isdigit(ch)) {
-			connWrkr-&gt;parseState.inputState = eInOctetCnt;
-			connWrkr-&gt;parseState.iOctetsRemain = 0;
-			connWrkr-&gt;parseState.framingMode = TCP_FRAMING_OCTET_COUNTING;
-		} else {
-			connWrkr-&gt;parseState.inputState = eInMsg;
-			connWrkr-&gt;parseState.framingMode = TCP_FRAMING_OCTET_STUFFING;
-		}
-	}
-
-	// parsing character.
-	if (connWrkr-&gt;parseState.inputState == eInOctetCnt) {
-		if (isdigit(ch)) {
-			if (connWrkr-&gt;parseState.iOctetsRemain &lt;= 200000000) {
-				connWrkr-&gt;parseState.iOctetsRemain = connWrkr-&gt;parseState.iOctetsRemain * 10 + ch - '0';
-			}
-			// temporarily save this character into the message buffer
-			if(connWrkr-&gt;iMsg + 1 &lt; s_iMaxLine) {
-				connWrkr-&gt;pMsg[connWrkr-&gt;iMsg++] = ch;
-			}
-		} else {
-			const char *remoteAddr = "";
-			if (connWrkr-&gt;propRemoteAddr) {
-				remoteAddr = (const char *)propGetSzStr(connWrkr-&gt;propRemoteAddr);
-			}
-
-			/* handle space delimeter */
-			if (ch != ' ') {
-				LogError(0, NO_ERRCODE, "Framing Error in received TCP message "
-					"from peer: (ip) %s: to input: %s, delimiter is not "
-					"SP but has ASCII value %d.",
-					remoteAddr, inst-&gt;pszInputName, ch);
-			}
-
-			if (connWrkr-&gt;parseState.iOctetsRemain &lt; 1) {
-				LogError(0, NO_ERRCODE, "Framing Error in received TCP message"
-					" from peer: (ip) %s: delimiter is not "
-					"SP but has ASCII value %d.",
-					remoteAddr, ch);
-			} else if (connWrkr-&gt;parseState.iOctetsRemain &gt; s_iMaxLine) {
-				DBGPRINTF("truncating message with %lu octets - max msg size is %lu\n",
-									connWrkr-&gt;parseState.iOctetsRemain, s_iMaxLine);
-				LogError(0, NO_ERRCODE, "received oversize message from peer: "
-					"(hostname) (ip) %s: size is %lu bytes, max msg "
-					"size is %lu, truncating...",
-					remoteAddr, connWrkr-&gt;parseState.iOctetsRemain, s_iMaxLine);
-			}
-			connWrkr-&gt;parseState.inputState = eInMsg;
-		}
-		/* reset msg len for actual message processing */
-		connWrkr-&gt;iMsg = 0;
-		/* retrieve next character */
-	}
-	RETiRet;
-}
-
-static rsRetVal
-processOctetCounting(const instanceConf_t *const inst,
-	struct conn_wrkr_s *connWrkr, const char* buf, size_t len)
-{
-	DEFiRet;
-	const uchar* pbuf = (const uchar*)buf;
-	const uchar* pbufLast = pbuf + len;
-
-	while (pbuf &lt; pbufLast) {
-		char ch = *pbuf;
-
-		if (connWrkr-&gt;parseState.inputState == eAtStrtFram || connWrkr-&gt;parseState.inputState == eInOctetCnt) {
-			processOctetMsgLen(inst, connWrkr, ch);
-			if (connWrkr-&gt;parseState.framingMode == TCP_FRAMING_OCTET_COUNTING) {
-				pbuf++;
-			}
-		} else if (connWrkr-&gt;parseState.inputState == eInMsg) {
-			if (connWrkr-&gt;parseState.framingMode == TCP_FRAMING_OCTET_STUFFING) {
-				if (connWrkr-&gt;iMsg &lt; s_iMaxLine) {
-					if (ch == '\n') {
-						doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
-						connWrkr-&gt;parseState.inputState = eAtStrtFram;
-					} else {
-						connWrkr-&gt;pMsg[connWrkr-&gt;iMsg++] = ch;
-					}
-				} else {
-					doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
-					connWrkr-&gt;parseState.inputState = eAtStrtFram;
-				}
-				pbuf++;
-			} else {
-				assert (connWrkr-&gt;parseState.framingMode == TCP_FRAMING_OCTET_COUNTING);
-				/* parsing payload */
-				size_t remainingBytes = pbufLast - pbuf;
-				// figure out how much is in block
-				size_t count = min (connWrkr-&gt;parseState.iOctetsRemain, remainingBytes);
-				if (connWrkr-&gt;iMsg + count &gt;= s_iMaxLine) {
-					count = s_iMaxLine - connWrkr-&gt;iMsg;
-				}
-
-				// just copy the bytes
-				if (count) {
-					memcpy(connWrkr-&gt;pMsg + connWrkr-&gt;iMsg, pbuf, count);
-					pbuf += count;
-					connWrkr-&gt;iMsg += count;
-					connWrkr-&gt;parseState.iOctetsRemain -= count;
-				}
-
-				if (connWrkr-&gt;parseState.iOctetsRemain == 0) {
-					doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
-					connWrkr-&gt;parseState.inputState = eAtStrtFram;
-				}
-			}
-		} else {
-			// unexpected
-			assert(0);
-			break;
-		}
-	}
-	RETiRet;
-}
-
-static rsRetVal
-processDisableLF(const instanceConf_t *const inst,
-	struct conn_wrkr_s *connWrkr, const char* buf, size_t len)
-{
-	DEFiRet;
-	const uchar *pbuf = (const uchar*)buf;
-	size_t remainingBytes = len;
-	const uchar* pbufLast = pbuf + len;
-
-	while (pbuf &lt; pbufLast) {
-		size_t count = 0;
-		if (connWrkr-&gt;iMsg + remainingBytes &gt;= s_iMaxLine) {
-			count = s_iMaxLine - connWrkr-&gt;iMsg;
-		} else {
-			count = remainingBytes;
-		}
-
-		if (count) {
-			memcpy(connWrkr-&gt;pMsg + connWrkr-&gt;iMsg, pbuf, count);
-			pbuf += count;
-			connWrkr-&gt;iMsg += count;
-			remainingBytes -= count;
-		}
-		doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
-	}
-	RETiRet;
-}
-
-static rsRetVal
-processDataUncompressed(const instanceConf_t *const inst,
-	struct conn_wrkr_s *connWrkr, const char* buf, size_t len)
-{
-	const uchar *pbuf = (const uchar*)buf;
-	DEFiRet;
-
-	if (inst-&gt;bDisableLFDelim) {
-		/* do block processing */
-		iRet = processDisableLF(inst, connWrkr, buf, len);
-	} else if (inst-&gt;bSuppOctetFram) {
-		iRet = processOctetCounting(inst, connWrkr, buf, len);
-	} else {
-		const uchar* pbufLast = pbuf + len;
-		while (pbuf &lt; pbufLast) {
-			char ch = *pbuf;
-			if (connWrkr-&gt;iMsg &lt; s_iMaxLine) {
-				if (ch == '\n') {
-					doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
-				} else {
-					connWrkr-&gt;pMsg[connWrkr-&gt;iMsg++] = ch;
-				}
-			} else {
-				doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
-			}
-			pbuf++;
-		}
-	}
-	RETiRet;
-}
-
-static rsRetVal
-processDataCompressed(const instanceConf_t *const inst,
-	struct conn_wrkr_s *connWrkr, const char* buf, size_t len)
-{
-	DEFiRet;
-
-	if (!connWrkr-&gt;parseState.bzInitDone) {
-		/* allocate deflate state */
-		connWrkr-&gt;parseState.zstrm.zalloc = Z_NULL;
-		connWrkr-&gt;parseState.zstrm.zfree = Z_NULL;
-		connWrkr-&gt;parseState.zstrm.opaque = Z_NULL;
-		int rc = inflateInit2(&amp;connWrkr-&gt;parseState.zstrm, (MAX_WBITS | 16));
-		if (rc != Z_OK) {
-			dbgprintf("imhttp: error %d returned from zlib/inflateInit()\n", rc);
-			ABORT_FINALIZE(RS_RET_ZLIB_ERR);
-		}
-		connWrkr-&gt;parseState.bzInitDone = 1;
-	}
-
-	connWrkr-&gt;parseState.zstrm.next_in = (Bytef*) buf;
-	connWrkr-&gt;parseState.zstrm.avail_in = len;
-	/* run inflate() on buffer until everything has been uncompressed */
-	int outtotal = 0;
-	do {
-		int zRet = 0;
-		int outavail = 0;
-		dbgprintf("imhttp: in inflate() loop, avail_in %d, total_in %ld\n",
-				connWrkr-&gt;parseState.zstrm.avail_in, connWrkr-&gt;parseState.zstrm.total_in);
-
-		connWrkr-&gt;parseState.zstrm.avail_out = sizeof(connWrkr-&gt;zipBuf);
-		connWrkr-&gt;parseState.zstrm.next_out = connWrkr-&gt;zipBuf;
-		zRet = inflate(&amp;connWrkr-&gt;parseState.zstrm, Z_SYNC_FLUSH);
-		dbgprintf("imhttp: inflate(), ret: %d, avail_out: %d\n", zRet, connWrkr-&gt;parseState.zstrm.avail_out);
-		outavail = sizeof(connWrkr-&gt;zipBuf) - connWrkr-&gt;parseState.zstrm.avail_out;
-		if (outavail != 0) {
-			outtotal += outavail;
-			CHKiRet(processDataUncompressed(inst, connWrkr, (const char*)connWrkr-&gt;zipBuf, outavail));
-		}
-	} while (connWrkr-&gt;parseState.zstrm.avail_out == 0);
-
-	dbgprintf("imhttp: processDataCompressed complete, sizes: in %lld, out %llu\n", (long long) len,
-		(long long unsigned) outtotal);
-
-finalize_it:
-	RETiRet;
-}
-
-static rsRetVal
-processData(const instanceConf_t *const inst,
-	struct conn_wrkr_s *connWrkr, const char* buf, size_t len)
-{
-	DEFiRet;
-
-	//inst-&gt;bDisableLFDelim = 0;
-	if (connWrkr-&gt;parseState.content_compressed) {
-		iRet = processDataCompressed(inst, connWrkr, buf, len);
-	} else {
-		iRet = processDataUncompressed(inst, connWrkr, buf, len);
-	}
-
-	RETiRet;
-}
-
-/* Return 1 on success. Always initializes the auth structure. */
-static int
-parse_auth_header(struct mg_connection *conn, struct auth_s *auth)
-{
-	if (!auth || !conn) {
-		return 0;
-	}
-
-	const char *auth_header = NULL;
-	if (((auth_header = mg_get_header(conn, "Authorization")) == NULL) ||
-			strncasecmp(auth_header, "Basic ", 6) != 0) {
-		return 0;
-	}
-
-	/* Parse authorization header */
-	const char* src = auth_header + 6;
-	size_t len = apr_base64_decode_len((const char*)src);
-	auth-&gt;pworkbuf = auth-&gt;workbuf;
-	if (len &gt; sizeof(auth-&gt;workbuf)) {
-		auth-&gt;pworkbuf = calloc(0, len);
-		auth-&gt;workbuf_len = len;
-	}
-	len = apr_base64_decode(auth-&gt;pworkbuf, src);
-	if (len == 0) {
-		return 0;
-	}
-
-	char *passwd = NULL, *saveptr = NULL;
-	char *user = strtok_r(auth-&gt;pworkbuf, ":", &amp;saveptr);
-	if (user) {
-		passwd = strtok_r(NULL, ":", &amp;saveptr);
-	}
-
-	auth-&gt;pszUser = user;
-	auth-&gt;pszPasswd = passwd;
-
-	return 1;
-}
-
-static int
-read_auth_file(FILE* filep, struct auth_s *auth)
-{
-	if (!filep) {
-		return 0;
-	}
-	char workbuf[IMHTTP_MAX_BUF_LEN];
-	size_t l = 0;
-	char* user;
-	char* passwd;
-
-	while (fgets(workbuf, sizeof(workbuf), filep)) {
-		l = strnlen(workbuf, sizeof(workbuf));
-		while (l &gt; 0) {
-			if (isspace(workbuf[l-1]) || iscntrl(workbuf[l-1])) {
-				l--;
-				workbuf[l] = 0;
-			} else {
-				break;
-			}
-		}
-
-		if (l &lt; 1) {
-			continue;
-		}
-
-		if (workbuf[0] == '#') {
-			continue;
-		}
-
-		user = workbuf;
-		passwd = strchr(workbuf, ':');
-		if (!passwd) {
-			continue;
-		}
-		*passwd = '\0';
-		passwd++;
-
-		if (!strcasecmp(auth-&gt;pszUser, user)) {
-			return (apr_password_validate(auth-&gt;pszPasswd, passwd) == APR_SUCCESS);
-		}
-	}
-	return 0;
-}
-
-/* Authorize against the opened passwords file. Return 1 if authorized. */
-static int
-authorize(struct mg_connection* conn, FILE* filep)
-{
-	if (!conn || !filep) {
-		return 0;
-	}
-
-	struct auth_s auth = { .workbuf_len=0, .pworkbuf=NULL, .pszUser=NULL, .pszPasswd=NULL};
-	if (!parse_auth_header(conn, &amp;auth)) {
-		return 0;
-	}
-
-	/* validate against htpasswd file */
-	return read_auth_file(filep, &amp;auth);
-}
-
-/* Provides Basic Authorization handling that validates against a 'htpasswd' file.
-	see also: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Authorization
-*/
-static int
-basicAuthHandler(struct mg_connection *conn, void *cbdata)
-{
-	const instanceConf_t* inst = (const instanceConf_t*) cbdata;
-	char errStr[512];
-	FILE *fp = NULL;
-	int ret = 1;
-
-	if (!inst-&gt;pszBasicAuthFile) {
-		mg_cry(conn, "warning: 'BasicAuthFile' not configured.\n");
-		ret = 0;
-		goto finalize;
-	}
-
-	fp = fopen((const char *)inst-&gt;pszBasicAuthFile, "r");
-	if (fp == NULL) {
-		if (strerror_r(errno, errStr, sizeof(errStr)) == 0) {
-			mg_cry(conn,
-					"error: 'BasicAuthFile' file '%s' could not be accessed: %s\n",
-					inst-&gt;pszBasicAuthFile, errStr);
-		} else {
-			mg_cry(conn,
-					"error: 'BasicAuthFile' file '%s' could not be accessed: %d\n",
-					inst-&gt;pszBasicAuthFile, errno);
-		}
-		ret = 0;
-		goto finalize;
-	}
-
-	ret = authorize(conn, fp);
-
-finalize:
-	if (!ret) {
-		mg_send_http_error(conn, 401, "WWW-Authenticate: Basic realm=\"User Visible Realm\"\n");
-	}
-	if (fp ) {
-		fclose(fp);
-	}
-	return ret;
-}
-
-/* cbdata should actually contain instance data and we can actually use this instance data
- * to hold reusable scratch buffer.
- */
-static int
-postHandler(struct mg_connection *conn, void *cbdata)
-{
-	int rc = 1;
-	instanceConf_t* inst = (instanceConf_t*) cbdata;
-	const struct mg_request_info *ri = mg_get_request_info(conn);
-	struct conn_wrkr_s *connWrkr = mg_get_thread_pointer(conn);
-	connWrkr-&gt;multiSub.nElem = 0;
-	memset(&amp;connWrkr-&gt;parseState, 0, sizeof(connWrkr-&gt;parseState));
-	connWrkr-&gt;pri = ri;
-
-	if (inst-&gt;bAddMetadata &amp;&amp; connWrkr-&gt;scratchBufSize == 0) {
-		connWrkr-&gt;pScratchBuf = calloc(1, INIT_SCRATCH_BUF_SIZE);
-		if (!connWrkr-&gt;pScratchBuf) {
-			mg_cry(conn, "%s() - could not alloc scratch buffer!\n", __FUNCTION__);
-			rc = 500;
-			FINALIZE;
-		}
-		connWrkr-&gt;scratchBufSize = INIT_SCRATCH_BUF_SIZE;
-	}
-
-	if (0 != strcmp(ri-&gt;request_method, "POST")) {
-		/* Not a POST request */
-		int ret = mg_get_request_link(conn, connWrkr-&gt;pReadBuf, connWrkr-&gt;readBufSize);
-		mg_printf(conn,
-		          "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n");
-		mg_printf(conn, "Content-Type: text/plain\r\n\r\n");
-		mg_printf(conn,
-		          "%s method not allowed in the POST handler\n",
-		          ri-&gt;request_method);
-		if (ret &gt;= 0) {
-			mg_printf(conn,
-			          "use a web tool to send a POST request to %s\n",
-			          connWrkr-&gt;pReadBuf);
-		}
-		STATSCOUNTER_INC(statsCounter.ctrFailed, statsCounter.mutCtrFailed);
-		rc = 405;
-		FINALIZE;
-	}
-
-	if (ri-&gt;remote_addr[0] != '\0') {
-		size_t len = strnlen(ri-&gt;remote_addr, sizeof(ri-&gt;remote_addr));
-		prop.CreateOrReuseStringProp(&amp;connWrkr-&gt;propRemoteAddr, (const uchar*)ri-&gt;remote_addr, len);
-	}
-
-	if (ri-&gt;content_length &gt;= 0) {
-		/* We know the content length in advance */
-		if (ri-&gt;content_length &gt; (long long) connWrkr-&gt;readBufSize) {
-			connWrkr-&gt;pReadBuf = realloc(connWrkr-&gt;pReadBuf, ri-&gt;content_length+1);
-			if (!connWrkr-&gt;pReadBuf) {
-				mg_cry(conn, "%s() - realloc failed!\n", __FUNCTION__);
-				FINALIZE;
-			}
-			connWrkr-&gt;readBufSize = ri-&gt;content_length+1;
-		}
-	} else {
-		/* We must read until we find the end (chunked encoding
-		 * or connection close), indicated my mg_read returning 0 */
-	}
-
-	if (ri-&gt;num_headers &gt; 0) {
-		int i;
-		for (i = 0; i &lt; ri-&gt;num_headers; i++) {
-			if (!strcasecmp(ri-&gt;http_headers[i].name, "content-encoding") &amp;&amp;
-					!strcasecmp(ri-&gt;http_headers[i].value, "gzip")) {
-				connWrkr-&gt;parseState.content_compressed = 1;
-			}
-		}
-	}
-
-	while (1) {
-		int count = mg_read(conn, connWrkr-&gt;pReadBuf, connWrkr-&gt;readBufSize);
-		if (count &gt; 0) {
-			processData(inst, connWrkr, (const char*)connWrkr-&gt;pReadBuf, count);
-		} else {
-			break;
-		}
-	}
-
-	/* submit remainder */
-	doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
-	multiSubmitFlush(&amp;connWrkr-&gt;multiSub);
-
-	mg_send_http_ok(conn, "text/plain", 0);
-	rc = 200;
-
-finalize_it:
-	if (connWrkr-&gt;parseState.bzInitDone) {
-		inflateEnd(&amp;connWrkr-&gt;parseState.zstrm);
-	}
-	/* reset */
-	connWrkr-&gt;iMsg = 0;
-
-	return rc;
-}
-
-static int runloop(void)
-{
-	dbgprintf("imhttp started.\n");
-
-	/* Add handler for form data */
-	for(instanceConf_t *inst = runModConf-&gt;root ; inst != NULL ; inst = inst-&gt;next) {
-		assert(inst-&gt;pszEndpoint);
-		if (inst-&gt;pszEndpoint) {
-			dbgprintf("setting request handler: '%s'\n", inst-&gt;pszEndpoint);
-			mg_set_request_handler(s_httpserv-&gt;ctx, (char *)inst-&gt;pszEndpoint, postHandler, inst);
-			if (inst-&gt;pszBasicAuthFile) {
-				mg_set_auth_handler(s_httpserv-&gt;ctx, (char *)inst-&gt;pszEndpoint, basicAuthHandler, inst);
-			}
-		}
-	}
-
-	/* Wait until the server should be closed */
-	while(glbl.GetGlobalInputTermState() == 0) {
-		sleep(1);
-	}
-	return EXIT_SUCCESS;
-}
-
-BEGINnewInpInst
-	struct cnfparamvals *pvals;
-	instanceConf_t *inst;
-	int i;
-CODESTARTnewInpInst
-	DBGPRINTF("newInpInst (imhttp)\n");
-	pvals = nvlstGetParams(lst, &amp;inppblk, NULL);
-	if(pvals == NULL) {
-		LogError(0, RS_RET_MISSING_CNFPARAMS,
-			        "imhttp: required parameter are missing\n");
-<a name="2"></a>		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if(Debug) {
-		dbgprintf("input param blk in imtcp:\n");
-		cnfparamsPrint(&amp;inppblk, pvals);
-	}
-
-	CHKiRet(createInstance(&amp;inst));
-
-	for(i = 0 ; i &lt; inppblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(inppblk.descr[i].name, "endpoint")) {
-<a name="1"></a>			inst-&gt;pszEndpoint = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(inppblk.descr[i].name, "basicauthfile")) {
-			inst-&gt;pszBasicAuthFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
-<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		} else if(!strcmp(inppblk.descr[i].name, "ruleset")) {
-			inst-&gt;pszBindRuleset = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(inppblk.descr[i].name, "name")) {
-			inst-&gt;pszInputName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(inppblk.descr[i].name, "ratelimit.burst")) {
-			inst-&gt;ratelimitBurst = (unsigned int) pvals[i].val.d.n;</b></font>
-		} else if(!strcmp(inppblk.descr[i].name, "ratelimit.interval")) {
-			inst-&gt;ratelimitInterval = (unsigned int) pvals[i].val.d.n;
-		} else if(!strcmp(inppblk.descr[i].name, "flowcontrol")) {
-			inst-&gt;flowControl = (int) pvals[i].val.d.n;
-		} else if(!strcmp(inppblk.descr[i].name, "disablelfdelimiter")) {
-			inst-&gt;bDisableLFDelim = (int) pvals[i].val.d.n;
-		} else if (!strcmp(inppblk.descr[i].name, "supportoctetcountedframing")) {
-			inst-&gt;bSuppOctetFram = (int) pvals[i].val.d.n;
-		} else if (!strcmp(inppblk.descr[i].name, "addmetadata")) {
-			inst-&gt;bAddMetadata = (int) pvals[i].val.d.n;
-		} else {
-			dbgprintf("imhttp: program error, non-handled "
-			  "param '%s'\n", inppblk.descr[i].name);
-		}
-	}
-
-	if (inst-&gt;pszInputName) {
-		CHKiRet(prop.Construct(&amp;inst-&gt;pInputName));
-		CHKiRet(prop.SetString(inst-&gt;pInputName, inst-&gt;pszInputName, ustrlen(inst-&gt;pszInputName)));
-		CHKiRet(prop.ConstructFinalize(inst-&gt;pInputName));
-	}
-	CHKiRet(ratelimitNew(&amp;inst-&gt;ratelimiter, "imphttp", NULL));
-	ratelimitSetLinuxLike(inst-&gt;ratelimiter, inst-&gt;ratelimitInterval, inst-&gt;ratelimitBurst);
-
-finalize_it:
-CODE_STD_FINALIZERnewInpInst
-	cnfparamvalsDestruct(pvals, &amp;inppblk);
-ENDnewInpInst
-
-
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	loadModConf = pModConf;
-	pModConf-&gt;pConf = pConf;
-	loadModConf-&gt;ports.name = NULL;
-	loadModConf-&gt;docroot.name = NULL;
-	loadModConf-&gt;nOptions = 0;
-	loadModConf-&gt;options = NULL;
-ENDbeginCnfLoad
-
-
-BEGINsetModCnf
-	struct cnfparamvals *pvals = NULL;
-CODESTARTsetModCnf
-	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
-	if(pvals == NULL) {
-		LogError(0, RS_RET_MISSING_CNFPARAMS, "imhttp: error processing module "
-				"config parameters [module(...)]");
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	if(Debug) {
-		dbgprintf("module (global) param blk for imhttp:\n");
-		cnfparamsPrint(&amp;modpblk, pvals);
-	}
-
-	for(int i = 0 ; i &lt; modpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(modpblk.descr[i].name, "ports")) {
-			assert(loadModConf-&gt;ports.name == NULL);
-			assert(loadModConf-&gt;ports.val == NULL);
-			loadModConf-&gt;ports.name = strdup(CIVETWEB_OPTION_NAME_PORTS);
-			loadModConf-&gt;ports.val = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if (!strcmp(modpblk.descr[i].name, "documentroot")) {
-			assert(loadModConf-&gt;docroot.name == NULL);
-			assert(loadModConf-&gt;docroot.val == NULL);
-			loadModConf-&gt;docroot.name = strdup(CIVETWEB_OPTION_NAME_DOCUMENT_ROOT);
-			loadModConf-&gt;docroot.val = es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(modpblk.descr[i].name, "liboptions")) {
-			loadModConf-&gt;nOptions = pvals[i].val.d.ar-&gt;nmemb;
-			CHKmalloc(loadModConf-&gt;options = malloc(sizeof(struct option) *
-			                                      pvals[i].val.d.ar-&gt;nmemb ));
-			for(int j = 0 ; j &lt;  pvals[i].val.d.ar-&gt;nmemb ; ++j) {
-				char *cstr = es_str2cstr(pvals[i].val.d.ar-&gt;arr[j], NULL);
-				CHKiRet(processCivetwebOptions(cstr, &amp;loadModConf-&gt;options[j].name,
-					&amp;loadModConf-&gt;options[j].val));
-				free(cstr);
-			}
-		} else {
-			dbgprintf("imhttp: program error, non-handled "
-			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
-		}
-	}
-
-finalize_it:
-	if(pvals != NULL)
-		cnfparamvalsDestruct(pvals, &amp;modpblk);
-ENDsetModCnf
-
-
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-	loadModConf = NULL; /* done loading */
-ENDendCnfLoad
-
-/* function to generate error message if framework does not find requested ruleset */
-static inline void
-std_checkRuleset_genErrMsg(__attribute__((unused)) modConfData_t *modConf, instanceConf_t *inst)
-{
-	LogError(0, NO_ERRCODE, "imhttp: ruleset '%s' for %s not found - "
-			"using default ruleset instead", inst-&gt;pszBindRuleset,
-			inst-&gt;pszEndpoint);
-}
-
-BEGINcheckCnf
-	instanceConf_t *inst;
-CODESTARTcheckCnf
-	for(inst = pModConf-&gt;root ; inst != NULL ; inst = inst-&gt;next) {
-		std_checkRuleset(pModConf, inst);
-	}
-	/* verify civetweb options are valid */
-	const struct mg_option *valid_opts = mg_get_valid_options();
-	for (int i = 0; i &lt; pModConf-&gt;nOptions; ++i) {
-		if (!valid_civetweb_option(valid_opts, pModConf-&gt;options[i].name)) {
-			LogError(0, RS_RET_CONF_PARSE_WARNING, "imhttp: module loaded, but "
-			"invalid civetweb option found - imhttp may not receive connections.");
-			iRet = RS_RET_CONF_PARSE_WARNING;
-		}
-	}
-ENDcheckCnf
-
-
-BEGINactivateCnf
-CODESTARTactivateCnf
-	runModConf = pModConf;
-
-	if (!s_httpserv) {
-		CHKmalloc(s_httpserv = calloc(1, sizeof(httpserv_t)));
-	}
-	/* options represents (key, value) so allocate 2x, and null terminated */
-	size_t count = 1;
-	if (runModConf-&gt;ports.val) {
-		count += 2;
-	}
-	if (runModConf-&gt;docroot.val) {
-		count += 2;
-	}
-	count += (2 * runModConf-&gt;nOptions);
-	CHKmalloc(s_httpserv-&gt;civetweb_options = calloc(count, sizeof(*s_httpserv-&gt;civetweb_options)));
-
-	const char **pcivetweb_options = s_httpserv-&gt;civetweb_options;
-	if (runModConf-&gt;nOptions) {
-		s_httpserv-&gt;civetweb_options_count = count;
-		for (int i = 0; i &lt; runModConf-&gt;nOptions; ++i) {
-			*pcivetweb_options = runModConf-&gt;options[i].name;
-			pcivetweb_options++;
-			*pcivetweb_options = runModConf-&gt;options[i].val;
-			pcivetweb_options++;
-		}
-	}
-	/* append port, docroot */
-	if (runModConf-&gt;ports.val) {
-		*pcivetweb_options = runModConf-&gt;ports.name;
-		pcivetweb_options++;
-		*pcivetweb_options = runModConf-&gt;ports.val;
-		pcivetweb_options++;
-	}
-	if (runModConf-&gt;docroot.val) {
-		*pcivetweb_options = runModConf-&gt;docroot.name;
-		pcivetweb_options++;
-		*pcivetweb_options = runModConf-&gt;docroot.val;
-		pcivetweb_options++;
-	}
-
-	const char **option = s_httpserv-&gt;civetweb_options;
-	for (; option &amp;&amp; *option != NULL; option++) {
-		dbgprintf("imhttp: civetweb option: %s\n", *option);
-	}
-
-	CHKiRet(statsobj.Construct(&amp;statsCounter.stats));
-	CHKiRet(statsobj.SetName(statsCounter.stats, UCHAR_CONSTANT("imhttp")));
-	CHKiRet(statsobj.SetOrigin(statsCounter.stats, UCHAR_CONSTANT("imhttp")));
-	STATSCOUNTER_INIT(statsCounter.ctrSubmitted, statsCounter.mutCtrSubmitted);
-	CHKiRet(statsobj.AddCounter(statsCounter.stats, UCHAR_CONSTANT("submitted"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(statsCounter.ctrSubmitted)));
-
-	STATSCOUNTER_INIT(statsCounter.ctrFailed, statsCounter.mutCtrFailed);
-	CHKiRet(statsobj.AddCounter(statsCounter.stats, UCHAR_CONSTANT("failed"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(statsCounter.ctrFailed)));
-
-	STATSCOUNTER_INIT(statsCounter.ctrDiscarded, statsCounter.mutCtrDiscarded);
-	CHKiRet(statsobj.AddCounter(statsCounter.stats, UCHAR_CONSTANT("discarded"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(statsCounter.ctrDiscarded)));
-
-	CHKiRet(statsobj.ConstructFinalize(statsCounter.stats));
-
-	/* init civetweb libs and start server w/no input */
-	mg_init_library(MG_FEATURES_TLS);
-	memset(&amp;callbacks, 0, sizeof(callbacks));
-	//callbacks.log_message = log_message;
-	//callbacks.init_ssl = init_ssl;
-	callbacks.init_thread = init_thread;
-	callbacks.exit_thread = exit_thread;
-	s_httpserv-&gt;ctx = mg_start(&amp;callbacks, NULL, s_httpserv-&gt;civetweb_options);
-	/* Check return value: */
-	if (s_httpserv-&gt;ctx == NULL) {
-		LogError(0, RS_RET_INTERNAL_ERROR, "Cannot start CivetWeb - mg_start failed.\n");
-		ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
-	}
-
-	finalize_it:
-	if (iRet != RS_RET_OK) {
-		free(s_httpserv);
-		s_httpserv = NULL;
-		LogError(0, NO_ERRCODE, "imhttp: error %d trying to activate configuration", iRet);
-	}
-	RETiRet;
-ENDactivateCnf
-
-BEGINfreeCnf
-	instanceConf_t *inst, *del;
-CODESTARTfreeCnf
-	for(inst = pModConf-&gt;root ; inst != NULL ; ) {
-		if (inst-&gt;ratelimiter) {
-			ratelimitDestruct(inst-&gt;ratelimiter);
-		}
-		if (inst-&gt;pInputName) {
-			prop.Destruct(&amp;inst-&gt;pInputName);
-		}
-		free(inst-&gt;pszEndpoint);
-		free(inst-&gt;pszBasicAuthFile);
-		free(inst-&gt;pszBindRuleset);
-		free(inst-&gt;pszInputName);
-
-		del = inst;
-		inst = inst-&gt;next;
-		free(del);
-	}
-
-	for (int i = 0; i &lt; pModConf-&gt;nOptions; ++i) {
-		free((void*) pModConf-&gt;options[i].name);
-		free((void*) pModConf-&gt;options[i].val);
-	}
-	free(pModConf-&gt;options);
-
-	free((void*)pModConf-&gt;ports.name);
-	free((void*)pModConf-&gt;ports.val);
-	free((void*)pModConf-&gt;docroot.name);
-	free((void*)pModConf-&gt;docroot.val);
-
-	if (statsCounter.stats) {
-		statsobj.Destruct(&amp;statsCounter.stats);
-	}
-ENDfreeCnf
-
-
-/* This function is called to gather input.
- */
-BEGINrunInput
-CODESTARTrunInput
-	runloop();
-ENDrunInput
-
-/* initialize and return if will run or not */
-BEGINwillRun
-CODESTARTwillRun
-ENDwillRun
-
-BEGINafterRun
-CODESTARTafterRun
-	if (s_httpserv) {
-		mg_stop(s_httpserv-&gt;ctx);
-		mg_exit_library();
-		free(s_httpserv-&gt;civetweb_options);
-		free(s_httpserv);
-	}
-ENDafterRun
-
-
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	// if(eFeat == sFEATURENonCancelInputTermination)
-	// 	iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-
-
-BEGINmodExit
-CODESTARTmodExit
-	if(pInputName != NULL) {
-		prop.Destruct(&amp;pInputName);
-	}
-
-	/* release objects we used */
-	objRelease(statsobj, CORE_COMPONENT);
-	objRelease(glbl, CORE_COMPONENT);
-	objRelease(prop, CORE_COMPONENT);
-	objRelease(ruleset, CORE_COMPONENT);
-ENDmodExit
-
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_IMOD_QUERIES
-CODEqueryEtryPt_STD_CONF2_QUERIES
-CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
-CODEqueryEtryPt_STD_CONF2_IMOD_QUERIES
-CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
-ENDqueryEtryPt
-
-
-BEGINmodInit()
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
-CODEmodInit_QueryRegCFSLineHdlr
-	CHKiRet(objUse(ruleset, CORE_COMPONENT));
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-	CHKiRet(objUse(prop, CORE_COMPONENT));
-	CHKiRet(objUse(statsobj, CORE_COMPONENT));
-
-	/* we need to create the inputName property (only once during our lifetime) */
-	CHKiRet(prop.Construct(&amp;pInputName));
-	CHKiRet(prop.SetString(pInputName, UCHAR_CONSTANT("imhttp"), sizeof("imhttp") - 1));
-	CHKiRet(prop.ConstructFinalize(pInputName));
-ENDmodInit
+1 #include "config.h"
+2 #include &lt;stdio.h&gt;
+3 #include &lt;stdlib.h&gt;
+4 #include &lt;assert.h&gt;
+5 #include &lt;string.h&gt;
+6 #include &lt;errno.h&gt;
+7 #include &lt;unistd.h&gt;
+8 #include &lt;stdarg.h&gt;
+9 #include &lt;ctype.h&gt;
+10 #include &lt;netinet/in.h&gt;
+11 #include &lt;netdb.h&gt;
+12 #include &lt;sys/types.h&gt;
+13 #include &lt;sys/socket.h&gt;
+14 #include "rsyslog.h"
+15 #include "cfsysline.h"		#include "module-template.h"
+16 #include "ruleset.h"
+17 #include "unicode-helper.h"
+18 #include "rsyslog.h"
+19 #include "errmsg.h"
+20 #include "statsobj.h"
+21 #include "ratelimit.h"
+22 #include "dirty.h"
+23 #include "civetweb.h"
+24 #include &lt;apr_base64.h&gt;
+25 #include &lt;apr_md5.h&gt;
+26 MODULE_TYPE_INPUT
+27 MODULE_TYPE_NOKEEP
+28 MODULE_CNFNAME("imhttp")
+29 DEF_OMOD_STATIC_DATA
+30 DEFobjCurrIf(glbl)
+31 DEFobjCurrIf(prop)
+32 DEFobjCurrIf(ruleset)
+33 DEFobjCurrIf(statsobj)
+34 #define CIVETWEB_OPTION_NAME_PORTS         "listening_ports"
+35 #define CIVETWEB_OPTION_NAME_DOCUMENT_ROOT "document_root"
+36 #define MAX_READ_BUFFER_SIZE  16384
+37 #define INIT_SCRATCH_BUF_SIZE 4096
+38 #define IMHTTP_MAX_BUF_LEN (8192)
+39 struct option {
+40 	const char *name;
+41 	const char *val;
+42 };
+43 struct auth_s {
+44 	char workbuf[IMHTTP_MAX_BUF_LEN];
+45 	char* pworkbuf;
+46 	size_t workbuf_len;
+47 	char* pszUser;
+48 	char* pszPasswd;
+49 };
+50 struct data_parse_s {
+51 	sbool  content_compressed;
+52 	sbool bzInitDone; 	z_stream zstrm;		enum {
+53 		eAtStrtFram,
+54 		eInOctetCnt,
+55 		eInMsg,
+56 	} inputState;
+57 	size_t iOctetsRemain;		enum {
+58 		TCP_FRAMING_OCTET_STUFFING,
+59 		TCP_FRAMING_OCTET_COUNTING
+60 	} framingMode;
+61 };
+62 struct modConfData_s {
+63 	rsconf_t *pConf;  	instanceConf_t *root, *tail;
+64 	struct option ports;
+65 	struct option docroot;
+66 	struct option *options;
+67 	int nOptions;
+68 };
+69 struct instanceConf_s {
+70 	struct instanceConf_s *next;
+71 	uchar *pszBindRuleset;    	uchar *pszEndpoint;       	uchar *pszBasicAuthFile;       	ruleset_t *pBindRuleset;  	ratelimit_t *ratelimiter;
+72 	unsigned int ratelimitInterval;
+73 	unsigned int ratelimitBurst;
+74 	uchar *pszInputName;	  	prop_t *pInputName;
+75 	sbool flowControl;
+76 	sbool bDisableLFDelim;
+77 	sbool bSuppOctetFram;
+78 	sbool bAddMetadata;
+79 };
+80 struct conn_wrkr_s {
+81 	struct data_parse_s parseState;
+82 	uchar* pMsg;							size_t iMsg;							uchar zipBuf[64*1024];
+83 	multi_submit_t multiSub;
+84 	smsg_t *pMsgs[CONF_NUM_MULTISUB];
+85 	char *pReadBuf;
+86 	size_t readBufSize;
+87 	prop_t *propRemoteAddr;
+88 	const struct mg_request_info *pri; 	char *pScratchBuf;
+89 	size_t scratchBufSize;
+90 };
+91 static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;static prop_t *pInputName = NULL;
+92 static size_t s_iMaxLine = 16384; 
+93 static struct cnfparamdescr modpdescr[] = {
+94 	{ "ports", eCmdHdlrString, 0 },
+95 	{ "documentroot", eCmdHdlrString, 0 },
+96 	{ "liboptions", eCmdHdlrArray, 0 },
+97 };
+98 static struct cnfparamblk modpblk = {
+99 	CNFPARAMBLK_VERSION,
+100 	sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+101 	modpdescr
+102 <a name="0"></a>};
+103 static struct cnfparamdescr inppdescr[] = {
+104 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "endpoint", eCmdHdlrString, 0},
+105 	{ "basicauthfile", eCmdHdlrString, 0},
+106 	{ "ruleset", eCmdHdlrString, 0 },
+107 	{ "flowcontrol", eCmdHdlrBinary, 0 },
+108 	{ "disablelfdelimiter", eCmdHdlrBinary, 0 },
+109 	{ "supportoctetcountedframing", eCmdHdlrBinary, 0 },
+110 	{ "name", eCmdHdlrString, 0 },
+111 	{ "ratelimit.interval", eCmdHdlrInt, 0 },
+112 	{ "ratelimit.burst", eCmdHdlrInt, 0 },
+113 	{ "addmetadata", eCmdHdlrBinary, 0 }
+114 };
+115 #include "im-helper.h" 
+116 static struct cnfparamblk inppblk = {
+117 	CNFPARAMBLK_VERSION,
+118 	sizeof(inppdescr)/sizeof(struct cnfparamdescr),
+119 	inppdescr
+120 };
+121 static struct {</b></font>
+122 	statsobj_t *stats;
+123 	STATSCOUNTER_DEF(ctrSubmitted, mutCtrSubmitted)
+124 	STATSCOUNTER_DEF(ctrFailed, mutCtrFailed);
+125 	STATSCOUNTER_DEF(ctrDiscarded, mutCtrDiscarded);
+126 } statsCounter;
+127 #include "im-helper.h" 
+128 #define min(a, b) \
+129 	({ __typeof__ (a) _a = (a); \
+130 	__typeof__ (b) _b = (b); \
+131 	_a &lt; _b ? _a : _b; })
+132 #define	EXIT_FAILURE	1
+133 #define	EXIT_SUCCESS	0
+134 #define EXIT_URI "/exit"
+135 volatile int exitNow = 0;
+136 struct mg_callbacks callbacks;
+137 typedef struct httpserv_s {
+138 	struct mg_context *ctx;
+139 	struct mg_callbacks callbacks;
+140 	const char **civetweb_options;
+141 	size_t civetweb_options_count;
+142 } httpserv_t;
+143 static httpserv_t *s_httpserv;
+144 static rsRetVal processData(const instanceConf_t *const inst,
+145 	struct conn_wrkr_s *connWrkr, const char* buf, size_t len);
+146 static rsRetVal
+147 createInstance(instanceConf_t **pinst)
+148 {
+149 <a name="3"></a>	instanceConf_t *inst;
+150 	DEFiRet;
+151 	CHKmalloc(inst = calloc(1, sizeof(instanceConf_t)));
+152 <font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	inst-&gt;next = NULL;
+153 	inst-&gt;pszBindRuleset = NULL;
+154 	inst-&gt;pBindRuleset = NULL;
+155 	inst-&gt;pszEndpoint = NULL;
+156 	inst-&gt;pszBasicAuthFile = NULL;
+157 	inst-&gt;ratelimiter = NULL;
+158 	inst-&gt;pszInputName = NULL;</b></font>
+159 	inst-&gt;pInputName = NULL;
+160 	inst-&gt;ratelimitBurst = 10000; 	inst-&gt;ratelimitInterval = 0; 	inst-&gt;flowControl = 1;
+161 	inst-&gt;bDisableLFDelim = 0;
+162 	inst-&gt;bSuppOctetFram = 0;
+163 	inst-&gt;bAddMetadata = 0;
+164 <a name="4"></a>	
+165 <font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if(loadModConf-&gt;tail == NULL) {
+166 		loadModConf-&gt;tail = loadModConf-&gt;root = inst;
+167 	} else {
+168 		loadModConf-&gt;tail-&gt;next = inst;
+169 		loadModConf-&gt;tail = inst;
+170 	}
+171 	*pinst = inst;</b></font>
+172 finalize_it:
+173 	RETiRet;
+174 }
+175 static rsRetVal
+176 processCivetwebOptions(char *const param,
+177 	const char **const name,
+178 	const char **const paramval)
+179 {
+180 	DEFiRet;
+181 	char *val = strstr(param, "=");
+182 	if(val == NULL) {
+183 		LogError(0, RS_RET_PARAM_ERROR, "missing equal sign in "
+184 				"parameter '%s'", param);
+185 		ABORT_FINALIZE(RS_RET_PARAM_ERROR);
+186 	}
+187 	*val = '\0'; 	++val; 	CHKmalloc(*name = strdup(param));
+188 	CHKmalloc(*paramval = strdup(val));
+189 finalize_it:
+190 	RETiRet;
+191 }
+192 static sbool valid_civetweb_option(const struct mg_option *valid_opts, const char* option)
+193 {
+194 	const struct mg_option *pvalid_opts = valid_opts;
+195 	for (; pvalid_opts != NULL &amp;&amp; pvalid_opts-&gt;name != NULL; pvalid_opts++) {
+196 		if (strcmp(pvalid_opts-&gt;name, option) == 0) {
+197 			return TRUE;
+198 		}
+199 	}
+200 	return FALSE;
+201 }
+202 #if 0
+203 static int
+204 log_message(__attribute__((unused)) const struct mg_connection *conn, const char *message)
+205 {
+206 	puts(message);
+207 	return 1;
+208 }
+209 #endif
+210 static void*
+211 init_thread(__attribute__((unused)) const struct mg_context *ctx, int thread_type)
+212 {
+213 	DEFiRet;
+214 	struct conn_wrkr_s *data = NULL;
+215 	if (thread_type == 1) {
+216 		CHKmalloc(data = calloc(1, sizeof(struct conn_wrkr_s)));
+217 		data-&gt;pMsg = NULL;
+218 		data-&gt;iMsg = 0;
+219 		data-&gt;parseState.bzInitDone = 0;
+220 		data-&gt;parseState.content_compressed = 0;
+221 		data-&gt;parseState.inputState = eAtStrtFram;
+222 		data-&gt;parseState.iOctetsRemain = 0;
+223 		data-&gt;multiSub.maxElem = CONF_NUM_MULTISUB;
+224 		data-&gt;multiSub.ppMsgs = data-&gt;pMsgs;
+225 		data-&gt;multiSub.nElem = 0;
+226 		data-&gt;pReadBuf = malloc(MAX_READ_BUFFER_SIZE);
+227 		data-&gt;readBufSize = MAX_READ_BUFFER_SIZE;
+228 		data-&gt;parseState.bzInitDone = 0;
+229 		data-&gt;parseState.content_compressed = 0;
+230 		data-&gt;parseState.inputState = eAtStrtFram;
+231 		data-&gt;parseState.iOctetsRemain = 0;
+232 		CHKmalloc(data-&gt;pMsg = calloc(1, 1 + s_iMaxLine));
+233 		data-&gt;iMsg = 0;
+234 		data-&gt;propRemoteAddr = NULL;
+235 		data-&gt;pScratchBuf = NULL;
+236 		data-&gt;scratchBufSize = 0;
+237 	}
+238 finalize_it:
+239 	if (iRet != RS_RET_OK) {
+240 		free(data);
+241 		return NULL;
+242 	}
+243 	return data;
+244 }
+245 static void
+246 exit_thread(__attribute__((unused)) const struct mg_context *ctx,
+247 	__attribute__((unused)) int thread_type, void *thread_pointer)
+248 {
+249 	if (thread_type == 1) {
+250 		struct conn_wrkr_s *data = (struct conn_wrkr_s *) thread_pointer;
+251 		if (data-&gt;propRemoteAddr) {
+252 			prop.Destruct(&amp;data-&gt;propRemoteAddr);
+253 		}
+254 		if (data-&gt;scratchBufSize) {
+255 			free(data-&gt;pScratchBuf);
+256 		}
+257 		free(data-&gt;pReadBuf);
+258 		free(data-&gt;pMsg);
+259 		free(data);
+260 	}
+261 }
+262 static rsRetVal
+263 msgAddMetadataFromHttpHeader(smsg_t *const __restrict__ pMsg, struct conn_wrkr_s *connWrkr)
+264 {
+265 	struct json_object *json = NULL;
+266 	DEFiRet;
+267 	const struct mg_request_info *ri = connWrkr-&gt;pri;
+268 	#define MAX_HTTP_HEADERS 64		int count = min(ri-&gt;num_headers, MAX_HTTP_HEADERS);
+269 	CHKmalloc(json = json_object_new_object());
+270 	for (int i = 0 ; i &lt; count ; i++ ) {
+271 		struct json_object *const jval = json_object_new_string(ri-&gt;http_headers[i].value);
+272 		CHKmalloc(jval);
+273 		strncpy(connWrkr-&gt;pScratchBuf, ri-&gt;http_headers[i].name, connWrkr-&gt;scratchBufSize - 1);
+274 		char* pname = connWrkr-&gt;pScratchBuf;
+275 		while (pname &amp;&amp; *pname != '\0') {
+276 			*pname = tolower(*pname);
+277 			pname++;
+278 		}
+279 		json_object_object_add(json, (const char *const)connWrkr-&gt;pScratchBuf, jval);
+280 	}
+281 	CHKiRet(msgAddJSON(pMsg, (uchar*)"!metadata!httpheaders", json, 0, 0));
+282 finalize_it:
+283 	if (iRet != RS_RET_OK &amp;&amp; json) {
+284 		json_object_put(json);
+285 	}
+286 	RETiRet;
+287 }
+288 static rsRetVal
+289 msgAddMetadataFromHttpQueryParams(smsg_t *const __restrict__ pMsg, struct conn_wrkr_s *connWrkr)
+290 {
+291 	struct json_object *json = NULL;
+292 	DEFiRet;
+293 	const struct mg_request_info *ri = connWrkr-&gt;pri;
+294 	if (ri &amp;&amp; ri-&gt;query_string) {
+295 		strncpy(connWrkr-&gt;pScratchBuf, ri-&gt;query_string, connWrkr-&gt;scratchBufSize - 1);
+296 		char *pquery_str = connWrkr-&gt;pScratchBuf;
+297 		if (pquery_str) {
+298 			CHKmalloc(json = json_object_new_object());
+299 			char* saveptr = NULL;
+300 			char *kv_pair = strtok_r(pquery_str, "&amp;;", &amp;saveptr);
+301 			for ( ; kv_pair != NULL; kv_pair = strtok_r(NULL, "&amp;;", &amp;saveptr)) {
+302 				char *saveptr2 = NULL;
+303 				char *key = strtok_r(kv_pair, "=", &amp;saveptr2);
+304 				if (key) {
+305 					char *value = strtok_r(NULL, "=", &amp;saveptr2);
+306 					struct json_object *const jval = json_object_new_string(value);
+307 					CHKmalloc(jval);
+308 					json_object_object_add(json, (const char *)key, jval);
+309 				}
+310 			}
+311 			CHKiRet(msgAddJSON(pMsg, (uchar*)"!metadata!queryparams", json, 0, 0));
+312 		}
+313 	}
+314 finalize_it:
+315 	if (iRet != RS_RET_OK &amp;&amp; json) {
+316 		json_object_put(json);
+317 	}
+318 	RETiRet;
+319 }
+320 static rsRetVal
+321 doSubmitMsg(const instanceConf_t *const __restrict__ inst,
+322 	struct conn_wrkr_s *connWrkr, const uchar* msg, size_t len)
+323 {
+324 	smsg_t *pMsg;
+325 	DEFiRet;
+326 	assert(len &lt;= s_iMaxLine);
+327 	if (len == 0) {
+328 		DBGPRINTF("discarding zero-sized message\n");
+329 		FINALIZE;
+330 	}
+331 	CHKiRet(msgConstruct(&amp;pMsg));
+332 	MsgSetFlowControlType(pMsg, inst-&gt;flowControl
+333 			            ? eFLOWCTL_LIGHT_DELAY : eFLOWCTL_NO_DELAY);
+334 	if (inst-&gt;pInputName) {
+335 		MsgSetInputName(pMsg, inst-&gt;pInputName);
+336 	} else {
+337 		MsgSetInputName(pMsg, pInputName);
+338 	}
+339 	MsgSetRawMsg(pMsg, (const char*)msg, len);
+340 	MsgSetMSGoffs(pMsg, 0);		if (connWrkr-&gt;propRemoteAddr) {
+341 		MsgSetRcvFromIP(pMsg, connWrkr-&gt;propRemoteAddr);
+342 	}
+343 	if (inst) {
+344 		MsgSetRuleset(pMsg, inst-&gt;pBindRuleset);
+345 	}
+346 	pMsg-&gt;msgFlags = NEEDS_PARSING | PARSE_HOSTNAME;
+347 	if (inst-&gt;bAddMetadata) {
+348 		CHKiRet(msgAddMetadataFromHttpHeader(pMsg, connWrkr));
+349 		CHKiRet(msgAddMetadataFromHttpQueryParams(pMsg, connWrkr));
+350 	}
+351 	ratelimitAddMsg(inst-&gt;ratelimiter, &amp;connWrkr-&gt;multiSub, pMsg);
+352 	STATSCOUNTER_INC(statsCounter.ctrSubmitted, statsCounter.mutCtrSubmitted);
+353 finalize_it:
+354 	connWrkr-&gt;iMsg = 0;
+355 	if (iRet != RS_RET_OK) {
+356 		STATSCOUNTER_INC(statsCounter.ctrDiscarded, statsCounter.mutCtrDiscarded);
+357 	}
+358 	RETiRet;
+359 }
+360 static rsRetVal
+361 processOctetMsgLen(const instanceConf_t *const inst, struct conn_wrkr_s *connWrkr, char ch)
+362 {
+363 	DEFiRet;
+364 	if (connWrkr-&gt;parseState.inputState == eAtStrtFram) {
+365 		if (inst-&gt;bSuppOctetFram &amp;&amp; isdigit(ch)) {
+366 			connWrkr-&gt;parseState.inputState = eInOctetCnt;
+367 			connWrkr-&gt;parseState.iOctetsRemain = 0;
+368 			connWrkr-&gt;parseState.framingMode = TCP_FRAMING_OCTET_COUNTING;
+369 		} else {
+370 			connWrkr-&gt;parseState.inputState = eInMsg;
+371 			connWrkr-&gt;parseState.framingMode = TCP_FRAMING_OCTET_STUFFING;
+372 		}
+373 	}
+374 	if (connWrkr-&gt;parseState.inputState == eInOctetCnt) {
+375 		if (isdigit(ch)) {
+376 			if (connWrkr-&gt;parseState.iOctetsRemain &lt;= 200000000) {
+377 				connWrkr-&gt;parseState.iOctetsRemain = connWrkr-&gt;parseState.iOctetsRemain * 10 + ch - '0';
+378 			}
+379 			if(connWrkr-&gt;iMsg + 1 &lt; s_iMaxLine) {
+380 				connWrkr-&gt;pMsg[connWrkr-&gt;iMsg++] = ch;
+381 			}
+382 		} else {
+383 			const char *remoteAddr = "";
+384 			if (connWrkr-&gt;propRemoteAddr) {
+385 				remoteAddr = (const char *)propGetSzStr(connWrkr-&gt;propRemoteAddr);
+386 			}
+387 			if (ch != ' ') {
+388 				LogError(0, NO_ERRCODE, "Framing Error in received TCP message "
+389 					"from peer: (ip) %s: to input: %s, delimiter is not "
+390 					"SP but has ASCII value %d.",
+391 					remoteAddr, inst-&gt;pszInputName, ch);
+392 			}
+393 			if (connWrkr-&gt;parseState.iOctetsRemain &lt; 1) {
+394 				LogError(0, NO_ERRCODE, "Framing Error in received TCP message"
+395 					" from peer: (ip) %s: delimiter is not "
+396 					"SP but has ASCII value %d.",
+397 					remoteAddr, ch);
+398 			} else if (connWrkr-&gt;parseState.iOctetsRemain &gt; s_iMaxLine) {
+399 				DBGPRINTF("truncating message with %lu octets - max msg size is %lu\n",
+400 									connWrkr-&gt;parseState.iOctetsRemain, s_iMaxLine);
+401 				LogError(0, NO_ERRCODE, "received oversize message from peer: "
+402 					"(hostname) (ip) %s: size is %lu bytes, max msg "
+403 					"size is %lu, truncating...",
+404 					remoteAddr, connWrkr-&gt;parseState.iOctetsRemain, s_iMaxLine);
+405 			}
+406 			connWrkr-&gt;parseState.inputState = eInMsg;
+407 		}
+408 		connWrkr-&gt;iMsg = 0;
+409 	}
+410 	RETiRet;
+411 }
+412 static rsRetVal
+413 processOctetCounting(const instanceConf_t *const inst,
+414 	struct conn_wrkr_s *connWrkr, const char* buf, size_t len)
+415 {
+416 	DEFiRet;
+417 	const uchar* pbuf = (const uchar*)buf;
+418 	const uchar* pbufLast = pbuf + len;
+419 	while (pbuf &lt; pbufLast) {
+420 		char ch = *pbuf;
+421 		if (connWrkr-&gt;parseState.inputState == eAtStrtFram || connWrkr-&gt;parseState.inputState == eInOctetCnt) {
+422 			processOctetMsgLen(inst, connWrkr, ch);
+423 			if (connWrkr-&gt;parseState.framingMode == TCP_FRAMING_OCTET_COUNTING) {
+424 				pbuf++;
+425 			}
+426 		} else if (connWrkr-&gt;parseState.inputState == eInMsg) {
+427 			if (connWrkr-&gt;parseState.framingMode == TCP_FRAMING_OCTET_STUFFING) {
+428 				if (connWrkr-&gt;iMsg &lt; s_iMaxLine) {
+429 					if (ch == '\n') {
+430 						doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
+431 						connWrkr-&gt;parseState.inputState = eAtStrtFram;
+432 					} else {
+433 						connWrkr-&gt;pMsg[connWrkr-&gt;iMsg++] = ch;
+434 					}
+435 				} else {
+436 					doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
+437 					connWrkr-&gt;parseState.inputState = eAtStrtFram;
+438 				}
+439 				pbuf++;
+440 			} else {
+441 				assert (connWrkr-&gt;parseState.framingMode == TCP_FRAMING_OCTET_COUNTING);
+442 				size_t remainingBytes = pbufLast - pbuf;
+443 				size_t count = min (connWrkr-&gt;parseState.iOctetsRemain, remainingBytes);
+444 				if (connWrkr-&gt;iMsg + count &gt;= s_iMaxLine) {
+445 					count = s_iMaxLine - connWrkr-&gt;iMsg;
+446 				}
+447 				if (count) {
+448 					memcpy(connWrkr-&gt;pMsg + connWrkr-&gt;iMsg, pbuf, count);
+449 					pbuf += count;
+450 					connWrkr-&gt;iMsg += count;
+451 					connWrkr-&gt;parseState.iOctetsRemain -= count;
+452 				}
+453 				if (connWrkr-&gt;parseState.iOctetsRemain == 0) {
+454 					doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
+455 					connWrkr-&gt;parseState.inputState = eAtStrtFram;
+456 				}
+457 			}
+458 		} else {
+459 			assert(0);
+460 			break;
+461 		}
+462 	}
+463 	RETiRet;
+464 }
+465 static rsRetVal
+466 processDisableLF(const instanceConf_t *const inst,
+467 	struct conn_wrkr_s *connWrkr, const char* buf, size_t len)
+468 {
+469 	DEFiRet;
+470 	const uchar *pbuf = (const uchar*)buf;
+471 	size_t remainingBytes = len;
+472 	const uchar* pbufLast = pbuf + len;
+473 	while (pbuf &lt; pbufLast) {
+474 		size_t count = 0;
+475 		if (connWrkr-&gt;iMsg + remainingBytes &gt;= s_iMaxLine) {
+476 			count = s_iMaxLine - connWrkr-&gt;iMsg;
+477 		} else {
+478 			count = remainingBytes;
+479 		}
+480 		if (count) {
+481 			memcpy(connWrkr-&gt;pMsg + connWrkr-&gt;iMsg, pbuf, count);
+482 			pbuf += count;
+483 			connWrkr-&gt;iMsg += count;
+484 			remainingBytes -= count;
+485 		}
+486 		doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
+487 	}
+488 	RETiRet;
+489 }
+490 static rsRetVal
+491 processDataUncompressed(const instanceConf_t *const inst,
+492 	struct conn_wrkr_s *connWrkr, const char* buf, size_t len)
+493 {
+494 	const uchar *pbuf = (const uchar*)buf;
+495 	DEFiRet;
+496 	if (inst-&gt;bDisableLFDelim) {
+497 		iRet = processDisableLF(inst, connWrkr, buf, len);
+498 	} else if (inst-&gt;bSuppOctetFram) {
+499 		iRet = processOctetCounting(inst, connWrkr, buf, len);
+500 	} else {
+501 		const uchar* pbufLast = pbuf + len;
+502 		while (pbuf &lt; pbufLast) {
+503 			char ch = *pbuf;
+504 			if (connWrkr-&gt;iMsg &lt; s_iMaxLine) {
+505 				if (ch == '\n') {
+506 					doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
+507 				} else {
+508 					connWrkr-&gt;pMsg[connWrkr-&gt;iMsg++] = ch;
+509 				}
+510 			} else {
+511 				doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
+512 			}
+513 			pbuf++;
+514 		}
+515 	}
+516 	RETiRet;
+517 }
+518 static rsRetVal
+519 processDataCompressed(const instanceConf_t *const inst,
+520 	struct conn_wrkr_s *connWrkr, const char* buf, size_t len)
+521 {
+522 	DEFiRet;
+523 	if (!connWrkr-&gt;parseState.bzInitDone) {
+524 		connWrkr-&gt;parseState.zstrm.zalloc = Z_NULL;
+525 		connWrkr-&gt;parseState.zstrm.zfree = Z_NULL;
+526 		connWrkr-&gt;parseState.zstrm.opaque = Z_NULL;
+527 		int rc = inflateInit2(&amp;connWrkr-&gt;parseState.zstrm, (MAX_WBITS | 16));
+528 		if (rc != Z_OK) {
+529 			dbgprintf("imhttp: error %d returned from zlib/inflateInit()\n", rc);
+530 			ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+531 		}
+532 		connWrkr-&gt;parseState.bzInitDone = 1;
+533 	}
+534 	connWrkr-&gt;parseState.zstrm.next_in = (Bytef*) buf;
+535 	connWrkr-&gt;parseState.zstrm.avail_in = len;
+536 	int outtotal = 0;
+537 	do {
+538 		int zRet = 0;
+539 		int outavail = 0;
+540 		dbgprintf("imhttp: in inflate() loop, avail_in %d, total_in %ld\n",
+541 				connWrkr-&gt;parseState.zstrm.avail_in, connWrkr-&gt;parseState.zstrm.total_in);
+542 		connWrkr-&gt;parseState.zstrm.avail_out = sizeof(connWrkr-&gt;zipBuf);
+543 		connWrkr-&gt;parseState.zstrm.next_out = connWrkr-&gt;zipBuf;
+544 		zRet = inflate(&amp;connWrkr-&gt;parseState.zstrm, Z_SYNC_FLUSH);
+545 		dbgprintf("imhttp: inflate(), ret: %d, avail_out: %d\n", zRet, connWrkr-&gt;parseState.zstrm.avail_out);
+546 		outavail = sizeof(connWrkr-&gt;zipBuf) - connWrkr-&gt;parseState.zstrm.avail_out;
+547 		if (outavail != 0) {
+548 			outtotal += outavail;
+549 			CHKiRet(processDataUncompressed(inst, connWrkr, (const char*)connWrkr-&gt;zipBuf, outavail));
+550 		}
+551 	} while (connWrkr-&gt;parseState.zstrm.avail_out == 0);
+552 	dbgprintf("imhttp: processDataCompressed complete, sizes: in %lld, out %llu\n", (long long) len,
+553 		(long long unsigned) outtotal);
+554 finalize_it:
+555 	RETiRet;
+556 }
+557 static rsRetVal
+558 processData(const instanceConf_t *const inst,
+559 	struct conn_wrkr_s *connWrkr, const char* buf, size_t len)
+560 {
+561 	DEFiRet;
+562 	if (connWrkr-&gt;parseState.content_compressed) {
+563 		iRet = processDataCompressed(inst, connWrkr, buf, len);
+564 	} else {
+565 		iRet = processDataUncompressed(inst, connWrkr, buf, len);
+566 	}
+567 	RETiRet;
+568 }
+569 static int
+570 parse_auth_header(struct mg_connection *conn, struct auth_s *auth)
+571 {
+572 	if (!auth || !conn) {
+573 		return 0;
+574 	}
+575 	const char *auth_header = NULL;
+576 	if (((auth_header = mg_get_header(conn, "Authorization")) == NULL) ||
+577 			strncasecmp(auth_header, "Basic ", 6) != 0) {
+578 		return 0;
+579 	}
+580 	const char* src = auth_header + 6;
+581 	size_t len = apr_base64_decode_len((const char*)src);
+582 	auth-&gt;pworkbuf = auth-&gt;workbuf;
+583 	if (len &gt; sizeof(auth-&gt;workbuf)) {
+584 		auth-&gt;pworkbuf = calloc(0, len);
+585 		auth-&gt;workbuf_len = len;
+586 	}
+587 	len = apr_base64_decode(auth-&gt;pworkbuf, src);
+588 	if (len == 0) {
+589 		return 0;
+590 	}
+591 	char *passwd = NULL, *saveptr = NULL;
+592 	char *user = strtok_r(auth-&gt;pworkbuf, ":", &amp;saveptr);
+593 	if (user) {
+594 		passwd = strtok_r(NULL, ":", &amp;saveptr);
+595 	}
+596 	auth-&gt;pszUser = user;
+597 	auth-&gt;pszPasswd = passwd;
+598 	return 1;
+599 }
+600 static int
+601 read_auth_file(FILE* filep, struct auth_s *auth)
+602 {
+603 	if (!filep) {
+604 		return 0;
+605 	}
+606 	char workbuf[IMHTTP_MAX_BUF_LEN];
+607 	size_t l = 0;
+608 	char* user;
+609 	char* passwd;
+610 	while (fgets(workbuf, sizeof(workbuf), filep)) {
+611 		l = strnlen(workbuf, sizeof(workbuf));
+612 		while (l &gt; 0) {
+613 			if (isspace(workbuf[l-1]) || iscntrl(workbuf[l-1])) {
+614 				l--;
+615 				workbuf[l] = 0;
+616 			} else {
+617 				break;
+618 			}
+619 		}
+620 		if (l &lt; 1) {
+621 			continue;
+622 		}
+623 		if (workbuf[0] == '#') {
+624 			continue;
+625 		}
+626 		user = workbuf;
+627 		passwd = strchr(workbuf, ':');
+628 		if (!passwd) {
+629 			continue;
+630 		}
+631 		*passwd = '\0';
+632 		passwd++;
+633 		if (!strcasecmp(auth-&gt;pszUser, user)) {
+634 			return (apr_password_validate(auth-&gt;pszPasswd, passwd) == APR_SUCCESS);
+635 		}
+636 	}
+637 	return 0;
+638 }
+639 static int
+640 authorize(struct mg_connection* conn, FILE* filep)
+641 {
+642 	if (!conn || !filep) {
+643 		return 0;
+644 	}
+645 	struct auth_s auth = { .workbuf_len=0, .pworkbuf=NULL, .pszUser=NULL, .pszPasswd=NULL};
+646 	if (!parse_auth_header(conn, &amp;auth)) {
+647 		return 0;
+648 	}
+649 	return read_auth_file(filep, &amp;auth);
+650 }
+651 static int
+652 basicAuthHandler(struct mg_connection *conn, void *cbdata)
+653 {
+654 	const instanceConf_t* inst = (const instanceConf_t*) cbdata;
+655 	char errStr[512];
+656 	FILE *fp = NULL;
+657 	int ret = 1;
+658 	if (!inst-&gt;pszBasicAuthFile) {
+659 		mg_cry(conn, "warning: 'BasicAuthFile' not configured.\n");
+660 		ret = 0;
+661 		goto finalize;
+662 	}
+663 	fp = fopen((const char *)inst-&gt;pszBasicAuthFile, "r");
+664 	if (fp == NULL) {
+665 		if (strerror_r(errno, errStr, sizeof(errStr)) == 0) {
+666 			mg_cry(conn,
+667 					"error: 'BasicAuthFile' file '%s' could not be accessed: %s\n",
+668 					inst-&gt;pszBasicAuthFile, errStr);
+669 		} else {
+670 			mg_cry(conn,
+671 					"error: 'BasicAuthFile' file '%s' could not be accessed: %d\n",
+672 					inst-&gt;pszBasicAuthFile, errno);
+673 		}
+674 		ret = 0;
+675 		goto finalize;
+676 	}
+677 	ret = authorize(conn, fp);
+678 finalize:
+679 	if (!ret) {
+680 		mg_send_http_error(conn, 401, "WWW-Authenticate: Basic realm=\"User Visible Realm\"\n");
+681 	}
+682 	if (fp ) {
+683 		fclose(fp);
+684 	}
+685 	return ret;
+686 }
+687 static int
+688 postHandler(struct mg_connection *conn, void *cbdata)
+689 {
+690 	int rc = 1;
+691 	instanceConf_t* inst = (instanceConf_t*) cbdata;
+692 	const struct mg_request_info *ri = mg_get_request_info(conn);
+693 	struct conn_wrkr_s *connWrkr = mg_get_thread_pointer(conn);
+694 	connWrkr-&gt;multiSub.nElem = 0;
+695 	memset(&amp;connWrkr-&gt;parseState, 0, sizeof(connWrkr-&gt;parseState));
+696 	connWrkr-&gt;pri = ri;
+697 	if (inst-&gt;bAddMetadata &amp;&amp; connWrkr-&gt;scratchBufSize == 0) {
+698 		connWrkr-&gt;pScratchBuf = calloc(1, INIT_SCRATCH_BUF_SIZE);
+699 		if (!connWrkr-&gt;pScratchBuf) {
+700 			mg_cry(conn, "%s() - could not alloc scratch buffer!\n", __FUNCTION__);
+701 			rc = 500;
+702 			FINALIZE;
+703 		}
+704 		connWrkr-&gt;scratchBufSize = INIT_SCRATCH_BUF_SIZE;
+705 	}
+706 	if (0 != strcmp(ri-&gt;request_method, "POST")) {
+707 		int ret = mg_get_request_link(conn, connWrkr-&gt;pReadBuf, connWrkr-&gt;readBufSize);
+708 		mg_printf(conn,
+709 		          "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n");
+710 		mg_printf(conn, "Content-Type: text/plain\r\n\r\n");
+711 		mg_printf(conn,
+712 		          "%s method not allowed in the POST handler\n",
+713 		          ri-&gt;request_method);
+714 		if (ret &gt;= 0) {
+715 			mg_printf(conn,
+716 			          "use a web tool to send a POST request to %s\n",
+717 			          connWrkr-&gt;pReadBuf);
+718 		}
+719 		STATSCOUNTER_INC(statsCounter.ctrFailed, statsCounter.mutCtrFailed);
+720 		rc = 405;
+721 		FINALIZE;
+722 	}
+723 	if (ri-&gt;remote_addr[0] != '\0') {
+724 		size_t len = strnlen(ri-&gt;remote_addr, sizeof(ri-&gt;remote_addr));
+725 		prop.CreateOrReuseStringProp(&amp;connWrkr-&gt;propRemoteAddr, (const uchar*)ri-&gt;remote_addr, len);
+726 	}
+727 	if (ri-&gt;content_length &gt;= 0) {
+728 		if (ri-&gt;content_length &gt; (long long) connWrkr-&gt;readBufSize) {
+729 			connWrkr-&gt;pReadBuf = realloc(connWrkr-&gt;pReadBuf, ri-&gt;content_length+1);
+730 			if (!connWrkr-&gt;pReadBuf) {
+731 				mg_cry(conn, "%s() - realloc failed!\n", __FUNCTION__);
+732 				FINALIZE;
+733 			}
+734 			connWrkr-&gt;readBufSize = ri-&gt;content_length+1;
+735 		}
+736 	} else {
+737 	}
+738 	if (ri-&gt;num_headers &gt; 0) {
+739 		int i;
+740 		for (i = 0; i &lt; ri-&gt;num_headers; i++) {
+741 			if (!strcasecmp(ri-&gt;http_headers[i].name, "content-encoding") &amp;&amp;
+742 					!strcasecmp(ri-&gt;http_headers[i].value, "gzip")) {
+743 				connWrkr-&gt;parseState.content_compressed = 1;
+744 			}
+745 		}
+746 	}
+747 	while (1) {
+748 		int count = mg_read(conn, connWrkr-&gt;pReadBuf, connWrkr-&gt;readBufSize);
+749 		if (count &gt; 0) {
+750 			processData(inst, connWrkr, (const char*)connWrkr-&gt;pReadBuf, count);
+751 		} else {
+752 			break;
+753 		}
+754 	}
+755 	doSubmitMsg(inst, connWrkr, connWrkr-&gt;pMsg, connWrkr-&gt;iMsg);
+756 	multiSubmitFlush(&amp;connWrkr-&gt;multiSub);
+757 	mg_send_http_ok(conn, "text/plain", 0);
+758 	rc = 200;
+759 finalize_it:
+760 	if (connWrkr-&gt;parseState.bzInitDone) {
+761 		inflateEnd(&amp;connWrkr-&gt;parseState.zstrm);
+762 	}
+763 	connWrkr-&gt;iMsg = 0;
+764 	return rc;
+765 }
+766 static int runloop(void)
+767 {
+768 	dbgprintf("imhttp started.\n");
+769 	for(instanceConf_t *inst = runModConf-&gt;root ; inst != NULL ; inst = inst-&gt;next) {
+770 		assert(inst-&gt;pszEndpoint);
+771 		if (inst-&gt;pszEndpoint) {
+772 			dbgprintf("setting request handler: '%s'\n", inst-&gt;pszEndpoint);
+773 			mg_set_request_handler(s_httpserv-&gt;ctx, (char *)inst-&gt;pszEndpoint, postHandler, inst);
+774 			if (inst-&gt;pszBasicAuthFile) {
+775 				mg_set_auth_handler(s_httpserv-&gt;ctx, (char *)inst-&gt;pszEndpoint, basicAuthHandler, inst);
+776 			}
+777 		}
+778 	}
+779 	while(glbl.GetGlobalInputTermState() == 0) {
+780 		sleep(1);
+781 	}
+782 	return EXIT_SUCCESS;
+783 }
+784 BEGINnewInpInst
+785 	struct cnfparamvals *pvals;
+786 	instanceConf_t *inst;
+787 	int i;
+788 CODESTARTnewInpInst
+789 	DBGPRINTF("newInpInst (imhttp)\n");
+790 	pvals = nvlstGetParams(lst, &amp;inppblk, NULL);
+791 	if(pvals == NULL) {
+792 		LogError(0, RS_RET_MISSING_CNFPARAMS,
+793 			        "imhttp: required parameter are missing\n");
+794 <a name="2"></a>		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+795 	}
+796 <font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if(Debug) {
+797 		dbgprintf("input param blk in imtcp:\n");
+798 		cnfparamsPrint(&amp;inppblk, pvals);
+799 	}
+800 	CHKiRet(createInstance(&amp;inst));
+801 	for(i = 0 ; i &lt; inppblk.nParams ; ++i) {
+802 		if(!pvals[i].bUsed)
+803 			continue;
+804 		if(!strcmp(inppblk.descr[i].name, "endpoint")) {
+805 <a name="1"></a>			inst-&gt;pszEndpoint = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+806 		} else if(!strcmp(inppblk.descr[i].name, "basicauthfile")) {
+807 			inst-&gt;pszBasicAuthFile = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
+808 <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		} else if(!strcmp(inppblk.descr[i].name, "ruleset")) {
+809 			inst-&gt;pszBindRuleset = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+810 		} else if(!strcmp(inppblk.descr[i].name, "name")) {
+811 			inst-&gt;pszInputName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+812 		} else if(!strcmp(inppblk.descr[i].name, "ratelimit.burst")) {
+813 			inst-&gt;ratelimitBurst = (unsigned int) pvals[i].val.d.n;</b></font>
+814 		} else if(!strcmp(inppblk.descr[i].name, "ratelimit.interval")) {
+815 			inst-&gt;ratelimitInterval = (unsigned int) pvals[i].val.d.n;
+816 		} else if(!strcmp(inppblk.descr[i].name, "flowcontrol")) {
+817 			inst-&gt;flowControl = (int) pvals[i].val.d.n;
+818 		} else if(!strcmp(inppblk.descr[i].name, "disablelfdelimiter")) {
+819 			inst-&gt;bDisableLFDelim = (int) pvals[i].val.d.n;
+820 		} else if (!strcmp(inppblk.descr[i].name, "supportoctetcountedframing")) {
+821 			inst-&gt;bSuppOctetFram = (int) pvals[i].val.d.n;
+822 		} else if (!strcmp(inppblk.descr[i].name, "addmetadata")) {
+823 			inst-&gt;bAddMetadata = (int) pvals[i].val.d.n;
+824 		} else {
+825 			dbgprintf("imhttp: program error, non-handled "
+826 			  "param '%s'\n", inppblk.descr[i].name);
+827 		}
+828 	}
+829 	if (inst-&gt;pszInputName) {
+830 		CHKiRet(prop.Construct(&amp;inst-&gt;pInputName));
+831 		CHKiRet(prop.SetString(inst-&gt;pInputName, inst-&gt;pszInputName, ustrlen(inst-&gt;pszInputName)));
+832 		CHKiRet(prop.ConstructFinalize(inst-&gt;pInputName));
+833 	}
+834 	CHKiRet(ratelimitNew(&amp;inst-&gt;ratelimiter, "imphttp", NULL));
+835 	ratelimitSetLinuxLike(inst-&gt;ratelimiter, inst-&gt;ratelimitInterval, inst-&gt;ratelimitBurst);
+836 finalize_it:
+837 CODE_STD_FINALIZERnewInpInst
+838 	cnfparamvalsDestruct(pvals, &amp;inppblk);
+839 ENDnewInpInst
+840 BEGINbeginCnfLoad
+841 CODESTARTbeginCnfLoad
+842 	loadModConf = pModConf;
+843 	pModConf-&gt;pConf = pConf;
+844 	loadModConf-&gt;ports.name = NULL;
+845 	loadModConf-&gt;docroot.name = NULL;
+846 	loadModConf-&gt;nOptions = 0;
+847 	loadModConf-&gt;options = NULL;
+848 ENDbeginCnfLoad
+849 BEGINsetModCnf
+850 	struct cnfparamvals *pvals = NULL;
+851 CODESTARTsetModCnf
+852 	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
+853 	if(pvals == NULL) {
+854 		LogError(0, RS_RET_MISSING_CNFPARAMS, "imhttp: error processing module "
+855 				"config parameters [module(...)]");
+856 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+857 	}
+858 	if(Debug) {
+859 		dbgprintf("module (global) param blk for imhttp:\n");
+860 		cnfparamsPrint(&amp;modpblk, pvals);
+861 	}
+862 	for(int i = 0 ; i &lt; modpblk.nParams ; ++i) {
+863 		if(!pvals[i].bUsed)
+864 			continue;
+865 		if(!strcmp(modpblk.descr[i].name, "ports")) {
+866 			assert(loadModConf-&gt;ports.name == NULL);
+867 			assert(loadModConf-&gt;ports.val == NULL);
+868 			loadModConf-&gt;ports.name = strdup(CIVETWEB_OPTION_NAME_PORTS);
+869 			loadModConf-&gt;ports.val = es_str2cstr(pvals[i].val.d.estr, NULL);
+870 		} else if (!strcmp(modpblk.descr[i].name, "documentroot")) {
+871 			assert(loadModConf-&gt;docroot.name == NULL);
+872 			assert(loadModConf-&gt;docroot.val == NULL);
+873 			loadModConf-&gt;docroot.name = strdup(CIVETWEB_OPTION_NAME_DOCUMENT_ROOT);
+874 			loadModConf-&gt;docroot.val = es_str2cstr(pvals[i].val.d.estr, NULL);
+875 		} else if(!strcmp(modpblk.descr[i].name, "liboptions")) {
+876 			loadModConf-&gt;nOptions = pvals[i].val.d.ar-&gt;nmemb;
+877 			CHKmalloc(loadModConf-&gt;options = malloc(sizeof(struct option) *
+878 			                                      pvals[i].val.d.ar-&gt;nmemb ));
+879 			for(int j = 0 ; j &lt;  pvals[i].val.d.ar-&gt;nmemb ; ++j) {
+880 				char *cstr = es_str2cstr(pvals[i].val.d.ar-&gt;arr[j], NULL);
+881 				CHKiRet(processCivetwebOptions(cstr, &amp;loadModConf-&gt;options[j].name,
+882 					&amp;loadModConf-&gt;options[j].val));
+883 				free(cstr);
+884 			}
+885 		} else {
+886 			dbgprintf("imhttp: program error, non-handled "
+887 			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
+888 		}
+889 	}
+890 finalize_it:
+891 	if(pvals != NULL)
+892 		cnfparamvalsDestruct(pvals, &amp;modpblk);
+893 ENDsetModCnf
+894 BEGINendCnfLoad
+895 CODESTARTendCnfLoad
+896 	loadModConf = NULL; ENDendCnfLoad
+897 static inline void
+898 std_checkRuleset_genErrMsg(__attribute__((unused)) modConfData_t *modConf, instanceConf_t *inst)
+899 {
+900 	LogError(0, NO_ERRCODE, "imhttp: ruleset '%s' for %s not found - "
+901 			"using default ruleset instead", inst-&gt;pszBindRuleset,
+902 			inst-&gt;pszEndpoint);
+903 }
+904 BEGINcheckCnf
+905 	instanceConf_t *inst;
+906 CODESTARTcheckCnf
+907 	for(inst = pModConf-&gt;root ; inst != NULL ; inst = inst-&gt;next) {
+908 		std_checkRuleset(pModConf, inst);
+909 	}
+910 	const struct mg_option *valid_opts = mg_get_valid_options();
+911 	for (int i = 0; i &lt; pModConf-&gt;nOptions; ++i) {
+912 		if (!valid_civetweb_option(valid_opts, pModConf-&gt;options[i].name)) {
+913 			LogError(0, RS_RET_CONF_PARSE_WARNING, "imhttp: module loaded, but "
+914 			"invalid civetweb option found - imhttp may not receive connections.");
+915 			iRet = RS_RET_CONF_PARSE_WARNING;
+916 		}
+917 	}
+918 ENDcheckCnf
+919 BEGINactivateCnf
+920 CODESTARTactivateCnf
+921 	runModConf = pModConf;
+922 	if (!s_httpserv) {
+923 		CHKmalloc(s_httpserv = calloc(1, sizeof(httpserv_t)));
+924 	}
+925 	size_t count = 1;
+926 	if (runModConf-&gt;ports.val) {
+927 		count += 2;
+928 	}
+929 	if (runModConf-&gt;docroot.val) {
+930 		count += 2;
+931 	}
+932 	count += (2 * runModConf-&gt;nOptions);
+933 	CHKmalloc(s_httpserv-&gt;civetweb_options = calloc(count, sizeof(*s_httpserv-&gt;civetweb_options)));
+934 	const char **pcivetweb_options = s_httpserv-&gt;civetweb_options;
+935 	if (runModConf-&gt;nOptions) {
+936 		s_httpserv-&gt;civetweb_options_count = count;
+937 		for (int i = 0; i &lt; runModConf-&gt;nOptions; ++i) {
+938 			*pcivetweb_options = runModConf-&gt;options[i].name;
+939 			pcivetweb_options++;
+940 			*pcivetweb_options = runModConf-&gt;options[i].val;
+941 			pcivetweb_options++;
+942 		}
+943 	}
+944 	if (runModConf-&gt;ports.val) {
+945 		*pcivetweb_options = runModConf-&gt;ports.name;
+946 		pcivetweb_options++;
+947 		*pcivetweb_options = runModConf-&gt;ports.val;
+948 		pcivetweb_options++;
+949 	}
+950 	if (runModConf-&gt;docroot.val) {
+951 		*pcivetweb_options = runModConf-&gt;docroot.name;
+952 		pcivetweb_options++;
+953 		*pcivetweb_options = runModConf-&gt;docroot.val;
+954 		pcivetweb_options++;
+955 	}
+956 	const char **option = s_httpserv-&gt;civetweb_options;
+957 	for (; option &amp;&amp; *option != NULL; option++) {
+958 		dbgprintf("imhttp: civetweb option: %s\n", *option);
+959 	}
+960 	CHKiRet(statsobj.Construct(&amp;statsCounter.stats));
+961 	CHKiRet(statsobj.SetName(statsCounter.stats, UCHAR_CONSTANT("imhttp")));
+962 	CHKiRet(statsobj.SetOrigin(statsCounter.stats, UCHAR_CONSTANT("imhttp")));
+963 	STATSCOUNTER_INIT(statsCounter.ctrSubmitted, statsCounter.mutCtrSubmitted);
+964 	CHKiRet(statsobj.AddCounter(statsCounter.stats, UCHAR_CONSTANT("submitted"),
+965 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(statsCounter.ctrSubmitted)));
+966 	STATSCOUNTER_INIT(statsCounter.ctrFailed, statsCounter.mutCtrFailed);
+967 	CHKiRet(statsobj.AddCounter(statsCounter.stats, UCHAR_CONSTANT("failed"),
+968 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(statsCounter.ctrFailed)));
+969 	STATSCOUNTER_INIT(statsCounter.ctrDiscarded, statsCounter.mutCtrDiscarded);
+970 	CHKiRet(statsobj.AddCounter(statsCounter.stats, UCHAR_CONSTANT("discarded"),
+971 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(statsCounter.ctrDiscarded)));
+972 	CHKiRet(statsobj.ConstructFinalize(statsCounter.stats));
+973 	mg_init_library(MG_FEATURES_TLS);
+974 	memset(&amp;callbacks, 0, sizeof(callbacks));
+975 	callbacks.init_thread = init_thread;
+976 	callbacks.exit_thread = exit_thread;
+977 	s_httpserv-&gt;ctx = mg_start(&amp;callbacks, NULL, s_httpserv-&gt;civetweb_options);
+978 	if (s_httpserv-&gt;ctx == NULL) {
+979 		LogError(0, RS_RET_INTERNAL_ERROR, "Cannot start CivetWeb - mg_start failed.\n");
+980 		ABORT_FINALIZE(RS_RET_INTERNAL_ERROR);
+981 	}
+982 	finalize_it:
+983 	if (iRet != RS_RET_OK) {
+984 		free(s_httpserv);
+985 		s_httpserv = NULL;
+986 		LogError(0, NO_ERRCODE, "imhttp: error %d trying to activate configuration", iRet);
+987 	}
+988 	RETiRet;
+989 ENDactivateCnf
+990 BEGINfreeCnf
+991 	instanceConf_t *inst, *del;
+992 CODESTARTfreeCnf
+993 	for(inst = pModConf-&gt;root ; inst != NULL ; ) {
+994 		if (inst-&gt;ratelimiter) {
+995 			ratelimitDestruct(inst-&gt;ratelimiter);
+996 		}
+997 		if (inst-&gt;pInputName) {
+998 			prop.Destruct(&amp;inst-&gt;pInputName);
+999 		}
+1000 		free(inst-&gt;pszEndpoint);
+1001 		free(inst-&gt;pszBasicAuthFile);
+1002 		free(inst-&gt;pszBindRuleset);
+1003 		free(inst-&gt;pszInputName);
+1004 		del = inst;
+1005 		inst = inst-&gt;next;
+1006 		free(del);
+1007 	}
+1008 	for (int i = 0; i &lt; pModConf-&gt;nOptions; ++i) {
+1009 		free((void*) pModConf-&gt;options[i].name);
+1010 		free((void*) pModConf-&gt;options[i].val);
+1011 	}
+1012 	free(pModConf-&gt;options);
+1013 	free((void*)pModConf-&gt;ports.name);
+1014 	free((void*)pModConf-&gt;ports.val);
+1015 	free((void*)pModConf-&gt;docroot.name);
+1016 	free((void*)pModConf-&gt;docroot.val);
+1017 	if (statsCounter.stats) {
+1018 		statsobj.Destruct(&amp;statsCounter.stats);
+1019 	}
+1020 ENDfreeCnf
+1021 BEGINrunInput
+1022 CODESTARTrunInput
+1023 	runloop();
+1024 ENDrunInput
+1025 BEGINwillRun
+1026 CODESTARTwillRun
+1027 ENDwillRun
+1028 BEGINafterRun
+1029 CODESTARTafterRun
+1030 	if (s_httpserv) {
+1031 		mg_stop(s_httpserv-&gt;ctx);
+1032 		mg_exit_library();
+1033 		free(s_httpserv-&gt;civetweb_options);
+1034 		free(s_httpserv);
+1035 	}
+1036 ENDafterRun
+1037 BEGINisCompatibleWithFeature
+1038 CODESTARTisCompatibleWithFeature
+1039 ENDisCompatibleWithFeature
+1040 BEGINmodExit
+1041 CODESTARTmodExit
+1042 	if(pInputName != NULL) {
+1043 		prop.Destruct(&amp;pInputName);
+1044 	}
+1045 	objRelease(statsobj, CORE_COMPONENT);
+1046 	objRelease(glbl, CORE_COMPONENT);
+1047 	objRelease(prop, CORE_COMPONENT);
+1048 	objRelease(ruleset, CORE_COMPONENT);
+1049 ENDmodExit
+1050 BEGINqueryEtryPt
+1051 CODESTARTqueryEtryPt
+1052 CODEqueryEtryPt_STD_IMOD_QUERIES
+1053 CODEqueryEtryPt_STD_CONF2_QUERIES
+1054 CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+1055 CODEqueryEtryPt_STD_CONF2_IMOD_QUERIES
+1056 CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
+1057 ENDqueryEtryPt
+1058 BEGINmodInit()
+1059 CODESTARTmodInit
+1060 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+1061 	CHKiRet(objUse(ruleset, CORE_COMPONENT));
+1062 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+1063 	CHKiRet(objUse(prop, CORE_COMPONENT));
+1064 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
+1065 	CHKiRet(prop.Construct(&amp;pInputName));
+1066 	CHKiRet(prop.SetString(pInputName, UCHAR_CONSTANT("imhttp"), sizeof("imhttp") - 1));
+1067 	CHKiRet(prop.ConstructFinalize(pInputName));
+1068 ENDmodInit
 </pre>
 </div>
 </div>

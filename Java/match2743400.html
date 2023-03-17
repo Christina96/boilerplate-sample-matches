@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for RepositoriesService.java &amp; MoreTypes.java</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -46,445 +45,325 @@ Matches for RepositoriesService.java &amp; MoreTypes.java
 </h3>
 <hr/>
 <pre>
-/*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
-package org.elasticsearch.repositories;
-
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
-import io.crate.common.io.IOUtils;
-<a name="0"></a>import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-import org.apache.logging.log4j.message.ParameterizedMessage;
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.ActionRunnable;
-import org.elasticsearch.action.admin.cluster.repositories.delete.DeleteRepositoryRequest;
-import org.elasticsearch.action.admin.cluster.repositories.put.PutRepositoryRequest;
-import org.elasticsearch.cluster.AckedClusterStateUpdateTask;
-import org.elasticsearch.cluster.ClusterChangedEvent;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.ClusterStateApplier;
-import org.elasticsearch.cluster.ack.ClusterStateUpdateResponse;
-import org.elasticsearch.cluster.metadata.Metadata;
-import org.elasticsearch.cluster.metadata.RepositoriesMetadata;
-import org.elasticsearch.cluster.metadata.RepositoryMetadata;
-import org.elasticsearch.cluster.node.DiscoveryNode;
-import org.elasticsearch.cluster.service.ClusterService;
-import org.elasticsearch.common.regex.Regex;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.snapshots.RestoreService;
-import org.elasticsearch.snapshots.SnapshotsService;
-import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.transport.TransportService;
-
-/**
- * Service responsible for maintaining and providing access to snapshot repositories on nodes.
- */
-public class RepositoriesService implements ClusterStateApplier {
-
-    private static final Logger LOGGER = LogManager.getLogger(RepositoriesService.class)</b></font>;
-
-    private final Map&lt;String, Repository.Factory&gt; typesRegistry;
-
-    private final ClusterService clusterService;
-
-    private final ThreadPool threadPool;
-
-    private final VerifyNodeRepositoryAction verifyAction;
-
-    private volatile Map&lt;String, Repository&gt; repositories = Collections.emptyMap();
-
-    public RepositoriesService(Settings settings, ClusterService clusterService, TransportService transportService,
-                               Map&lt;String, Repository.Factory&gt; typesRegistry,
-                               ThreadPool threadPool) {
-        this.typesRegistry = typesRegistry;
-        this.clusterService = clusterService;
-        this.threadPool = threadPool;
-        // Doesn't make sense to maintain repositories on non-master and non-data nodes
-        // Nothing happens there anyway
-        if (DiscoveryNode.isDataNode(settings) || DiscoveryNode.isMasterEligibleNode(settings)) {
-            clusterService.addStateApplier(this);
-        }
-        this.verifyAction = new VerifyNodeRepositoryAction(transportService, clusterService, this);
-    }
-
-    /**
-     * Registers new repository in the cluster
-     * &lt;p&gt;
-     * This method can be only called on the master node. It tries to create a new repository on the master
-     * and if it was successful it adds new repository to cluster metadata.
-     *
-     * @param request  register repository request
-     * @param listener register repository listener
-     */
-    public void registerRepository(final PutRepositoryRequest request, final ActionListener&lt;ClusterStateUpdateResponse&gt; listener) {
-        final RepositoryMetadata newRepositoryMetadata = new RepositoryMetadata(request.name(), request.type(), request.settings());
-
-        final ActionListener&lt;ClusterStateUpdateResponse&gt; registrationListener;
-        if (request.verify()) {
-            registrationListener = ActionListener.delegateFailure(listener, (delegatedListener, clusterStateUpdateResponse) -&gt; {
-                if (clusterStateUpdateResponse.isAcknowledged()) {
-                    // The response was acknowledged - all nodes should know about the new repository, let's verify them
-                    verifyRepository(request.name(), ActionListener.delegateFailure(delegatedListener,
-                        (innerDelegatedListener, discoveryNodes) -&gt; innerDelegatedListener.onResponse(clusterStateUpdateResponse)));
-                } else {
-                    delegatedListener.onResponse(clusterStateUpdateResponse);
-                }
-            });
-        } else {
-            registrationListener = listener;
-        }
-
-        clusterService.submitStateUpdateTask("put_repository [" + request.name() + "]",
-            new AckedClusterStateUpdateTask&lt;ClusterStateUpdateResponse&gt;(request, registrationListener) {
-
-                @Override
-                protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
-                    return new ClusterStateUpdateResponse(acknowledged);
-                }
-
-                @Override
-                public ClusterState execute(ClusterState currentState) throws IOException {
-                    ensureRepositoryNotInUse(currentState, request.name());
-                    // Trying to create the new repository on master to make sure it works
-                    if (!registerRepository(newRepositoryMetadata)) {
-                        // The new repository has the same settings as the old one - ignore
-                        return currentState;
-                    }
-                    Metadata metadata = currentState.metadata();
-                    Metadata.Builder mdBuilder = Metadata.builder(currentState.metadata());
-                    RepositoriesMetadata repositories = metadata.custom(RepositoriesMetadata.TYPE);
-                    if (repositories == null) {
-                        LOGGER.info("put repository [{}]", request.name());
-                        repositories = new RepositoriesMetadata(
-                            Collections.singletonList(new RepositoryMetadata(request.name(), request.type(), request.settings())));
-                    } else {
-                        boolean found = false;
-                        List&lt;RepositoryMetadata&gt; repositoriesMetadata = new ArrayList&lt;&gt;(repositories.repositories().size() + 1);
-
-                        for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {
-                            if (repositoryMetadata.name().equals(newRepositoryMetadata.name())) {
-                                if (newRepositoryMetadata.equalsIgnoreGenerations(repositoryMetadata)) {
-                                    // Previous version is the same as this one no update is needed.
-                                    return currentState;
-                                }
-                                found = true;
-                                repositoriesMetadata.add(newRepositoryMetadata);
-                            } else {
-                                repositoriesMetadata.add(repositoryMetadata);
-                            }
-                        }
-                        if (!found) {
-                            LOGGER.info("put repository [{}]", request.name());
-                            repositoriesMetadata.add(new RepositoryMetadata(request.name(), request.type(), request.settings()));
-                        } else {
-                            LOGGER.info("update repository [{}]", request.name());
-                        }
-                        repositories = new RepositoriesMetadata(repositoriesMetadata);
-                    }
-                    mdBuilder.putCustom(RepositoriesMetadata.TYPE, repositories);
-                    return ClusterState.builder(currentState).metadata(mdBuilder).build();
-                }
-<a name="2"></a>
-                @Override
-                public void onFailure(String source, Exception e) {
-                    LOGGER.warn(() -&gt; new ParameterizedMessage("failed to create repository [{}]", <font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>request.name()), e);
-                    super.onFailure(source, e);
-                }
-
-                @Override
-                public boolean mustAck(DiscoveryNode discoveryNode) {
-                    // repository is created on both master and data nodes
-                    return discoveryNode.isMasterEligibleNode</b></font>() || discoveryNode.isDataNode();
-                }
-            });
-    }
-
-    /**
-     * Unregisters repository in the cluster
-     * &lt;p&gt;
-     * This method can be only called on the master node. It removes repository information from cluster metadata.
-     *
-     * @param request  unregister repository request
-     * @param listener unregister repository listener
-     */
-    public void unregisterRepository(final DeleteRepositoryRequest request, final ActionListener&lt;ClusterStateUpdateResponse&gt; listener) {
-        clusterService.submitStateUpdateTask("delete_repository [" + request.name() + "]",
-            new AckedClusterStateUpdateTask&lt;&gt;(request, listener) {
-                @Override
-                protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
-                    return new ClusterStateUpdateResponse(acknowledged);
-                }
-
-                @Override
-                public ClusterState execute(ClusterState currentState) {
-                    ensureRepositoryNotInUse(currentState, request.name());
-                    Metadata metadata = currentState.metadata();
-                    Metadata.Builder mdBuilder = Metadata.builder(currentState.metadata());
-                    RepositoriesMetadata repositories = metadata.custom(RepositoriesMetadata.TYPE);
-                    if (repositories != null &amp;&amp; repositories.repositories().size() &gt; 0) {
-                        List&lt;RepositoryMetadata&gt; repositoriesMetadata = new ArrayList&lt;&gt;(repositories.repositories().size());
-                        boolean changed = false;
-                        for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {
-                            if (Regex.simpleMatch(request.name(), repositoryMetadata.name())) {
-                                LOGGER.info("delete repository [{}]", repositoryMetadata.name());
-                                changed = true;
-                            } else {
-                                repositoriesMetadata.add(repositoryMetadata);
-                            }
-                        }
-                        if (changed) {
-                            repositories = new RepositoriesMetadata(repositoriesMetadata);
-                            mdBuilder.putCustom(RepositoriesMetadata.TYPE, repositories);
-                            return ClusterState.builder(currentState).metadata(mdBuilder).build();
-                        }
-                    }
-<a name="5"></a>                    if (Regex.isMatchAllPattern(request.name())) { // we use a wildcard so we don't barf if it's not present.
-                        return currentState;
-                    }
-                    throw new RepositoryMissingException(<font color="#151b8d"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>request.name());
-                }
-
-                @Override
-                public boolean mustAck(DiscoveryNode discoveryNode) {
-                    // repository was created on both master and data nodes
-                    return discoveryNode.isMasterEligibleNode</b></font>() || discoveryNode.isDataNode();
-                }
-            });
-    }
-
-    public void verifyRepository(final String repositoryName, final ActionListener&lt;List&lt;DiscoveryNode&gt;&gt; listener) {
-        final Repository repository = repository(repositoryName);
-        final boolean readOnly = repository.isReadOnly();
-        threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(new ActionRunnable&lt;&gt;(listener) {
-
-            @Override
-            protected void doRun() {
-                final String verificationToken = repository.startVerification();
-                if (verificationToken != null) {
-                    try {
-                        verifyAction.verify(repositoryName, readOnly, verificationToken, ActionListener.delegateFailure(listener,
-                            (delegatedListener, verifyResponse) -&gt; threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(() -&gt; {
-                                try {
-                                    repository.endVerification(verificationToken);
-                                } catch (Exception e) {
-                                    LOGGER.warn(() -&gt; new ParameterizedMessage(
-                                        "[{}] failed to finish repository verification", repositoryName), e);
-                                    delegatedListener.onFailure(e);
-                                    return;
-                                }
-                                delegatedListener.onResponse(verifyResponse);
-                            })));
-                    } catch (Exception e) {
-                        threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(() -&gt; {
-                            try {
-                                repository.endVerification(verificationToken);
-                            } catch (Exception inner) {
-                                inner.addSuppressed(e);
-                                LOGGER.warn(() -&gt; new ParameterizedMessage(
-                                    "[{}] failed to finish repository verification", repositoryName), inner);
-                            }
-                            listener.onFailure(e);
-                        });
-                    }
-                } else {
-                    listener.onResponse(Collections.emptyList());
-                }
-            }
-        });
-    }
-
-
-    /**
-     * Checks if new repositories appeared in or disappeared from cluster metadata and updates current list of
-     * repositories accordingly.
-     *
-     * @param event cluster changed event
-     */
-    @Override
-    public void applyClusterState(ClusterChangedEvent event) {
-        try {
-            final ClusterState state = event.state();
-            RepositoriesMetadata oldMetadata = event.previousState().getMetadata().custom(RepositoriesMetadata.TYPE);
-            RepositoriesMetadata newMetadata = state.getMetadata().custom(RepositoriesMetadata.TYPE);
-
-            // Check if repositories got changed
-            if ((oldMetadata == null &amp;&amp; newMetadata == null) || (oldMetadata != null &amp;&amp; oldMetadata.equalsIgnoreGenerations(newMetadata))) {
-                for (Repository repo : repositories.values()) {
-                    repo.updateState(state);
-                }
-                return;
-            }
-
-            LOGGER.trace("processing new index repositories for state version [{}]", event.state().version());
-
-            Map&lt;String, Repository&gt; survivors = new HashMap&lt;&gt;();
-            // First, remove repositories that are no longer there
-            for (Map.Entry&lt;String, Repository&gt; entry : repositories.entrySet()) {
-                if (newMetadata == null || newMetadata.repository(entry.getKey()) == null) {
-                    LOGGER.debug("unregistering repository [{}]", entry.getKey());
-                    closeRepository(entry.getValue());
-                } else {
-                    survivors.put(entry.getKey(), entry.getValue());
-                }
-            }
-
-            Map&lt;String, Repository&gt; builder = new HashMap&lt;&gt;();
-            if (newMetadata != null) {
-                // Now go through all repositories and update existing or create missing
-                for (RepositoryMetadata repositoryMetadata : newMetadata.repositories()) {
-                    Repository repository = survivors.get(repositoryMetadata.name());
-                    if (repository != null) {
-                        // Found previous version of this repository
-                        RepositoryMetadata previousMetadata = repository.getMetadata();
-                        if (previousMetadata.type().equals(repositoryMetadata.type()) == false
-                            || previousMetadata.settings().equals(repositoryMetadata.settings()) == false) {
-                            // Previous version is different from the version in settings
-                            LOGGER.debug("updating repository [{}]", repositoryMetadata.name());
-                            closeRepository(repository);
-                            repository = null;
-                            try {
-                                repository = createRepository(repositoryMetadata);
-                            } catch (RepositoryException ex) {
-                                // TODO: this catch is bogus, it means the old repo is already closed,
-                                // but we have nothing to replace it
-                                LOGGER.warn(() -&gt; new ParameterizedMessage("failed to change repository [{}]", repositoryMetadata.name()), ex);
-                            }
-                        }
-                    } else {
-                        try {
-                            repository = createRepository(repositoryMetadata);
-                        } catch (RepositoryException ex) {
-                            LOGGER.warn(() -&gt; new ParameterizedMessage("failed to create repository [{}]", repositoryMetadata.name()), ex);
-                        }
-                    }
-                    if (repository != null) {
-                        LOGGER.debug("registering repository [{}]", repositoryMetadata.name());
-                        builder.put(repositoryMetadata.name(), repository);
-                    }
-                }
-            }
-            for (Repository repo : builder.values()) {
-                repo.updateState(state);
-            }
-            repositories = Collections.unmodifiableMap(builder);
-<a name="1"></a>        } catch (Exception ex) {
-            LOGGER.warn("failure updating cluster state ", ex);
-        }
-    <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>}
-
-    /**
-     * Returns registered repository
-     * &lt;p&gt;
-     * This method is called only on the master node
-     *
-     * @param repositoryName repository name
-     * @return registered repository
-     * @throws RepositoryMissingException if repository with such name isn't registered
-     */
-    public Repository repository(String repositoryName) {
-        Repository repository = repositories.get(repositoryName);
-<a name="4"></a>        if (repository != null) {
-            return</b></font> repository;
-        }
-        <font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>throw new RepositoryMissingException(repositoryName);
-    }
-
-    /**
-     * Creates a new repository and adds it to the list of registered repositories.
-     * &lt;p&gt;
-     * If a repository with the same name but different types or settings already exists, it will be closed and
-     * replaced with the new repository. If a repository with the same name exists but it has the same type and settings
-     * the new repository is ignored.
-     *
-     * @param repositoryMetadata new repository metadata
-     * @return {@code true} if new repository was added or {@code false} if it was ignored
-     */
-    private boolean registerRepository(RepositoryMetadata repositoryMetadata) throws IOException {
-        Repository previous = repositories.get</b></font>(repositoryMetadata.name());
-        if (previous != null) {
-            RepositoryMetadata previousMetadata = previous.getMetadata();
-            if (previousMetadata.equals(repositoryMetadata)) {
-                // Previous version is the same as this one - ignore it
-                return false;
-            }
-        }
-        Repository newRepo = createRepository(repositoryMetadata);
-        if (previous != null) {
-            closeRepository(previous);
-        }
-        Map&lt;String, Repository&gt; newRepositories = new HashMap&lt;&gt;(repositories);
-        newRepositories.put(repositoryMetadata.name(), newRepo);
-        repositories = newRepositories;
-        return true;
-    }
-
-    /** Closes the given repository. */
-    private void closeRepository(Repository repository) throws IOException {
-        LOGGER.debug("closing repository [{}][{}]", repository.getMetadata().type(), repository.getMetadata().name());
-        repository.close();
-    }
-
-    /**
-     * Creates repository holder
-<a name="3"></a>     */
-    private Repository createRepository(RepositoryMetadata repositoryMetadata) {
-        LOGGER.debug("creating repository [{}][{}]", repositoryMetadata.type(), repositoryMetadata.name());
-        Repository.Factory factory = typesRegistry.get(<font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>repositoryMetadata.type());
-        if (factory == null) {
-            throw new RepositoryException(repositoryMetadata.name(),
-                "repository type [" + repositoryMetadata.type() + "] does not exist");
-        }</b></font>
-        Repository repository = null;
-        try {
-            repository = factory.create(repositoryMetadata);
-            repository.start();
-            return repository;
-        } catch (Exception e) {
-            IOUtils.closeWhileHandlingException(repository);
-            LOGGER.warn(new ParameterizedMessage("failed to create repository [{}][{}]",
-                repositoryMetadata.type(), repositoryMetadata.name()), e);
-            throw new RepositoryException(repositoryMetadata.name(), "failed to create repository", e);
-        }
-    }
-
-    private void ensureRepositoryNotInUse(ClusterState clusterState, String repository) {
-        if (SnapshotsService.isRepositoryInUse(clusterState, repository) || RestoreService.isRepositoryInUse(clusterState, repository)) {
-            throw new IllegalStateException("trying to modify or unregister repository that is currently used ");
-        }
-    }
-
-    public Collection&lt;Repository&gt; getRepositoriesList() {
-        return Collections.unmodifiableCollection(repositories.values());
-    }
-
-    public Map&lt;String, Repository.Factory&gt; typesRegistry() {
-        return typesRegistry;
-    }
-}
+1 package org.elasticsearch.repositories;
+2 import java.io.IOException;
+3 import java.util.ArrayList;
+4 import java.util.Collection;
+5 import java.util.Collections;
+6 import java.util.HashMap;
+7 import java.util.List;
+8 import java.util.Map;
+9 import io.crate.common.io.IOUtils;
+10 <a name="0"></a>import org.apache.logging.log4j.LogManager;
+11 import org.apache.logging.log4j.Logger;
+12 import org.apache.logging.log4j.message.ParameterizedMessage;
+13 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>import org.elasticsearch.action.ActionListener;
+14 import org.elasticsearch.action.ActionRunnable;
+15 import org.elasticsearch.action.admin.cluster.repositories.delete.DeleteRepositoryRequest;
+16 import org.elasticsearch.action.admin.cluster.repositories.put.PutRepositoryRequest;
+17 import org.elasticsearch.cluster.AckedClusterStateUpdateTask;
+18 import org.elasticsearch.cluster.ClusterChangedEvent;
+19 import org.elasticsearch.cluster.ClusterState;
+20 import org.elasticsearch.cluster.ClusterStateApplier;
+21 import org.elasticsearch.cluster.ack.ClusterStateUpdateResponse;
+22 import org.elasticsearch.cluster.metadata.Metadata;
+23 import org.elasticsearch.cluster.metadata.RepositoriesMetadata;
+24 import org.elasticsearch.cluster.metadata.RepositoryMetadata;
+25 import org.elasticsearch.cluster.node.DiscoveryNode;
+26 import org.elasticsearch.cluster.service.ClusterService;
+27 import org.elasticsearch.common.regex.Regex;
+28 import org.elasticsearch.common.settings.Settings;
+29 import org.elasticsearch.snapshots.RestoreService;
+30 import org.elasticsearch.snapshots.SnapshotsService;
+31 import org.elasticsearch.threadpool.ThreadPool;
+32 import org.elasticsearch.transport.TransportService;
+33 public class RepositoriesService implements ClusterStateApplier {
+34     private static final Logger LOGGER = LogManager.getLogger(RepositoriesService.class)</b></font>;
+35     private final Map&lt;String, Repository.Factory&gt; typesRegistry;
+36     private final ClusterService clusterService;
+37     private final ThreadPool threadPool;
+38     private final VerifyNodeRepositoryAction verifyAction;
+39     private volatile Map&lt;String, Repository&gt; repositories = Collections.emptyMap();
+40     public RepositoriesService(Settings settings, ClusterService clusterService, TransportService transportService,
+41                                Map&lt;String, Repository.Factory&gt; typesRegistry,
+42                                ThreadPool threadPool) {
+43         this.typesRegistry = typesRegistry;
+44         this.clusterService = clusterService;
+45         this.threadPool = threadPool;
+46         if (DiscoveryNode.isDataNode(settings) || DiscoveryNode.isMasterEligibleNode(settings)) {
+47             clusterService.addStateApplier(this);
+48         }
+49         this.verifyAction = new VerifyNodeRepositoryAction(transportService, clusterService, this);
+50     }
+51     public void registerRepository(final PutRepositoryRequest request, final ActionListener&lt;ClusterStateUpdateResponse&gt; listener) {
+52         final RepositoryMetadata newRepositoryMetadata = new RepositoryMetadata(request.name(), request.type(), request.settings());
+53         final ActionListener&lt;ClusterStateUpdateResponse&gt; registrationListener;
+54         if (request.verify()) {
+55             registrationListener = ActionListener.delegateFailure(listener, (delegatedListener, clusterStateUpdateResponse) -&gt; {
+56                 if (clusterStateUpdateResponse.isAcknowledged()) {
+57                     verifyRepository(request.name(), ActionListener.delegateFailure(delegatedListener,
+58                         (innerDelegatedListener, discoveryNodes) -&gt; innerDelegatedListener.onResponse(clusterStateUpdateResponse)));
+59                 } else {
+60                     delegatedListener.onResponse(clusterStateUpdateResponse);
+61                 }
+62             });
+63         } else {
+64             registrationListener = listener;
+65         }
+66         clusterService.submitStateUpdateTask("put_repository [" + request.name() + "]",
+67             new AckedClusterStateUpdateTask&lt;ClusterStateUpdateResponse&gt;(request, registrationListener) {
+68                 @Override
+69                 protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
+70                     return new ClusterStateUpdateResponse(acknowledged);
+71                 }
+72                 @Override
+73                 public ClusterState execute(ClusterState currentState) throws IOException {
+74                     ensureRepositoryNotInUse(currentState, request.name());
+75                     if (!registerRepository(newRepositoryMetadata)) {
+76                         return currentState;
+77                     }
+78                     Metadata metadata = currentState.metadata();
+79                     Metadata.Builder mdBuilder = Metadata.builder(currentState.metadata());
+80                     RepositoriesMetadata repositories = metadata.custom(RepositoriesMetadata.TYPE);
+81                     if (repositories == null) {
+82                         LOGGER.info("put repository [{}]", request.name());
+83                         repositories = new RepositoriesMetadata(
+84                             Collections.singletonList(new RepositoryMetadata(request.name(), request.type(), request.settings())));
+85                     } else {
+86                         boolean found = false;
+87                         List&lt;RepositoryMetadata&gt; repositoriesMetadata = new ArrayList&lt;&gt;(repositories.repositories().size() + 1);
+88                         for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {
+89                             if (repositoryMetadata.name().equals(newRepositoryMetadata.name())) {
+90                                 if (newRepositoryMetadata.equalsIgnoreGenerations(repositoryMetadata)) {
+91                                     return currentState;
+92                                 }
+93                                 found = true;
+94                                 repositoriesMetadata.add(newRepositoryMetadata);
+95                             } else {
+96                                 repositoriesMetadata.add(repositoryMetadata);
+97                             }
+98                         }
+99                         if (!found) {
+100                             LOGGER.info("put repository [{}]", request.name());
+101                             repositoriesMetadata.add(new RepositoryMetadata(request.name(), request.type(), request.settings()));
+102                         } else {
+103                             LOGGER.info("update repository [{}]", request.name());
+104                         }
+105                         repositories = new RepositoriesMetadata(repositoriesMetadata);
+106                     }
+107                     mdBuilder.putCustom(RepositoriesMetadata.TYPE, repositories);
+108                     return ClusterState.builder(currentState).metadata(mdBuilder).build();
+109                 }
+110 <a name="2"></a>
+111                 @Override
+112                 public void onFailure(String source, Exception e) {
+113                     LOGGER.warn(() -&gt; new ParameterizedMessage("failed to create repository [{}]", <font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>request.name()), e);
+114                     super.onFailure(source, e);
+115                 }
+116                 @Override
+117                 public boolean mustAck(DiscoveryNode discoveryNode) {
+118                     return discoveryNode.isMasterEligibleNode</b></font>() || discoveryNode.isDataNode();
+119                 }
+120             });
+121     }
+122     public void unregisterRepository(final DeleteRepositoryRequest request, final ActionListener&lt;ClusterStateUpdateResponse&gt; listener) {
+123         clusterService.submitStateUpdateTask("delete_repository [" + request.name() + "]",
+124             new AckedClusterStateUpdateTask&lt;&gt;(request, listener) {
+125                 @Override
+126                 protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
+127                     return new ClusterStateUpdateResponse(acknowledged);
+128                 }
+129                 @Override
+130                 public ClusterState execute(ClusterState currentState) {
+131                     ensureRepositoryNotInUse(currentState, request.name());
+132                     Metadata metadata = currentState.metadata();
+133                     Metadata.Builder mdBuilder = Metadata.builder(currentState.metadata());
+134                     RepositoriesMetadata repositories = metadata.custom(RepositoriesMetadata.TYPE);
+135                     if (repositories != null &amp;&amp; repositories.repositories().size() &gt; 0) {
+136                         List&lt;RepositoryMetadata&gt; repositoriesMetadata = new ArrayList&lt;&gt;(repositories.repositories().size());
+137                         boolean changed = false;
+138                         for (RepositoryMetadata repositoryMetadata : repositories.repositories()) {
+139                             if (Regex.simpleMatch(request.name(), repositoryMetadata.name())) {
+140                                 LOGGER.info("delete repository [{}]", repositoryMetadata.name());
+141                                 changed = true;
+142                             } else {
+143                                 repositoriesMetadata.add(repositoryMetadata);
+144                             }
+145                         }
+146                         if (changed) {
+147                             repositories = new RepositoriesMetadata(repositoriesMetadata);
+148                             mdBuilder.putCustom(RepositoriesMetadata.TYPE, repositories);
+149                             return ClusterState.builder(currentState).metadata(mdBuilder).build();
+150                         }
+151                     }
+152 <a name="5"></a>                    if (Regex.isMatchAllPattern(request.name())) {                         return currentState;
+153                     }
+154                     throw new RepositoryMissingException(<font color="#151b8d"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>request.name());
+155                 }
+156                 @Override
+157                 public boolean mustAck(DiscoveryNode discoveryNode) {
+158                     return discoveryNode.isMasterEligibleNode</b></font>() || discoveryNode.isDataNode();
+159                 }
+160             });
+161     }
+162     public void verifyRepository(final String repositoryName, final ActionListener&lt;List&lt;DiscoveryNode&gt;&gt; listener) {
+163         final Repository repository = repository(repositoryName);
+164         final boolean readOnly = repository.isReadOnly();
+165         threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(new ActionRunnable&lt;&gt;(listener) {
+166             @Override
+167             protected void doRun() {
+168                 final String verificationToken = repository.startVerification();
+169                 if (verificationToken != null) {
+170                     try {
+171                         verifyAction.verify(repositoryName, readOnly, verificationToken, ActionListener.delegateFailure(listener,
+172                             (delegatedListener, verifyResponse) -&gt; threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(() -&gt; {
+173                                 try {
+174                                     repository.endVerification(verificationToken);
+175                                 } catch (Exception e) {
+176                                     LOGGER.warn(() -&gt; new ParameterizedMessage(
+177                                         "[{}] failed to finish repository verification", repositoryName), e);
+178                                     delegatedListener.onFailure(e);
+179                                     return;
+180                                 }
+181                                 delegatedListener.onResponse(verifyResponse);
+182                             })));
+183                     } catch (Exception e) {
+184                         threadPool.executor(ThreadPool.Names.SNAPSHOT).execute(() -&gt; {
+185                             try {
+186                                 repository.endVerification(verificationToken);
+187                             } catch (Exception inner) {
+188                                 inner.addSuppressed(e);
+189                                 LOGGER.warn(() -&gt; new ParameterizedMessage(
+190                                     "[{}] failed to finish repository verification", repositoryName), inner);
+191                             }
+192                             listener.onFailure(e);
+193                         });
+194                     }
+195                 } else {
+196                     listener.onResponse(Collections.emptyList());
+197                 }
+198             }
+199         });
+200     }
+201     @Override
+202     public void applyClusterState(ClusterChangedEvent event) {
+203         try {
+204             final ClusterState state = event.state();
+205             RepositoriesMetadata oldMetadata = event.previousState().getMetadata().custom(RepositoriesMetadata.TYPE);
+206             RepositoriesMetadata newMetadata = state.getMetadata().custom(RepositoriesMetadata.TYPE);
+207             if ((oldMetadata == null &amp;&amp; newMetadata == null) || (oldMetadata != null &amp;&amp; oldMetadata.equalsIgnoreGenerations(newMetadata))) {
+208                 for (Repository repo : repositories.values()) {
+209                     repo.updateState(state);
+210                 }
+211                 return;
+212             }
+213             LOGGER.trace("processing new index repositories for state version [{}]", event.state().version());
+214             Map&lt;String, Repository&gt; survivors = new HashMap&lt;&gt;();
+215             for (Map.Entry&lt;String, Repository&gt; entry : repositories.entrySet()) {
+216                 if (newMetadata == null || newMetadata.repository(entry.getKey()) == null) {
+217                     LOGGER.debug("unregistering repository [{}]", entry.getKey());
+218                     closeRepository(entry.getValue());
+219                 } else {
+220                     survivors.put(entry.getKey(), entry.getValue());
+221                 }
+222             }
+223             Map&lt;String, Repository&gt; builder = new HashMap&lt;&gt;();
+224             if (newMetadata != null) {
+225                 for (RepositoryMetadata repositoryMetadata : newMetadata.repositories()) {
+226                     Repository repository = survivors.get(repositoryMetadata.name());
+227                     if (repository != null) {
+228                         RepositoryMetadata previousMetadata = repository.getMetadata();
+229                         if (previousMetadata.type().equals(repositoryMetadata.type()) == false
+230                             || previousMetadata.settings().equals(repositoryMetadata.settings()) == false) {
+231                             LOGGER.debug("updating repository [{}]", repositoryMetadata.name());
+232                             closeRepository(repository);
+233                             repository = null;
+234                             try {
+235                                 repository = createRepository(repositoryMetadata);
+236                             } catch (RepositoryException ex) {
+237                                 LOGGER.warn(() -&gt; new ParameterizedMessage("failed to change repository [{}]", repositoryMetadata.name()), ex);
+238                             }
+239                         }
+240                     } else {
+241                         try {
+242                             repository = createRepository(repositoryMetadata);
+243                         } catch (RepositoryException ex) {
+244                             LOGGER.warn(() -&gt; new ParameterizedMessage("failed to create repository [{}]", repositoryMetadata.name()), ex);
+245                         }
+246                     }
+247                     if (repository != null) {
+248                         LOGGER.debug("registering repository [{}]", repositoryMetadata.name());
+249                         builder.put(repositoryMetadata.name(), repository);
+250                     }
+251                 }
+252             }
+253             for (Repository repo : builder.values()) {
+254                 repo.updateState(state);
+255             }
+256             repositories = Collections.unmodifiableMap(builder);
+257 <a name="1"></a>        } catch (Exception ex) {
+258             LOGGER.warn("failure updating cluster state ", ex);
+259         }
+260     <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>}
+261     public Repository repository(String repositoryName) {
+262         Repository repository = repositories.get(repositoryName);
+263 <a name="4"></a>        if (repository != null) {
+264             return</b></font> repository;
+265         }
+266         <font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>throw new RepositoryMissingException(repositoryName);
+267     }
+268     private boolean registerRepository(RepositoryMetadata repositoryMetadata) throws IOException {
+269         Repository previous = repositories.get</b></font>(repositoryMetadata.name());
+270         if (previous != null) {
+271             RepositoryMetadata previousMetadata = previous.getMetadata();
+272             if (previousMetadata.equals(repositoryMetadata)) {
+273                 return false;
+274             }
+275         }
+276         Repository newRepo = createRepository(repositoryMetadata);
+277         if (previous != null) {
+278             closeRepository(previous);
+279         }
+280         Map&lt;String, Repository&gt; newRepositories = new HashMap&lt;&gt;(repositories);
+281         newRepositories.put(repositoryMetadata.name(), newRepo);
+282         repositories = newRepositories;
+283         return true;
+284     }
+285     private void closeRepository(Repository repository) throws IOException {
+286         LOGGER.debug("closing repository [{}][{}]", repository.getMetadata().type(), repository.getMetadata().name());
+287         repository.close();
+288     }
+289     private Repository createRepository(RepositoryMetadata repositoryMetadata) {
+290         LOGGER.debug("creating repository [{}][{}]", repositoryMetadata.type(), repositoryMetadata.name());
+291         Repository.Factory factory = typesRegistry.get(<font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>repositoryMetadata.type());
+292         if (factory == null) {
+293             throw new RepositoryException(repositoryMetadata.name(),
+294                 "repository type [" + repositoryMetadata.type() + "] does not exist");
+295         }</b></font>
+296         Repository repository = null;
+297         try {
+298             repository = factory.create(repositoryMetadata);
+299             repository.start();
+300             return repository;
+301         } catch (Exception e) {
+302             IOUtils.closeWhileHandlingException(repository);
+303             LOGGER.warn(new ParameterizedMessage("failed to create repository [{}][{}]",
+304                 repositoryMetadata.type(), repositoryMetadata.name()), e);
+305             throw new RepositoryException(repositoryMetadata.name(), "failed to create repository", e);
+306         }
+307     }
+308     private void ensureRepositoryNotInUse(ClusterState clusterState, String repository) {
+309         if (SnapshotsService.isRepositoryInUse(clusterState, repository) || RestoreService.isRepositoryInUse(clusterState, repository)) {
+310             throw new IllegalStateException("trying to modify or unregister repository that is currently used ");
+311         }
+312     }
+313     public Collection&lt;Repository&gt; getRepositoriesList() {
+314         return Collections.unmodifiableCollection(repositories.values());
+315     }
+316     public Map&lt;String, Repository.Factory&gt; typesRegistry() {
+317         return typesRegistry;
+318     }
+319 }
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -497,690 +376,492 @@ public class RepositoriesService implements ClusterStateApplier {
 </h3>
 <hr/>
 <pre>
-/*
- * Copyright (C) 2008 Google Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-<a name="0"></a>
-package org.elasticsearch.common.inject.internal;
-
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>import org.elasticsearch.common.inject.ConfigurationException;
-import org.elasticsearch.common.inject.TypeLiteral;
-import org.elasticsearch.common.inject.spi.Message;
-
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
-import java.lang.reflect.GenericArrayType;
-import java.lang.reflect.GenericDeclaration;
-import java.lang.reflect.Member;
-import java.lang.reflect.Method;
-import java.lang.reflect.ParameterizedType;
-import java.lang.reflect.Type;
-import java.lang.reflect.TypeVariable;
-import java.lang.reflect.WildcardType;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.NoSuchElementException;
-import java.util.Objects;
-
-import static java.util.Collections.singleton;
-import static java.util.Collections.unmodifiableMap;
-
-/**
- * Static methods for working with types that we aren't publishing in the
- * public {@code Types} API.
- *
- * @author jessewilson@google.com (Jesse Wilson)
- */
-public class MoreTypes {
-
-    public static final Type[] EMPTY_TYPE_ARRAY = new Type[]{}</b></font>;
-
-    private MoreTypes() {
-    }
-
-    private static final Map&lt;TypeLiteral&lt;?&gt;, TypeLiteral&lt;?&gt;&gt; PRIMITIVE_TO_WRAPPER;
-
-    static {
-        Map&lt;TypeLiteral&lt;?&gt;, TypeLiteral&lt;?&gt;&gt; primitiveToWrapper = new HashMap&lt;&gt;();
-        primitiveToWrapper.put(TypeLiteral.get(boolean.class), TypeLiteral.get(Boolean.class));
-        primitiveToWrapper.put(TypeLiteral.get(byte.class), TypeLiteral.get(Byte.class));
-        primitiveToWrapper.put(TypeLiteral.get(short.class), TypeLiteral.get(Short.class));
-        primitiveToWrapper.put(TypeLiteral.get(int.class), TypeLiteral.get(Integer.class));
-        primitiveToWrapper.put(TypeLiteral.get(long.class), TypeLiteral.get(Long.class));
-        primitiveToWrapper.put(TypeLiteral.get(float.class), TypeLiteral.get(Float.class));
-        primitiveToWrapper.put(TypeLiteral.get(double.class), TypeLiteral.get(Double.class));
-        primitiveToWrapper.put(TypeLiteral.get(char.class), TypeLiteral.get(Character.class));
-        primitiveToWrapper.put(TypeLiteral.get(void.class), TypeLiteral.get(Void.class));
-        PRIMITIVE_TO_WRAPPER = unmodifiableMap(primitiveToWrapper);
-    }
-
-    /**
-     * Returns an equivalent type that's safe for use in a key. The returned type will be free of
-     * primitive types. Type literals of primitives will return the corresponding wrapper types.
-     *
-     * @throws ConfigurationException if {@code type} contains a type variable
-     */
-    public static &lt;T&gt; TypeLiteral&lt;T&gt; makeKeySafe(TypeLiteral&lt;T&gt; type) {
-        if (!isFullySpecified(type.getType())) {
-            String message = type + " cannot be used as a key; It is not fully specified.";
-            throw new ConfigurationException(singleton(new Message(message)));
-        }
-
-        @SuppressWarnings("unchecked")
-        TypeLiteral&lt;T&gt; wrappedPrimitives = (TypeLiteral&lt;T&gt;) PRIMITIVE_TO_WRAPPER.get(type);
-        return wrappedPrimitives != null
-                ? wrappedPrimitives
-                : type;
-    }
-
-    /**
-     * Returns true if {@code type} is free from type variables.
-     */
-    private static boolean isFullySpecified(Type type) {
-        if (type instanceof Class) {
-            return true;
-
-        } else if (type instanceof CompositeType) {
-            return ((CompositeType) type).isFullySpecified();
-
-        } else if (type instanceof TypeVariable) {
-            return false;
-
-        } else {
-            return ((CompositeType) canonicalize(type)).isFullySpecified();
-        }
-    }
-
-    /**
-     * Returns a type that is functionally equal but not necessarily equal
-     * according to {@link Object#equals(Object) Object.equals()}.
-     */
-    public static Type canonicalize(Type type) {
-        if (type instanceof ParameterizedTypeImpl
-                || type instanceof GenericArrayTypeImpl
-                || type instanceof WildcardTypeImpl) {
-            return type;
-
-        } else if (type instanceof ParameterizedType) {
-            ParameterizedType p = (ParameterizedType) type;
-            return new ParameterizedTypeImpl(p.getOwnerType(),
-                    p.getRawType(), p.getActualTypeArguments());
-
-        } else if (type instanceof GenericArrayType) {
-            GenericArrayType g = (GenericArrayType) type;
-            return new GenericArrayTypeImpl(g.getGenericComponentType());
-
-        } else if (type instanceof Class &amp;&amp; ((Class&lt;?&gt;) type).isArray()) {
-            Class&lt;?&gt; c = (Class&lt;?&gt;) type;
-            return new GenericArrayTypeImpl(c.getComponentType());
-
-        } else if (type instanceof WildcardType) {
-            WildcardType w = (WildcardType) type;
-            return new WildcardTypeImpl(w.getUpperBounds(), w.getLowerBounds());
-
-        } else {
-            // type is either serializable as-is or unsupported
-            return type;
-        }
-    }
-
-    public static Class&lt;?&gt; getRawType(Type type) {
-        if (type instanceof Class&lt;?&gt;) {
-            // type is a normal class.
-            return (Class&lt;?&gt;) type;
-
-        } else if (type instanceof ParameterizedType) {
-            ParameterizedType parameterizedType = (ParameterizedType) type;
-
-<a name="3"></a>            // I'm not exactly sure why getRawType() returns Type instead of Class.
-            // Neal isn't either but suspects some pathological case related
-            // to nested classes exists.
-            Type rawType = <font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>parameterizedType.getRawType();
-            if (!(rawType instanceof Class)) {
-                throw new IllegalArgumentException(
-                    "Expected a Class, but &lt;" + type + "&gt; is of type " + type.getClass().getName()
-                );
-            }</b></font>
-            return (Class&lt;?&gt;) rawType;
-
-        } else if (type instanceof GenericArrayType) {
-            // TODO: Is this sufficient?
-            return Object[].class;
-
-        } else if (type instanceof TypeVariable) {
-            // we could use the variable's bounds, but that'll won't work if there are multiple.
-            // having a raw type that's more general than necessary is okay
-            return Object.class;
-
-        } else {
-            throw new IllegalArgumentException("Expected a Class, ParameterizedType, or "
-                    + "GenericArrayType, but &lt;" + type + "&gt; is of type " + type.getClass().getName());
-        }
-    }
-
-    /**
-     * Returns true if {@code a} and {@code b} are equal.
-     */
-    public static boolean equals(Type a, Type b) {
-        if (a == b) {
-            // also handles (a == null &amp;&amp; b == null)
-            return true;
-
-        } else if (a instanceof Class) {
-            // Class already specifies equals().
-            return a.equals(b);
-
-        } else if (a instanceof ParameterizedType) {
-            if (!(b instanceof ParameterizedType)) {
-                return false;
-            }
-
-            // TODO: save a .clone() call
-            ParameterizedType pa = (ParameterizedType) a;
-            ParameterizedType pb = (ParameterizedType) b;
-            return Objects.equals(pa.getOwnerType(), pb.getOwnerType())
-                    &amp;&amp; pa.getRawType().equals(pb.getRawType())
-                    &amp;&amp; Arrays.equals(pa.getActualTypeArguments(), pb.getActualTypeArguments());
-
-        } else if (a instanceof GenericArrayType) {
-            if (!(b instanceof GenericArrayType)) {
-                return false;
-            }
-
-            GenericArrayType ga = (GenericArrayType) a;
-            GenericArrayType gb = (GenericArrayType) b;
-            return equals(ga.getGenericComponentType(), gb.getGenericComponentType());
-
-        } else if (a instanceof WildcardType) {
-            if (!(b instanceof WildcardType)) {
-                return false;
-            }
-
-            WildcardType wa = (WildcardType) a;
-            WildcardType wb = (WildcardType) b;
-            return Arrays.equals(wa.getUpperBounds(), wb.getUpperBounds())
-                    &amp;&amp; Arrays.equals(wa.getLowerBounds(), wb.getLowerBounds());
-
-        } else if (a instanceof TypeVariable) {
-            if (!(b instanceof TypeVariable)) {
-                return false;
-            }
-            TypeVariable&lt;?&gt; va = (TypeVariable) a;
-            TypeVariable&lt;?&gt; vb = (TypeVariable) b;
-            return va.getGenericDeclaration() == vb.getGenericDeclaration()
-                    &amp;&amp; va.getName().equals(vb.getName());
-
-        } else {
-            // This isn't a type we support. Could be a generic array type, wildcard type, etc.
-            return false;
-        }
-    }
-
-    /**
-     * Returns the hashCode of {@code type}.
-     */
-    public static int hashCode(Type type) {
-        if (type instanceof Class) {
-            // Class specifies hashCode().
-            return type.hashCode();
-
-        } else if (type instanceof ParameterizedType) {
-            ParameterizedType p = (ParameterizedType) type;
-            return Arrays.hashCode(p.getActualTypeArguments())
-                    ^ p.getRawType().hashCode()
-                    ^ hashCodeOrZero(p.getOwnerType());
-
-        } else if (type instanceof GenericArrayType) {
-            return hashCode(((GenericArrayType) type).getGenericComponentType());
-
-        } else if (type instanceof WildcardType) {
-            WildcardType w = (WildcardType) type;
-            return Arrays.hashCode(w.getLowerBounds()) ^ Arrays.hashCode(w.getUpperBounds());
-
-        } else {
-            // This isn't a type we support. Probably a type variable
-            return hashCodeOrZero(type);
-        }
-    }
-
-    private static int hashCodeOrZero(Object o) {
-        return o != null ? o.hashCode() : 0;
-    }
-
-    public static String toString(Type type) {
-        if (type instanceof Class&lt;?&gt;) {
-            return ((Class) type).getName();
-
-        } else if (type instanceof ParameterizedType) {
-            ParameterizedType parameterizedType = (ParameterizedType) type;
-            Type[] arguments = parameterizedType.getActualTypeArguments();
-            Type ownerType = parameterizedType.getOwnerType();
-            StringBuilder stringBuilder = new StringBuilder();
-            if (ownerType != null) {
-                stringBuilder.append(toString(ownerType)).append(".");
-            }
-            stringBuilder.append(toString(parameterizedType.getRawType()));
-            if (arguments.length &gt; 0) {
-                stringBuilder
-                        .append("&lt;")
-                        .append(toString(arguments[0]));
-                for (int i = 1; i &lt; arguments.length; i++) {
-                    stringBuilder.append(", ").append(toString(arguments[i]));
-                }
-            }
-            return stringBuilder.append("&gt;").toString();
-
-        } else if (type instanceof GenericArrayType) {
-            return toString(((GenericArrayType) type).getGenericComponentType()) + "[]";
-
-        } else if (type instanceof WildcardType) {
-            WildcardType wildcardType = (WildcardType) type;
-            Type[] lowerBounds = wildcardType.getLowerBounds();
-            Type[] upperBounds = wildcardType.getUpperBounds();
-
-            if (upperBounds.length != 1 || lowerBounds.length &gt; 1) {
-                throw new UnsupportedOperationException("Unsupported wildcard type " + type);
-            }
-
-            if (lowerBounds.length == 1) {
-                if (upperBounds[0] != Object.class) {
-                    throw new UnsupportedOperationException("Unsupported wildcard type " + type);
-                }
-                return "? super " + toString(lowerBounds[0]);
-            } else if (upperBounds[0] == Object.class) {
-                return "?";
-            } else {
-                return "? extends " + toString(upperBounds[0]);
-            }
-
-        } else {
-            return type.toString();
-        }
-    }
-
-    /**
-     * Returns {@code Field.class}, {@code Method.class} or {@code Constructor.class}.
-     */
-    public static Class&lt;? extends Member&gt; memberType(Member member) {
-        Objects.requireNonNull(member, "member");
-
-        if (member instanceof MemberImpl) {
-            return ((MemberImpl) member).memberType;
-
-        } else if (member instanceof Field) {
-            return Field.class;
-
-        } else if (member instanceof Method) {
-            return Method.class;
-
-        } else if (member instanceof Constructor) {
-            return Constructor.class;
-
-        } else {
-<a name="1"></a>            throw new IllegalArgumentException(
-                    "Unsupported implementation class for Member, " + member.getClass());
-        }
-    <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>}
-
-    /**
-     * Formats a member as concise string, such as {@code java.util.ArrayList.size},
-     * {@code java.util.ArrayList&lt;init&gt;()} or {@code java.util.List.remove()}.
-     */
-    public static String toString(Member member) {
-        Class&lt;? extends Member&gt; memberType = memberType(member);
-
-        if (memberType == Method.class) {
-            return</b></font> member.getDeclaringClass().getName() + "." + member.getName() + "()";
-        } else if (memberType == Field.class) {
-            return member.getDeclaringClass().getName() + "." + member.getName();
-        } else if (memberType == Constructor.class) {
-            return member.getDeclaringClass().getName() + ".&lt;init&gt;()";
-        } else {
-            throw new AssertionError();
-        }
-    }
-
-    public static String memberKey(Member member) {
-        Objects.requireNonNull(member, "member");
-
-        return "&lt;NO_MEMBER_KEY&gt;";
-    }
-
-    /**
-     * Returns the generic supertype for {@code supertype}. For example, given a class {@code
-     * IntegerSet}, the result for when supertype is {@code Set.class} is {@code Set&lt;Integer&gt;} and the
-     * result when the supertype is {@code Collection.class} is {@code Collection&lt;Integer&gt;}.
-     */
-    public static Type getGenericSupertype(Type type, Class&lt;?&gt; rawType, Class&lt;?&gt; toResolve) {
-        if (toResolve == rawType) {
-            return type;
-        }
-
-        // we skip searching through interfaces if unknown is an interface
-        if (toResolve.isInterface()) {
-            Class[] interfaces = rawType.getInterfaces();
-            for (int i = 0, length = interfaces.length; i &lt; length; i++) {
-                if (interfaces[i] == toResolve) {
-                    return rawType.getGenericInterfaces()[i];
-                } else if (toResolve.isAssignableFrom(interfaces[i])) {
-                    return getGenericSupertype(rawType.getGenericInterfaces()[i], interfaces[i], toResolve);
-                }
-            }
-        }
-
-        // check our supertypes
-        if (!rawType.isInterface()) {
-            while (rawType != Object.class) {
-                Class&lt;?&gt; rawSupertype = rawType.getSuperclass();
-                if (rawSupertype == toResolve) {
-                    return rawType.getGenericSuperclass();
-                } else if (toResolve.isAssignableFrom(rawSupertype)) {
-                    return getGenericSupertype(rawType.getGenericSuperclass(), rawSupertype, toResolve);
-                }
-                rawType = rawSupertype;
-            }
-        }
-
-        // we can't resolve this further
-        return toResolve;
-    }
-
-    public static Type resolveTypeVariable(Type type, Class&lt;?&gt; rawType, TypeVariable unknown) {
-        Class&lt;?&gt; declaredByRaw = declaringClassOf(unknown);
-
-        // we can't reduce this further
-        if (declaredByRaw == null) {
-            return unknown;
-        }
-
-        Type declaredBy = getGenericSupertype(type, rawType, declaredByRaw);
-        if (declaredBy instanceof ParameterizedType) {
-            int index = indexOf(declaredByRaw.getTypeParameters(), unknown);
-            return ((ParameterizedType) declaredBy).getActualTypeArguments()[index];
-        }
-
-        return unknown;
-    }
-
-    private static int indexOf(Object[] array, Object toFind) {
-        for (int i = 0; i &lt; array.length; i++) {
-            if (toFind.equals(array[i])) {
-<a name="4"></a>                return i;
-            }
-        }
-        <font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>throw new NoSuchElementException();
-    }
-
-    /**
-     * Returns the declaring class of {@code typeVariable}, or {@code null} if it was not declared by
-     * a class.
-     */
-    private static Class&lt;?&gt; declaringClassOf(TypeVariable typeVariable) {
-        GenericDeclaration genericDeclaration = typeVariable.getGenericDeclaration</b></font>();
-        return genericDeclaration instanceof Class
-                ? (Class&lt;?&gt;) genericDeclaration
-                : null;
-    }
-
-    public static class ParameterizedTypeImpl
-            implements ParameterizedType, CompositeType {
-        private final Type ownerType;
-        private final Type rawType;
-        private final Type[] typeArguments;
-
-        public ParameterizedTypeImpl(Type ownerType, Type rawType, Type... typeArguments) {
-            // require an owner type if the raw type needs it
-            if (rawType instanceof Class&lt;?&gt;) {
-                Class rawTypeAsClass = (Class) rawType;
-                if (ownerType == null &amp;&amp; rawTypeAsClass.getEnclosingClass() != null) {
-                    throw new IllegalArgumentException("No owner type for enclosed " + rawType);
-                }
-                if (ownerType != null &amp;&amp; rawTypeAsClass.getEnclosingClass() == null) {
-                    throw new IllegalArgumentException("Owner type for unenclosed " + rawType);
-                }
-
-            }
-
-            this.ownerType = ownerType == null ? null : canonicalize(ownerType);
-            this.rawType = canonicalize(rawType);
-            this.typeArguments = typeArguments.clone();
-            for (int t = 0; t &lt; this.typeArguments.length; t++) {
-                Objects.requireNonNull(this.typeArguments[t], "type parameter");
-                checkNotPrimitive(this.typeArguments[t], "type parameters");
-                this.typeArguments[t] = canonicalize(this.typeArguments[t]);
-            }
-        }
-
-        @Override
-        public Type[] getActualTypeArguments() {
-            return typeArguments.clone();
-        }
-
-        @Override
-        public Type getRawType() {
-            return rawType;
-        }
-
-        @Override
-        public Type getOwnerType() {
-            return ownerType;
-        }
-
-        @Override
-        public boolean isFullySpecified() {
-            if (ownerType != null &amp;&amp; !MoreTypes.isFullySpecified(ownerType)) {
-                return false;
-            }
-
-            if (!MoreTypes.isFullySpecified(rawType)) {
-                return false;
-            }
-
-            for (Type type : typeArguments) {
-                if (!MoreTypes.isFullySpecified(type)) {
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
-        @Override
-        public boolean equals(Object other) {
-            return other instanceof ParameterizedType
-                    &amp;&amp; MoreTypes.equals(this, (ParameterizedType) other);
-        }
-
-        @Override
-        public int hashCode() {
-            return MoreTypes.hashCode(this);
-        }
-
-        @Override
-        public String toString() {
-            return MoreTypes.toString(this);
-        }
-    }
-
-    public static class GenericArrayTypeImpl
-            implements GenericArrayType, CompositeType {
-        private final Type componentType;
-
-        public GenericArrayTypeImpl(Type componentType) {
-            this.componentType = canonicalize(componentType);
-        }
-
-        @Override
-        public Type getGenericComponentType() {
-            return componentType;
-        }
-<a name="5"></a>
-        @Override
-        public boolean isFullySpecified() {
-            return <font color="#151b8d"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>MoreTypes.isFullySpecified(componentType);
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            return o instanceof GenericArrayType
-                    &amp;&amp; MoreTypes.equals</b></font>(this, (GenericArrayType) o);
-        }
-
-        @Override
-        public int hashCode() {
-            return MoreTypes.hashCode(this);
-        }
-
-        @Override
-        public String toString() {
-            return MoreTypes.toString(this);
-        }
-    }
-
-    /**
-     * The WildcardType interface supports multiple upper bounds and multiple
-     * lower bounds. We only support what the Java 6 language needs - at most one
-     * bound. If a lower bound is set, the upper bound must be Object.class.
-     */
-    public static class WildcardTypeImpl implements WildcardType, CompositeType {
-        private final Type upperBound;
-        private final Type lowerBound;
-
-        public WildcardTypeImpl(Type[] upperBounds, Type[] lowerBounds) {
-            if (lowerBounds.length &gt; 1) {
-                throw new IllegalArgumentException("Must have at most one lower bound.");
-            }
-            if (upperBounds.length != 1) {
-                throw new IllegalArgumentException("Must have exactly one upper bound.");
-            }
-            if (lowerBounds.length == 1) {
-                Objects.requireNonNull(lowerBounds[0], "lowerBound");
-                checkNotPrimitive(lowerBounds[0], "wildcard bounds");
-                if (upperBounds[0] != Object.class) {
-                    throw new IllegalArgumentException("bounded both ways");
-                }
-                this.lowerBound = canonicalize(lowerBounds[0]);
-                this.upperBound = Object.class;
-
-            } else {
-                Objects.requireNonNull(upperBounds[0], "upperBound");
-                checkNotPrimitive(upperBounds[0], "wildcard bounds");
-                this.lowerBound = null;
-                this.upperBound = canonicalize(upperBounds[0]);
-            }
-        }
-
-        @Override
-        public Type[] getUpperBounds() {
-            return new Type[]{upperBound};
-        }
-
-        @Override
-        public Type[] getLowerBounds() {
-            return lowerBound != null ? new Type[]{lowerBound} : EMPTY_TYPE_ARRAY;
-        }
-<a name="2"></a>
-        @Override
-        public boolean isFullySpecified() {
-            return <font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>MoreTypes.isFullySpecified(upperBound)
-                    &amp;&amp; (lowerBound == null || MoreTypes.isFullySpecified(lowerBound));
-        }
-
-        @Override
-        public boolean equals(Object other) {
-            return other instanceof WildcardType
-                    &amp;&amp; MoreTypes.equals</b></font>(this, (WildcardType) other);
-        }
-
-        @Override
-        public int hashCode() {
-            return MoreTypes.hashCode(this);
-        }
-
-        @Override
-        public String toString() {
-            return MoreTypes.toString(this);
-        }
-    }
-
-    private static void checkNotPrimitive(Type type, String use) {
-        if (type instanceof Class&lt;?&gt; &amp;&amp; ((Class) type).isPrimitive()) {
-            throw new IllegalArgumentException("Primitive types are not allowed in " + use + ": " + type);
-        }
-    }
-
-    /**
-     * We cannot serialize the built-in Java member classes, which prevents us from using Members in
-     * our exception types. We workaround this with this serializable implementation. It includes all
-     * of the API methods, plus everything we use for line numbers and messaging.
-     */
-    public static class MemberImpl implements Member {
-        private final Class&lt;?&gt; declaringClass;
-        private final String name;
-        private final int modifiers;
-        private final boolean synthetic;
-        private final Class&lt;? extends Member&gt; memberType;
-        private final String memberKey;
-
-        private MemberImpl(Member member) {
-            this.declaringClass = member.getDeclaringClass();
-            this.name = member.getName();
-            this.modifiers = member.getModifiers();
-            this.synthetic = member.isSynthetic();
-            this.memberType = memberType(member);
-            this.memberKey = memberKey(member);
-        }
-
-        @Override
-        public Class getDeclaringClass() {
-            return declaringClass;
-        }
-
-        @Override
-        public String getName() {
-            return name;
-        }
-
-        @Override
-        public int getModifiers() {
-            return modifiers;
-        }
-
-        @Override
-        public boolean isSynthetic() {
-            return synthetic;
-        }
-
-        @Override
-        public String toString() {
-            return MoreTypes.toString(this);
-        }
-    }
-
-    /**
-     * A type formed from other types, such as arrays, parameterized types or wildcard types
-     */
-    private interface CompositeType {
-        /**
-         * Returns true if there are no type variables in this type.
-         */
-        boolean isFullySpecified();
-    }
-}
+1 <a name="0"></a>
+2 package org.elasticsearch.common.inject.internal;
+3 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>import org.elasticsearch.common.inject.ConfigurationException;
+4 import org.elasticsearch.common.inject.TypeLiteral;
+5 import org.elasticsearch.common.inject.spi.Message;
+6 import java.lang.reflect.Constructor;
+7 import java.lang.reflect.Field;
+8 import java.lang.reflect.GenericArrayType;
+9 import java.lang.reflect.GenericDeclaration;
+10 import java.lang.reflect.Member;
+11 import java.lang.reflect.Method;
+12 import java.lang.reflect.ParameterizedType;
+13 import java.lang.reflect.Type;
+14 import java.lang.reflect.TypeVariable;
+15 import java.lang.reflect.WildcardType;
+16 import java.util.Arrays;
+17 import java.util.HashMap;
+18 import java.util.Map;
+19 import java.util.NoSuchElementException;
+20 import java.util.Objects;
+21 import static java.util.Collections.singleton;
+22 import static java.util.Collections.unmodifiableMap;
+23 public class MoreTypes {
+24     public static final Type[] EMPTY_TYPE_ARRAY = new Type[]{}</b></font>;
+25     private MoreTypes() {
+26     }
+27     private static final Map&lt;TypeLiteral&lt;?&gt;, TypeLiteral&lt;?&gt;&gt; PRIMITIVE_TO_WRAPPER;
+28     static {
+29         Map&lt;TypeLiteral&lt;?&gt;, TypeLiteral&lt;?&gt;&gt; primitiveToWrapper = new HashMap&lt;&gt;();
+30         primitiveToWrapper.put(TypeLiteral.get(boolean.class), TypeLiteral.get(Boolean.class));
+31         primitiveToWrapper.put(TypeLiteral.get(byte.class), TypeLiteral.get(Byte.class));
+32         primitiveToWrapper.put(TypeLiteral.get(short.class), TypeLiteral.get(Short.class));
+33         primitiveToWrapper.put(TypeLiteral.get(int.class), TypeLiteral.get(Integer.class));
+34         primitiveToWrapper.put(TypeLiteral.get(long.class), TypeLiteral.get(Long.class));
+35         primitiveToWrapper.put(TypeLiteral.get(float.class), TypeLiteral.get(Float.class));
+36         primitiveToWrapper.put(TypeLiteral.get(double.class), TypeLiteral.get(Double.class));
+37         primitiveToWrapper.put(TypeLiteral.get(char.class), TypeLiteral.get(Character.class));
+38         primitiveToWrapper.put(TypeLiteral.get(void.class), TypeLiteral.get(Void.class));
+39         PRIMITIVE_TO_WRAPPER = unmodifiableMap(primitiveToWrapper);
+40     }
+41     public static &lt;T&gt; TypeLiteral&lt;T&gt; makeKeySafe(TypeLiteral&lt;T&gt; type) {
+42         if (!isFullySpecified(type.getType())) {
+43             String message = type + " cannot be used as a key; It is not fully specified.";
+44             throw new ConfigurationException(singleton(new Message(message)));
+45         }
+46         @SuppressWarnings("unchecked")
+47         TypeLiteral&lt;T&gt; wrappedPrimitives = (TypeLiteral&lt;T&gt;) PRIMITIVE_TO_WRAPPER.get(type);
+48         return wrappedPrimitives != null
+49                 ? wrappedPrimitives
+50                 : type;
+51     }
+52     private static boolean isFullySpecified(Type type) {
+53         if (type instanceof Class) {
+54             return true;
+55         } else if (type instanceof CompositeType) {
+56             return ((CompositeType) type).isFullySpecified();
+57         } else if (type instanceof TypeVariable) {
+58             return false;
+59         } else {
+60             return ((CompositeType) canonicalize(type)).isFullySpecified();
+61         }
+62     }
+63     public static Type canonicalize(Type type) {
+64         if (type instanceof ParameterizedTypeImpl
+65                 || type instanceof GenericArrayTypeImpl
+66                 || type instanceof WildcardTypeImpl) {
+67             return type;
+68         } else if (type instanceof ParameterizedType) {
+69             ParameterizedType p = (ParameterizedType) type;
+70             return new ParameterizedTypeImpl(p.getOwnerType(),
+71                     p.getRawType(), p.getActualTypeArguments());
+72         } else if (type instanceof GenericArrayType) {
+73             GenericArrayType g = (GenericArrayType) type;
+74             return new GenericArrayTypeImpl(g.getGenericComponentType());
+75         } else if (type instanceof Class &amp;&amp; ((Class&lt;?&gt;) type).isArray()) {
+76             Class&lt;?&gt; c = (Class&lt;?&gt;) type;
+77             return new GenericArrayTypeImpl(c.getComponentType());
+78         } else if (type instanceof WildcardType) {
+79             WildcardType w = (WildcardType) type;
+80             return new WildcardTypeImpl(w.getUpperBounds(), w.getLowerBounds());
+81         } else {
+82             return type;
+83         }
+84     }
+85     public static Class&lt;?&gt; getRawType(Type type) {
+86         if (type instanceof Class&lt;?&gt;) {
+87             return (Class&lt;?&gt;) type;
+88         } else if (type instanceof ParameterizedType) {
+89             ParameterizedType parameterizedType = (ParameterizedType) type;
+90 <a name="3"></a>                        Type rawType = <font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>parameterizedType.getRawType();
+91             if (!(rawType instanceof Class)) {
+92                 throw new IllegalArgumentException(
+93                     "Expected a Class, but &lt;" + type + "&gt; is of type " + type.getClass().getName()
+94                 );
+95             }</b></font>
+96             return (Class&lt;?&gt;) rawType;
+97         } else if (type instanceof GenericArrayType) {
+98             return Object[].class;
+99         } else if (type instanceof TypeVariable) {
+100             return Object.class;
+101         } else {
+102             throw new IllegalArgumentException("Expected a Class, ParameterizedType, or "
+103                     + "GenericArrayType, but &lt;" + type + "&gt; is of type " + type.getClass().getName());
+104         }
+105     }
+106     public static boolean equals(Type a, Type b) {
+107         if (a == b) {
+108             return true;
+109         } else if (a instanceof Class) {
+110             return a.equals(b);
+111         } else if (a instanceof ParameterizedType) {
+112             if (!(b instanceof ParameterizedType)) {
+113                 return false;
+114             }
+115             ParameterizedType pa = (ParameterizedType) a;
+116             ParameterizedType pb = (ParameterizedType) b;
+117             return Objects.equals(pa.getOwnerType(), pb.getOwnerType())
+118                     &amp;&amp; pa.getRawType().equals(pb.getRawType())
+119                     &amp;&amp; Arrays.equals(pa.getActualTypeArguments(), pb.getActualTypeArguments());
+120         } else if (a instanceof GenericArrayType) {
+121             if (!(b instanceof GenericArrayType)) {
+122                 return false;
+123             }
+124             GenericArrayType ga = (GenericArrayType) a;
+125             GenericArrayType gb = (GenericArrayType) b;
+126             return equals(ga.getGenericComponentType(), gb.getGenericComponentType());
+127         } else if (a instanceof WildcardType) {
+128             if (!(b instanceof WildcardType)) {
+129                 return false;
+130             }
+131             WildcardType wa = (WildcardType) a;
+132             WildcardType wb = (WildcardType) b;
+133             return Arrays.equals(wa.getUpperBounds(), wb.getUpperBounds())
+134                     &amp;&amp; Arrays.equals(wa.getLowerBounds(), wb.getLowerBounds());
+135         } else if (a instanceof TypeVariable) {
+136             if (!(b instanceof TypeVariable)) {
+137                 return false;
+138             }
+139             TypeVariable&lt;?&gt; va = (TypeVariable) a;
+140             TypeVariable&lt;?&gt; vb = (TypeVariable) b;
+141             return va.getGenericDeclaration() == vb.getGenericDeclaration()
+142                     &amp;&amp; va.getName().equals(vb.getName());
+143         } else {
+144             return false;
+145         }
+146     }
+147     public static int hashCode(Type type) {
+148         if (type instanceof Class) {
+149             return type.hashCode();
+150         } else if (type instanceof ParameterizedType) {
+151             ParameterizedType p = (ParameterizedType) type;
+152             return Arrays.hashCode(p.getActualTypeArguments())
+153                     ^ p.getRawType().hashCode()
+154                     ^ hashCodeOrZero(p.getOwnerType());
+155         } else if (type instanceof GenericArrayType) {
+156             return hashCode(((GenericArrayType) type).getGenericComponentType());
+157         } else if (type instanceof WildcardType) {
+158             WildcardType w = (WildcardType) type;
+159             return Arrays.hashCode(w.getLowerBounds()) ^ Arrays.hashCode(w.getUpperBounds());
+160         } else {
+161             return hashCodeOrZero(type);
+162         }
+163     }
+164     private static int hashCodeOrZero(Object o) {
+165         return o != null ? o.hashCode() : 0;
+166     }
+167     public static String toString(Type type) {
+168         if (type instanceof Class&lt;?&gt;) {
+169             return ((Class) type).getName();
+170         } else if (type instanceof ParameterizedType) {
+171             ParameterizedType parameterizedType = (ParameterizedType) type;
+172             Type[] arguments = parameterizedType.getActualTypeArguments();
+173             Type ownerType = parameterizedType.getOwnerType();
+174             StringBuilder stringBuilder = new StringBuilder();
+175             if (ownerType != null) {
+176                 stringBuilder.append(toString(ownerType)).append(".");
+177             }
+178             stringBuilder.append(toString(parameterizedType.getRawType()));
+179             if (arguments.length &gt; 0) {
+180                 stringBuilder
+181                         .append("&lt;")
+182                         .append(toString(arguments[0]));
+183                 for (int i = 1; i &lt; arguments.length; i++) {
+184                     stringBuilder.append(", ").append(toString(arguments[i]));
+185                 }
+186             }
+187             return stringBuilder.append("&gt;").toString();
+188         } else if (type instanceof GenericArrayType) {
+189             return toString(((GenericArrayType) type).getGenericComponentType()) + "[]";
+190         } else if (type instanceof WildcardType) {
+191             WildcardType wildcardType = (WildcardType) type;
+192             Type[] lowerBounds = wildcardType.getLowerBounds();
+193             Type[] upperBounds = wildcardType.getUpperBounds();
+194             if (upperBounds.length != 1 || lowerBounds.length &gt; 1) {
+195                 throw new UnsupportedOperationException("Unsupported wildcard type " + type);
+196             }
+197             if (lowerBounds.length == 1) {
+198                 if (upperBounds[0] != Object.class) {
+199                     throw new UnsupportedOperationException("Unsupported wildcard type " + type);
+200                 }
+201                 return "? super " + toString(lowerBounds[0]);
+202             } else if (upperBounds[0] == Object.class) {
+203                 return "?";
+204             } else {
+205                 return "? extends " + toString(upperBounds[0]);
+206             }
+207         } else {
+208             return type.toString();
+209         }
+210     }
+211     public static Class&lt;? extends Member&gt; memberType(Member member) {
+212         Objects.requireNonNull(member, "member");
+213         if (member instanceof MemberImpl) {
+214             return ((MemberImpl) member).memberType;
+215         } else if (member instanceof Field) {
+216             return Field.class;
+217         } else if (member instanceof Method) {
+218             return Method.class;
+219         } else if (member instanceof Constructor) {
+220             return Constructor.class;
+221         } else {
+222 <a name="1"></a>            throw new IllegalArgumentException(
+223                     "Unsupported implementation class for Member, " + member.getClass());
+224         }
+225     <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>}
+226     public static String toString(Member member) {
+227         Class&lt;? extends Member&gt; memberType = memberType(member);
+228         if (memberType == Method.class) {
+229             return</b></font> member.getDeclaringClass().getName() + "." + member.getName() + "()";
+230         } else if (memberType == Field.class) {
+231             return member.getDeclaringClass().getName() + "." + member.getName();
+232         } else if (memberType == Constructor.class) {
+233             return member.getDeclaringClass().getName() + ".&lt;init&gt;()";
+234         } else {
+235             throw new AssertionError();
+236         }
+237     }
+238     public static String memberKey(Member member) {
+239         Objects.requireNonNull(member, "member");
+240         return "&lt;NO_MEMBER_KEY&gt;";
+241     }
+242     public static Type getGenericSupertype(Type type, Class&lt;?&gt; rawType, Class&lt;?&gt; toResolve) {
+243         if (toResolve == rawType) {
+244             return type;
+245         }
+246         if (toResolve.isInterface()) {
+247             Class[] interfaces = rawType.getInterfaces();
+248             for (int i = 0, length = interfaces.length; i &lt; length; i++) {
+249                 if (interfaces[i] == toResolve) {
+250                     return rawType.getGenericInterfaces()[i];
+251                 } else if (toResolve.isAssignableFrom(interfaces[i])) {
+252                     return getGenericSupertype(rawType.getGenericInterfaces()[i], interfaces[i], toResolve);
+253                 }
+254             }
+255         }
+256         if (!rawType.isInterface()) {
+257             while (rawType != Object.class) {
+258                 Class&lt;?&gt; rawSupertype = rawType.getSuperclass();
+259                 if (rawSupertype == toResolve) {
+260                     return rawType.getGenericSuperclass();
+261                 } else if (toResolve.isAssignableFrom(rawSupertype)) {
+262                     return getGenericSupertype(rawType.getGenericSuperclass(), rawSupertype, toResolve);
+263                 }
+264                 rawType = rawSupertype;
+265             }
+266         }
+267         return toResolve;
+268     }
+269     public static Type resolveTypeVariable(Type type, Class&lt;?&gt; rawType, TypeVariable unknown) {
+270         Class&lt;?&gt; declaredByRaw = declaringClassOf(unknown);
+271         if (declaredByRaw == null) {
+272             return unknown;
+273         }
+274         Type declaredBy = getGenericSupertype(type, rawType, declaredByRaw);
+275         if (declaredBy instanceof ParameterizedType) {
+276             int index = indexOf(declaredByRaw.getTypeParameters(), unknown);
+277             return ((ParameterizedType) declaredBy).getActualTypeArguments()[index];
+278         }
+279         return unknown;
+280     }
+281     private static int indexOf(Object[] array, Object toFind) {
+282         for (int i = 0; i &lt; array.length; i++) {
+283             if (toFind.equals(array[i])) {
+284 <a name="4"></a>                return i;
+285             }
+286         }
+287         <font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>throw new NoSuchElementException();
+288     }
+289     private static Class&lt;?&gt; declaringClassOf(TypeVariable typeVariable) {
+290         GenericDeclaration genericDeclaration = typeVariable.getGenericDeclaration</b></font>();
+291         return genericDeclaration instanceof Class
+292                 ? (Class&lt;?&gt;) genericDeclaration
+293                 : null;
+294     }
+295     public static class ParameterizedTypeImpl
+296             implements ParameterizedType, CompositeType {
+297         private final Type ownerType;
+298         private final Type rawType;
+299         private final Type[] typeArguments;
+300         public ParameterizedTypeImpl(Type ownerType, Type rawType, Type... typeArguments) {
+301             if (rawType instanceof Class&lt;?&gt;) {
+302                 Class rawTypeAsClass = (Class) rawType;
+303                 if (ownerType == null &amp;&amp; rawTypeAsClass.getEnclosingClass() != null) {
+304                     throw new IllegalArgumentException("No owner type for enclosed " + rawType);
+305                 }
+306                 if (ownerType != null &amp;&amp; rawTypeAsClass.getEnclosingClass() == null) {
+307                     throw new IllegalArgumentException("Owner type for unenclosed " + rawType);
+308                 }
+309             }
+310             this.ownerType = ownerType == null ? null : canonicalize(ownerType);
+311             this.rawType = canonicalize(rawType);
+312             this.typeArguments = typeArguments.clone();
+313             for (int t = 0; t &lt; this.typeArguments.length; t++) {
+314                 Objects.requireNonNull(this.typeArguments[t], "type parameter");
+315                 checkNotPrimitive(this.typeArguments[t], "type parameters");
+316                 this.typeArguments[t] = canonicalize(this.typeArguments[t]);
+317             }
+318         }
+319         @Override
+320         public Type[] getActualTypeArguments() {
+321             return typeArguments.clone();
+322         }
+323         @Override
+324         public Type getRawType() {
+325             return rawType;
+326         }
+327         @Override
+328         public Type getOwnerType() {
+329             return ownerType;
+330         }
+331         @Override
+332         public boolean isFullySpecified() {
+333             if (ownerType != null &amp;&amp; !MoreTypes.isFullySpecified(ownerType)) {
+334                 return false;
+335             }
+336             if (!MoreTypes.isFullySpecified(rawType)) {
+337                 return false;
+338             }
+339             for (Type type : typeArguments) {
+340                 if (!MoreTypes.isFullySpecified(type)) {
+341                     return false;
+342                 }
+343             }
+344             return true;
+345         }
+346         @Override
+347         public boolean equals(Object other) {
+348             return other instanceof ParameterizedType
+349                     &amp;&amp; MoreTypes.equals(this, (ParameterizedType) other);
+350         }
+351         @Override
+352         public int hashCode() {
+353             return MoreTypes.hashCode(this);
+354         }
+355         @Override
+356         public String toString() {
+357             return MoreTypes.toString(this);
+358         }
+359     }
+360     public static class GenericArrayTypeImpl
+361             implements GenericArrayType, CompositeType {
+362         private final Type componentType;
+363         public GenericArrayTypeImpl(Type componentType) {
+364             this.componentType = canonicalize(componentType);
+365         }
+366         @Override
+367         public Type getGenericComponentType() {
+368             return componentType;
+369         }
+370 <a name="5"></a>
+371         @Override
+372         public boolean isFullySpecified() {
+373             return <font color="#151b8d"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>MoreTypes.isFullySpecified(componentType);
+374         }
+375         @Override
+376         public boolean equals(Object o) {
+377             return o instanceof GenericArrayType
+378                     &amp;&amp; MoreTypes.equals</b></font>(this, (GenericArrayType) o);
+379         }
+380         @Override
+381         public int hashCode() {
+382             return MoreTypes.hashCode(this);
+383         }
+384         @Override
+385         public String toString() {
+386             return MoreTypes.toString(this);
+387         }
+388     }
+389     public static class WildcardTypeImpl implements WildcardType, CompositeType {
+390         private final Type upperBound;
+391         private final Type lowerBound;
+392         public WildcardTypeImpl(Type[] upperBounds, Type[] lowerBounds) {
+393             if (lowerBounds.length &gt; 1) {
+394                 throw new IllegalArgumentException("Must have at most one lower bound.");
+395             }
+396             if (upperBounds.length != 1) {
+397                 throw new IllegalArgumentException("Must have exactly one upper bound.");
+398             }
+399             if (lowerBounds.length == 1) {
+400                 Objects.requireNonNull(lowerBounds[0], "lowerBound");
+401                 checkNotPrimitive(lowerBounds[0], "wildcard bounds");
+402                 if (upperBounds[0] != Object.class) {
+403                     throw new IllegalArgumentException("bounded both ways");
+404                 }
+405                 this.lowerBound = canonicalize(lowerBounds[0]);
+406                 this.upperBound = Object.class;
+407             } else {
+408                 Objects.requireNonNull(upperBounds[0], "upperBound");
+409                 checkNotPrimitive(upperBounds[0], "wildcard bounds");
+410                 this.lowerBound = null;
+411                 this.upperBound = canonicalize(upperBounds[0]);
+412             }
+413         }
+414         @Override
+415         public Type[] getUpperBounds() {
+416             return new Type[]{upperBound};
+417         }
+418         @Override
+419         public Type[] getLowerBounds() {
+420             return lowerBound != null ? new Type[]{lowerBound} : EMPTY_TYPE_ARRAY;
+421         }
+422 <a name="2"></a>
+423         @Override
+424         public boolean isFullySpecified() {
+425             return <font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>MoreTypes.isFullySpecified(upperBound)
+426                     &amp;&amp; (lowerBound == null || MoreTypes.isFullySpecified(lowerBound));
+427         }
+428         @Override
+429         public boolean equals(Object other) {
+430             return other instanceof WildcardType
+431                     &amp;&amp; MoreTypes.equals</b></font>(this, (WildcardType) other);
+432         }
+433         @Override
+434         public int hashCode() {
+435             return MoreTypes.hashCode(this);
+436         }
+437         @Override
+438         public String toString() {
+439             return MoreTypes.toString(this);
+440         }
+441     }
+442     private static void checkNotPrimitive(Type type, String use) {
+443         if (type instanceof Class&lt;?&gt; &amp;&amp; ((Class) type).isPrimitive()) {
+444             throw new IllegalArgumentException("Primitive types are not allowed in " + use + ": " + type);
+445         }
+446     }
+447     public static class MemberImpl implements Member {
+448         private final Class&lt;?&gt; declaringClass;
+449         private final String name;
+450         private final int modifiers;
+451         private final boolean synthetic;
+452         private final Class&lt;? extends Member&gt; memberType;
+453         private final String memberKey;
+454         private MemberImpl(Member member) {
+455             this.declaringClass = member.getDeclaringClass();
+456             this.name = member.getName();
+457             this.modifiers = member.getModifiers();
+458             this.synthetic = member.isSynthetic();
+459             this.memberType = memberType(member);
+460             this.memberKey = memberKey(member);
+461         }
+462         @Override
+463         public Class getDeclaringClass() {
+464             return declaringClass;
+465         }
+466         @Override
+467         public String getName() {
+468             return name;
+469         }
+470         @Override
+471         public int getModifiers() {
+472             return modifiers;
+473         }
+474         @Override
+475         public boolean isSynthetic() {
+476             return synthetic;
+477         }
+478         @Override
+479         public String toString() {
+480             return MoreTypes.toString(this);
+481         }
+482     }
+483     private interface CompositeType {
+484         boolean isFullySpecified();
+485     }
+486 }
 </pre>
 </div>
 </div>

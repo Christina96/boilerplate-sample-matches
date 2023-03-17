@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for jxlload.c &amp; niftiload.c</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -44,936 +43,650 @@ Matches for jxlload.c &amp; niftiload.c
 </h3>
 <hr/>
 <pre>
-/* load jpeg-xl
- *
- * 18/3/20
- * 	- from heifload.c
- */
-
-/*
-
-    This file is part of VIPS.
-    
-    VIPS is free software; you can redistribute it and/or modify
-    it under the terms of the GNU Lesser General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Lesser General Public License for more details.
-
-    You should have received a copy of the GNU Lesser General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
-
- */
-
-/*
-
-    These files are distributed with VIPS - http://www.vips.ecs.soton.ac.uk
-
- */
-
-/*
-#define DEBUG_VERBOSE
-#define DEBUG
- */
-
-#ifdef HAVE_CONFIG_H
-#include &lt;config.h&gt;
-#endif /*HAVE_CONFIG_H*/
-#include &lt;vips/intl.h&gt;
-
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-
-#include &lt;vips/vips.h&gt;
-#include &lt;vips/debug.h&gt;
-#include &lt;vips/internal.h&gt;
-
-#ifdef HAVE_LIBJXL
-
-#include &lt;jxl/decode.h&gt;
-#include &lt;jxl/thread_parallel_runner.h&gt;
-
-#include "pforeign.h"
-
-/* TODO:
- *
- * - add metadata support
- *
- * - add animation support
- *
- * - add "shrink" option to read out 8x shrunk image?
- *
- * - fix scRGB gamma 
- */
-
-#define INPUT_BUFFER_SIZE (4096)
-
-typedef struct _VipsForeignLoadJxl {
-	VipsForeignLoad parent_object;
-
-	/* Source to load from (set by subclasses).
-	 */
-	VipsSource *source;
-
-	/* Page set by user, then we translate that into shrink factor.
-	 */
-	int page;
-	int shrink;
-
-	/* Base image properties.
-	 */
-	JxlBasicInfo info;
-	JxlPixelFormat format;
-	size_t icc_size;
-	uint8_t *icc_data;
-
-	/* Decompress state.
-	 */
-	void *runner;
-	JxlDecoder *decoder;
-
-	/* Our input buffer.
-	 */
-	uint8_t input_buffer[INPUT_BUFFER_SIZE];
-	size_t bytes_in_buffer;
-
-	/* Number of errors reported during load -- use this to block load of
-	 * corrupted images.
-	 */
-	int n_errors;
-
-	/* If we need to upsample tiles read from opj.
-	 */
-	gboolean upsample;
-
-	/* If we need to do ycc-&gt;rgb conversion on load.
-	 */
-	gboolean ycc_to_rgb;
-} VipsForeignLoadJxl;
-
-typedef VipsForeignLoadClass VipsForeignLoadJxlClass;
-
-G_DEFINE_ABSTRACT_TYPE( VipsForeignLoadJxl, vips_foreign_load_jxl, 
-	VIPS_TYPE_FOREIGN_LOAD );
-
-static void
-vips_foreign_load_jxl_dispose( GObject *gobject )
-{
-	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) gobject;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_jxl_dispose:\n" );
-#endif /*DEBUG*/
-
-	VIPS_FREEF( JxlThreadParallelRunnerDestroy, jxl-&gt;runner );
-	VIPS_FREEF( JxlDecoderDestroy, jxl-&gt;decoder );
-	VIPS_FREE( jxl-&gt;icc_data );
-
-	G_OBJECT_CLASS( vips_foreign_load_jxl_parent_class )-&gt;
-		dispose( gobject );
-}
-
-static void
-vips_foreign_load_jxl_error( VipsForeignLoadJxl *jxl, const char *details )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( jxl );
-
-	/* TODO ... jxl has no way to get error messages at the moment.
-	 */
-	vips_error( class-&gt;nickname, "error %s", details );
-}
-
-static int
-vips_foreign_load_jxl_build( VipsObject *object )
-{
-	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) object;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_jxl_build:\n" );
-#endif /*DEBUG*/
-
-	jxl-&gt;runner = JxlThreadParallelRunnerCreate( NULL, 
-		vips_concurrency_get() );
-	jxl-&gt;decoder = JxlDecoderCreate( NULL );
-
-	if( JxlDecoderSubscribeEvents( jxl-&gt;decoder, 
-		JXL_DEC_COLOR_ENCODING |
-		JXL_DEC_BASIC_INFO |
-		JXL_DEC_FULL_IMAGE ) ) {
-		vips_foreign_load_jxl_error( jxl, "JxlDecoderSubscribeEvents" );
-		return( -1 );
-	}
-	if( JxlDecoderSetParallelRunner( jxl-&gt;decoder, 
-		JxlThreadParallelRunner, jxl-&gt;runner ) ) {
-		vips_foreign_load_jxl_error( jxl, 
-			"JxlDecoderSetParallelRunner" );
-		return( -1 );
-	}
-
-	if( VIPS_OBJECT_CLASS( vips_foreign_load_jxl_parent_class )-&gt;
-		build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static gboolean
-vips_foreign_load_jxl_is_a_source( VipsSource *source )
-{
-	const unsigned char *p;
-	JxlSignature sig;
-
-	return( (p = vips_source_sniff( source, 12 )) &amp;&amp;
-		(sig = JxlSignatureCheck( p, 12 )) == JXL_SIG_CODESTREAM );
-}
-
-static VipsForeignFlags
-vips_foreign_load_jxl_get_flags( VipsForeignLoad *load )
-{
-	return( VIPS_FOREIGN_PARTIAL );
-}
-
-static int
-vips_foreign_load_jxl_fill_input( VipsForeignLoadJxl *jxl, 
-	size_t bytes_remaining )
-{
-	gint64 bytes_read;
-
-#ifdef DEBUG_VERBOSE
-	printf( "vips_foreign_load_jxl_fill_input: %zd bytes requested\n", 
-		INPUT_BUFFER_SIZE - bytes_remaining );
-#endif /*DEBUG_VERBOSE*/
-
-	memcpy( jxl-&gt;input_buffer, 
-		jxl-&gt;input_buffer + jxl-&gt;bytes_in_buffer - bytes_remaining,
-		bytes_remaining );
-	bytes_read = vips_source_read( jxl-&gt;source,
-		jxl-&gt;input_buffer + bytes_remaining,
-		INPUT_BUFFER_SIZE - bytes_remaining );
-	/* Read error, or unexpected end of input.
-	 */
-	if( bytes_read &lt;= 0 ) 
-		return( -1 );
-	jxl-&gt;bytes_in_buffer = bytes_read + bytes_remaining;
-
-#ifdef DEBUG_VERBOSE
-	printf( "vips_foreign_load_jxl_fill_input: %zd bytes read\n", 
-		bytes_read );
-#endif /*DEBUG_VERBOSE*/
-
-	return( 0 );
-}
-
-#ifdef DEBUG
-static void
-vips_foreign_load_jxl_print_status( JxlDecoderStatus status )
-{
-	switch( status ) {
-	case JXL_DEC_SUCCESS:
-		printf( "JXL_DEC_SUCCESS\n" );
-		break;
-
-	case JXL_DEC_ERROR:
-		printf( "JXL_DEC_ERROR\n" );
-		break;
-
-	case JXL_DEC_NEED_MORE_INPUT:
-		printf( "JXL_DEC_NEED_MORE_INPUT\n" );
-		break;
-
-	case JXL_DEC_NEED_PREVIEW_OUT_BUFFER:
-		printf( "JXL_DEC_NEED_PREVIEW_OUT_BUFFER\n" );
-		break;
-
-	case JXL_DEC_NEED_DC_OUT_BUFFER:
-		printf( "JXL_DEC_NEED_DC_OUT_BUFFER\n" );
-		break;
-
-	case JXL_DEC_NEED_IMAGE_OUT_BUFFER:
-		printf( "JXL_DEC_NEED_IMAGE_OUT_BUFFER\n" );
-		break;
-
-	case JXL_DEC_JPEG_NEED_MORE_OUTPUT:
-		printf( "JXL_DEC_JPEG_NEED_MORE_OUTPUT\n" );
-		break;
-
-	case JXL_DEC_BASIC_INFO:
-		printf( "JXL_DEC_BASIC_INFO\n" );
-		break;
-
-	case JXL_DEC_EXTENSIONS:
-		printf( "JXL_DEC_EXTENSIONS\n" );
-		break;
-
-	case JXL_DEC_COLOR_ENCODING:
-		printf( "JXL_DEC_COLOR_ENCODING\n" );
-		break;
-
-	case JXL_DEC_PREVIEW_IMAGE:
-		printf( "JXL_DEC_PREVIEW_IMAGE\n" );
-		break;
-
-	case JXL_DEC_FRAME:
-		printf( "JXL_DEC_FRAME\n" );
-		break;
-
-	case JXL_DEC_DC_IMAGE:
-		printf( "JXL_DEC_DC_IMAGE\n" );
-		break;
-
-	case JXL_DEC_FULL_IMAGE:
-		printf( "JXL_DEC_FULL_IMAGE\n" );
-		break;
-
-	case JXL_DEC_JPEG_RECONSTRUCTION:
-		printf( "JXL_DEC_JPEG_RECONSTRUCTION\n" );
-		break;
-
-	default:
-		printf( "JXL_DEC_&lt;unknown&gt;\n" );
-		break;
-	}
-}
-
-static void
-vips_foreign_load_jxl_print_info( JxlBasicInfo *info )
-{
-	printf( "JxlBasicInfo:\n" );
-	printf( "    have_container = %d\n", info-&gt;have_container );
-	printf( "    xsize = %d\n", info-&gt;xsize );
-	printf( "    ysize = %d\n", info-&gt;ysize );
-	printf( "    bits_per_sample = %d\n", info-&gt;bits_per_sample );
-	printf( "    exponent_bits_per_sample = %d\n", 
-		info-&gt;exponent_bits_per_sample );
-	printf( "    intensity_target = %g\n", info-&gt;intensity_target );
-	printf( "    min_nits = %g\n", info-&gt;min_nits );
-	printf( "    relative_to_max_display = %d\n", 
-		info-&gt;relative_to_max_display );
-	printf( "    linear_below = %g\n", info-&gt;linear_below );
-	printf( "    uses_original_profile = %d\n", 
-		info-&gt;uses_original_profile );
-	printf( "    have_preview = %d\n", info-&gt;have_preview );
-	printf( "    have_animation = %d\n", info-&gt;have_animation );
-	printf( "    orientation = %d\n", info-&gt;orientation );
-	printf( "    num_color_channels = %d\n", info-&gt;num_color_channels );
-	printf( "    num_extra_channels = %d\n", info-&gt;num_extra_channels );
-	printf( "    alpha_bits = %d\n", info-&gt;alpha_bits );
-	printf( "    alpha_exponent_bits = %d\n", info-&gt;alpha_exponent_bits );
-	printf( "    alpha_premultiplied = %d\n", info-&gt;alpha_premultiplied );
-	printf( "    preview.xsize = %d\n", info-&gt;preview.xsize );
-	printf( "    preview.ysize = %d\n", info-&gt;preview.ysize );
-	printf( "    animation.tps_numerator = %d\n", 
-		info-&gt;animation.tps_numerator );
-	printf( "    animation.tps_denominator = %d\n", 
-		info-&gt;animation.tps_denominator );
-	printf( "    animation.num_loops = %d\n", info-&gt;animation.num_loops );
-	printf( "    animation.have_timecodes = %d\n", 
-		info-&gt;animation.have_timecodes );
-}
-
-static void
-vips_foreign_load_jxl_print_format( JxlPixelFormat *format )
-{
-	printf( "JxlPixelFormat:\n" );
-	printf( "    data_type = " );
-	switch( format-&gt;data_type ) {
-	case JXL_TYPE_UINT8: 
-		printf( "JXL_TYPE_UINT8" );
-		break;
-
-	case JXL_TYPE_UINT16: 
-		printf( "JXL_TYPE_UINT16" );
-		break;
-
-	case JXL_TYPE_UINT32: 
-		printf( "JXL_TYPE_UINT32" );
-		break;
-
-	case JXL_TYPE_FLOAT: 
-		printf( "JXL_TYPE_FLOAT" );
-		break;
-
-	default:
-		printf( "(unknown)" );
-		break;
-	}
-	printf( "\n" );
-	printf( "    num_channels = %d\n", format-&gt;num_channels );
-	printf( "    endianness = %d\n", format-&gt;endianness );
-	printf( "    align = %zd\n", format-&gt;align );
-}
-#endif /*DEBUG*/
-
-static JxlDecoderStatus 
-vips_foreign_load_jxl_process( VipsForeignLoadJxl *jxl )
-{
-	JxlDecoderStatus status;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_jxl_process: starting ...\n" );
-#endif /*DEBUG*/
-
-	while( (status = JxlDecoderProcessInput( jxl-&gt;decoder )) == 
-		JXL_DEC_NEED_MORE_INPUT ) {
-		size_t bytes_remaining;
-
-		bytes_remaining = JxlDecoderReleaseInput( jxl-&gt;decoder );
-		if( vips_foreign_load_jxl_fill_input( jxl, bytes_remaining ) )
-			return( JXL_DEC_ERROR );
-
-		JxlDecoderSetInput( jxl-&gt;decoder,
-			jxl-&gt;input_buffer, jxl-&gt;bytes_in_buffer );
-	}
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_jxl_process: seen " );
-	vips_foreign_load_jxl_print_status( status );
-#endif /*DEBUG*/
-
-	return( status );
-}
-
-static int
-vips_foreign_load_jxl_set_header( VipsForeignLoadJxl *jxl, VipsImage *out )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( jxl );
-
-	VipsBandFormat format;
-	VipsInterpretation interpretation;
-
-	if( jxl-&gt;info.xsize &gt;= VIPS_MAX_COORD || 
-		jxl-&gt;info.ysize &gt;= VIPS_MAX_COORD ) {
-		vips_error( class-&gt;nickname, 
-			"%s", _( "image size out of bounds" ) );
-		return( -1 );
-	}
-
-	switch( jxl-&gt;format.data_type ) {
-	case JXL_TYPE_UINT8:
-		format = VIPS_FORMAT_UCHAR;
-		break;
-
-	case JXL_TYPE_UINT16:
-		format = VIPS_FORMAT_USHORT;
-		break;
-
-	case JXL_TYPE_UINT32:
-		format = VIPS_FORMAT_UINT;
-		break;
-
-	case JXL_TYPE_FLOAT:
-		format = VIPS_FORMAT_FLOAT;
-		break;
-
-	default:
-		g_assert_not_reached();
-	}
-
-	switch( jxl-&gt;info.num_color_channels ) {
-	case 1:
-		switch( format ) {
-		case VIPS_FORMAT_UCHAR:
-			interpretation = VIPS_INTERPRETATION_B_W;
-			break;
-
-		case VIPS_FORMAT_USHORT:
-		case VIPS_FORMAT_UINT:
-			interpretation = VIPS_INTERPRETATION_GREY16;
-			break;
-
-		default:
-			interpretation = VIPS_INTERPRETATION_B_W;
-			break;
-		}
-		break;
-
-	case 3:
-		switch( format ) {
-		case VIPS_FORMAT_UCHAR:
-			interpretation = VIPS_INTERPRETATION_sRGB;
-			break;
-
-		case VIPS_FORMAT_USHORT:
-		case VIPS_FORMAT_UINT:
-			interpretation = VIPS_INTERPRETATION_RGB16;
-			break;
-
-		case VIPS_FORMAT_FLOAT:
-			interpretation = VIPS_INTERPRETATION_scRGB;
-			break;
-
-		default:
-			interpretation = VIPS_INTERPRETATION_sRGB;
-			break;
-		}
-		break;
-
-	default:
-		interpretation = VIPS_INTERPRETATION_MULTIBAND;
-		break;
-	}
-
-	vips_image_init_fields( out,
-		jxl-&gt;info.xsize, jxl-&gt;info.ysize, jxl-&gt;format.num_channels, 
-		format, VIPS_CODING_NONE, interpretation, 1.0, 1.0 );
-
-	/* Even though this is a full image reader, we hint thinstrip since 
-	 * we are quite happy serving that if anything downstream 
-	 * would like it.
-	 */
-        if( vips_image_pipelinev( out, VIPS_DEMAND_STYLE_THINSTRIP, NULL ) )
-		return( -1 );
-
-	if( jxl-&gt;icc_data &amp;&amp;
-		jxl-&gt;icc_size &gt; 0 ) {
-		vips_image_set_blob( out, VIPS_META_ICC_NAME, 
-			(VipsCallbackFn) vips_area_free_cb, 
-			jxl-&gt;icc_data, jxl-&gt;icc_size );
-		jxl-&gt;icc_data = NULL;
-		jxl-&gt;icc_size = 0;
-	}
-
-	vips_image_set_int( out, 
-		VIPS_META_ORIENTATION, jxl-&gt;info.orientation );
-
-	return( 0 );
-}
-
-static int
-vips_foreign_load_jxl_header( VipsForeignLoad *load )
-{
-	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) load;
-
-	JxlDecoderStatus status;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_jxl_header:\n" );
-#endif /*DEBUG*/
-
-	if( vips_source_rewind( jxl-&gt;source ) )
-                return( -1 );
-
-	if( vips_foreign_load_jxl_fill_input( jxl, 0 ) )
-		return( -1 );
-	JxlDecoderSetInput( jxl-&gt;decoder, 
-		jxl-&gt;input_buffer, jxl-&gt;bytes_in_buffer );
-
-	/* Read to the end of the header.
-	 */
-	do {
-		switch( (status = vips_foreign_load_jxl_process( jxl )) ) {
-		case JXL_DEC_ERROR:   
-			vips_foreign_load_jxl_error( jxl, 
-				"JxlDecoderProcessInput" );
-			return( -1 );
-
-		case JXL_DEC_BASIC_INFO:   
-			if( JxlDecoderGetBasicInfo( jxl-&gt;decoder, 
-				&amp;jxl-&gt;info ) ) {
-				vips_foreign_load_jxl_error( jxl, 
-					"JxlDecoderGetBasicInfo" );
-				return( -1 );
-			}
-#ifdef DEBUG
-			vips_foreign_load_jxl_print_info( &amp;jxl-&gt;info );
-#endif /*DEBUG*/
-
-			/* Pick a pixel format to decode to.
-			 */
-			jxl-&gt;format.num_channels = 
-				jxl-&gt;info.num_color_channels + 
-				jxl-&gt;info.num_extra_channels;
-			if( jxl-&gt;info.exponent_bits_per_sample &gt; 0 ||
-				jxl-&gt;info.alpha_exponent_bits &gt; 0 )
-				jxl-&gt;format.data_type = JXL_TYPE_FLOAT;
-			else if( jxl-&gt;info.bits_per_sample &gt; 16 )
-				jxl-&gt;format.data_type = JXL_TYPE_UINT32;
-			else if( jxl-&gt;info.bits_per_sample &gt; 8 )
-				jxl-&gt;format.data_type = JXL_TYPE_UINT16;
-			else
-				jxl-&gt;format.data_type = JXL_TYPE_UINT8;
-			jxl-&gt;format.endianness = JXL_NATIVE_ENDIAN;
-			jxl-&gt;format.align = 0;
-
-#ifdef DEBUG
-			vips_foreign_load_jxl_print_format( &amp;jxl-&gt;format );
-#endif /*DEBUG*/
-
-			break;
-
-		case JXL_DEC_COLOR_ENCODING:
-			if( JxlDecoderGetICCProfileSize( jxl-&gt;decoder,
-				&amp;jxl-&gt;format, 
-				JXL_COLOR_PROFILE_TARGET_DATA, 
-				&amp;jxl-&gt;icc_size ) ) {
-				vips_foreign_load_jxl_error( jxl, 
-					"JxlDecoderGetICCProfileSize" );
-				return( -1 );
-			}
-
-#ifdef DEBUG
-			printf( "vips_foreign_load_jxl_header: "
-				"%zd byte profile\n", jxl-&gt;icc_size );
-#endif /*DEBUG*/
-			if( !(jxl-&gt;icc_data = vips_malloc( NULL, 
-				jxl-&gt;icc_size )) ) 
-				return( -1 );
-
-			if( JxlDecoderGetColorAsICCProfile( jxl-&gt;decoder, 
-				&amp;jxl-&gt;format, 
-				JXL_COLOR_PROFILE_TARGET_DATA,
-				jxl-&gt;icc_data, jxl-&gt;icc_size ) ) {
-				vips_foreign_load_jxl_error( jxl, 
-					"JxlDecoderGetColorAsICCProfile" );
-				return( -1 );
-			}
-			break;
-
-		default:
-			break;
-		}
-	/* JXL_DEC_COLOR_ENCODING is always the last status signal before
-	 * pixel decoding starts.
-	 */
-	} while( status != JXL_DEC_COLOR_ENCODING );
-
-	if( vips_foreign_load_jxl_set_header( jxl, load-&gt;out ) ) 
-		return( -1 );
-
-	VIPS_SETSTR( load-&gt;out-&gt;filename, 
-		vips_connection_filename( VIPS_CONNECTION( jxl-&gt;source ) ) );
-
-	return( 0 );
-}
-
-static int
-vips_foreign_load_jxl_load( VipsForeignLoad *load )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( load );
-	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) load;
-	VipsImage **t = (VipsImage **) 
-		vips_object_local_array( VIPS_OBJECT( load ), 3 );
-
-	size_t buffer_size;
-	JxlDecoderStatus status;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_jxl_load:\n" );
-#endif /*DEBUG*/
-
-	t[0] = vips_image_new();
-	if( vips_foreign_load_jxl_set_header( jxl, t[0] ) ) 
-		return( -1 );
-
-	/* Read to the end of the image.
-	 */
-	do {
-		switch( (status = vips_foreign_load_jxl_process( jxl )) ) {
-		case JXL_DEC_ERROR:   
-			vips_foreign_load_jxl_error( jxl, 
-				"JxlDecoderProcessInput" );
-			return( -1 );
-
-		case JXL_DEC_NEED_IMAGE_OUT_BUFFER:   
-			if( vips_image_write_prepare( t[0] ) )
-				return( -1 );
-
-			if( JxlDecoderImageOutBufferSize( jxl-&gt;decoder, 
-				&amp;jxl-&gt;format, 
-				&amp;buffer_size ) ) {
-				vips_foreign_load_jxl_error( jxl, 
-					"JxlDecoderImageOutBufferSize" );
-				return( -1 );
-			}
-			if( buffer_size != 
-				VIPS_IMAGE_SIZEOF_IMAGE( t[0] ) ) {
-				vips_error( class-&gt;nickname, 
-					"%s", _( "bad buffer size" ) );
-				return( -1 );
-			}
-			if( JxlDecoderSetImageOutBuffer( jxl-&gt;decoder,
-				&amp;jxl-&gt;format, 
-				VIPS_IMAGE_ADDR( t[0], 0, 0 ),
-				VIPS_IMAGE_SIZEOF_IMAGE( t[0] ) ) ) {
-				vips_foreign_load_jxl_error( jxl, 
-					"JxlDecoderSetImageOutBuffer" );
-				return( -1 );
-			}
-			break;
-
-		case JXL_DEC_FULL_IMAGE:
-			/* Image decoded.
-			 */
-			break;
-
-		default:
-			break;
-		}
-	} while( status != JXL_DEC_SUCCESS );
-
-	if( vips_image_write( t[0], load-&gt;real ) ) 
-		return( -1 );
-
-	return( 0 );
-}
-
-<a name="0"></a>static void
-vips_foreign_load_jxl_class_init( VipsForeignLoadJxlClass *class )
-{
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;dispose = vips_foreign_load_jxl_dispose;
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "jxlload_base";
-	object_class-&gt;description = _( "load JPEG-XL image" );
-	object_class-&gt;build = vips_foreign_load_jxl_build;
-
-	load_class-&gt;get_flags = vips_foreign_load_jxl_get_flags;
-	load_class-&gt;header = vips_foreign_load_jxl_header;
-	load_class-&gt;load = vips_foreign_load_jxl_load;
-
-}
-
-static void
-vips_foreign_load_jxl_init( VipsForeignLoadJxl *jxl )
-{
-}
-
-typedef struct _VipsForeignLoadJxlFile {
-	VipsForeignLoadJxl parent_object;
-
-	/* Filename for load.
-	 */
-	char *filename; 
-
-} VipsForeignLoadJxlFile;
-
-typedef VipsForeignLoadJxlClass VipsForeignLoadJxlFileClass;
-
-G_DEFINE_TYPE( VipsForeignLoadJxlFile, vips_foreign_load_jxl_file, 
-	vips_foreign_load_jxl_get_type() );
-
-static int
-vips_foreign_load_jxl_file_build( VipsObject *object )
-{
-	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) object;
-	VipsForeignLoadJxlFile *file = (VipsForeignLoadJxlFile *) object;
-
-	if( file-&gt;filename &amp;&amp;
-		!(jxl-&gt;source = vips_source_new_from_file( file-&gt;filename )) )
-		return( -1 );
-
-	if( VIPS_OBJECT_CLASS( vips_foreign_load_jxl_file_parent_class )-&gt;
-		build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-const char *vips__jxl_suffs[] = 
-	{ ".jxl", NULL };
-
-static int
-vips_foreign_load_jxl_is_a( const char *filename )
-{</b></font>
-	VipsSource *source;
-	gboolean result;
-
-	if( !(source = vips_source_new_from_file( filename )) )
-		return( FALSE );
-	result = vips_foreign_load_jxl_is_a_source( source );
-	VIPS_UNREF( source );
-
-	return( result );
-}
-
-static void
-vips_foreign_load_jxl_file_class_init( VipsForeignLoadJxlFileClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-<a name="1"></a>	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "jxlload";
-	object_class-&gt;build = vips_foreign_load_jxl_file_build;
-
-	foreign_class-&gt;suffs = vips__jxl_suffs;
-
-	load_class-&gt;is_a = vips_foreign_load_jxl_is_a;
-
-	VIPS_ARG_STRING( class, "filename", 1, 
-		_( "Filename" ),
-		_( "Filename to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadJxlFile, filename ),
-		NULL );
-
-}
-
-static void
-vips_foreign_load_jxl_file_init( VipsForeignLoadJxlFile *jxl )
-{
-}
-
-typedef struct _VipsForeignLoadJxlBuffer {
-	VipsForeignLoadJxl parent_object;
-
-	/* Load from a buffer.
-	 */
-	VipsArea *buf;
-
-} VipsForeignLoadJxlBuffer;
-
-typedef VipsForeignLoadJxlClass VipsForeignLoadJxlBufferClass;
-
-G_DEFINE_TYPE( VipsForeignLoadJxlBuffer, vips_foreign_load_jxl_buffer, 
-	vips_foreign_load_jxl_get_type() );
-
-static int
-vips_foreign_load_jxl_buffer_build( VipsObject *object )
-{
-	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) object;
-	VipsForeignLoadJxlBuffer *buffer = 
-		(VipsForeignLoadJxlBuffer *) object;
-
-	if( buffer-&gt;buf )</b></font>
-		if( !(jxl-&gt;source = vips_source_new_from_memory( 
-			VIPS_AREA( buffer-&gt;buf )-&gt;data, 
-			VIPS_AREA( buffer-&gt;buf )-&gt;length )) )
-			return( -1 );
-
-	if( VIPS_OBJECT_CLASS( vips_foreign_load_jxl_file_parent_class )-&gt;
-		build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static gboolean
-vips_foreign_load_jxl_buffer_is_a( const void *buf, size_t len )
-{
-	VipsSource *source;
-	gboolean result;
-
-	if( !(source = vips_source_new_from_memory( buf, len )) )
-		return( FALSE );
-	result = vips_foreign_load_jxl_is_a_source( source );
-<a name="2"></a>	VIPS_UNREF( source );
-
-	return( result );
-<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>}
-
-static void
-vips_foreign_load_jxl_buffer_class_init( VipsForeignLoadJxlBufferClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "jxlload_buffer";
-	object_class-&gt;build = vips_foreign_load_jxl_buffer_build;
-
-	load_class-&gt;is_a_buffer = vips_foreign_load_jxl_buffer_is_a;</b></font>
-
-	VIPS_ARG_BOXED( class, "buffer", 1, 
-		_( "Buffer" ),
-		_( "Buffer to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadJxlBuffer, buf ),
-		VIPS_TYPE_BLOB );
-
-}
-
-static void
-vips_foreign_load_jxl_buffer_init( VipsForeignLoadJxlBuffer *buffer )
-{
-}
-
-typedef struct _VipsForeignLoadJxlSource {
-	VipsForeignLoadJxl parent_object;
-
-	/* Load from a source.
-	 */
-	VipsSource *source;
-
-} VipsForeignLoadJxlSource;
-
-typedef VipsForeignLoadJxlClass VipsForeignLoadJxlSourceClass;
-
-G_DEFINE_TYPE( VipsForeignLoadJxlSource, vips_foreign_load_jxl_source, 
-	vips_foreign_load_jxl_get_type() );
-
-static int
-vips_foreign_load_jxl_source_build( VipsObject *object )
-{
-	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) object;
-	VipsForeignLoadJxlSource *source = 
-		(VipsForeignLoadJxlSource *) object;
-
-	if( source-&gt;source ) {
-		jxl-&gt;source = source-&gt;source;
-<a name="3"></a>		g_object_ref( jxl-&gt;source );
-	}
-
-<font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if( VIPS_OBJECT_CLASS( 
-		vips_foreign_load_jxl_source_parent_class )-&gt;
-			build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static void
-vips_foreign_load_jxl_source_class_init( VipsForeignLoadJxlSourceClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;</b></font>
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "jxlload_source";
-	object_class-&gt;build = vips_foreign_load_jxl_source_build;
-
-	load_class-&gt;is_a_source = vips_foreign_load_jxl_is_a_source;
-
-	VIPS_ARG_OBJECT( class, "source", 1,
-		_( "Source" ),
-		_( "Source to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadJxlSource, source ),
-		VIPS_TYPE_SOURCE );
-
-}
-
-static void
-vips_foreign_load_jxl_source_init( VipsForeignLoadJxlSource *jxl )
-{
-}
-
-#endif /*HAVE_LIBJXL*/
-
-/* The C API wrappers are defined in foreign.c.
- */
+1 #ifdef HAVE_CONFIG_H
+2 #include &lt;config.h&gt;
+3 #include &lt;vips/intl.h&gt;
+4 #include &lt;stdio.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;vips/vips.h&gt;
+8 #include &lt;vips/debug.h&gt;
+9 #include &lt;vips/internal.h&gt;
+10 #ifdef HAVE_LIBJXL
+11 #include &lt;jxl/decode.h&gt;
+12 #include &lt;jxl/thread_parallel_runner.h&gt;
+13 #include "pforeign.h"
+14 #define INPUT_BUFFER_SIZE (4096)
+15 typedef struct _VipsForeignLoadJxl {
+16 	VipsForeignLoad parent_object;
+17 	VipsSource *source;
+18 	int page;
+19 	int shrink;
+20 	JxlBasicInfo info;
+21 	JxlPixelFormat format;
+22 	size_t icc_size;
+23 	uint8_t *icc_data;
+24 	void *runner;
+25 	JxlDecoder *decoder;
+26 	uint8_t input_buffer[INPUT_BUFFER_SIZE];
+27 	size_t bytes_in_buffer;
+28 	int n_errors;
+29 	gboolean upsample;
+30 	gboolean ycc_to_rgb;
+31 } VipsForeignLoadJxl;
+32 typedef VipsForeignLoadClass VipsForeignLoadJxlClass;
+33 G_DEFINE_ABSTRACT_TYPE( VipsForeignLoadJxl, vips_foreign_load_jxl, 
+34 	VIPS_TYPE_FOREIGN_LOAD );
+35 static void
+36 vips_foreign_load_jxl_dispose( GObject *gobject )
+37 {
+38 	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) gobject;
+39 #ifdef DEBUG
+40 	printf( "vips_foreign_load_jxl_dispose:\n" );
+41 	VIPS_FREEF( JxlThreadParallelRunnerDestroy, jxl-&gt;runner );
+42 	VIPS_FREEF( JxlDecoderDestroy, jxl-&gt;decoder );
+43 	VIPS_FREE( jxl-&gt;icc_data );
+44 	G_OBJECT_CLASS( vips_foreign_load_jxl_parent_class )-&gt;
+45 		dispose( gobject );
+46 }
+47 static void
+48 vips_foreign_load_jxl_error( VipsForeignLoadJxl *jxl, const char *details )
+49 {
+50 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( jxl );
+51 	vips_error( class-&gt;nickname, "error %s", details );
+52 }
+53 static int
+54 vips_foreign_load_jxl_build( VipsObject *object )
+55 {
+56 	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) object;
+57 #ifdef DEBUG
+58 	printf( "vips_foreign_load_jxl_build:\n" );
+59 	jxl-&gt;runner = JxlThreadParallelRunnerCreate( NULL, 
+60 		vips_concurrency_get() );
+61 	jxl-&gt;decoder = JxlDecoderCreate( NULL );
+62 	if( JxlDecoderSubscribeEvents( jxl-&gt;decoder, 
+63 		JXL_DEC_COLOR_ENCODING |
+64 		JXL_DEC_BASIC_INFO |
+65 		JXL_DEC_FULL_IMAGE ) ) {
+66 		vips_foreign_load_jxl_error( jxl, "JxlDecoderSubscribeEvents" );
+67 		return( -1 );
+68 	}
+69 	if( JxlDecoderSetParallelRunner( jxl-&gt;decoder, 
+70 		JxlThreadParallelRunner, jxl-&gt;runner ) ) {
+71 		vips_foreign_load_jxl_error( jxl, 
+72 			"JxlDecoderSetParallelRunner" );
+73 		return( -1 );
+74 	}
+75 	if( VIPS_OBJECT_CLASS( vips_foreign_load_jxl_parent_class )-&gt;
+76 		build( object ) )
+77 		return( -1 );
+78 	return( 0 );
+79 }
+80 static gboolean
+81 vips_foreign_load_jxl_is_a_source( VipsSource *source )
+82 {
+83 	const unsigned char *p;
+84 	JxlSignature sig;
+85 	return( (p = vips_source_sniff( source, 12 )) &amp;&amp;
+86 		(sig = JxlSignatureCheck( p, 12 )) == JXL_SIG_CODESTREAM );
+87 }
+88 static VipsForeignFlags
+89 vips_foreign_load_jxl_get_flags( VipsForeignLoad *load )
+90 {
+91 	return( VIPS_FOREIGN_PARTIAL );
+92 }
+93 static int
+94 vips_foreign_load_jxl_fill_input( VipsForeignLoadJxl *jxl, 
+95 	size_t bytes_remaining )
+96 {
+97 	gint64 bytes_read;
+98 #ifdef DEBUG_VERBOSE
+99 	printf( "vips_foreign_load_jxl_fill_input: %zd bytes requested\n", 
+100 		INPUT_BUFFER_SIZE - bytes_remaining );
+101 	memcpy( jxl-&gt;input_buffer, 
+102 		jxl-&gt;input_buffer + jxl-&gt;bytes_in_buffer - bytes_remaining,
+103 		bytes_remaining );
+104 	bytes_read = vips_source_read( jxl-&gt;source,
+105 		jxl-&gt;input_buffer + bytes_remaining,
+106 		INPUT_BUFFER_SIZE - bytes_remaining );
+107 	if( bytes_read &lt;= 0 ) 
+108 		return( -1 );
+109 	jxl-&gt;bytes_in_buffer = bytes_read + bytes_remaining;
+110 #ifdef DEBUG_VERBOSE
+111 	printf( "vips_foreign_load_jxl_fill_input: %zd bytes read\n", 
+112 		bytes_read );
+113 	return( 0 );
+114 }
+115 #ifdef DEBUG
+116 static void
+117 vips_foreign_load_jxl_print_status( JxlDecoderStatus status )
+118 {
+119 	switch( status ) {
+120 	case JXL_DEC_SUCCESS:
+121 		printf( "JXL_DEC_SUCCESS\n" );
+122 		break;
+123 	case JXL_DEC_ERROR:
+124 		printf( "JXL_DEC_ERROR\n" );
+125 		break;
+126 	case JXL_DEC_NEED_MORE_INPUT:
+127 		printf( "JXL_DEC_NEED_MORE_INPUT\n" );
+128 		break;
+129 	case JXL_DEC_NEED_PREVIEW_OUT_BUFFER:
+130 		printf( "JXL_DEC_NEED_PREVIEW_OUT_BUFFER\n" );
+131 		break;
+132 	case JXL_DEC_NEED_DC_OUT_BUFFER:
+133 		printf( "JXL_DEC_NEED_DC_OUT_BUFFER\n" );
+134 		break;
+135 	case JXL_DEC_NEED_IMAGE_OUT_BUFFER:
+136 		printf( "JXL_DEC_NEED_IMAGE_OUT_BUFFER\n" );
+137 		break;
+138 	case JXL_DEC_JPEG_NEED_MORE_OUTPUT:
+139 		printf( "JXL_DEC_JPEG_NEED_MORE_OUTPUT\n" );
+140 		break;
+141 	case JXL_DEC_BASIC_INFO:
+142 		printf( "JXL_DEC_BASIC_INFO\n" );
+143 		break;
+144 	case JXL_DEC_EXTENSIONS:
+145 		printf( "JXL_DEC_EXTENSIONS\n" );
+146 		break;
+147 	case JXL_DEC_COLOR_ENCODING:
+148 		printf( "JXL_DEC_COLOR_ENCODING\n" );
+149 		break;
+150 	case JXL_DEC_PREVIEW_IMAGE:
+151 		printf( "JXL_DEC_PREVIEW_IMAGE\n" );
+152 		break;
+153 	case JXL_DEC_FRAME:
+154 		printf( "JXL_DEC_FRAME\n" );
+155 		break;
+156 	case JXL_DEC_DC_IMAGE:
+157 		printf( "JXL_DEC_DC_IMAGE\n" );
+158 		break;
+159 	case JXL_DEC_FULL_IMAGE:
+160 		printf( "JXL_DEC_FULL_IMAGE\n" );
+161 		break;
+162 	case JXL_DEC_JPEG_RECONSTRUCTION:
+163 		printf( "JXL_DEC_JPEG_RECONSTRUCTION\n" );
+164 		break;
+165 	default:
+166 		printf( "JXL_DEC_&lt;unknown&gt;\n" );
+167 		break;
+168 	}
+169 }
+170 static void
+171 vips_foreign_load_jxl_print_info( JxlBasicInfo *info )
+172 {
+173 	printf( "JxlBasicInfo:\n" );
+174 	printf( "    have_container = %d\n", info-&gt;have_container );
+175 	printf( "    xsize = %d\n", info-&gt;xsize );
+176 	printf( "    ysize = %d\n", info-&gt;ysize );
+177 	printf( "    bits_per_sample = %d\n", info-&gt;bits_per_sample );
+178 	printf( "    exponent_bits_per_sample = %d\n", 
+179 		info-&gt;exponent_bits_per_sample );
+180 	printf( "    intensity_target = %g\n", info-&gt;intensity_target );
+181 	printf( "    min_nits = %g\n", info-&gt;min_nits );
+182 	printf( "    relative_to_max_display = %d\n", 
+183 		info-&gt;relative_to_max_display );
+184 	printf( "    linear_below = %g\n", info-&gt;linear_below );
+185 	printf( "    uses_original_profile = %d\n", 
+186 		info-&gt;uses_original_profile );
+187 	printf( "    have_preview = %d\n", info-&gt;have_preview );
+188 	printf( "    have_animation = %d\n", info-&gt;have_animation );
+189 	printf( "    orientation = %d\n", info-&gt;orientation );
+190 	printf( "    num_color_channels = %d\n", info-&gt;num_color_channels );
+191 	printf( "    num_extra_channels = %d\n", info-&gt;num_extra_channels );
+192 	printf( "    alpha_bits = %d\n", info-&gt;alpha_bits );
+193 	printf( "    alpha_exponent_bits = %d\n", info-&gt;alpha_exponent_bits );
+194 	printf( "    alpha_premultiplied = %d\n", info-&gt;alpha_premultiplied );
+195 	printf( "    preview.xsize = %d\n", info-&gt;preview.xsize );
+196 	printf( "    preview.ysize = %d\n", info-&gt;preview.ysize );
+197 	printf( "    animation.tps_numerator = %d\n", 
+198 		info-&gt;animation.tps_numerator );
+199 	printf( "    animation.tps_denominator = %d\n", 
+200 		info-&gt;animation.tps_denominator );
+201 	printf( "    animation.num_loops = %d\n", info-&gt;animation.num_loops );
+202 	printf( "    animation.have_timecodes = %d\n", 
+203 		info-&gt;animation.have_timecodes );
+204 }
+205 static void
+206 vips_foreign_load_jxl_print_format( JxlPixelFormat *format )
+207 {
+208 	printf( "JxlPixelFormat:\n" );
+209 	printf( "    data_type = " );
+210 	switch( format-&gt;data_type ) {
+211 	case JXL_TYPE_UINT8: 
+212 		printf( "JXL_TYPE_UINT8" );
+213 		break;
+214 	case JXL_TYPE_UINT16: 
+215 		printf( "JXL_TYPE_UINT16" );
+216 		break;
+217 	case JXL_TYPE_UINT32: 
+218 		printf( "JXL_TYPE_UINT32" );
+219 		break;
+220 	case JXL_TYPE_FLOAT: 
+221 		printf( "JXL_TYPE_FLOAT" );
+222 		break;
+223 	default:
+224 		printf( "(unknown)" );
+225 		break;
+226 	}
+227 	printf( "\n" );
+228 	printf( "    num_channels = %d\n", format-&gt;num_channels );
+229 	printf( "    endianness = %d\n", format-&gt;endianness );
+230 	printf( "    align = %zd\n", format-&gt;align );
+231 }
+232 static JxlDecoderStatus 
+233 vips_foreign_load_jxl_process( VipsForeignLoadJxl *jxl )
+234 {
+235 	JxlDecoderStatus status;
+236 #ifdef DEBUG
+237 	printf( "vips_foreign_load_jxl_process: starting ...\n" );
+238 	while( (status = JxlDecoderProcessInput( jxl-&gt;decoder )) == 
+239 		JXL_DEC_NEED_MORE_INPUT ) {
+240 		size_t bytes_remaining;
+241 		bytes_remaining = JxlDecoderReleaseInput( jxl-&gt;decoder );
+242 		if( vips_foreign_load_jxl_fill_input( jxl, bytes_remaining ) )
+243 			return( JXL_DEC_ERROR );
+244 		JxlDecoderSetInput( jxl-&gt;decoder,
+245 			jxl-&gt;input_buffer, jxl-&gt;bytes_in_buffer );
+246 	}
+247 #ifdef DEBUG
+248 	printf( "vips_foreign_load_jxl_process: seen " );
+249 	vips_foreign_load_jxl_print_status( status );
+250 	return( status );
+251 }
+252 static int
+253 vips_foreign_load_jxl_set_header( VipsForeignLoadJxl *jxl, VipsImage *out )
+254 {
+255 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( jxl );
+256 	VipsBandFormat format;
+257 	VipsInterpretation interpretation;
+258 	if( jxl-&gt;info.xsize &gt;= VIPS_MAX_COORD || 
+259 		jxl-&gt;info.ysize &gt;= VIPS_MAX_COORD ) {
+260 		vips_error( class-&gt;nickname, 
+261 			"%s", _( "image size out of bounds" ) );
+262 		return( -1 );
+263 	}
+264 	switch( jxl-&gt;format.data_type ) {
+265 	case JXL_TYPE_UINT8:
+266 		format = VIPS_FORMAT_UCHAR;
+267 		break;
+268 	case JXL_TYPE_UINT16:
+269 		format = VIPS_FORMAT_USHORT;
+270 		break;
+271 	case JXL_TYPE_UINT32:
+272 		format = VIPS_FORMAT_UINT;
+273 		break;
+274 	case JXL_TYPE_FLOAT:
+275 		format = VIPS_FORMAT_FLOAT;
+276 		break;
+277 	default:
+278 		g_assert_not_reached();
+279 	}
+280 	switch( jxl-&gt;info.num_color_channels ) {
+281 	case 1:
+282 		switch( format ) {
+283 		case VIPS_FORMAT_UCHAR:
+284 			interpretation = VIPS_INTERPRETATION_B_W;
+285 			break;
+286 		case VIPS_FORMAT_USHORT:
+287 		case VIPS_FORMAT_UINT:
+288 			interpretation = VIPS_INTERPRETATION_GREY16;
+289 			break;
+290 		default:
+291 			interpretation = VIPS_INTERPRETATION_B_W;
+292 			break;
+293 		}
+294 		break;
+295 	case 3:
+296 		switch( format ) {
+297 		case VIPS_FORMAT_UCHAR:
+298 			interpretation = VIPS_INTERPRETATION_sRGB;
+299 			break;
+300 		case VIPS_FORMAT_USHORT:
+301 		case VIPS_FORMAT_UINT:
+302 			interpretation = VIPS_INTERPRETATION_RGB16;
+303 			break;
+304 		case VIPS_FORMAT_FLOAT:
+305 			interpretation = VIPS_INTERPRETATION_scRGB;
+306 			break;
+307 		default:
+308 			interpretation = VIPS_INTERPRETATION_sRGB;
+309 			break;
+310 		}
+311 		break;
+312 	default:
+313 		interpretation = VIPS_INTERPRETATION_MULTIBAND;
+314 		break;
+315 	}
+316 	vips_image_init_fields( out,
+317 		jxl-&gt;info.xsize, jxl-&gt;info.ysize, jxl-&gt;format.num_channels, 
+318 		format, VIPS_CODING_NONE, interpretation, 1.0, 1.0 );
+319         if( vips_image_pipelinev( out, VIPS_DEMAND_STYLE_THINSTRIP, NULL ) )
+320 		return( -1 );
+321 	if( jxl-&gt;icc_data &amp;&amp;
+322 		jxl-&gt;icc_size &gt; 0 ) {
+323 		vips_image_set_blob( out, VIPS_META_ICC_NAME, 
+324 			(VipsCallbackFn) vips_area_free_cb, 
+325 			jxl-&gt;icc_data, jxl-&gt;icc_size );
+326 		jxl-&gt;icc_data = NULL;
+327 		jxl-&gt;icc_size = 0;
+328 	}
+329 	vips_image_set_int( out, 
+330 		VIPS_META_ORIENTATION, jxl-&gt;info.orientation );
+331 	return( 0 );
+332 }
+333 static int
+334 vips_foreign_load_jxl_header( VipsForeignLoad *load )
+335 {
+336 	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) load;
+337 	JxlDecoderStatus status;
+338 #ifdef DEBUG
+339 	printf( "vips_foreign_load_jxl_header:\n" );
+340 	if( vips_source_rewind( jxl-&gt;source ) )
+341                 return( -1 );
+342 	if( vips_foreign_load_jxl_fill_input( jxl, 0 ) )
+343 		return( -1 );
+344 	JxlDecoderSetInput( jxl-&gt;decoder, 
+345 		jxl-&gt;input_buffer, jxl-&gt;bytes_in_buffer );
+346 	do {
+347 		switch( (status = vips_foreign_load_jxl_process( jxl )) ) {
+348 		case JXL_DEC_ERROR:   
+349 			vips_foreign_load_jxl_error( jxl, 
+350 				"JxlDecoderProcessInput" );
+351 			return( -1 );
+352 		case JXL_DEC_BASIC_INFO:   
+353 			if( JxlDecoderGetBasicInfo( jxl-&gt;decoder, 
+354 				&amp;jxl-&gt;info ) ) {
+355 				vips_foreign_load_jxl_error( jxl, 
+356 					"JxlDecoderGetBasicInfo" );
+357 				return( -1 );
+358 			}
+359 #ifdef DEBUG
+360 			vips_foreign_load_jxl_print_info( &amp;jxl-&gt;info );
+361 			jxl-&gt;format.num_channels = 
+362 				jxl-&gt;info.num_color_channels + 
+363 				jxl-&gt;info.num_extra_channels;
+364 			if( jxl-&gt;info.exponent_bits_per_sample &gt; 0 ||
+365 				jxl-&gt;info.alpha_exponent_bits &gt; 0 )
+366 				jxl-&gt;format.data_type = JXL_TYPE_FLOAT;
+367 			else if( jxl-&gt;info.bits_per_sample &gt; 16 )
+368 				jxl-&gt;format.data_type = JXL_TYPE_UINT32;
+369 			else if( jxl-&gt;info.bits_per_sample &gt; 8 )
+370 				jxl-&gt;format.data_type = JXL_TYPE_UINT16;
+371 			else
+372 				jxl-&gt;format.data_type = JXL_TYPE_UINT8;
+373 			jxl-&gt;format.endianness = JXL_NATIVE_ENDIAN;
+374 			jxl-&gt;format.align = 0;
+375 #ifdef DEBUG
+376 			vips_foreign_load_jxl_print_format( &amp;jxl-&gt;format );
+377 			break;
+378 		case JXL_DEC_COLOR_ENCODING:
+379 			if( JxlDecoderGetICCProfileSize( jxl-&gt;decoder,
+380 				&amp;jxl-&gt;format, 
+381 				JXL_COLOR_PROFILE_TARGET_DATA, 
+382 				&amp;jxl-&gt;icc_size ) ) {
+383 				vips_foreign_load_jxl_error( jxl, 
+384 					"JxlDecoderGetICCProfileSize" );
+385 				return( -1 );
+386 			}
+387 #ifdef DEBUG
+388 			printf( "vips_foreign_load_jxl_header: "
+389 				"%zd byte profile\n", jxl-&gt;icc_size );
+390 			if( !(jxl-&gt;icc_data = vips_malloc( NULL, 
+391 				jxl-&gt;icc_size )) ) 
+392 				return( -1 );
+393 			if( JxlDecoderGetColorAsICCProfile( jxl-&gt;decoder, 
+394 				&amp;jxl-&gt;format, 
+395 				JXL_COLOR_PROFILE_TARGET_DATA,
+396 				jxl-&gt;icc_data, jxl-&gt;icc_size ) ) {
+397 				vips_foreign_load_jxl_error( jxl, 
+398 					"JxlDecoderGetColorAsICCProfile" );
+399 				return( -1 );
+400 			}
+401 			break;
+402 		default:
+403 			break;
+404 		}
+405 	} while( status != JXL_DEC_COLOR_ENCODING );
+406 	if( vips_foreign_load_jxl_set_header( jxl, load-&gt;out ) ) 
+407 		return( -1 );
+408 	VIPS_SETSTR( load-&gt;out-&gt;filename, 
+409 		vips_connection_filename( VIPS_CONNECTION( jxl-&gt;source ) ) );
+410 	return( 0 );
+411 }
+412 static int
+413 vips_foreign_load_jxl_load( VipsForeignLoad *load )
+414 {
+415 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( load );
+416 	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) load;
+417 	VipsImage **t = (VipsImage **) 
+418 		vips_object_local_array( VIPS_OBJECT( load ), 3 );
+419 	size_t buffer_size;
+420 	JxlDecoderStatus status;
+421 #ifdef DEBUG
+422 	printf( "vips_foreign_load_jxl_load:\n" );
+423 	t[0] = vips_image_new();
+424 	if( vips_foreign_load_jxl_set_header( jxl, t[0] ) ) 
+425 		return( -1 );
+426 	do {
+427 		switch( (status = vips_foreign_load_jxl_process( jxl )) ) {
+428 		case JXL_DEC_ERROR:   
+429 			vips_foreign_load_jxl_error( jxl, 
+430 				"JxlDecoderProcessInput" );
+431 			return( -1 );
+432 		case JXL_DEC_NEED_IMAGE_OUT_BUFFER:   
+433 			if( vips_image_write_prepare( t[0] ) )
+434 				return( -1 );
+435 			if( JxlDecoderImageOutBufferSize( jxl-&gt;decoder, 
+436 				&amp;jxl-&gt;format, 
+437 				&amp;buffer_size ) ) {
+438 				vips_foreign_load_jxl_error( jxl, 
+439 					"JxlDecoderImageOutBufferSize" );
+440 				return( -1 );
+441 			}
+442 			if( buffer_size != 
+443 				VIPS_IMAGE_SIZEOF_IMAGE( t[0] ) ) {
+444 				vips_error( class-&gt;nickname, 
+445 					"%s", _( "bad buffer size" ) );
+446 				return( -1 );
+447 			}
+448 			if( JxlDecoderSetImageOutBuffer( jxl-&gt;decoder,
+449 				&amp;jxl-&gt;format, 
+450 				VIPS_IMAGE_ADDR( t[0], 0, 0 ),
+451 				VIPS_IMAGE_SIZEOF_IMAGE( t[0] ) ) ) {
+452 				vips_foreign_load_jxl_error( jxl, 
+453 					"JxlDecoderSetImageOutBuffer" );
+454 				return( -1 );
+455 			}
+456 			break;
+457 		case JXL_DEC_FULL_IMAGE:
+458 			break;
+459 		default:
+460 			break;
+461 		}
+462 	} while( status != JXL_DEC_SUCCESS );
+463 	if( vips_image_write( t[0], load-&gt;real ) ) 
+464 		return( -1 );
+465 	return( 0 );
+466 }
+467 <a name="0"></a>static void
+468 vips_foreign_load_jxl_class_init( VipsForeignLoadJxlClass *class )
+469 {
+470 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+471 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+472 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+473 	gobject_class-&gt;dispose = vips_foreign_load_jxl_dispose;
+474 	gobject_class-&gt;set_property = vips_object_set_property;
+475 	gobject_class-&gt;get_property = vips_object_get_property;
+476 	object_class-&gt;nickname = "jxlload_base";
+477 	object_class-&gt;description = _( "load JPEG-XL image" );
+478 	object_class-&gt;build = vips_foreign_load_jxl_build;
+479 	load_class-&gt;get_flags = vips_foreign_load_jxl_get_flags;
+480 	load_class-&gt;header = vips_foreign_load_jxl_header;
+481 	load_class-&gt;load = vips_foreign_load_jxl_load;
+482 }
+483 static void
+484 vips_foreign_load_jxl_init( VipsForeignLoadJxl *jxl )
+485 {
+486 }
+487 typedef struct _VipsForeignLoadJxlFile {
+488 	VipsForeignLoadJxl parent_object;
+489 	char *filename; 
+490 } VipsForeignLoadJxlFile;
+491 typedef VipsForeignLoadJxlClass VipsForeignLoadJxlFileClass;
+492 G_DEFINE_TYPE( VipsForeignLoadJxlFile, vips_foreign_load_jxl_file, 
+493 	vips_foreign_load_jxl_get_type() );
+494 static int
+495 vips_foreign_load_jxl_file_build( VipsObject *object )
+496 {
+497 	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) object;
+498 	VipsForeignLoadJxlFile *file = (VipsForeignLoadJxlFile *) object;
+499 	if( file-&gt;filename &amp;&amp;
+500 		!(jxl-&gt;source = vips_source_new_from_file( file-&gt;filename )) )
+501 		return( -1 );
+502 	if( VIPS_OBJECT_CLASS( vips_foreign_load_jxl_file_parent_class )-&gt;
+503 		build( object ) )
+504 		return( -1 );
+505 	return( 0 );
+506 }
+507 const char *vips__jxl_suffs[] = 
+508 	{ ".jxl", NULL };
+509 static int
+510 vips_foreign_load_jxl_is_a( const char *filename )
+511 {</b></font>
+512 	VipsSource *source;
+513 	gboolean result;
+514 	if( !(source = vips_source_new_from_file( filename )) )
+515 		return( FALSE );
+516 	result = vips_foreign_load_jxl_is_a_source( source );
+517 	VIPS_UNREF( source );
+518 	return( result );
+519 }
+520 static void
+521 vips_foreign_load_jxl_file_class_init( VipsForeignLoadJxlFileClass *class )
+522 {
+523 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+524 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+525 <a name="1"></a>	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
+526 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+527 <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	gobject_class-&gt;set_property = vips_object_set_property;
+528 	gobject_class-&gt;get_property = vips_object_get_property;
+529 	object_class-&gt;nickname = "jxlload";
+530 	object_class-&gt;build = vips_foreign_load_jxl_file_build;
+531 	foreign_class-&gt;suffs = vips__jxl_suffs;
+532 	load_class-&gt;is_a = vips_foreign_load_jxl_is_a;
+533 	VIPS_ARG_STRING( class, "filename", 1, 
+534 		_( "Filename" ),
+535 		_( "Filename to load from" ),
+536 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+537 		G_STRUCT_OFFSET( VipsForeignLoadJxlFile, filename ),
+538 		NULL );
+539 }
+540 static void
+541 vips_foreign_load_jxl_file_init( VipsForeignLoadJxlFile *jxl )
+542 {
+543 }
+544 typedef struct _VipsForeignLoadJxlBuffer {
+545 	VipsForeignLoadJxl parent_object;
+546 	VipsArea *buf;
+547 } VipsForeignLoadJxlBuffer;
+548 typedef VipsForeignLoadJxlClass VipsForeignLoadJxlBufferClass;
+549 G_DEFINE_TYPE( VipsForeignLoadJxlBuffer, vips_foreign_load_jxl_buffer, 
+550 	vips_foreign_load_jxl_get_type() );
+551 static int
+552 vips_foreign_load_jxl_buffer_build( VipsObject *object )
+553 {
+554 	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) object;
+555 	VipsForeignLoadJxlBuffer *buffer = 
+556 		(VipsForeignLoadJxlBuffer *) object;
+557 	if( buffer-&gt;buf )</b></font>
+558 		if( !(jxl-&gt;source = vips_source_new_from_memory( 
+559 			VIPS_AREA( buffer-&gt;buf )-&gt;data, 
+560 			VIPS_AREA( buffer-&gt;buf )-&gt;length )) )
+561 			return( -1 );
+562 	if( VIPS_OBJECT_CLASS( vips_foreign_load_jxl_file_parent_class )-&gt;
+563 		build( object ) )
+564 		return( -1 );
+565 	return( 0 );
+566 }
+567 static gboolean
+568 vips_foreign_load_jxl_buffer_is_a( const void *buf, size_t len )
+569 {
+570 	VipsSource *source;
+571 	gboolean result;
+572 	if( !(source = vips_source_new_from_memory( buf, len )) )
+573 		return( FALSE );
+574 	result = vips_foreign_load_jxl_is_a_source( source );
+575 <a name="2"></a>	VIPS_UNREF( source );
+576 	return( result );
+577 <font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>}
+578 static void
+579 vips_foreign_load_jxl_buffer_class_init( VipsForeignLoadJxlBufferClass *class )
+580 {
+581 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+582 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+583 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+584 	gobject_class-&gt;set_property = vips_object_set_property;
+585 	gobject_class-&gt;get_property = vips_object_get_property;
+586 	object_class-&gt;nickname = "jxlload_buffer";
+587 	object_class-&gt;build = vips_foreign_load_jxl_buffer_build;
+588 	load_class-&gt;is_a_buffer = vips_foreign_load_jxl_buffer_is_a;</b></font>
+589 	VIPS_ARG_BOXED( class, "buffer", 1, 
+590 		_( "Buffer" ),
+591 		_( "Buffer to load from" ),
+592 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+593 		G_STRUCT_OFFSET( VipsForeignLoadJxlBuffer, buf ),
+594 		VIPS_TYPE_BLOB );
+595 }
+596 static void
+597 vips_foreign_load_jxl_buffer_init( VipsForeignLoadJxlBuffer *buffer )
+598 {
+599 }
+600 typedef struct _VipsForeignLoadJxlSource {
+601 	VipsForeignLoadJxl parent_object;
+602 	VipsSource *source;
+603 } VipsForeignLoadJxlSource;
+604 typedef VipsForeignLoadJxlClass VipsForeignLoadJxlSourceClass;
+605 G_DEFINE_TYPE( VipsForeignLoadJxlSource, vips_foreign_load_jxl_source, 
+606 	vips_foreign_load_jxl_get_type() );
+607 static int
+608 vips_foreign_load_jxl_source_build( VipsObject *object )
+609 {
+610 	VipsForeignLoadJxl *jxl = (VipsForeignLoadJxl *) object;
+611 	VipsForeignLoadJxlSource *source = 
+612 		(VipsForeignLoadJxlSource *) object;
+613 	if( source-&gt;source ) {
+614 		jxl-&gt;source = source-&gt;source;
+615 <a name="3"></a>		g_object_ref( jxl-&gt;source );
+616 	}
+617 <font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if( VIPS_OBJECT_CLASS( 
+618 		vips_foreign_load_jxl_source_parent_class )-&gt;
+619 			build( object ) )
+620 		return( -1 );
+621 	return( 0 );
+622 }
+623 static void
+624 vips_foreign_load_jxl_source_class_init( VipsForeignLoadJxlSourceClass *class )
+625 {
+626 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+627 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+628 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+629 	gobject_class-&gt;set_property = vips_object_set_property;</b></font>
+630 	gobject_class-&gt;get_property = vips_object_get_property;
+631 	object_class-&gt;nickname = "jxlload_source";
+632 	object_class-&gt;build = vips_foreign_load_jxl_source_build;
+633 	load_class-&gt;is_a_source = vips_foreign_load_jxl_is_a_source;
+634 	VIPS_ARG_OBJECT( class, "source", 1,
+635 		_( "Source" ),
+636 		_( "Source to load from" ),
+637 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+638 		G_STRUCT_OFFSET( VipsForeignLoadJxlSource, source ),
+639 		VIPS_TYPE_SOURCE );
+640 }
+641 static void
+642 vips_foreign_load_jxl_source_init( VipsForeignLoadJxlSource *jxl )
+643 {
+644 }
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -986,846 +699,561 @@ vips_foreign_load_jxl_source_init( VipsForeignLoadJxlSource *jxl )
 </h3>
 <hr/>
 <pre>
-/* load nifti from a file
- *
- * 29/6/18
- * 	- from fitsload.c
- * 9/9/19
- * 	- use double for all floating point scalar metadata, like other loaders
- * 	- remove stray use of "n" property
- */
-
-/*
-
-    This file is part of VIPS.
-    
-    VIPS is free software; you can redistribute it and/or modify
-    it under the terms of the GNU Lesser General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Lesser General Public License for more details.
-
-    You should have received a copy of the GNU Lesser General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
-
- */
-
-/*
-
-    These files are distributed with VIPS - http://www.vips.ecs.soton.ac.uk
-
- */
-
-/*
-#define DEBUG
-#define VIPS_DEBUG
- */
-
-/* TODO
- *
- * - for uncompressed images, we could do direct mapping of the input
- * - perhaps we could stream compressed images? but only if ext is defined at 
- *   the start of the file
- *   	(yes, file format is magic number, 348-byte header, extension data,
- *   	pixel data, then all gz'd)
- * - we could use the much faster byteswap in glib?
- * - I have not been able to test the ext stuff :( 
- *
- * There should be at least a x2 speedup possible.
- */
-
-#ifdef HAVE_CONFIG_H
-#include &lt;config.h&gt;
-#endif /*HAVE_CONFIG_H*/
-#include &lt;vips/intl.h&gt;
-
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-
-#include &lt;vips/vips.h&gt;
-#include &lt;vips/debug.h&gt;
-#include &lt;vips/internal.h&gt;
-
-#ifdef HAVE_NIFTI
-
-#include &lt;nifti1_io.h&gt;
-
-#include "pforeign.h"
-
-typedef struct _VipsForeignLoadNifti {
-	VipsForeignLoad parent_object;
-
-	/* Source to load from (set by subclasses).
-	 */
-	VipsSource *source;
-
-	/* Filename from source.
-	 */
-	const char *filename;
-
-	/* The NIFTI image loaded to memory.
-	 */
-	nifti_image *nim;
-
-	/* Wrap this VipsImage around the NIFTI pointer, then redirect read
-	 * requests to that. Saves a copy. 
-	 */
-	VipsImage *memory;
-
-} VipsForeignLoadNifti;
-
-typedef VipsForeignLoadClass VipsForeignLoadNiftiClass;
-
-G_DEFINE_ABSTRACT_TYPE( VipsForeignLoadNifti, vips_foreign_load_nifti, 
-	VIPS_TYPE_FOREIGN_LOAD );
-
-static void
-vips_foreign_load_nifti_dispose( GObject *gobject )
-{
-	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) gobject;
-
-	VIPS_UNREF( nifti-&gt;source );
-	VIPS_UNREF( nifti-&gt;memory );
-	VIPS_FREEF( nifti_image_free, nifti-&gt;nim );
-
-	G_OBJECT_CLASS( vips_foreign_load_nifti_parent_class )-&gt;
-		dispose( gobject );
-}
-
-static int
-vips_foreign_load_nifti_build( VipsObject *object )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( object );
-	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) object;
-
-	/* We can only open source which have an associated filename, since
-	 * the nifti library works in terms of filenames.
-	 */
-	if( nifti-&gt;source ) {
-		nifti-&gt;filename = vips_connection_filename( VIPS_CONNECTION( 
-			nifti-&gt;source ) );
-		if( !nifti-&gt;filename ) {
-			vips_error( class-&gt;nickname, "%s", 
-				_( "no filename available" ) );
-			return( -1 );
-		}
-	}
-
-	if( VIPS_OBJECT_CLASS( vips_foreign_load_nifti_parent_class )-&gt;
-		build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-/* Map DT_* datatype values to VipsBandFormat.
- */
-typedef struct _VipsForeignDT2Vips {
-	int datatype;
-	VipsBandFormat fmt;
-} VipsForeignDT2Vips ;
-
-static VipsForeignDT2Vips vips_foreign_nifti_DT2Vips[] = {
-	{ DT_UINT8, VIPS_FORMAT_UCHAR },
-	{ DT_INT8, VIPS_FORMAT_CHAR },
-	{ DT_UINT16, VIPS_FORMAT_USHORT },
-	{ DT_INT16, VIPS_FORMAT_SHORT },
-	{ DT_UINT32, VIPS_FORMAT_UINT },
-	{ DT_INT32, VIPS_FORMAT_INT },
-	{ DT_FLOAT32, VIPS_FORMAT_FLOAT },
-	{ DT_FLOAT64, VIPS_FORMAT_DOUBLE },
-	{ DT_COMPLEX64, VIPS_FORMAT_COMPLEX },
-	{ DT_COMPLEX128, VIPS_FORMAT_DPCOMPLEX },
-	{ DT_RGB, VIPS_FORMAT_UCHAR },
-	{ DT_RGBA32, VIPS_FORMAT_UCHAR }
-};
-
-VipsBandFormat
-vips__foreign_nifti_datatype2BandFmt( int datatype )
-{
-	int i;
-
-	for( i = 0; i &lt; VIPS_NUMBER( vips_foreign_nifti_DT2Vips ); i++ )
-		if( vips_foreign_nifti_DT2Vips[i].datatype == datatype )
-			return( vips_foreign_nifti_DT2Vips[i].fmt );
-
-	return( VIPS_FORMAT_NOTSET );
-}
-
-int
-vips__foreign_nifti_BandFmt2datatype( VipsBandFormat fmt )
-{
-	int i;
-
-	for( i = 0; i &lt; VIPS_NUMBER( vips_foreign_nifti_DT2Vips ); i++ )
-		if( vips_foreign_nifti_DT2Vips[i].fmt == fmt )
-			return( vips_foreign_nifti_DT2Vips[i].datatype );
-
-	return( -1 );
-}
-
-/* All the header fields we attach as metadata.
- */
-typedef struct _VipsForeignNiftiFields {
-	char *name;
-	GType type;
-	glong offset;
-} VipsForeignNiftiFields;
-
-static VipsForeignNiftiFields vips_foreign_nifti_fields[] = {
-	/* The first 8 must be the dims[] fields, see
-	 * vips_foreign_save_nifti_make_nim().
-	 */
-	{ "ndim", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, ndim ) }, 
-	{ "nx", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nx ) }, 
-	{ "ny", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, ny ) }, 
-	{ "nz", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nz ) }, 
-	{ "nt", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nt ) }, 
-	{ "nu", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nu ) }, 
-	{ "nv", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nv ) }, 
-	{ "nw", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nw ) }, 
-
-	{ "dx", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dx ) }, 
-	{ "dy", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dy ) }, 
-	{ "dz", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dz ) }, 
-	{ "dt", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dt ) }, 
-	{ "du", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, du ) }, 
-	{ "dv", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dv ) }, 
-	{ "dw", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dw ) }, 
-
-	{ "scl_slope", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, scl_slope ) }, 
-	{ "scl_inter", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, scl_inter ) }, 
-
-	{ "cal_min", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, cal_min ) }, 
-	{ "cal_max", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, cal_max ) }, 
-
-	{ "qform_code", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, qform_code ) }, 
-	{ "sform_code", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, sform_code ) }, 
-
-	{ "freq_dim", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, freq_dim ) }, 
-	{ "phase_dim", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, phase_dim ) }, 
-	{ "slice_dim", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, slice_dim ) }, 
-
-	{ "slice_code", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, slice_code ) }, 
-	{ "slice_start", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, slice_start ) }, 
-	{ "slice_end", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, slice_end ) }, 
-	{ "slice_duration", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, slice_duration ) }, 
-
-	{ "quatern_b", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, quatern_b ) }, 
-	{ "quatern_c", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, quatern_c ) }, 
-	{ "quatern_d", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, quatern_d ) }, 
-	{ "qoffset_x", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, qoffset_x ) }, 
-	{ "qoffset_y", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, qoffset_y ) }, 
-	{ "qoffset_z", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, qoffset_z ) }, 
-	{ "qfac", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, qfac ) }, 
-
-	{ "sto_xyz00", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[0][0] ) }, 
-	{ "sto_xyz01", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[0][1] ) }, 
-	{ "sto_xyz02", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[0][2] ) }, 
-	{ "sto_xyz03", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[0][3] ) }, 
-
-	{ "sto_xyz10", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[1][0] ) }, 
-	{ "sto_xyz11", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[1][1] ) }, 
-	{ "sto_xyz12", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[1][2] ) }, 
-	{ "sto_xyz13", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[1][3] ) }, 
-
-	{ "sto_xyz20", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[2][0] ) }, 
-	{ "sto_xyz21", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[2][1] ) }, 
-	{ "sto_xyz22", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[2][2] ) }, 
-	{ "sto_xyz23", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[2][3] ) }, 
-
-	{ "sto_xyz30", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[3][0] ) }, 
-	{ "sto_xyz31", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[3][1] ) }, 
-	{ "sto_xyz32", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[3][2] ) }, 
-	{ "sto_xyz33", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[3][3] ) }, 
-
-	{ "toffset", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, toffset ) }, 
-
-	{ "xyz_units", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, xyz_units ) }, 
-	{ "time_units", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, time_units ) }, 
-
-	{ "nifti_type", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, nifti_type ) }, 
-	{ "intent_code", G_TYPE_INT, 
-		G_STRUCT_OFFSET( nifti_image, intent_code ) }, 
-	{ "intent_p1", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, intent_p1 ) }, 
-	{ "intent_p2", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, intent_p2 ) }, 
-	{ "intent_p3", G_TYPE_DOUBLE, 
-		G_STRUCT_OFFSET( nifti_image, intent_p3 ) }, 
-};
-
-void *
-vips__foreign_nifti_map( VipsNiftiMapFn fn, void *a, void *b )
-{
-	int i;
-	void *result;
-
-	for( i = 0; i &lt; VIPS_NUMBER( vips_foreign_nifti_fields ); i++ ) {
-		GValue value = { 0 };
-
-		g_value_init( &amp;value, vips_foreign_nifti_fields[i].type );
-		result = fn( vips_foreign_nifti_fields[i].name, &amp;value,
-			vips_foreign_nifti_fields[i].offset, a, b );
-		g_value_unset( &amp;value );
-
-		if( result )
-			return( result );
-	}
-
-	return( NULL );
-}
-
-/* How I wish glib had something like this :( Just implement the ones we need
- * for vips_foreign_nifti_fields above.
- */
-static void
-vips_gvalue_read( GValue *value, void *p )
-{
-	switch( G_VALUE_TYPE( value ) ) {
-	case G_TYPE_INT:
-		g_value_set_int( value, *((int *) p) );
-		break;
-
-	case G_TYPE_DOUBLE:
-		/* We set as double rather than float, as things like pyvips
-		 * expect double for metadata items.
-		 */
-		g_value_set_double( value, *((float *) p) );
-		break;
-
-	default:
-		g_warning( "vips_gvalue_read: unsupported GType %s", 
-			g_type_name( G_VALUE_TYPE( value ) ) );
-	}
-}
-
-static void *
-vips_foreign_load_nifti_set( const char *name, GValue *value, glong offset,
-	void *a, void *b )
-{
-	nifti_image *nim = (nifti_image *) a;
-	VipsImage *out = VIPS_IMAGE( b );
-
-	char vips_name[256];
-
-	vips_gvalue_read( value, (gpointer) nim + offset );
-	vips_snprintf( vips_name, 256, "nifti-%s", name );
-	vips_image_set( out, vips_name, value );
-
-	return( NULL );
-}
-
-static int
-vips_foreign_load_nifti_set_header( VipsForeignLoadNifti *nifti,
-	nifti_image *nim, VipsImage *out )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( nifti );
-
-	guint width;
-	guint height;
-	guint bands;
-	VipsBandFormat fmt;
-	double xres;
-	double yres;
-	int i;
-	char txt[256];
-
-	if( nim-&gt;ndim &lt; 1 ||
-		nim-&gt;ndim &gt; 7 ) {
-		vips_error( class-&gt;nickname, 
-			_( "%d-dimensional images not supported" ), 
-			nim-&gt;ndim ); 
-		return( 0 );
-	}
-	for( i = 1; i &lt; 8 &amp;&amp; i &lt; nim-&gt;ndim + 1; i++ ) {
-		if( nim-&gt;dim[i] &lt;= 0 ) {
-			vips_error( class-&gt;nickname, 
-				"%s", _( "invalid dimension" ) ); 
-			return( 0 );
-		}
-
-		/* If we have several images in a dimension, the spacing must
-		 * be non-zero or we'll get a /0 error in resolution
-		 * calculation.
-		 */
-		if( nim-&gt;dim[i] &gt; 1 &amp;&amp; 
-			nim-&gt;pixdim[i] == 0 ) {
-			vips_error( class-&gt;nickname, 
-				"%s", _( "invalid resolution" ) ); 
-			return( 0 );
-		}
-	}
-
-	/* Unfold higher dimensions vertically. bands is updated below for
-	 * DT_RGB. Be careful to avoid height going over 2^31.
-	 */
-	bands = 1;
-	width = (guint) nim-&gt;nx;
-	height = (guint) nim-&gt;ny;
-	for( i = 3; i &lt; 8 &amp;&amp; i &lt; nim-&gt;ndim + 1; i++ )
-		if( !g_uint_checked_mul( &amp;height, height, nim-&gt;dim[i] ) ) {
-			vips_error( class-&gt;nickname, 
-				"%s", _( "dimension overflow" ) ); 
-			return( 0 );
-		}
-	if( height &gt; INT_MAX ) {
-		vips_error( class-&gt;nickname, "%s", _( "dimension overflow" ) ); 
-		return( 0 );
-	}
-
-	fmt = vips__foreign_nifti_datatype2BandFmt( nim-&gt;datatype );
-	if( fmt == VIPS_FORMAT_NOTSET ) { 
-		vips_error( class-&gt;nickname, 
-			_( "datatype %d not supported" ), nim-&gt;datatype );
-		return( -1 );
-	}
-
-	if( nim-&gt;datatype == DT_RGB )
-		bands = 3;
-	if( nim-&gt;datatype == DT_RGBA32 )
-		bands = 4;
-
-	/* We fold y and z together, so they must have the same resolution..
-	 */
-	xres = 1.0;
-	yres = 1.0;
-	if( nim-&gt;nz == 1 ||
-		nim-&gt;dz == nim-&gt;dy ) 
-		switch( nim-&gt;xyz_units ) {
-		case NIFTI_UNITS_METER:
-			xres = 1000.0 / nim-&gt;dx; 
-			yres = 1000.0 / nim-&gt;dy; 
-			break; 
-		case NIFTI_UNITS_MM:
-			xres = 1.0 / nim-&gt;dx; 
-			yres = 1.0 / nim-&gt;dy; 
-			break;
-
-		case NIFTI_UNITS_MICRON:
-			xres = 1.0 / (1000.0 * nim-&gt;dx); 
-			yres = 1.0 / (1000.0 * nim-&gt;dy); 
-			break;
-
-		default:
-			break;
-		}
-
-#ifdef DEBUG
-	printf( "get_vips_properties: width = %d\n", width );
-	printf( "get_vips_properties: height = %d\n", height );
-	printf( "get_vips_properties: bands = %d\n", bands );
-	printf( "get_vips_properties: fmt = %d\n", fmt );
-#endif /*DEBUG*/
-
-	vips_image_pipelinev( out, VIPS_DEMAND_STYLE_SMALLTILE, NULL );
-	vips_image_init_fields( out,
-		width, height, bands, fmt, 
-		VIPS_CODING_NONE, 
-		bands == 1 ? 
-			VIPS_INTERPRETATION_B_W : VIPS_INTERPRETATION_sRGB, 
-		xres, yres );
-
-	/* Set some vips metadata for every nifti header field.
-	 */
-	if( vips__foreign_nifti_map( vips_foreign_load_nifti_set, nim, out ) )
-		return( -1 ); 
-
-	/* One byte longer than the spec to leave space for any extra
-	 * '\0' termination.
-	 */
-	vips_strncpy( txt, nim-&gt;intent_name, 17 );
-	vips_image_set_string( out, "nifti-intent_name", txt );
-	vips_strncpy( txt, nim-&gt;descrip, 81 );
-	vips_image_set_string( out, "nifti-descrip", txt );
-
-	for( i = 0; i &lt; nim-&gt;num_ext; i++ ) {
-		nifti1_extension *ext = &amp;nim-&gt;ext_list[i];
-
-		vips_snprintf( txt, 256, "nifti-ext-%d-%d", i, ext-&gt;ecode );
-		vips_image_set_blob_copy( out, txt, ext-&gt;edata, ext-&gt;esize );
-	}
-
-	vips_image_set_int( out, VIPS_META_PAGE_HEIGHT, nim-&gt;ny );
-
-	return( 0 );
-}
-
-static int
-vips_foreign_load_nifti_header( VipsForeignLoad *load )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( load );
-	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) load;
-
-	/* We can't use the (much faster) nifti_read_header() since it just
-	 * reads the 348 bytes of the analyze struct and does not read any of
-	 * the extension fields.
-	 */
-
-	/* FALSE means don't read data, just the header. Use
-	 * nifti_image_load() later to pull the data in.
-	 */
-	if( !(nifti-&gt;nim = nifti_image_read( nifti-&gt;filename, FALSE )) ) { 
-		vips_error( class-&gt;nickname, 
-			"%s", _( "unable to read NIFTI header" ) );
-		return( 0 );
-	}
-
-	if( vips_foreign_load_nifti_set_header( nifti, 
-		nifti-&gt;nim, load-&gt;out ) ) {
-		return( -1 );
-	}
-
-	VIPS_SETSTR( load-&gt;out-&gt;filename, nifti-&gt;filename );
-
-	return( 0 );
-}
-
-static int
-vips_foreign_load_nifti_load( VipsForeignLoad *load )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( load );
-	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) load;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_nifti_load: loading image\n" );
-#endif /*DEBUG*/
-
-	/* We just read the entire image to memory. 
-	 */
-	if( nifti_image_load( nifti-&gt;nim ) ) {
-		vips_error( class-&gt;nickname, 
-			"%s", _( "unable to load NIFTI file" ) );
-		return( -1 );
-	}
-
-	if( !(nifti-&gt;memory = vips_image_new_from_memory( 
-		nifti-&gt;nim-&gt;data, VIPS_IMAGE_SIZEOF_IMAGE( load-&gt;out ),
-		load-&gt;out-&gt;Xsize, load-&gt;out-&gt;Ysize, 
-		load-&gt;out-&gt;Bands, load-&gt;out-&gt;BandFmt )) ) 
-		return( -1 );
-
-	if( vips_image_write( nifti-&gt;memory, load-&gt;real ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static void
-<a name="0"></a>vips_foreign_load_nifti_class_init( VipsForeignLoadNiftiClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;dispose = vips_foreign_load_nifti_dispose;
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "niftiload_base";
-	object_class-&gt;description = _( "load a NIFTI image" );
-	object_class-&gt;build = vips_foreign_load_nifti_build;
-
-	/* is_a() is not that quick ... lower the priority.
-	 */
-	foreign_class-&gt;priority = -50;
-
-	load_class-&gt;header = vips_foreign_load_nifti_header;
-	load_class-&gt;load = vips_foreign_load_nifti_load;
-}
-
-static void
-vips_foreign_load_nifti_init( VipsForeignLoadNifti *nifti )
-{
-}
-
-typedef struct _VipsForeignLoadNiftiFile {
-	VipsForeignLoadNifti parent_object;
-
-	/* Filename for load.
-	 */
-	char *filename; 
-
-} VipsForeignLoadNiftiFile;
-
-typedef VipsForeignLoadNiftiClass VipsForeignLoadNiftiFileClass;
-
-G_DEFINE_TYPE( VipsForeignLoadNiftiFile, vips_foreign_load_nifti_file, 
-	vips_foreign_load_nifti_get_type() );
-
-static int
-vips_foreign_load_nifti_file_build( VipsObject *object )
-{
-	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) object;
-	VipsForeignLoadNiftiFile *file = (VipsForeignLoadNiftiFile *) object;
-
-	if( file-&gt;filename &amp;&amp;
-		!(nifti-&gt;source = 
-			vips_source_new_from_file( file-&gt;filename )) )
-		return( -1 );
-
-	if( VIPS_OBJECT_CLASS( vips_foreign_load_nifti_file_parent_class )-&gt;
-		build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-const char *vips_foreign_nifti_suffs[] = { 
-	".nii", ".nii.gz", 
-	".hdr", ".hdr.gz", 
-	".img", ".img.gz", 
-	".nia", ".nia.gz", 
-	NULL 
-};
-
-static int
-vips_foreign_load_nifti_is_a( const char *filename )
-{</b></font>
-	char *hfile;
-	znzFile fp;
-	nifti_1_header nhdr;
-
-	/* Unfortunately is_nifti_file() is very slow and produces lots of
-	 * output. We have to make our own.
-	 */
-
-	if( !(hfile = nifti_findhdrname( filename )) )
-		return( 0 );
-
-	fp = znzopen( hfile, "rb", nifti_is_gzfile( hfile ));
-	if( znz_isnull( fp ) ) { 
-		free( hfile );
-		return( 0 );
-	}
-	free( hfile );
-
-	(void) znzread( &amp;nhdr, 1, sizeof( nhdr ), fp );
-
-	znzclose( fp );
-
-	/* Test for sanity both ways around. There's a thing to test for byte
-	 * order in niftilib, but it's static :(
-	 */
-<a name="3"></a>	if( nifti_hdr_looks_good( &amp;nhdr ) ) 
-		return( 1 );
-	swap_nifti_header( &amp;nhdr, FALSE );
-<font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if( nifti_hdr_looks_good( &amp;nhdr ) ) 
-		return( 1 );
-
-	return( 0 );
-}
-
-static void
-vips_foreign_load_nifti_file_class_init( 
-	VipsForeignLoadNiftiFileClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
-<a name="1"></a>	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;</b></font>
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "niftiload";
-	object_class-&gt;description = _( "load NIfTI volume" );
-	object_class-&gt;build = vips_foreign_load_nifti_file_build;
-
-	foreign_class-&gt;suffs = vips_foreign_nifti_suffs;
-
-	load_class-&gt;is_a = vips_foreign_load_nifti_is_a;
-
-	VIPS_ARG_STRING( class, "filename", 1, 
-		_( "Filename" ),
-		_( "Filename to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadNiftiFile, filename ),
-		NULL );
-
-}
-
-static void
-vips_foreign_load_nifti_file_init( VipsForeignLoadNiftiFile *nifti )
-{
-}
-
-typedef struct _VipsForeignLoadNiftiSource {
-	VipsForeignLoadNifti parent_object;
-
-	/* Load from a source.
-	 */
-	VipsSource *source;
-
-} VipsForeignLoadNiftiSource;
-
-typedef VipsForeignLoadNiftiClass VipsForeignLoadNiftiSourceClass;
-
-G_DEFINE_TYPE( VipsForeignLoadNiftiSource, vips_foreign_load_nifti_source, 
-	vips_foreign_load_nifti_get_type() );
-
-static int
-vips_foreign_load_nifti_source_build( VipsObject *object )
-{
-	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) object;
-	VipsForeignLoadNiftiSource *source = 
-		(VipsForeignLoadNiftiSource *) object;
-
-	if( source-&gt;source ) {</b></font>
-		nifti-&gt;source = source-&gt;source;
-		g_object_ref( nifti-&gt;source );
-	}
-
-	if( VIPS_OBJECT_CLASS( 
-		vips_foreign_load_nifti_source_parent_class )-&gt;
-			build( object ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static gboolean
-vips_foreign_load_nifti_source_is_a_source( VipsSource *source )
-{
-	const char *filename;
-
-<a name="2"></a>	return( (filename = 
-		vips_connection_filename( VIPS_CONNECTION( source ) )) &amp;&amp;
-		vips_foreign_load_nifti_is_a( filename ) );
-<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>}
-
-static void
-vips_foreign_load_nifti_source_class_init( 
-	VipsForeignLoadNiftiSourceClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "niftiload_source";
-	object_class-&gt;description = _( "load NIfTI volumes" );
-	object_class-&gt;build = vips_foreign_load_nifti_source_build;</b></font>
-
-	load_class-&gt;is_a_source = 
-		vips_foreign_load_nifti_source_is_a_source;
-
-	VIPS_ARG_OBJECT( class, "source", 1,
-		_( "Source" ),
-		_( "Source to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadNiftiSource, source ),
-		VIPS_TYPE_SOURCE );
-
-}
-
-static void
-vips_foreign_load_nifti_source_init( 
-	VipsForeignLoadNiftiSource *nifti )
-{
-}
-
-#endif /*HAVE_NIFTI*/
-
-/**
- * vips_niftiload:
- * @filename: file to load
- * @out: (out): decompressed image
- * @...: %NULL-terminated list of optional named arguments
- *
- * Read a NIFTI image file into a VIPS image. 
- *
- * NIFTI metadata is attached with the "nifti-" prefix.
- *
- * See also: vips_image_new_from_file().
- *
- * Returns: 0 on success, -1 on error.
- */
-int
-vips_niftiload( const char *filename, VipsImage **out, ... )
-{
-	va_list ap;
-	int result;
-
-	va_start( ap, out );
-	result = vips_call_split( "niftiload", ap, filename, out );
-	va_end( ap );
-
-	return( result );
-}
-
-/**
- * vips_niftiload_source:
- * @source: source to load from
- * @out: (out): decompressed image
- * @...: %NULL-terminated list of optional named arguments
- *
- * Exactly as vips_niftiload(), but read from a source. 
- *
- * Returns: 0 on success, -1 on error.
- */
-int
-vips_niftiload_source( VipsSource *source, VipsImage **out, ... )
-{
-	va_list ap;
-	int result;
-
-	va_start( ap, out );
-	result = vips_call_split( "niftiload_source", ap, source, out );
-	va_end( ap );
-
-	return( result );
-}
+1 #ifdef HAVE_CONFIG_H
+2 #include &lt;config.h&gt;
+3 #include &lt;vips/intl.h&gt;
+4 #include &lt;stdio.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;vips/vips.h&gt;
+8 #include &lt;vips/debug.h&gt;
+9 #include &lt;vips/internal.h&gt;
+10 #ifdef HAVE_NIFTI
+11 #include &lt;nifti1_io.h&gt;
+12 #include "pforeign.h"
+13 typedef struct _VipsForeignLoadNifti {
+14 	VipsForeignLoad parent_object;
+15 	VipsSource *source;
+16 	const char *filename;
+17 	nifti_image *nim;
+18 	VipsImage *memory;
+19 } VipsForeignLoadNifti;
+20 typedef VipsForeignLoadClass VipsForeignLoadNiftiClass;
+21 G_DEFINE_ABSTRACT_TYPE( VipsForeignLoadNifti, vips_foreign_load_nifti, 
+22 	VIPS_TYPE_FOREIGN_LOAD );
+23 static void
+24 vips_foreign_load_nifti_dispose( GObject *gobject )
+25 {
+26 	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) gobject;
+27 	VIPS_UNREF( nifti-&gt;source );
+28 	VIPS_UNREF( nifti-&gt;memory );
+29 	VIPS_FREEF( nifti_image_free, nifti-&gt;nim );
+30 	G_OBJECT_CLASS( vips_foreign_load_nifti_parent_class )-&gt;
+31 		dispose( gobject );
+32 }
+33 static int
+34 vips_foreign_load_nifti_build( VipsObject *object )
+35 {
+36 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( object );
+37 	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) object;
+38 	if( nifti-&gt;source ) {
+39 		nifti-&gt;filename = vips_connection_filename( VIPS_CONNECTION( 
+40 			nifti-&gt;source ) );
+41 		if( !nifti-&gt;filename ) {
+42 			vips_error( class-&gt;nickname, "%s", 
+43 				_( "no filename available" ) );
+44 			return( -1 );
+45 		}
+46 	}
+47 	if( VIPS_OBJECT_CLASS( vips_foreign_load_nifti_parent_class )-&gt;
+48 		build( object ) )
+49 		return( -1 );
+50 	return( 0 );
+51 }
+52 typedef struct _VipsForeignDT2Vips {
+53 	int datatype;
+54 	VipsBandFormat fmt;
+55 } VipsForeignDT2Vips ;
+56 static VipsForeignDT2Vips vips_foreign_nifti_DT2Vips[] = {
+57 	{ DT_UINT8, VIPS_FORMAT_UCHAR },
+58 	{ DT_INT8, VIPS_FORMAT_CHAR },
+59 	{ DT_UINT16, VIPS_FORMAT_USHORT },
+60 	{ DT_INT16, VIPS_FORMAT_SHORT },
+61 	{ DT_UINT32, VIPS_FORMAT_UINT },
+62 	{ DT_INT32, VIPS_FORMAT_INT },
+63 	{ DT_FLOAT32, VIPS_FORMAT_FLOAT },
+64 	{ DT_FLOAT64, VIPS_FORMAT_DOUBLE },
+65 	{ DT_COMPLEX64, VIPS_FORMAT_COMPLEX },
+66 	{ DT_COMPLEX128, VIPS_FORMAT_DPCOMPLEX },
+67 	{ DT_RGB, VIPS_FORMAT_UCHAR },
+68 	{ DT_RGBA32, VIPS_FORMAT_UCHAR }
+69 };
+70 VipsBandFormat
+71 vips__foreign_nifti_datatype2BandFmt( int datatype )
+72 {
+73 	int i;
+74 	for( i = 0; i &lt; VIPS_NUMBER( vips_foreign_nifti_DT2Vips ); i++ )
+75 		if( vips_foreign_nifti_DT2Vips[i].datatype == datatype )
+76 			return( vips_foreign_nifti_DT2Vips[i].fmt );
+77 	return( VIPS_FORMAT_NOTSET );
+78 }
+79 int
+80 vips__foreign_nifti_BandFmt2datatype( VipsBandFormat fmt )
+81 {
+82 	int i;
+83 	for( i = 0; i &lt; VIPS_NUMBER( vips_foreign_nifti_DT2Vips ); i++ )
+84 		if( vips_foreign_nifti_DT2Vips[i].fmt == fmt )
+85 			return( vips_foreign_nifti_DT2Vips[i].datatype );
+86 	return( -1 );
+87 }
+88 typedef struct _VipsForeignNiftiFields {
+89 	char *name;
+90 	GType type;
+91 	glong offset;
+92 } VipsForeignNiftiFields;
+93 static VipsForeignNiftiFields vips_foreign_nifti_fields[] = {
+94 	{ "ndim", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, ndim ) }, 
+95 	{ "nx", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nx ) }, 
+96 	{ "ny", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, ny ) }, 
+97 	{ "nz", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nz ) }, 
+98 	{ "nt", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nt ) }, 
+99 	{ "nu", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nu ) }, 
+100 	{ "nv", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nv ) }, 
+101 	{ "nw", G_TYPE_INT, G_STRUCT_OFFSET( nifti_image, nw ) }, 
+102 	{ "dx", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dx ) }, 
+103 	{ "dy", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dy ) }, 
+104 	{ "dz", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dz ) }, 
+105 	{ "dt", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dt ) }, 
+106 	{ "du", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, du ) }, 
+107 	{ "dv", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dv ) }, 
+108 	{ "dw", G_TYPE_DOUBLE, G_STRUCT_OFFSET( nifti_image, dw ) }, 
+109 	{ "scl_slope", G_TYPE_DOUBLE, 
+110 		G_STRUCT_OFFSET( nifti_image, scl_slope ) }, 
+111 	{ "scl_inter", G_TYPE_DOUBLE, 
+112 		G_STRUCT_OFFSET( nifti_image, scl_inter ) }, 
+113 	{ "cal_min", G_TYPE_DOUBLE, 
+114 		G_STRUCT_OFFSET( nifti_image, cal_min ) }, 
+115 	{ "cal_max", G_TYPE_DOUBLE, 
+116 		G_STRUCT_OFFSET( nifti_image, cal_max ) }, 
+117 	{ "qform_code", G_TYPE_INT, 
+118 		G_STRUCT_OFFSET( nifti_image, qform_code ) }, 
+119 	{ "sform_code", G_TYPE_INT, 
+120 		G_STRUCT_OFFSET( nifti_image, sform_code ) }, 
+121 	{ "freq_dim", G_TYPE_INT, 
+122 		G_STRUCT_OFFSET( nifti_image, freq_dim ) }, 
+123 	{ "phase_dim", G_TYPE_INT, 
+124 		G_STRUCT_OFFSET( nifti_image, phase_dim ) }, 
+125 	{ "slice_dim", G_TYPE_INT, 
+126 		G_STRUCT_OFFSET( nifti_image, slice_dim ) }, 
+127 	{ "slice_code", G_TYPE_INT, 
+128 		G_STRUCT_OFFSET( nifti_image, slice_code ) }, 
+129 	{ "slice_start", G_TYPE_INT, 
+130 		G_STRUCT_OFFSET( nifti_image, slice_start ) }, 
+131 	{ "slice_end", G_TYPE_INT, 
+132 		G_STRUCT_OFFSET( nifti_image, slice_end ) }, 
+133 	{ "slice_duration", G_TYPE_DOUBLE, 
+134 		G_STRUCT_OFFSET( nifti_image, slice_duration ) }, 
+135 	{ "quatern_b", G_TYPE_DOUBLE, 
+136 		G_STRUCT_OFFSET( nifti_image, quatern_b ) }, 
+137 	{ "quatern_c", G_TYPE_DOUBLE, 
+138 		G_STRUCT_OFFSET( nifti_image, quatern_c ) }, 
+139 	{ "quatern_d", G_TYPE_DOUBLE, 
+140 		G_STRUCT_OFFSET( nifti_image, quatern_d ) }, 
+141 	{ "qoffset_x", G_TYPE_DOUBLE, 
+142 		G_STRUCT_OFFSET( nifti_image, qoffset_x ) }, 
+143 	{ "qoffset_y", G_TYPE_DOUBLE, 
+144 		G_STRUCT_OFFSET( nifti_image, qoffset_y ) }, 
+145 	{ "qoffset_z", G_TYPE_DOUBLE, 
+146 		G_STRUCT_OFFSET( nifti_image, qoffset_z ) }, 
+147 	{ "qfac", G_TYPE_DOUBLE, 
+148 		G_STRUCT_OFFSET( nifti_image, qfac ) }, 
+149 	{ "sto_xyz00", G_TYPE_DOUBLE, 
+150 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[0][0] ) }, 
+151 	{ "sto_xyz01", G_TYPE_DOUBLE, 
+152 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[0][1] ) }, 
+153 	{ "sto_xyz02", G_TYPE_DOUBLE, 
+154 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[0][2] ) }, 
+155 	{ "sto_xyz03", G_TYPE_DOUBLE, 
+156 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[0][3] ) }, 
+157 	{ "sto_xyz10", G_TYPE_DOUBLE, 
+158 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[1][0] ) }, 
+159 	{ "sto_xyz11", G_TYPE_DOUBLE, 
+160 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[1][1] ) }, 
+161 	{ "sto_xyz12", G_TYPE_DOUBLE, 
+162 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[1][2] ) }, 
+163 	{ "sto_xyz13", G_TYPE_DOUBLE, 
+164 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[1][3] ) }, 
+165 	{ "sto_xyz20", G_TYPE_DOUBLE, 
+166 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[2][0] ) }, 
+167 	{ "sto_xyz21", G_TYPE_DOUBLE, 
+168 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[2][1] ) }, 
+169 	{ "sto_xyz22", G_TYPE_DOUBLE, 
+170 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[2][2] ) }, 
+171 	{ "sto_xyz23", G_TYPE_DOUBLE, 
+172 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[2][3] ) }, 
+173 	{ "sto_xyz30", G_TYPE_DOUBLE, 
+174 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[3][0] ) }, 
+175 	{ "sto_xyz31", G_TYPE_DOUBLE, 
+176 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[3][1] ) }, 
+177 	{ "sto_xyz32", G_TYPE_DOUBLE, 
+178 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[3][2] ) }, 
+179 	{ "sto_xyz33", G_TYPE_DOUBLE, 
+180 		G_STRUCT_OFFSET( nifti_image, sto_xyz.m[3][3] ) }, 
+181 	{ "toffset", G_TYPE_DOUBLE, 
+182 		G_STRUCT_OFFSET( nifti_image, toffset ) }, 
+183 	{ "xyz_units", G_TYPE_INT, 
+184 		G_STRUCT_OFFSET( nifti_image, xyz_units ) }, 
+185 	{ "time_units", G_TYPE_INT, 
+186 		G_STRUCT_OFFSET( nifti_image, time_units ) }, 
+187 	{ "nifti_type", G_TYPE_INT, 
+188 		G_STRUCT_OFFSET( nifti_image, nifti_type ) }, 
+189 	{ "intent_code", G_TYPE_INT, 
+190 		G_STRUCT_OFFSET( nifti_image, intent_code ) }, 
+191 	{ "intent_p1", G_TYPE_DOUBLE, 
+192 		G_STRUCT_OFFSET( nifti_image, intent_p1 ) }, 
+193 	{ "intent_p2", G_TYPE_DOUBLE, 
+194 		G_STRUCT_OFFSET( nifti_image, intent_p2 ) }, 
+195 	{ "intent_p3", G_TYPE_DOUBLE, 
+196 		G_STRUCT_OFFSET( nifti_image, intent_p3 ) }, 
+197 };
+198 void *
+199 vips__foreign_nifti_map( VipsNiftiMapFn fn, void *a, void *b )
+200 {
+201 	int i;
+202 	void *result;
+203 	for( i = 0; i &lt; VIPS_NUMBER( vips_foreign_nifti_fields ); i++ ) {
+204 		GValue value = { 0 };
+205 		g_value_init( &amp;value, vips_foreign_nifti_fields[i].type );
+206 		result = fn( vips_foreign_nifti_fields[i].name, &amp;value,
+207 			vips_foreign_nifti_fields[i].offset, a, b );
+208 		g_value_unset( &amp;value );
+209 		if( result )
+210 			return( result );
+211 	}
+212 	return( NULL );
+213 }
+214 static void
+215 vips_gvalue_read( GValue *value, void *p )
+216 {
+217 	switch( G_VALUE_TYPE( value ) ) {
+218 	case G_TYPE_INT:
+219 		g_value_set_int( value, *((int *) p) );
+220 		break;
+221 	case G_TYPE_DOUBLE:
+222 		g_value_set_double( value, *((float *) p) );
+223 		break;
+224 	default:
+225 		g_warning( "vips_gvalue_read: unsupported GType %s", 
+226 			g_type_name( G_VALUE_TYPE( value ) ) );
+227 	}
+228 }
+229 static void *
+230 vips_foreign_load_nifti_set( const char *name, GValue *value, glong offset,
+231 	void *a, void *b )
+232 {
+233 	nifti_image *nim = (nifti_image *) a;
+234 	VipsImage *out = VIPS_IMAGE( b );
+235 	char vips_name[256];
+236 	vips_gvalue_read( value, (gpointer) nim + offset );
+237 	vips_snprintf( vips_name, 256, "nifti-%s", name );
+238 	vips_image_set( out, vips_name, value );
+239 	return( NULL );
+240 }
+241 static int
+242 vips_foreign_load_nifti_set_header( VipsForeignLoadNifti *nifti,
+243 	nifti_image *nim, VipsImage *out )
+244 {
+245 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( nifti );
+246 	guint width;
+247 	guint height;
+248 	guint bands;
+249 	VipsBandFormat fmt;
+250 	double xres;
+251 	double yres;
+252 	int i;
+253 	char txt[256];
+254 	if( nim-&gt;ndim &lt; 1 ||
+255 		nim-&gt;ndim &gt; 7 ) {
+256 		vips_error( class-&gt;nickname, 
+257 			_( "%d-dimensional images not supported" ), 
+258 			nim-&gt;ndim ); 
+259 		return( 0 );
+260 	}
+261 	for( i = 1; i &lt; 8 &amp;&amp; i &lt; nim-&gt;ndim + 1; i++ ) {
+262 		if( nim-&gt;dim[i] &lt;= 0 ) {
+263 			vips_error( class-&gt;nickname, 
+264 				"%s", _( "invalid dimension" ) ); 
+265 			return( 0 );
+266 		}
+267 		if( nim-&gt;dim[i] &gt; 1 &amp;&amp; 
+268 			nim-&gt;pixdim[i] == 0 ) {
+269 			vips_error( class-&gt;nickname, 
+270 				"%s", _( "invalid resolution" ) ); 
+271 			return( 0 );
+272 		}
+273 	}
+274 	bands = 1;
+275 	width = (guint) nim-&gt;nx;
+276 	height = (guint) nim-&gt;ny;
+277 	for( i = 3; i &lt; 8 &amp;&amp; i &lt; nim-&gt;ndim + 1; i++ )
+278 		if( !g_uint_checked_mul( &amp;height, height, nim-&gt;dim[i] ) ) {
+279 			vips_error( class-&gt;nickname, 
+280 				"%s", _( "dimension overflow" ) ); 
+281 			return( 0 );
+282 		}
+283 	if( height &gt; INT_MAX ) {
+284 		vips_error( class-&gt;nickname, "%s", _( "dimension overflow" ) ); 
+285 		return( 0 );
+286 	}
+287 	fmt = vips__foreign_nifti_datatype2BandFmt( nim-&gt;datatype );
+288 	if( fmt == VIPS_FORMAT_NOTSET ) { 
+289 		vips_error( class-&gt;nickname, 
+290 			_( "datatype %d not supported" ), nim-&gt;datatype );
+291 		return( -1 );
+292 	}
+293 	if( nim-&gt;datatype == DT_RGB )
+294 		bands = 3;
+295 	if( nim-&gt;datatype == DT_RGBA32 )
+296 		bands = 4;
+297 	xres = 1.0;
+298 	yres = 1.0;
+299 	if( nim-&gt;nz == 1 ||
+300 		nim-&gt;dz == nim-&gt;dy ) 
+301 		switch( nim-&gt;xyz_units ) {
+302 		case NIFTI_UNITS_METER:
+303 			xres = 1000.0 / nim-&gt;dx; 
+304 			yres = 1000.0 / nim-&gt;dy; 
+305 			break; 
+306 		case NIFTI_UNITS_MM:
+307 			xres = 1.0 / nim-&gt;dx; 
+308 			yres = 1.0 / nim-&gt;dy; 
+309 			break;
+310 		case NIFTI_UNITS_MICRON:
+311 			xres = 1.0 / (1000.0 * nim-&gt;dx); 
+312 			yres = 1.0 / (1000.0 * nim-&gt;dy); 
+313 			break;
+314 		default:
+315 			break;
+316 		}
+317 #ifdef DEBUG
+318 	printf( "get_vips_properties: width = %d\n", width );
+319 	printf( "get_vips_properties: height = %d\n", height );
+320 	printf( "get_vips_properties: bands = %d\n", bands );
+321 	printf( "get_vips_properties: fmt = %d\n", fmt );
+322 	vips_image_pipelinev( out, VIPS_DEMAND_STYLE_SMALLTILE, NULL );
+323 	vips_image_init_fields( out,
+324 		width, height, bands, fmt, 
+325 		VIPS_CODING_NONE, 
+326 		bands == 1 ? 
+327 			VIPS_INTERPRETATION_B_W : VIPS_INTERPRETATION_sRGB, 
+328 		xres, yres );
+329 	if( vips__foreign_nifti_map( vips_foreign_load_nifti_set, nim, out ) )
+330 		return( -1 ); 
+331 	vips_strncpy( txt, nim-&gt;intent_name, 17 );
+332 	vips_image_set_string( out, "nifti-intent_name", txt );
+333 	vips_strncpy( txt, nim-&gt;descrip, 81 );
+334 	vips_image_set_string( out, "nifti-descrip", txt );
+335 	for( i = 0; i &lt; nim-&gt;num_ext; i++ ) {
+336 		nifti1_extension *ext = &amp;nim-&gt;ext_list[i];
+337 		vips_snprintf( txt, 256, "nifti-ext-%d-%d", i, ext-&gt;ecode );
+338 		vips_image_set_blob_copy( out, txt, ext-&gt;edata, ext-&gt;esize );
+339 	}
+340 	vips_image_set_int( out, VIPS_META_PAGE_HEIGHT, nim-&gt;ny );
+341 	return( 0 );
+342 }
+343 static int
+344 vips_foreign_load_nifti_header( VipsForeignLoad *load )
+345 {
+346 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( load );
+347 	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) load;
+348 	if( !(nifti-&gt;nim = nifti_image_read( nifti-&gt;filename, FALSE )) ) { 
+349 		vips_error( class-&gt;nickname, 
+350 			"%s", _( "unable to read NIFTI header" ) );
+351 		return( 0 );
+352 	}
+353 	if( vips_foreign_load_nifti_set_header( nifti, 
+354 		nifti-&gt;nim, load-&gt;out ) ) {
+355 		return( -1 );
+356 	}
+357 	VIPS_SETSTR( load-&gt;out-&gt;filename, nifti-&gt;filename );
+358 	return( 0 );
+359 }
+360 static int
+361 vips_foreign_load_nifti_load( VipsForeignLoad *load )
+362 {
+363 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( load );
+364 	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) load;
+365 #ifdef DEBUG
+366 	printf( "vips_foreign_load_nifti_load: loading image\n" );
+367 	if( nifti_image_load( nifti-&gt;nim ) ) {
+368 		vips_error( class-&gt;nickname, 
+369 			"%s", _( "unable to load NIFTI file" ) );
+370 		return( -1 );
+371 	}
+372 	if( !(nifti-&gt;memory = vips_image_new_from_memory( 
+373 		nifti-&gt;nim-&gt;data, VIPS_IMAGE_SIZEOF_IMAGE( load-&gt;out ),
+374 		load-&gt;out-&gt;Xsize, load-&gt;out-&gt;Ysize, 
+375 		load-&gt;out-&gt;Bands, load-&gt;out-&gt;BandFmt )) ) 
+376 		return( -1 );
+377 	if( vips_image_write( nifti-&gt;memory, load-&gt;real ) )
+378 		return( -1 );
+379 	return( 0 );
+380 }
+381 static void
+382 <a name="0"></a>vips_foreign_load_nifti_class_init( VipsForeignLoadNiftiClass *class )
+383 {
+384 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+385 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	VipsObjectClass *object_class = (VipsObjectClass *) class;
+386 	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
+387 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+388 	gobject_class-&gt;dispose = vips_foreign_load_nifti_dispose;
+389 	gobject_class-&gt;set_property = vips_object_set_property;
+390 	gobject_class-&gt;get_property = vips_object_get_property;
+391 	object_class-&gt;nickname = "niftiload_base";
+392 	object_class-&gt;description = _( "load a NIFTI image" );
+393 	object_class-&gt;build = vips_foreign_load_nifti_build;
+394 	foreign_class-&gt;priority = -50;
+395 	load_class-&gt;header = vips_foreign_load_nifti_header;
+396 	load_class-&gt;load = vips_foreign_load_nifti_load;
+397 }
+398 static void
+399 vips_foreign_load_nifti_init( VipsForeignLoadNifti *nifti )
+400 {
+401 }
+402 typedef struct _VipsForeignLoadNiftiFile {
+403 	VipsForeignLoadNifti parent_object;
+404 	char *filename; 
+405 } VipsForeignLoadNiftiFile;
+406 typedef VipsForeignLoadNiftiClass VipsForeignLoadNiftiFileClass;
+407 G_DEFINE_TYPE( VipsForeignLoadNiftiFile, vips_foreign_load_nifti_file, 
+408 	vips_foreign_load_nifti_get_type() );
+409 static int
+410 vips_foreign_load_nifti_file_build( VipsObject *object )
+411 {
+412 	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) object;
+413 	VipsForeignLoadNiftiFile *file = (VipsForeignLoadNiftiFile *) object;
+414 	if( file-&gt;filename &amp;&amp;
+415 		!(nifti-&gt;source = 
+416 			vips_source_new_from_file( file-&gt;filename )) )
+417 		return( -1 );
+418 	if( VIPS_OBJECT_CLASS( vips_foreign_load_nifti_file_parent_class )-&gt;
+419 		build( object ) )
+420 		return( -1 );
+421 	return( 0 );
+422 }
+423 const char *vips_foreign_nifti_suffs[] = { 
+424 	".nii", ".nii.gz", 
+425 	".hdr", ".hdr.gz", 
+426 	".img", ".img.gz", 
+427 	".nia", ".nia.gz", 
+428 	NULL 
+429 };
+430 static int
+431 vips_foreign_load_nifti_is_a( const char *filename )
+432 {</b></font>
+433 	char *hfile;
+434 	znzFile fp;
+435 	nifti_1_header nhdr;
+436 	if( !(hfile = nifti_findhdrname( filename )) )
+437 		return( 0 );
+438 	fp = znzopen( hfile, "rb", nifti_is_gzfile( hfile ));
+439 	if( znz_isnull( fp ) ) { 
+440 		free( hfile );
+441 		return( 0 );
+442 	}
+443 	free( hfile );
+444 	(void) znzread( &amp;nhdr, 1, sizeof( nhdr ), fp );
+445 	znzclose( fp );
+446 <a name="3"></a>	if( nifti_hdr_looks_good( &amp;nhdr ) ) 
+447 		return( 1 );
+448 	swap_nifti_header( &amp;nhdr, FALSE );
+449 <font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if( nifti_hdr_looks_good( &amp;nhdr ) ) 
+450 		return( 1 );
+451 	return( 0 );
+452 }
+453 static void
+454 vips_foreign_load_nifti_file_class_init( 
+455 	VipsForeignLoadNiftiFileClass *class )
+456 {
+457 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+458 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+459 	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
+460 <a name="1"></a>	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;</b></font>
+461 	gobject_class-&gt;set_property = vips_object_set_property;
+462 <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	gobject_class-&gt;get_property = vips_object_get_property;
+463 	object_class-&gt;nickname = "niftiload";
+464 	object_class-&gt;description = _( "load NIfTI volume" );
+465 	object_class-&gt;build = vips_foreign_load_nifti_file_build;
+466 	foreign_class-&gt;suffs = vips_foreign_nifti_suffs;
+467 	load_class-&gt;is_a = vips_foreign_load_nifti_is_a;
+468 	VIPS_ARG_STRING( class, "filename", 1, 
+469 		_( "Filename" ),
+470 		_( "Filename to load from" ),
+471 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+472 		G_STRUCT_OFFSET( VipsForeignLoadNiftiFile, filename ),
+473 		NULL );
+474 }
+475 static void
+476 vips_foreign_load_nifti_file_init( VipsForeignLoadNiftiFile *nifti )
+477 {
+478 }
+479 typedef struct _VipsForeignLoadNiftiSource {
+480 	VipsForeignLoadNifti parent_object;
+481 	VipsSource *source;
+482 } VipsForeignLoadNiftiSource;
+483 typedef VipsForeignLoadNiftiClass VipsForeignLoadNiftiSourceClass;
+484 G_DEFINE_TYPE( VipsForeignLoadNiftiSource, vips_foreign_load_nifti_source, 
+485 	vips_foreign_load_nifti_get_type() );
+486 static int
+487 vips_foreign_load_nifti_source_build( VipsObject *object )
+488 {
+489 	VipsForeignLoadNifti *nifti = (VipsForeignLoadNifti *) object;
+490 	VipsForeignLoadNiftiSource *source = 
+491 		(VipsForeignLoadNiftiSource *) object;
+492 	if( source-&gt;source ) {</b></font>
+493 		nifti-&gt;source = source-&gt;source;
+494 		g_object_ref( nifti-&gt;source );
+495 	}
+496 	if( VIPS_OBJECT_CLASS( 
+497 		vips_foreign_load_nifti_source_parent_class )-&gt;
+498 			build( object ) )
+499 		return( -1 );
+500 	return( 0 );
+501 }
+502 static gboolean
+503 vips_foreign_load_nifti_source_is_a_source( VipsSource *source )
+504 {
+505 	const char *filename;
+506 <a name="2"></a>	return( (filename = 
+507 		vips_connection_filename( VIPS_CONNECTION( source ) )) &amp;&amp;
+508 		vips_foreign_load_nifti_is_a( filename ) );
+509 <font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>}
+510 static void
+511 vips_foreign_load_nifti_source_class_init( 
+512 	VipsForeignLoadNiftiSourceClass *class )
+513 {
+514 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+515 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+516 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+517 	gobject_class-&gt;set_property = vips_object_set_property;
+518 	gobject_class-&gt;get_property = vips_object_get_property;
+519 	object_class-&gt;nickname = "niftiload_source";
+520 	object_class-&gt;description = _( "load NIfTI volumes" );
+521 	object_class-&gt;build = vips_foreign_load_nifti_source_build;</b></font>
+522 	load_class-&gt;is_a_source = 
+523 		vips_foreign_load_nifti_source_is_a_source;
+524 	VIPS_ARG_OBJECT( class, "source", 1,
+525 		_( "Source" ),
+526 		_( "Source to load from" ),
+527 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+528 		G_STRUCT_OFFSET( VipsForeignLoadNiftiSource, source ),
+529 		VIPS_TYPE_SOURCE );
+530 }
+531 static void
+532 vips_foreign_load_nifti_source_init( 
+533 	VipsForeignLoadNiftiSource *nifti )
+534 {
+535 }
+536 int
+537 vips_niftiload( const char *filename, VipsImage **out, ... )
+538 {
+539 	va_list ap;
+540 	int result;
+541 	va_start( ap, out );
+542 	result = vips_call_split( "niftiload", ap, filename, out );
+543 	va_end( ap );
+544 	return( result );
+545 }
+546 int
+547 vips_niftiload_source( VipsSource *source, VipsImage **out, ... )
+548 {
+549 	va_list ap;
+550 	int result;
+551 	va_start( ap, out );
+552 	result = vips_call_split( "niftiload_source", ap, source, out );
+553 	va_end( ap );
+554 	return( result );
+555 }
 </pre>
 </div>
 </div>

@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for pmsnare.c &amp; omfile-hardened.c</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -42,450 +41,291 @@ Matches for pmsnare.c &amp; omfile-hardened.c
 </h3>
 <hr/>
 <pre>
-/* pmsnare.c
- *
- * this detects logs sent by Snare and cleans them up so that they can be processed by the normal parser
- *
- * there are two variations of this, if the client is set to 'syslog' mode it sends
- *
- * &lt;pri&gt;timestamp&lt;sp&gt;hostname&lt;sp&gt;tag&lt;tab&gt;otherstuff
- *
- * if the client is not set to syslog it sends
- *
- * hostname&lt;tab&gt;tag&lt;tab&gt;otherstuff
- *
- * The tabs can be represented in different ways. This module will auto-detect the tab representation based on
- * the global config settings, but they can be overridden for each instance in the config file if needed.
- *
- * ToDo, take advantage of items in the message itself to set more friendly information
- * where the normal parser will find it by re-writing more of the message
- *
- * Interesting information includes:
- *
- * in the case of windows snare messages:
- *   the system hostname is field 12
- *   the severity is field 3 (criticality ranging form 0 to 4)
- *   the source of the log is field 4 and may be able to be mapped to facility
- *
- *
- * created 2010-12-13 by David Lang based on pmlastmsg
- * Modified 2017-05-29 by Shane Lawrence.
- *
- * This file is part of rsyslog.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *       http://www.apache.org/licenses/LICENSE-2.0
- *       -or-
- *       see COPYING.ASL20 in the source distribution
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-#include "config.h"
-#include "rsyslog.h"
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;ctype.h&gt;
-#include "conf.h"
-#include "syslogd-types.h"
-#include "template.h"
-#include "msg.h"
-#include "module-template.h"
-#include "glbl.h"
-#include "errmsg.h"
-#include "parser.h"
-#include "datetime.h"
-#include "unicode-helper.h"
-#include "rsconf.h"
-
-MODULE_TYPE_PARSER
-MODULE_TYPE_NOKEEP
-PARSER_NAME("rsyslog.snare")
-MODULE_CNFNAME("pmsnare")
-
-/* internal structures
- */
-DEF_PMOD_STATIC_DATA
-DEFobjCurrIf(glbl)
-DEFobjCurrIf(parser)
-DEFobjCurrIf(datetime)
-
-
-/* static data */
-static int bParseHOSTNAMEandTAG;	/* cache for the equally-named global param - performance enhancement */
-
-/* Keep a list of parser instances so we can apply global settings after config is loaded. */
-typedef struct modInstances_s {
-	instanceConf_t *root;
-	instanceConf_t *tail;
-} modInstances_t;
-static modInstances_t *modInstances = NULL;
-
-struct modConfData_s {
-	rsconf_t *pConf;	/* our overall config object */
-};
-static modConfData_t *modConf = NULL;
-<a name="1"></a>
-/* Per-instance config settings. */
-static struct cnfparamdescr parserpdescr[] = {
-<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "parser.controlcharacterescapeprefix", eCmdHdlrGetChar, 0 },
-	{ "parser.escapecontrolcharactersonreceive", eCmdHdlrBinary, 0 },
-	{ "parser.escapecontrolcharactertab", eCmdHdlrBinary, 0},
-	{ "parser.escapecontrolcharacterscstyle", eCmdHdlrBinary, 0 }
-};
-static struct cnfparamblk parserpblk = {
-	CNFPARAMBLK_VERSION,
-	sizeof(parserpdescr)/sizeof(struct cnfparamdescr),
-	parserpdescr
-};</b></font>
-struct instanceConf_s {
-	int bEscapeCCOnRcv;
-	int bEscapeTab;
-	int bParserEscapeCCCStyle;
-	uchar cCCEscapeChar;
-	int tabLength;
-	char tabRepresentation[5];
-	struct instanceConf_s *next;
-};
-
-/* Creates the instance and adds it to the list of instances. */
-static rsRetVal createInstance(instanceConf_t **pinst) {
-	instanceConf_t *inst;
-	DEFiRet;
-	CHKmalloc(inst = malloc(sizeof(instanceConf_t)));
-	inst-&gt;next = NULL;
-	*pinst = inst;
-
-	/*  Add to list of instances. */
-	if(modInstances == NULL) {
-		CHKmalloc(modInstances = malloc(sizeof(modInstances_t)));
-		modInstances-&gt;tail = modInstances-&gt;root = NULL;
-	}
-	if (modInstances-&gt;tail == NULL) {
-		modInstances-&gt;tail = modInstances-&gt;root = inst;
-	} else {
-		modInstances-&gt;tail-&gt;next = inst;
-		modInstances-&gt;tail = inst;
-	}
-
-	finalize_it:
-	RETiRet;
-}
-
-BEGINnewParserInst
-	struct cnfparamvals *pvals = NULL;
-	int i;
-CODESTARTnewParserInst
-	DBGPRINTF("newParserInst (pmsnare)\n");
-	inst = NULL;
-	CHKiRet(createInstance(&amp;inst));
-
-	/* Mark these as unset so we know if they should be overridden later. */
-	inst-&gt;bEscapeCCOnRcv = -1;
-	inst-&gt;bEscapeTab = -1;
-	inst-&gt;bParserEscapeCCCStyle = -1;
-	inst-&gt;cCCEscapeChar = '\0';
-
-	/* If using the old config, just use global settings for each instance. */
-	if (lst == NULL)
-<a name="0"></a>		FINALIZE;
-
-	/* If using the new config, process module settings for this instance. */
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if((pvals = nvlstGetParams(lst, &amp;parserpblk, NULL)) == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	if(Debug) {
-		dbgprintf("pmsnare: parser param blk:\n");
-		cnfparamsPrint(&amp;parserpblk, pvals);
-	}
-
-	for(i = 0 ; i &lt; parserpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(parserpblk.descr[i].name, "parser.escapecontrolcharactersonreceive")) {
-			inst-&gt;bEscapeCCOnRcv = pvals[i].val.d.n;
-		} else if(!strcmp(parserpblk.descr[i].name, "parser.escapecontrolcharactertab")) {
-			inst-&gt;bEscapeTab = pvals[i].val.d.n;</b></font>
-		} else if(!strcmp(parserpblk.descr[i].name, "parser.escapecontrolcharacterscstyle")) {
-			inst-&gt;bParserEscapeCCCStyle = pvals[i].val.d.n;
-		} else if(!strcmp(parserpblk.descr[i].name, "parser.controlcharacterescapeprefix")) {
-			inst-&gt;cCCEscapeChar = (uchar) *es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else {
-			dbgprintf("pmsnare: program error, non-handled param '%s'\n", parserpblk.descr[i].name);
-		}
-	}
-
-finalize_it:
-CODE_STD_FINALIZERnewParserInst
-	if(lst != NULL)
-		cnfparamvalsDestruct(pvals, &amp;parserpblk);
-	if(iRet != RS_RET_OK)
-		free(inst);
-ENDnewParserInst
-
-BEGINfreeParserInst
-CODESTARTfreeParserInst
-	dbgprintf("pmsnare: free parser instance %p\n", pInst);
-ENDfreeParserInst
-
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATUREAutomaticSanitazion)
-		iRet = RS_RET_OK;
-	if(eFeat == sFEATUREAutomaticPRIParsing)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-
-/* Interface with the global config. */
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	modConf = pModConf;
-	pModConf-&gt;pConf = pConf;
-ENDbeginCnfLoad
-
-BEGINsetModCnf
-CODESTARTsetModCnf
-	/* Could use module-globals here, but not global globals. */
-	(void) lst;
-ENDsetModCnf
-
-BEGINendCnfLoad
-	instanceConf_t *inst;
-CODESTARTendCnfLoad
-	dbgprintf("pmsnare: Begin endCnfLoad\n");
-	/* Loop through each parser instance and apply global settings to any option that hasn't been overridden.
-	 * This can't be done any earlier because the config wasn't fully loaded until now. */
-	for(inst = modInstances-&gt;root; inst != NULL; inst = inst-&gt;next) {
-		if(inst-&gt;bEscapeCCOnRcv == -1)
-			inst-&gt;bEscapeCCOnRcv = glbl.GetParserEscapeControlCharactersOnReceive(modConf-&gt;pConf);
-		if(inst-&gt;bEscapeTab == -1)
-			inst-&gt;bEscapeTab = glbl.GetParserEscapeControlCharacterTab(modConf-&gt;pConf);
-		if(inst-&gt;bParserEscapeCCCStyle == -1)
-			inst-&gt;bParserEscapeCCCStyle = glbl.GetParserEscapeControlCharactersCStyle(modConf-&gt;pConf);
-		if(inst-&gt;cCCEscapeChar == '\0')
-			inst-&gt;cCCEscapeChar = glbl.GetParserControlCharacterEscapePrefix(modConf-&gt;pConf);
-
-		/* Determine tab representation. Possible options:
-		 *		"#011"	escape on, escapetabs on, no change to prefix (default)
-		 *		"?011"	prefix changed in config
-		 *		"\\t"	C style
-		 *		'\t' 	escape turned off
-		 */
-		if (inst-&gt;bEscapeCCOnRcv &amp;&amp; inst-&gt;bEscapeTab) {
-			if (inst-&gt;bParserEscapeCCCStyle) {
-				strncpy(inst-&gt;tabRepresentation, "\\t", 5);
-			} else {
-				strncpy(inst-&gt;tabRepresentation, "#011", 5);
-				inst-&gt;tabRepresentation[0] = inst-&gt;cCCEscapeChar;
-			}
-		} else {
-			strncpy(inst-&gt;tabRepresentation, "\t", 5);
-		}
-		inst-&gt;tabLength=strlen(inst-&gt;tabRepresentation);
-		/* TODO: This debug message would be more useful if it told which Snare instance! */
-		dbgprintf("pmsnare: Snare parser will treat '%s' as tab.\n", inst-&gt;tabRepresentation);
-	}
-
-	assert(pModConf == modConf);
-ENDendCnfLoad
-
-BEGINcheckCnf
-CODESTARTcheckCnf
-ENDcheckCnf
-
-BEGINactivateCnf
-CODESTARTactivateCnf
-ENDactivateCnf
-
-BEGINfreeCnf
-	instanceConf_t *inst, *del;
-CODESTARTfreeCnf
-	for(inst = modInstances-&gt;root ; inst != NULL ; ) {
-		del = inst;
-		inst = inst-&gt;next;
-		free(del);
-	}
-	free(modInstances);
-ENDfreeCnf
-
-BEGINparse2
-	uchar *p2parse;
-	int lenMsg;
-	int snaremessage; /* 0 means not a snare message, otherwise it's the index of the tab after the tag  */
-
-CODESTARTparse2
-	dbgprintf("Message will now be parsed by fix Snare parser.\n");
-	assert(pMsg != NULL);
-	assert(pMsg-&gt;pszRawMsg != NULL);
-
-	/* check if this message is of the type we handle in this (very limited) parser
-	 *
-	 * - Find out if the first separator is a tab.
-	 * - If it is, see if the second word is one of our expected tags.
-	 *   - If so, flag as Snare and replace the first tab with space so that
-	 *     hostname and syslog tag are going to be parsed properly
-	 *   - Else not a snare message, abort.
-	 * - Else assume valid 3164 timestamp, move over to the syslog tag.
-	 * - See if syslog header is followed by tab and one of our expected tags.
-	 *   - If so, flag as Snare.
-	 * - See if either type flagged as Snare.
-	 *   - If so, replace the tab with a space so that it will be parsed properly.
-	 */
-
-	snaremessage=0;
-	/* note: offAfterPRI is already the number of PRI chars (do not add one!) */
-	lenMsg = pMsg-&gt;iLenRawMsg - pMsg-&gt;offAfterPRI;
-	/* point to start of text, after PRI */
-	p2parse = pMsg-&gt;pszRawMsg + pMsg-&gt;offAfterPRI;
-	dbgprintf("pmsnare: msg to look at: [%d]'%s'\n", lenMsg, p2parse);
-	if((unsigned) lenMsg &lt; 30) {
-		/* too short, can not be "our" message */
-		dbgprintf("pmsnare: Message is too short to be Snare!\n");
-		ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
-	}
-
-	/* Find the first separator and check if it's a tab. */
-	while(lenMsg &amp;&amp; *p2parse != ' ' &amp;&amp; *p2parse != '\t' &amp;&amp; *p2parse != pInst-&gt;tabRepresentation[0]) {
-		--lenMsg;
-		++p2parse;
-	}
-	if ((lenMsg &gt; pInst-&gt;tabLength) &amp;&amp; (strncasecmp((char *)p2parse, pInst-&gt;tabRepresentation,
-			pInst-&gt;tabLength) == 0)) {
-		dbgprintf("pmsnare: tab separated message\n");
-		dbgprintf("pmsnare: tab [%d]'%s'	msg at the first separator: [%d]'%s'\n",
-			pInst-&gt;tabLength, pInst-&gt;tabRepresentation, lenMsg, p2parse);
-
-		/* Look for the Snare tag. */
-		if(strncasecmp((char*)(p2parse + pInst-&gt;tabLength), "MSWinEventLog", 13) == 0) {
-			dbgprintf("Found a non-syslog Windows Snare message.\n");
-			snaremessage = p2parse - pMsg-&gt;pszRawMsg + pInst-&gt;tabLength + 13;
-		}
-		else if(strncasecmp((char*) (p2parse + pInst-&gt;tabLength), "LinuxKAudit", 11) == 0) {
-			dbgprintf("Found a non-syslog Linux Snare message.\n");
-			snaremessage = p2parse - pMsg-&gt;pszRawMsg + pInst-&gt;tabLength + 11;
-		} else {
-			/* Tab-separated but no Snare tag-&gt; can't be Snare! */
-			ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
-		}
-
-		/* This is a non-syslog Snare message. Example:
-		 * other.lab.home	MSWinEventLog	1	Security	606129	Wed May 17 02:25:10 2017
-		 */
-
-		/* Remove the tab between the hostname and Snare tag. */
-		*p2parse = ' ';
-		p2parse++;
-		lenMsg--;
-		lenMsg -= (pInst-&gt;tabLength-1); /* size of tab goes from tabLength to 1, so shorten
-						the message by the difference */
-		memmove(p2parse, p2parse+(pInst-&gt;tabLength-1), lenMsg);
-		/* move the message portion up to overwrite the tab */
-		*(p2parse + lenMsg)	= '\0';
-		pMsg-&gt;iLenRawMsg -= (pInst-&gt;tabLength-1);
-		pMsg-&gt;iLenMSG -= (pInst-&gt;tabLength-1);
-		snaremessage -= (pInst-&gt;tabLength-1);
-	} else {
-		/* The first separator is not a tab. Look for a syslog Snare message. Example:
-		 * &lt;14&gt;May 17 02:25:10 syslog.lab.home MSWinEventLog     1    Security  606129
-			Wed May 17 02:25:10 2017
-		 */
-
-		/* go back to the beginning of the message */
-		lenMsg = pMsg-&gt;iLenRawMsg - pMsg-&gt;offAfterPRI;
-		/* offAfterPRI is already the number of PRI chars (do not add one!) */
-		p2parse = pMsg-&gt;pszRawMsg + pMsg-&gt;offAfterPRI;
-
-		/* skip over timestamp and space (15 chars + space). */
-		lenMsg -=16;
-		p2parse +=16;
-		/* skip over what should be the hostname and space */
-		while(lenMsg &amp;&amp; *p2parse != ' ') {
-			--lenMsg;
-			++p2parse;
-		}
-		if (lenMsg){
-			--lenMsg;
-			++p2parse;
-		}
-		dbgprintf("pmsnare: tab [%d]'%s'	msg after the timestamp and hostname: [%d]'%s'\n",
-				pInst-&gt;tabLength,pInst-&gt;tabRepresentation,lenMsg, p2parse);
-
-		/* Look for the Snare tag. */
-		if(lenMsg &gt; 13 &amp;&amp; strncasecmp((char*) p2parse, "MSWinEventLog", 13) == 0) {
-			dbgprintf("Found a syslog Windows Snare message.\n");
-			snaremessage = p2parse - pMsg-&gt;pszRawMsg + 13;
-		}
-		else if(lenMsg &gt; 11 &amp;&amp; strncasecmp((char*) p2parse, "LinuxKAudit", 11) == 0) {
-			dbgprintf("pmsnare: Found a syslog Linux Snare message.\n");
-			snaremessage = p2parse - pMsg-&gt;pszRawMsg + 11;
-		}
-	}
-
-	if(snaremessage) {
-		/* Skip to the end of the tag. */
-		p2parse = pMsg-&gt;pszRawMsg + snaremessage;
-		lenMsg = pMsg-&gt;iLenRawMsg - snaremessage;
-
-		/* Remove the tab after the tag. */
-		*p2parse = ' ';
-		p2parse++;
-		lenMsg--;
-		lenMsg -= (pInst-&gt;tabLength-1); /* size of tab goes from tabLength to 1, so shorten
-						the message by the difference */
-		memmove(p2parse, p2parse+(pInst-&gt;tabLength-1), lenMsg);
-		/* move the message portion up to overwrite the tab */
-		*(p2parse + lenMsg) = '\0';
-		pMsg-&gt;iLenRawMsg -= (pInst-&gt;tabLength-1);
-		pMsg-&gt;iLenMSG -= (pInst-&gt;tabLength-1);
-
-		DBGPRINTF("pmsnare: new message: [%d]'%s'\n", lenMsg, pMsg-&gt;pszRawMsg + pMsg-&gt;offAfterPRI);
-	}
-
-	ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
-
-finalize_it:
-ENDparse2
-
-BEGINmodExit
-CODESTARTmodExit
-	/* release what we no longer need */
-	objRelease(glbl, CORE_COMPONENT);
-	objRelease(parser, CORE_COMPONENT);
-	objRelease(datetime, CORE_COMPONENT);
-ENDmodExit
-
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_MOD_QUERIES
-CODEqueryEtryPt_STD_CONF2_QUERIES
-CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
-CODEqueryEtryPt_STD_PMOD2_QUERIES
-CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
-ENDqueryEtryPt
-
-BEGINmodInit()
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
-CODEmodInit_QueryRegCFSLineHdlr
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-	CHKiRet(objUse(parser, CORE_COMPONENT));
-	CHKiRet(objUse(datetime, CORE_COMPONENT));
-
-	DBGPRINTF("snare parser init called, compiled with version %s\n", VERSION);
-	bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG(loadConf);
-	/* cache value, is set only during rsyslogd option processing */
-ENDmodInit
-
-/* vim:set ai:
- */
+1 #include "config.h"
+2 #include "rsyslog.h"
+3 #include &lt;stdlib.h&gt;
+4 #include &lt;string.h&gt;
+5 #include &lt;assert.h&gt;
+6 #include &lt;ctype.h&gt;
+7 #include "conf.h"
+8 #include "syslogd-types.h"
+9 #include "template.h"
+10 #include "msg.h"
+11 #include "module-template.h"
+12 #include "glbl.h"
+13 #include "errmsg.h"
+14 #include "parser.h"
+15 #include "datetime.h"
+16 #include "unicode-helper.h"
+17 #include "rsconf.h"
+18 MODULE_TYPE_PARSER
+19 MODULE_TYPE_NOKEEP
+20 PARSER_NAME("rsyslog.snare")
+21 MODULE_CNFNAME("pmsnare")
+22 DEF_PMOD_STATIC_DATA
+23 DEFobjCurrIf(glbl)
+24 DEFobjCurrIf(parser)
+25 DEFobjCurrIf(datetime)
+26 static int bParseHOSTNAMEandTAG;	
+27 typedef struct modInstances_s {
+28 	instanceConf_t *root;
+29 	instanceConf_t *tail;
+30 } modInstances_t;
+31 static modInstances_t *modInstances = NULL;
+32 struct modConfData_s {
+33 	rsconf_t *pConf;	};
+34 static modConfData_t *modConf = NULL;
+35 <a name="1"></a>
+36 static struct cnfparamdescr parserpdescr[] = {
+37 <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "parser.controlcharacterescapeprefix", eCmdHdlrGetChar, 0 },
+38 	{ "parser.escapecontrolcharactersonreceive", eCmdHdlrBinary, 0 },
+39 	{ "parser.escapecontrolcharactertab", eCmdHdlrBinary, 0},
+40 	{ "parser.escapecontrolcharacterscstyle", eCmdHdlrBinary, 0 }
+41 };
+42 static struct cnfparamblk parserpblk = {
+43 	CNFPARAMBLK_VERSION,
+44 	sizeof(parserpdescr)/sizeof(struct cnfparamdescr),
+45 	parserpdescr
+46 };</b></font>
+47 struct instanceConf_s {
+48 	int bEscapeCCOnRcv;
+49 	int bEscapeTab;
+50 	int bParserEscapeCCCStyle;
+51 	uchar cCCEscapeChar;
+52 	int tabLength;
+53 	char tabRepresentation[5];
+54 	struct instanceConf_s *next;
+55 };
+56 static rsRetVal createInstance(instanceConf_t **pinst) {
+57 	instanceConf_t *inst;
+58 	DEFiRet;
+59 	CHKmalloc(inst = malloc(sizeof(instanceConf_t)));
+60 	inst-&gt;next = NULL;
+61 	*pinst = inst;
+62 	if(modInstances == NULL) {
+63 		CHKmalloc(modInstances = malloc(sizeof(modInstances_t)));
+64 		modInstances-&gt;tail = modInstances-&gt;root = NULL;
+65 	}
+66 	if (modInstances-&gt;tail == NULL) {
+67 		modInstances-&gt;tail = modInstances-&gt;root = inst;
+68 	} else {
+69 		modInstances-&gt;tail-&gt;next = inst;
+70 		modInstances-&gt;tail = inst;
+71 	}
+72 	finalize_it:
+73 	RETiRet;
+74 }
+75 BEGINnewParserInst
+76 	struct cnfparamvals *pvals = NULL;
+77 	int i;
+78 CODESTARTnewParserInst
+79 	DBGPRINTF("newParserInst (pmsnare)\n");
+80 	inst = NULL;
+81 	CHKiRet(createInstance(&amp;inst));
+82 	inst-&gt;bEscapeCCOnRcv = -1;
+83 	inst-&gt;bEscapeTab = -1;
+84 	inst-&gt;bParserEscapeCCCStyle = -1;
+85 	inst-&gt;cCCEscapeChar = '\0';
+86 	if (lst == NULL)
+87 <a name="0"></a>		FINALIZE;
+88 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if((pvals = nvlstGetParams(lst, &amp;parserpblk, NULL)) == NULL) {
+89 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+90 	}
+91 	if(Debug) {
+92 		dbgprintf("pmsnare: parser param blk:\n");
+93 		cnfparamsPrint(&amp;parserpblk, pvals);
+94 	}
+95 	for(i = 0 ; i &lt; parserpblk.nParams ; ++i) {
+96 		if(!pvals[i].bUsed)
+97 			continue;
+98 		if(!strcmp(parserpblk.descr[i].name, "parser.escapecontrolcharactersonreceive")) {
+99 			inst-&gt;bEscapeCCOnRcv = pvals[i].val.d.n;
+100 		} else if(!strcmp(parserpblk.descr[i].name, "parser.escapecontrolcharactertab")) {
+101 			inst-&gt;bEscapeTab = pvals[i].val.d.n;</b></font>
+102 		} else if(!strcmp(parserpblk.descr[i].name, "parser.escapecontrolcharacterscstyle")) {
+103 			inst-&gt;bParserEscapeCCCStyle = pvals[i].val.d.n;
+104 		} else if(!strcmp(parserpblk.descr[i].name, "parser.controlcharacterescapeprefix")) {
+105 			inst-&gt;cCCEscapeChar = (uchar) *es_str2cstr(pvals[i].val.d.estr, NULL);
+106 		} else {
+107 			dbgprintf("pmsnare: program error, non-handled param '%s'\n", parserpblk.descr[i].name);
+108 		}
+109 	}
+110 finalize_it:
+111 CODE_STD_FINALIZERnewParserInst
+112 	if(lst != NULL)
+113 		cnfparamvalsDestruct(pvals, &amp;parserpblk);
+114 	if(iRet != RS_RET_OK)
+115 		free(inst);
+116 ENDnewParserInst
+117 BEGINfreeParserInst
+118 CODESTARTfreeParserInst
+119 	dbgprintf("pmsnare: free parser instance %p\n", pInst);
+120 ENDfreeParserInst
+121 BEGINisCompatibleWithFeature
+122 CODESTARTisCompatibleWithFeature
+123 	if(eFeat == sFEATUREAutomaticSanitazion)
+124 		iRet = RS_RET_OK;
+125 	if(eFeat == sFEATUREAutomaticPRIParsing)
+126 		iRet = RS_RET_OK;
+127 ENDisCompatibleWithFeature
+128 BEGINbeginCnfLoad
+129 CODESTARTbeginCnfLoad
+130 	modConf = pModConf;
+131 	pModConf-&gt;pConf = pConf;
+132 ENDbeginCnfLoad
+133 BEGINsetModCnf
+134 CODESTARTsetModCnf
+135 	(void) lst;
+136 ENDsetModCnf
+137 BEGINendCnfLoad
+138 	instanceConf_t *inst;
+139 CODESTARTendCnfLoad
+140 	dbgprintf("pmsnare: Begin endCnfLoad\n");
+141 	for(inst = modInstances-&gt;root; inst != NULL; inst = inst-&gt;next) {
+142 		if(inst-&gt;bEscapeCCOnRcv == -1)
+143 			inst-&gt;bEscapeCCOnRcv = glbl.GetParserEscapeControlCharactersOnReceive(modConf-&gt;pConf);
+144 		if(inst-&gt;bEscapeTab == -1)
+145 			inst-&gt;bEscapeTab = glbl.GetParserEscapeControlCharacterTab(modConf-&gt;pConf);
+146 		if(inst-&gt;bParserEscapeCCCStyle == -1)
+147 			inst-&gt;bParserEscapeCCCStyle = glbl.GetParserEscapeControlCharactersCStyle(modConf-&gt;pConf);
+148 		if(inst-&gt;cCCEscapeChar == '\0')
+149 			inst-&gt;cCCEscapeChar = glbl.GetParserControlCharacterEscapePrefix(modConf-&gt;pConf);
+150 		if (inst-&gt;bEscapeCCOnRcv &amp;&amp; inst-&gt;bEscapeTab) {
+151 			if (inst-&gt;bParserEscapeCCCStyle) {
+152 				strncpy(inst-&gt;tabRepresentation, "\\t", 5);
+153 			} else {
+154 				strncpy(inst-&gt;tabRepresentation, "#011", 5);
+155 				inst-&gt;tabRepresentation[0] = inst-&gt;cCCEscapeChar;
+156 			}
+157 		} else {
+158 			strncpy(inst-&gt;tabRepresentation, "\t", 5);
+159 		}
+160 		inst-&gt;tabLength=strlen(inst-&gt;tabRepresentation);
+161 		dbgprintf("pmsnare: Snare parser will treat '%s' as tab.\n", inst-&gt;tabRepresentation);
+162 	}
+163 	assert(pModConf == modConf);
+164 ENDendCnfLoad
+165 BEGINcheckCnf
+166 CODESTARTcheckCnf
+167 ENDcheckCnf
+168 BEGINactivateCnf
+169 CODESTARTactivateCnf
+170 ENDactivateCnf
+171 BEGINfreeCnf
+172 	instanceConf_t *inst, *del;
+173 CODESTARTfreeCnf
+174 	for(inst = modInstances-&gt;root ; inst != NULL ; ) {
+175 		del = inst;
+176 		inst = inst-&gt;next;
+177 		free(del);
+178 	}
+179 	free(modInstances);
+180 ENDfreeCnf
+181 BEGINparse2
+182 	uchar *p2parse;
+183 	int lenMsg;
+184 	int snaremessage; 
+185 CODESTARTparse2
+186 	dbgprintf("Message will now be parsed by fix Snare parser.\n");
+187 	assert(pMsg != NULL);
+188 	assert(pMsg-&gt;pszRawMsg != NULL);
+189 	snaremessage=0;
+190 	lenMsg = pMsg-&gt;iLenRawMsg - pMsg-&gt;offAfterPRI;
+191 	p2parse = pMsg-&gt;pszRawMsg + pMsg-&gt;offAfterPRI;
+192 	dbgprintf("pmsnare: msg to look at: [%d]'%s'\n", lenMsg, p2parse);
+193 	if((unsigned) lenMsg &lt; 30) {
+194 		dbgprintf("pmsnare: Message is too short to be Snare!\n");
+195 		ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
+196 	}
+197 	while(lenMsg &amp;&amp; *p2parse != ' ' &amp;&amp; *p2parse != '\t' &amp;&amp; *p2parse != pInst-&gt;tabRepresentation[0]) {
+198 		--lenMsg;
+199 		++p2parse;
+200 	}
+201 	if ((lenMsg &gt; pInst-&gt;tabLength) &amp;&amp; (strncasecmp((char *)p2parse, pInst-&gt;tabRepresentation,
+202 			pInst-&gt;tabLength) == 0)) {
+203 		dbgprintf("pmsnare: tab separated message\n");
+204 		dbgprintf("pmsnare: tab [%d]'%s'	msg at the first separator: [%d]'%s'\n",
+205 			pInst-&gt;tabLength, pInst-&gt;tabRepresentation, lenMsg, p2parse);
+206 		if(strncasecmp((char*)(p2parse + pInst-&gt;tabLength), "MSWinEventLog", 13) == 0) {
+207 			dbgprintf("Found a non-syslog Windows Snare message.\n");
+208 			snaremessage = p2parse - pMsg-&gt;pszRawMsg + pInst-&gt;tabLength + 13;
+209 		}
+210 		else if(strncasecmp((char*) (p2parse + pInst-&gt;tabLength), "LinuxKAudit", 11) == 0) {
+211 			dbgprintf("Found a non-syslog Linux Snare message.\n");
+212 			snaremessage = p2parse - pMsg-&gt;pszRawMsg + pInst-&gt;tabLength + 11;
+213 		} else {
+214 			ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
+215 		}
+216 		*p2parse = ' ';
+217 		p2parse++;
+218 		lenMsg--;
+219 		memmove(p2parse, p2parse+(pInst-&gt;tabLength-1), lenMsg);
+220 		*(p2parse + lenMsg)	= '\0';
+221 		pMsg-&gt;iLenRawMsg -= (pInst-&gt;tabLength-1);
+222 		pMsg-&gt;iLenMSG -= (pInst-&gt;tabLength-1);
+223 		snaremessage -= (pInst-&gt;tabLength-1);
+224 	} else {
+225 		lenMsg = pMsg-&gt;iLenRawMsg - pMsg-&gt;offAfterPRI;
+226 		p2parse = pMsg-&gt;pszRawMsg + pMsg-&gt;offAfterPRI;
+227 		lenMsg -=16;
+228 		p2parse +=16;
+229 		while(lenMsg &amp;&amp; *p2parse != ' ') {
+230 			--lenMsg;
+231 			++p2parse;
+232 		}
+233 		if (lenMsg){
+234 			--lenMsg;
+235 			++p2parse;
+236 		}
+237 		dbgprintf("pmsnare: tab [%d]'%s'	msg after the timestamp and hostname: [%d]'%s'\n",
+238 				pInst-&gt;tabLength,pInst-&gt;tabRepresentation,lenMsg, p2parse);
+239 		if(lenMsg &gt; 13 &amp;&amp; strncasecmp((char*) p2parse, "MSWinEventLog", 13) == 0) {
+240 			dbgprintf("Found a syslog Windows Snare message.\n");
+241 			snaremessage = p2parse - pMsg-&gt;pszRawMsg + 13;
+242 		}
+243 		else if(lenMsg &gt; 11 &amp;&amp; strncasecmp((char*) p2parse, "LinuxKAudit", 11) == 0) {
+244 			dbgprintf("pmsnare: Found a syslog Linux Snare message.\n");
+245 			snaremessage = p2parse - pMsg-&gt;pszRawMsg + 11;
+246 		}
+247 	}
+248 	if(snaremessage) {
+249 		p2parse = pMsg-&gt;pszRawMsg + snaremessage;
+250 		lenMsg = pMsg-&gt;iLenRawMsg - snaremessage;
+251 		*p2parse = ' ';
+252 		p2parse++;
+253 		lenMsg--;
+254 		memmove(p2parse, p2parse+(pInst-&gt;tabLength-1), lenMsg);
+255 		*(p2parse + lenMsg) = '\0';
+256 		pMsg-&gt;iLenRawMsg -= (pInst-&gt;tabLength-1);
+257 		pMsg-&gt;iLenMSG -= (pInst-&gt;tabLength-1);
+258 		DBGPRINTF("pmsnare: new message: [%d]'%s'\n", lenMsg, pMsg-&gt;pszRawMsg + pMsg-&gt;offAfterPRI);
+259 	}
+260 	ABORT_FINALIZE(RS_RET_COULD_NOT_PARSE);
+261 finalize_it:
+262 ENDparse2
+263 BEGINmodExit
+264 CODESTARTmodExit
+265 	objRelease(glbl, CORE_COMPONENT);
+266 	objRelease(parser, CORE_COMPONENT);
+267 	objRelease(datetime, CORE_COMPONENT);
+268 ENDmodExit
+269 BEGINqueryEtryPt
+270 CODESTARTqueryEtryPt
+271 CODEqueryEtryPt_STD_MOD_QUERIES
+272 CODEqueryEtryPt_STD_CONF2_QUERIES
+273 CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+274 CODEqueryEtryPt_STD_PMOD2_QUERIES
+275 CODEqueryEtryPt_IsCompatibleWithFeature_IF_OMOD_QUERIES
+276 ENDqueryEtryPt
+277 BEGINmodInit()
+278 CODESTARTmodInit
+279 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+280 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+281 	CHKiRet(objUse(parser, CORE_COMPONENT));
+282 	CHKiRet(objUse(datetime, CORE_COMPONENT));
+283 	DBGPRINTF("snare parser init called, compiled with version %s\n", VERSION);
+284 	bParseHOSTNAMEandTAG = glbl.GetParseHOSTNAMEandTAG(loadConf);
+285 ENDmodInit
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -498,1660 +338,1133 @@ ENDmodInit
 </h3>
 <hr/>
 <pre>
-/* omfile.c
- * This is the implementation of the build-in file output module.
- *
- * NOTE: read comments in module-template.h to understand how this file
- *       works!
- *
- * File begun on 2007-07-21 by RGerhards (extracted from syslogd.c, which
- * at the time of the fork from sysklogd was under BSD license)
- *
- * A large re-write of this file was done in June, 2009. The focus was
- * to introduce many more features (like zipped writing), clean up the code
- * and make it more reliable. In short, that rewrite tries to provide a new
- * solid basis for the next three to five years to come. During it, bugs
- * may have been introduced ;) -- rgerhards, 2009-06-04
- *
- * Note that as of 2010-02-28 this module does no longer handle
- * pipes. These have been moved to ompipe, to reduced the entanglement
- * between the two different functionalities. -- rgerhards
- *
- * Copyright 2007-2017 Adiscon GmbH.
- *
- * This file is part of rsyslog.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *       http://www.apache.org/licenses/LICENSE-2.0
- *       -or-
- *       see COPYING.ASL20 in the source distribution
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-#include "config.h"
-#include "rsyslog.h"
-#include "glbl.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;time.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;ctype.h&gt;
-#include &lt;libgen.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;sys/file.h&gt;
-#include &lt;fcntl.h&gt;
-#include &lt;sys/statvfs.h&gt;
-#ifdef HAVE_ATOMIC_BUILTINS
-#	include &lt;pthread.h&gt;
-#endif
-
-
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "template.h"
-#include "outchannel.h"
-#include "omfile.h"
-#include "cfsysline.h"
-#include "module-template.h"
-#include "errmsg.h"
-#include "stream.h"
-#include "unicode-helper.h"
-#include "atomic.h"
-#include "statsobj.h"
-#include "sigprov.h"
-#include "cryprov.h"
-#include "parserif.h"
-#include "janitor.h"
-#include "rsconf.h"
-
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("omfile")
-
-/* forward definitions */
-static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal);
-
-/* internal structures
- */
-DEF_OMOD_STATIC_DATA
-DEFobjCurrIf(glbl)
-DEFobjCurrIf(strm)
-DEFobjCurrIf(statsobj)
-
-/* for our current LRU mechanism, we need a monotonically increasing counters. We use
- * it much like a "Lamport logical clock": we do not need the actual time, we just need
- * to know the sequence in which files were accessed. So we use a simple counter to
- * create that sequence. We use an unsigned 64 bit value which is extremely unlike to
- * wrap within the lifetime of a process. If we process 1,000,000 file writes per
- * second, the process could still exist over 500,000 years before a wrap to 0 happens.
- * That should be sufficient (and even than, there would no really bad effect ;)).
- * The variable below is the global counter/clock.
- */
-#if HAVE_ATOMIC_BUILTINS64
-static uint64 clockFileAccess = 0;
-#else
-static unsigned clockFileAccess = 0;
-#endif
-/* and the "tick" function */
-#ifndef HAVE_ATOMIC_BUILTINS
-static pthread_mutex_t mutClock;
-#endif
-static uint64
-getClockFileAccess(void)
-{
-#if HAVE_ATOMIC_BUILTINS64
-	return ATOMIC_INC_AND_FETCH_uint64(&amp;clockFileAccess, &amp;mutClock);
-#else
-	return ATOMIC_INC_AND_FETCH_unsigned(&amp;clockFileAccess, &amp;mutClock);
-#endif
-}
-
-
-/* The following structure is a dynafile name cache entry.
- */
-struct s_dynaFileCacheEntry {
-	uchar *pName;		/* name currently open, if dynamic name */
-	strm_t	*pStrm;		/* our output stream */
-	void	*sigprovFileData;	/* opaque data ptr for provider use */
-	uint64	clkTickAccessed;/* for LRU - based on clockFileAccess */
-	short nInactive;	/* number of minutes not writen - for close timeout */
-};
-typedef struct s_dynaFileCacheEntry dynaFileCacheEntry;
-
-
-#define IOBUF_DFLT_SIZE 4096	/* default size for io buffers */
-#define FLUSH_INTRVL_DFLT 1 	/* default buffer flush interval (in seconds) */
-#define USE_ASYNCWRITER_DFLT 0 	/* default buffer use async writer */
-#define FLUSHONTX_DFLT 1 	/* default for flush on TX end */
-
-typedef struct _instanceData {
-	pthread_mutex_t mutWrite; /* guard against multiple instances writing to single file */
-	uchar	*fname;	/* file or template name (display only) */
-	uchar 	*tplName;	/* name of assigned template */
-	strm_t	*pStrm;		/* our output stream */
-	short nInactive;	/* number of minutes not writen (STATIC files only) */
-	char	bDynamicName;	/* 0 - static name, 1 - dynamic name (with properties) */
-	int	fCreateMode;	/* file creation mode for open() */
-	int	fDirCreateMode;	/* creation mode for mkdir() */
-	int	bCreateDirs;	/* auto-create directories? */
-	int	bSyncFile;	/* should the file by sync()'ed? 1- yes, 0- no */
-	uint8_t iNumTpls;	/* number of tpls we use */
-	uid_t	fileUID;	/* IDs for creation */
-	uid_t	dirUID;
-	gid_t	fileGID;
-	gid_t	dirGID;
-	int	bFailOnChown;	/* fail creation if chown fails? */
-	uchar 	*sigprovName;	/* signature provider */
-	uchar 	*sigprovNameFull;/* full internal signature provider name */
-	sigprov_if_t sigprov;	/* ptr to signature provider interface */
-	void	*sigprovData;	/* opaque data ptr for provider use */
-	void 	*sigprovFileData;/* opaque data ptr for file instance */
-	sbool	useSigprov;	/* quicker than checkig ptr (1 vs 8 bytes!) */
-	uchar 	*cryprovName;	/* crypto provider */
-	uchar 	*cryprovNameFull;/* full internal crypto provider name */
-	void	*cryprovData;	/* opaque data ptr for provider use */
-	cryprov_if_t cryprov;	/* ptr to crypto provider interface */
-	sbool	useCryprov;	/* quicker than checkig ptr (1 vs 8 bytes!) */
-	int	iCurrElt;	/* currently active cache element (-1 = none) */
-	uint	iCurrCacheSize;	/* currently cache size (1-based) */
-	uint	iDynaFileCacheSize; /* size of file handle cache */
-	/* The cache is implemented as an array. An empty element is indicated
-	 * by a NULL pointer. Memory is allocated as needed. The following
-	 * pointer points to the overall structure.
-	 */
-	dynaFileCacheEntry **dynCache;
-	off_t	iSizeLimit;		/* file size limit, 0 = no limit */
-	uchar	*pszSizeLimitCmd;	/* command to carry out when size limit is reached */
-	int 	iZipLevel;		/* zip mode to use for this selector */
-	uint	iIOBufSize;		/* size of associated io buffer */
-	int	iFlushInterval;		/* how fast flush buffer on inactivity? */
-	short	iCloseTimeout;		/* after how many *minutes* shall the file be closed if inactive? */
-	sbool	bFlushOnTXEnd;		/* flush write buffers when transaction has ended? */
-	sbool	bUseAsyncWriter;	/* use async stream writer? */
-	sbool	bVeryRobustZip;
-	statsobj_t *stats;		/* dynafile, primarily cache stats */
-	STATSCOUNTER_DEF(ctrRequests, mutCtrRequests);
-	STATSCOUNTER_DEF(ctrLevel0, mutCtrLevel0);
-	STATSCOUNTER_DEF(ctrEvict, mutCtrEvict);
-	STATSCOUNTER_DEF(ctrMiss, mutCtrMiss);
-	STATSCOUNTER_DEF(ctrMax, mutCtrMax);
-	STATSCOUNTER_DEF(ctrCloseTimeouts, mutCtrCloseTimeouts);
-	char janitorID[128];		/* holds ID for janitor calls */
-} instanceData;
-
-
-typedef struct wrkrInstanceData {
-	instanceData *pData;
-} wrkrInstanceData_t;
-
-
-typedef struct configSettings_s {
-	uint iDynaFileCacheSize; /* max cache for dynamic files */
-	int fCreateMode; /* mode to use when creating files */
-	int fDirCreateMode; /* mode to use when creating files */
-	int	bFailOnChown;	/* fail if chown fails? */
-	uid_t	fileUID;	/* UID to be used for newly created files */
-	uid_t	fileGID;	/* GID to be used for newly created files */
-	uid_t	dirUID;		/* UID to be used for newly created directories */
-	uid_t	dirGID;		/* GID to be used for newly created directories */
-	int	bCreateDirs;/* auto-create directories for dynaFiles: 0 - no, 1 - yes */
-	int	bEnableSync;/* enable syncing of files (no dash in front of pathname in conf): 0 - no, 1 - yes */
-	int	iZipLevel;	/* zip compression mode (0..9 as usual) */
-	sbool	bFlushOnTXEnd;/* flush write buffers when transaction has ended? */
-	int64	iIOBufSize;	/* size of an io buffer */
-	int	iFlushInterval; 	/* how often flush the output buffer on inactivity? */
-	int	bUseAsyncWriter;	/* should we enable asynchronous writing? */
-	EMPTY_STRUCT
-} configSettings_t;
-static configSettings_t cs;
-uchar	*pszFileDfltTplName; /* name of the default template to use */
-
-struct modConfData_s {
-	rsconf_t *pConf;	/* our overall config object */
-	uchar 	*tplName;	/* default template */
-	int fCreateMode; /* default mode to use when creating files */
-	int fDirCreateMode; /* default mode to use when creating files */
-	uid_t fileUID;	/* default IDs for creation */
-	uid_t dirUID;
-	gid_t fileGID;
-	gid_t dirGID;
-	int bDynafileDoNotSuspend;
-};
-
-static modConfData_t *loadModConf = NULL;/* modConf ptr to use for the current load process */
-static modConfData_t *runModConf = NULL;/* modConf ptr to use for the current exec process */
-
-/* tables for interfacing with the v6 config system */
-/* module-global parameters */
-static struct cnfparamdescr modpdescr[] = {
-	{ "template", eCmdHdlrGetWord, 0 },
-	{ "dircreatemode", eCmdHdlrFileCreateMode, 0 },
-	{ "filecreatemode", eCmdHdlrFileCreateMode, 0 },
-	{ "dirowner", eCmdHdlrUID, 0 },
-	{ "dirownernum", eCmdHdlrInt, 0 },
-<a name="1"></a>	{ "dirgroup", eCmdHdlrGID, 0 },
-	{ "dirgroupnum", eCmdHdlrInt, 0 },
-	{ "fileowner", eCmdHdlrUID, 0 },
-<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "fileownernum", eCmdHdlrInt, 0 },
-	{ "filegroup", eCmdHdlrGID, 0 },
-	{ "dynafile.donotsuspend", eCmdHdlrBinary, 0 },
-	{ "filegroupnum", eCmdHdlrInt, 0 },
-};
-static struct cnfparamblk modpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
-	  modpdescr
-	};</b></font>
-
-/* action (instance) parameters */
-static struct cnfparamdescr actpdescr[] = {
-	{ "dynafilecachesize", eCmdHdlrInt, 0 }, /* legacy: dynafilecachesize */
-	{ "ziplevel", eCmdHdlrInt, 0 }, /* legacy: omfileziplevel */
-	{ "flushinterval", eCmdHdlrInt, 0 }, /* legacy: omfileflushinterval */
-	{ "asyncwriting", eCmdHdlrBinary, 0 }, /* legacy: omfileasyncwriting */
-	{ "veryrobustzip", eCmdHdlrBinary, 0 },
-	{ "flushontxend", eCmdHdlrBinary, 0 }, /* legacy: omfileflushontxend */
-	{ "iobuffersize", eCmdHdlrSize, 0 }, /* legacy: omfileiobuffersize */
-	{ "dirowner", eCmdHdlrUID, 0 }, /* legacy: dirowner */
-	{ "dirownernum", eCmdHdlrInt, 0 }, /* legacy: dirownernum */
-	{ "dirgroup", eCmdHdlrGID, 0 }, /* legacy: dirgroup */
-	{ "dirgroupnum", eCmdHdlrInt, 0 }, /* legacy: dirgroupnum */
-	{ "fileowner", eCmdHdlrUID, 0 }, /* legacy: fileowner */
-	{ "fileownernum", eCmdHdlrInt, 0 }, /* legacy: fileownernum */
-	{ "filegroup", eCmdHdlrGID, 0 }, /* legacy: filegroup */
-	{ "filegroupnum", eCmdHdlrInt, 0 }, /* legacy: filegroupnum */
-	{ "dircreatemode", eCmdHdlrFileCreateMode, 0 }, /* legacy: dircreatemode */
-	{ "filecreatemode", eCmdHdlrFileCreateMode, 0 }, /* legacy: filecreatemode */
-	{ "failonchownfailure", eCmdHdlrBinary, 0 }, /* legacy: failonchownfailure */
-	{ "createdirs", eCmdHdlrBinary, 0 }, /* legacy: createdirs */
-	{ "sync", eCmdHdlrBinary, 0 }, /* legacy: actionfileenablesync */
-	{ "file", eCmdHdlrString, 0 },     /* either "file" or ... */
-	{ "dynafile", eCmdHdlrString, 0 }, /* "dynafile" MUST be present */
-	{ "sig.provider", eCmdHdlrGetWord, 0 },
-	{ "cry.provider", eCmdHdlrGetWord, 0 },
-	{ "closetimeout", eCmdHdlrPositiveInt, 0 },
-	{ "template", eCmdHdlrGetWord, 0 }
-};
-static struct cnfparamblk actpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	  actpdescr
-	};
-
-
-/* this function gets the default template. It coordinates action between
- * old-style and new-style configuration parts.
- */
-static uchar*
-getDfltTpl(void)
-{
-	if(loadModConf != NULL &amp;&amp; loadModConf-&gt;tplName != NULL)
-		return loadModConf-&gt;tplName;
-	else if(pszFileDfltTplName == NULL)
-		return (uchar*)"RSYSLOG_FileFormat";
-	else
-		return pszFileDfltTplName;
-}
-
-
-BEGINinitConfVars		/* (re)set config variables to default values */
-CODESTARTinitConfVars
-	pszFileDfltTplName = NULL; /* make sure this can be free'ed! */
-	iRet = resetConfigVariables(NULL, NULL); /* params are dummies */
-ENDinitConfVars
-
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURERepeatedMsgReduction)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-
-
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-	if(pData-&gt;bDynamicName) {
-		dbgprintf("[dynamic]\n");
-	} else { /* regular file */
-		dbgprintf("%s%s\n", pData-&gt;fname,
-			  (pData-&gt;pStrm == NULL) ? " (closed)" : "");
-	}
-
-	dbgprintf("\ttemplate='%s'\n", pData-&gt;fname);
-	dbgprintf("\tuse async writer=%d\n", pData-&gt;bUseAsyncWriter);
-	dbgprintf("\tflush on TX end=%d\n", pData-&gt;bFlushOnTXEnd);
-	dbgprintf("\tflush interval=%d\n", pData-&gt;iFlushInterval);
-	dbgprintf("\tfile cache size=%d\n", pData-&gt;iDynaFileCacheSize);
-	dbgprintf("\tcreate directories: %s\n", pData-&gt;bCreateDirs ? "on" : "off");
-	dbgprintf("\tvery robust zip: %s\n", pData-&gt;bCreateDirs ? "on" : "off");
-	dbgprintf("\tfile owner %d, group %d\n", (int) pData-&gt;fileUID, (int) pData-&gt;fileGID);
-	dbgprintf("\tdirectory owner %d, group %d\n", (int) pData-&gt;dirUID, (int) pData-&gt;dirGID);
-	dbgprintf("\tdir create mode 0%3.3o, file create mode 0%3.3o\n",
-		  pData-&gt;fDirCreateMode, pData-&gt;fCreateMode);
-	dbgprintf("\tfail if owner/group can not be set: %s\n", pData-&gt;bFailOnChown ? "yes" : "no");
-ENDdbgPrintInstInfo
-
-
-
-/* set the default template to be used
- * This is a module-global parameter, and as such needs special handling. It needs to
- * be coordinated with values set via the v2 config system (rsyslog v6+). What we do
- * is we do not permit this directive after the v2 config system has been used to set
- * the parameter.
- */
-static rsRetVal
-setLegacyDfltTpl(void __attribute__((unused)) *pVal, uchar* newVal)
-{
-	DEFiRet;
-
-	if(loadModConf != NULL &amp;&amp; loadModConf-&gt;tplName != NULL) {
-		free(newVal);
-		parser_errmsg("omfile: default template already set via module "
-			"global parameter - can no longer be changed");
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	free(pszFileDfltTplName);
-	pszFileDfltTplName = newVal;
-finalize_it:
-	RETiRet;
-}
-
-
-/* set the dynaFile cache size. Does some limit checking.
- * rgerhards, 2007-07-31
- */
-static rsRetVal setDynaFileCacheSize(void __attribute__((unused)) *pVal, int iNewVal)
-{
-	DEFiRet;
-
-	if(iNewVal &lt; 1) {
-		errno = 0;
-		parser_errmsg(
-		         "DynaFileCacheSize must be greater 0 (%d given), changed to 1.", iNewVal);
-		iRet = RS_RET_VAL_OUT_OF_RANGE;
-		iNewVal = 1;
-	} else if(iNewVal &gt; 1000) {
-		errno = 0;
-		parser_errmsg(
-		         "DynaFileCacheSize maximum is 1,000 (%d given), changed to 1,000.", iNewVal);
-		iRet = RS_RET_VAL_OUT_OF_RANGE;
-		iNewVal = 1000;
-	}
-
-	cs.iDynaFileCacheSize = iNewVal;
-	DBGPRINTF("DynaFileCacheSize changed to %d.\n", iNewVal);
-
-	RETiRet;
-}
-
-
-/* Helper to cfline(). Parses a output channel name up until the first
- * comma and then looks for the template specifier. Tries
- * to find that template. Maps the output channel to the
- * proper filed structure settings. Everything is stored in the
- * filed struct. Over time, the dependency on filed might be
- * removed.
- * rgerhards 2005-06-21
- */
-static rsRetVal cflineParseOutchannel(instanceData *pData, uchar* p, omodStringRequest_t *pOMSR,
-	int iEntry, int iTplOpts)
-{
-	DEFiRet;
-	size_t i;
-	struct outchannel *pOch;
-	char szBuf[128];	/* should be more than sufficient */
-
-	++p; /* skip '$' */
-	i = 0;
-	/* get outchannel name */
-	while(*p &amp;&amp; *p != ';' &amp;&amp; *p != ' ' &amp;&amp;
-	      i &lt; (sizeof(szBuf) - 1) ) {
-	      szBuf[i++] = *p++;
-	}
-	szBuf[i] = '\0';
-
-	/* got the name, now look up the channel... */
-	pOch = ochFind(szBuf, i);
-
-	if(pOch == NULL) {
-		parser_errmsg(
-			 "outchannel '%s' not found - ignoring action line",
-			 szBuf);
-		ABORT_FINALIZE(RS_RET_NOT_FOUND);
-	}
-
-	/* check if there is a file name in the outchannel... */
-	if(pOch-&gt;pszFileTemplate == NULL) {
-		parser_errmsg(
-			 "outchannel '%s' has no file name template - ignoring action line",
-			 szBuf);
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-
-	/* OK, we finally got a correct template. So let's use it... */
-	pData-&gt;fname = ustrdup(pOch-&gt;pszFileTemplate);
-	pData-&gt;iSizeLimit = pOch-&gt;uSizeLimit;
-	/* WARNING: It is dangerous "just" to pass the pointer. As we
-	 * never rebuild the output channel description, this is acceptable here.
-	 */
-	pData-&gt;pszSizeLimitCmd = pOch-&gt;cmdOnSizeLimit;
-
-	iRet = cflineParseTemplateName(&amp;p, pOMSR, iEntry, iTplOpts, getDfltTpl());
-
-finalize_it:
-	RETiRet;
-}
-
-
-/* This function deletes an entry from the dynamic file name
- * cache. A pointer to the cache must be passed in as well
- * as the index of the to-be-deleted entry. This index may
- * point to an unallocated entry, in whcih case the
- * function immediately returns. Parameter bFreeEntry is 1
- * if the entry should be free()ed and 0 if not.
- */
-static rsRetVal
-dynaFileDelCacheEntry(instanceData *__restrict__ const pData, const int iEntry, const int bFreeEntry)
-{
-	dynaFileCacheEntry **pCache = pData-&gt;dynCache;
-	DEFiRet;
-	assert(pCache != NULL);
-
-	if(pCache[iEntry] == NULL)
-		FINALIZE;
-
-	DBGPRINTF("Removing entry %d for file '%s' from dynaCache.\n", iEntry,
-		pCache[iEntry]-&gt;pName == NULL ? UCHAR_CONSTANT("[OPEN FAILED]") : pCache[iEntry]-&gt;pName);
-
-	if(pCache[iEntry]-&gt;pName != NULL) {
-		free(pCache[iEntry]-&gt;pName);
-		pCache[iEntry]-&gt;pName = NULL;
-	}
-
-	if(pCache[iEntry]-&gt;pStrm != NULL) {
-		strm.Destruct(&amp;pCache[iEntry]-&gt;pStrm);
-		if(pData-&gt;useSigprov) {
-			pData-&gt;sigprov.OnFileClose(pCache[iEntry]-&gt;sigprovFileData);
-			pCache[iEntry]-&gt;sigprovFileData = NULL;
-		}
-	}
-
-	if(bFreeEntry) {
-		free(pCache[iEntry]);
-		pCache[iEntry] = NULL;
-	}
-
-finalize_it:
-	RETiRet;
-}
-
-
-/* This function frees all dynamic file name cache entries and closes the
- * relevant files. Part of Shutdown and HUP processing.
- * rgerhards, 2008-10-23
- */
-static void
-dynaFileFreeCacheEntries(instanceData *__restrict__ const pData)
-{
-	register uint i;
-	assert(pData != NULL);
-
-	for(i = 0 ; i &lt; pData-&gt;iCurrCacheSize ; ++i) {
-		dynaFileDelCacheEntry(pData, i, 1);
-	}
-	pData-&gt;iCurrElt = -1; /* invalidate current element */
-}
-
-
-/* This function frees the dynamic file name cache.
- */
-static void dynaFileFreeCache(instanceData *__restrict__ const pData)
-{
-	assert(pData != NULL);
-
-	dynaFileFreeCacheEntries(pData);
-	if(pData-&gt;dynCache != NULL)
-		free(pData-&gt;dynCache);
-}
-
-
-/* close current file */
-static rsRetVal
-closeFile(instanceData *__restrict__ const pData)
-{
-	DEFiRet;
-	if(pData-&gt;useSigprov) {
-		pData-&gt;sigprov.OnFileClose(pData-&gt;sigprovFileData);
-		pData-&gt;sigprovFileData = NULL;
-	}
-	strm.Destruct(&amp;pData-&gt;pStrm);
-	RETiRet;
-}
-
-
-/* This prepares the signature provider to process a file */
-static rsRetVal
-sigprovPrepare(instanceData *__restrict__ const pData, uchar *__restrict__ const fn)
-{
-	DEFiRet;
-	pData-&gt;sigprov.OnFileOpen(pData-&gt;sigprovData, fn, &amp;pData-&gt;sigprovFileData);
-	RETiRet;
-}
-
-/* This is now shared code for all types of files. It simply prepares
- * file access, which, among others, means the the file wil be opened
- * and any directories in between will be created (based on config, of
- * course). -- rgerhards, 2008-10-22
- * changed to iRet interface - 2009-03-19
- */
-static rsRetVal
-prepareFile(instanceData *__restrict__ const pData, const uchar *__restrict__ const newFileName)
-{
-	int fd;
-	char errStr[1024]; /* buffer for strerr() */
-	DEFiRet;
-
-	pData-&gt;pStrm = NULL;
-	if(access((char*)newFileName, F_OK) != 0) {
-		/* file does not exist, create it (and eventually parent directories */
-		if(pData-&gt;bCreateDirs) {
-			/* We first need to create parent dirs if they are missing.
-			 * We do not report any errors here ourselfs but let the code
-			 * fall through to error handler below.
-			 */
-			if(makeFileParentDirs(newFileName, ustrlen(newFileName),
-			     pData-&gt;fDirCreateMode, pData-&gt;dirUID,
-			     pData-&gt;dirGID, pData-&gt;bFailOnChown) != 0) {
-				rs_strerror_r(errno, errStr, sizeof(errStr));
-				parser_errmsg( "omfile: creating parent "
-					"directories for file  '%s' failed: %s",
-					newFileName, errStr);
-			     	ABORT_FINALIZE(RS_RET_ERR); /* we give up */
-			}
-		}
-		/* no matter if we needed to create directories or not, we now try to create
-		 * the file. -- rgerhards, 2008-12-18 (based on patch from William Tisater)
-		 */
-		fd = open((char*) newFileName, O_WRONLY|O_APPEND|O_CREAT|O_NOCTTY|O_CLOEXEC,
-				pData-&gt;fCreateMode);
-		if(fd != -1) {
-			/* check and set uid/gid */
-			if(pData-&gt;fileUID != (uid_t)-1 || pData-&gt;fileGID != (gid_t) -1) {
-				/* we need to set owner/group */
-				if(fchown(fd, pData-&gt;fileUID, pData-&gt;fileGID) != 0) {
-					rs_strerror_r(errno, errStr, sizeof(errStr));
-					parser_errmsg(
-						"omfile: chown for file '%s' failed: %s",
-						newFileName, errStr);
-					if(pData-&gt;bFailOnChown) {
-						close(fd);
-						ABORT_FINALIZE(RS_RET_ERR); /* we give up */
-					}
-					/* we will silently ignore the chown() failure
-					 * if configured to do so.
-					 */
-				}
-			}
-			close(fd); /* close again, as we need a stream further on */
-		}
-		else {
-			ABORT_FINALIZE(RS_RET_ERR);
-		}
-	}
-
-	/* the copies below are clumpsy, but there is no way around given the
-	 * anomalies in dirname() and basename() [they MODIFY the provided buffer...]
-	 */
-	uchar szNameBuf[MAXFNAME+1];
-	uchar szDirName[MAXFNAME+1];
-	uchar szBaseName[MAXFNAME+1];
-	ustrncpy(szNameBuf, newFileName, MAXFNAME);
-	szNameBuf[MAXFNAME] = '\0';
-	ustrncpy(szDirName, (uchar*)dirname((char*)szNameBuf), MAXFNAME);
-	szDirName[MAXFNAME] = '\0';
-	ustrncpy(szNameBuf, newFileName, MAXFNAME);
-	szNameBuf[MAXFNAME] = '\0';
-	ustrncpy(szBaseName, (uchar*)basename((char*)szNameBuf), MAXFNAME);
-	szBaseName[MAXFNAME] = '\0';
-
-	CHKiRet(strm.Construct(&amp;pData-&gt;pStrm));
-	CHKiRet(strm.SetFName(pData-&gt;pStrm, szBaseName, ustrlen(szBaseName)));
-	CHKiRet(strm.SetDir(pData-&gt;pStrm, szDirName, ustrlen(szDirName)));
-	CHKiRet(strm.SetiZipLevel(pData-&gt;pStrm, pData-&gt;iZipLevel));
-	CHKiRet(strm.SetbVeryReliableZip(pData-&gt;pStrm, pData-&gt;bVeryRobustZip));
-	CHKiRet(strm.SetsIOBufSize(pData-&gt;pStrm, (size_t) pData-&gt;iIOBufSize));
-	CHKiRet(strm.SettOperationsMode(pData-&gt;pStrm, STREAMMODE_WRITE_APPEND));
-	CHKiRet(strm.SettOpenMode(pData-&gt;pStrm, cs.fCreateMode));
-	CHKiRet(strm.SetbSync(pData-&gt;pStrm, pData-&gt;bSyncFile));
-	CHKiRet(strm.SetsType(pData-&gt;pStrm, STREAMTYPE_FILE_SINGLE));
-	CHKiRet(strm.SetiSizeLimit(pData-&gt;pStrm, pData-&gt;iSizeLimit));
-	if(pData-&gt;useCryprov) {
-		CHKiRet(strm.Setcryprov(pData-&gt;pStrm, &amp;pData-&gt;cryprov));
-		CHKiRet(strm.SetcryprovData(pData-&gt;pStrm, pData-&gt;cryprovData));
-	}
-	/* set the flush interval only if we actually use it - otherwise it will activate
-	 * async processing, which is a real performance waste if we do not do buffered
-	 * writes! -- rgerhards, 2009-07-06
-	 */
-	if(pData-&gt;bUseAsyncWriter)
-		CHKiRet(strm.SetiFlushInterval(pData-&gt;pStrm, pData-&gt;iFlushInterval));
-	if(pData-&gt;pszSizeLimitCmd != NULL)
-		CHKiRet(strm.SetpszSizeLimitCmd(pData-&gt;pStrm, ustrdup(pData-&gt;pszSizeLimitCmd)));
-	CHKiRet(strm.ConstructFinalize(pData-&gt;pStrm));
-
-	if(pData-&gt;useSigprov)
-		sigprovPrepare(pData, szNameBuf);
-
-finalize_it:
-	if(iRet != RS_RET_OK) {
-		if(pData-&gt;pStrm != NULL) {
-			closeFile(pData);
-		}
-	}
-	RETiRet;
-}
-
-// &lt;kortemik date="2018-02-20"&gt;
-/* verify enough we have space left for writes */
-static rsRetVal
-fsCheck(instanceData *__restrict__ const pData, const uchar *__restrict__ const fileName)
-{
-	DEFiRet;
-	struct statvfs stat;
-	char *pathcopy;
-	const char *path;
-
-	pathcopy = strdup((char*)fileName);
-	path = dirname(pathcopy);
-
-	if (statvfs(path, &amp;stat) != 0) {
-		iRet = RS_RET_FILE_NO_STAT;
-		LogError(0, iRet, "could not stat %s", path);
-		FINALIZE;
-	}
-
-	/* check if we have space available for all buffers to be flushed and for
-	 * a maximum length message, perhaps current msg size would be enough */
-	if (stat.f_bsize * stat.f_bavail &lt;
-		pData-&gt;iIOBufSize * pData-&gt;iDynaFileCacheSize + (uint)(glbl.GetMaxLine(runModConf-&gt;pConf)))
-		{
-			iRet = RS_RET_FS_ERR;
-			LogError(0, iRet, "too few available blocks in %s", path);
-			FINALIZE;
-		}
-	/* there must be enough inodes left, one is left for administrative purposes
-	 * check is not done if file system reports 0 total inodes, such as btrfs */
-	if (stat.f_favail &lt; 2 &amp;&amp; stat.f_files &gt; 0)
-		{
-			iRet = RS_RET_FS_ERR;
-			LogError(0, iRet, "too few available inodes in %s", path);
-			FINALIZE;
-		}
-
-	/* file system must not be read only */
-	if (stat.f_flag == ST_RDONLY)
-		{
-			iRet = RS_RET_FS_ERR;
-			LogError(0, iRet, "file-system is read-only in %s", path);
-			FINALIZE;
-		}
-
-	iRet = RS_RET_OK;
-
-finalize_it:
-	if (pathcopy != NULL)
-		free(pathcopy);
-	RETiRet;
-}
-// &lt;/kortemik&gt;
-
-/* This function handles dynamic file names. It checks if the
- * requested file name is already open and, if not, does everything
- * needed to switch to the it.
- * Function returns 0 if all went well and non-zero otherwise.
- * On successful return pData-&gt;fd must point to the correct file to
- * be written.
- * This is a helper to writeFile(). rgerhards, 2007-07-03
- */
-static rsRetVal
-prepareDynFile(instanceData *__restrict__ const pData, const uchar *__restrict__ const newFileName)
-{
-	uint64 ctOldest; /* "timestamp" of oldest element */
-	int iOldest;
-	uint i;
-	int iFirstFree;
-	rsRetVal localRet;
-	dynaFileCacheEntry **pCache;
-	DEFiRet;
-
-	assert(pData != NULL);
-	assert(newFileName != NULL);
-
-	pCache = pData-&gt;dynCache;
-
-	/* first check, if we still have the current file */
-	if(   (pData-&gt;iCurrElt != -1)
-	   &amp;&amp; !ustrcmp(newFileName, pCache[pData-&gt;iCurrElt]-&gt;pName)) {
-		CHKiRet(fsCheck(pData, newFileName));
-
-	   	/* great, we are all set */
-		pCache[pData-&gt;iCurrElt]-&gt;clkTickAccessed = getClockFileAccess();
-		STATSCOUNTER_INC(pData-&gt;ctrLevel0, pData-&gt;mutCtrLevel0);
-		/* LRU needs only a strictly monotonically increasing counter, so such a one could do */
-		FINALIZE;
-	}
-
-	/* ok, no luck. Now let's search the table if we find a matching spot.
-	 * While doing so, we also prepare for creation of a new one.
-	 */
-	pData-&gt;iCurrElt = -1;	/* invalid current element pointer */
-	iFirstFree = -1; /* not yet found */
-	iOldest = 0; /* we assume the first element to be the oldest - that will change as we loop */
-	ctOldest = getClockFileAccess(); /* there must always be an older one */
-	for(i = 0 ; i &lt; pData-&gt;iCurrCacheSize ; ++i) {
-		if(pCache[i] == NULL || pCache[i]-&gt;pName == NULL) {
-			if(iFirstFree == -1)
-				iFirstFree = i;
-		} else { /* got an element, let's see if it matches */
-			if(!ustrcmp(newFileName, pCache[i]-&gt;pName)) {
-				CHKiRet(fsCheck(pData, newFileName));
-
-				/* we found our element! */
-				pData-&gt;pStrm = pCache[i]-&gt;pStrm;
-				if(pData-&gt;useSigprov)
-					pData-&gt;sigprovFileData = pCache[i]-&gt;sigprovFileData;
-				pData-&gt;iCurrElt = i;
-				pCache[i]-&gt;clkTickAccessed = getClockFileAccess(); /* update "timestamp" for LRU */
-				FINALIZE;
-			}
-			/* did not find it - so lets keep track of the counters for LRU */
-			if(pCache[i]-&gt;clkTickAccessed &lt; ctOldest) {
-				ctOldest = pCache[i]-&gt;clkTickAccessed;
-				iOldest = i;
-				}
-		}
-	}
-
-	/* we have not found an entry */
-	STATSCOUNTER_INC(pData-&gt;ctrMiss, pData-&gt;mutCtrMiss);
-
-	/* similarly, we need to set the current pStrm to NULL, because otherwise, if prepareFile() fails,
-	 * we may end up using an old stream. This bug depends on how exactly prepareFile fails,
-	 * but it could be triggered in the common case of a failed open() system call.
-	 * rgerhards, 2010-03-22
-	 */
-	pData-&gt;pStrm = NULL, pData-&gt;sigprovFileData = NULL;
-
-	if(iFirstFree == -1 &amp;&amp; (pData-&gt;iCurrCacheSize &lt; pData-&gt;iDynaFileCacheSize)) {
-		/* there is space left, so set it to that index */
-		iFirstFree = pData-&gt;iCurrCacheSize++;
-		STATSCOUNTER_SETMAX_NOMUT(pData-&gt;ctrMax, (unsigned) pData-&gt;iCurrCacheSize);
-	}
-
-	/* Note that the following code sequence does not work with the cache entry itself,
-	 * but rather with pData-&gt;pStrm, the (sole) stream pointer in the non-dynafile case.
-	 * The cache array is only updated after the open was successful. -- rgerhards, 2010-03-21
-	 */
-	if(iFirstFree == -1) {
-		dynaFileDelCacheEntry(pData, iOldest, 0);
-		STATSCOUNTER_INC(pData-&gt;ctrEvict, pData-&gt;mutCtrEvict);
-		iFirstFree = iOldest; /* this one *is* now free ;) */
-	} else {
-		/* we need to allocate memory for the cache structure */
-		CHKmalloc(pCache[iFirstFree] = (dynaFileCacheEntry*) calloc(1, sizeof(dynaFileCacheEntry)));
-	}
-
-	/* Ok, we finally can open the file */
-	localRet = prepareFile(pData, newFileName); /* ignore exact error, we check fd below */
-
-	/* check if we had an error */
-	if(localRet != RS_RET_OK) {
-		/* We do no longer care about internal messages. The errmsg rate limiter
-		 * will take care of too-frequent error messages.
-		 */
-		parser_errmsg("Could not open dynamic file '%s' [state %d]", newFileName, localRet);
-		ABORT_FINALIZE(localRet);
-	}
-
-	localRet = fsCheck(pData, newFileName);
-	if(localRet != RS_RET_OK) {
-		parser_errmsg("Invalid file-system condition for dynamic file '%s' [state %d]", newFileName, localRet);
-		ABORT_FINALIZE(localRet);
-	}
-
-	if((pCache[iFirstFree]-&gt;pName = ustrdup(newFileName)) == NULL) {
-		closeFile(pData); /* need to free failed entry! */
-		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
-	}
-	pCache[iFirstFree]-&gt;pStrm = pData-&gt;pStrm;
-	if(pData-&gt;useSigprov)
-		pCache[iFirstFree]-&gt;sigprovFileData = pData-&gt;sigprovFileData;
-	pCache[iFirstFree]-&gt;clkTickAccessed = getClockFileAccess();
-	pData-&gt;iCurrElt = iFirstFree;
-	DBGPRINTF("Added new entry %d for file cache, file '%s'.\n", iFirstFree, newFileName);
-
-finalize_it:
-	if(iRet == RS_RET_OK)
-		pCache[pData-&gt;iCurrElt]-&gt;nInactive = 0;
-	RETiRet;
-}
-
-
-/* do the actual write process. This function is to be called once we are ready for writing.
- * It will do buffered writes and persist data only when the buffer is full. Note that we must
- * be careful to detect when the file handle changed.
- * rgerhards, 2009-06-03
- */
-static  rsRetVal
-doWrite(instanceData *__restrict__ const pData, uchar *__restrict__ const pszBuf, const int lenBuf)
-{
-	DEFiRet;
-	assert(pData != NULL);
-	assert(pszBuf != NULL);
-
-	DBGPRINTF("omfile: write to stream, pData-&gt;pStrm %p, lenBuf %d, strt data %.128s\n",
-		  pData-&gt;pStrm, lenBuf, pszBuf);
-	if(pData-&gt;pStrm != NULL){
-		CHKiRet(strm.Write(pData-&gt;pStrm, pszBuf, lenBuf));
-		if(pData-&gt;useSigprov) {
-			CHKiRet(pData-&gt;sigprov.OnRecordWrite(pData-&gt;sigprovFileData, pszBuf, lenBuf));
-		}
-	}
-
-finalize_it:
-	RETiRet;
-}
-
-/* rgerhards 2004-11-11: write to a file output.  */
-static rsRetVal
-writeFile(instanceData *__restrict__ const pData,
-	  const actWrkrIParams_t *__restrict__ const pParam,
-	  const int iMsg)
-{
-	DEFiRet;
-
-	STATSCOUNTER_INC(pData-&gt;ctrRequests, pData-&gt;mutCtrRequests);
-	/* first check if we have a dynamic file name and, if so,
-	 * check if it still is ok or a new file needs to be created
-	 */
-	if(pData-&gt;bDynamicName) {
-		DBGPRINTF("omfile: file to log to: %s\n",
-			  actParam(pParam, pData-&gt;iNumTpls, iMsg, 1).param);
-		CHKiRet(prepareDynFile(pData, actParam(pParam, pData-&gt;iNumTpls, iMsg, 1).param));
-	} else { /* "regular", non-dynafile */
-		if(pData-&gt;pStrm == NULL) {
-			CHKiRet(prepareFile(pData, pData-&gt;fname));
-			if(pData-&gt;pStrm == NULL) {
-				parser_errmsg(
-					"Could not open output file '%s'", pData-&gt;fname);
-			}
-			CHKiRet(fsCheck(pData, pData-&gt;fname));
-		}
-		pData-&gt;nInactive = 0;
-	}
-
-	iRet = doWrite(pData, actParam(pParam, pData-&gt;iNumTpls, iMsg, 0).param,
-		actParam(pParam, pData-&gt;iNumTpls, iMsg, 0).lenStr);
-
-finalize_it:
-	RETiRet;
-}
-
-
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	loadModConf = pModConf;
-	pModConf-&gt;pConf = pConf;
-	pModConf-&gt;tplName = NULL;
-	pModConf-&gt;fCreateMode = 0644;
-	pModConf-&gt;fDirCreateMode = 0700;
-	pModConf-&gt;fileUID = -1;
-	pModConf-&gt;dirUID = -1;
-	pModConf-&gt;fileGID = -1;
-	pModConf-&gt;dirGID = -1;
-	pModConf-&gt;bDynafileDoNotSuspend = 1;
-ENDbeginCnfLoad
-
-BEGINsetModCnf
-	struct cnfparamvals *pvals = NULL;
-	int i;
-CODESTARTsetModCnf
-	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
-	if(pvals == NULL) {
-		parser_errmsg("error processing module "
-				"config parameters [module(...)]");
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	if(Debug) {
-		dbgprintf("module (global) param blk for omfile:\n");
-		cnfparamsPrint(&amp;modpblk, pvals);
-	}
-
-	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed) {
-			continue;
-		}
-
-		if(!strcmp(modpblk.descr[i].name, "template")) {
-			loadModConf-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			if(pszFileDfltTplName != NULL) {
-				parser_errmsg("omfile: warning: default template was already "
-					"set via legacy directive - may lead to inconsistent "
-					"results.");
-			}
-		} else if(!strcmp(modpblk.descr[i].name, "dircreatemode")) {
-			loadModConf-&gt;fDirCreateMode = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "filecreatemode")) {
-			loadModConf-&gt;fCreateMode = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "dirowner")) {
-			loadModConf-&gt;dirUID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "dirownernum")) {
-			loadModConf-&gt;dirUID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "dirgroup")) {
-			loadModConf-&gt;dirGID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "dirgroupnum")) {
-			loadModConf-&gt;dirGID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "fileowner")) {
-			loadModConf-&gt;fileUID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "fileownernum")) {
-			loadModConf-&gt;fileUID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "filegroup")) {
-			loadModConf-&gt;fileGID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "filegroupnum")) {
-			loadModConf-&gt;fileGID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "dynafile.donotsuspend")) {
-			loadModConf-&gt;bDynafileDoNotSuspend = (int) pvals[i].val.d.n;
-		} else {
-			dbgprintf("omfile: program error, non-handled "
-			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
-		}
-	}
-finalize_it:
-	if(pvals != NULL)
-		cnfparamvalsDestruct(pvals, &amp;modpblk);
-ENDsetModCnf
-
-/* This function checks dynafile cache for janitor action */
-static void
-janitorChkDynaFiles(instanceData *__restrict__ const pData)
-{
-	uint i;
-	dynaFileCacheEntry **pCache = pData-&gt;dynCache;
-
-	for(i = 0 ; i &lt; pData-&gt;iCurrCacheSize ; ++i) {
-		if(pCache[i] == NULL)
-			continue;
-		DBGPRINTF("omfile janitor: checking dynafile %d:%s, inactive since %d\n", i,
-			pCache[i]-&gt;pName == NULL ? UCHAR_CONSTANT("[OPEN FAILED]") : pCache[i]-&gt;pName,
-			(int) pCache[i]-&gt;nInactive);
-		if(pCache[i]-&gt;nInactive &gt;= pData-&gt;iCloseTimeout) {
-			STATSCOUNTER_INC(pData-&gt;ctrCloseTimeouts, pData-&gt;mutCtrCloseTimeouts);
-			dynaFileDelCacheEntry(pData, i, 1);
-			if(pData-&gt;iCurrElt &gt;= 0) {
-				if((uint)(pData-&gt;iCurrElt) == i)
-				pData-&gt;iCurrElt = -1; /* no longer available! */
-			}
-		} else {
-			pCache[i]-&gt;nInactive += runModConf-&gt;pConf-&gt;globals.janitorInterval;
-		}
-	}
-}
-
-/* callback for the janitor. This cleans out files (if so configured) */
-static void
-janitorCB(void *pUsr)
-{
-	instanceData *__restrict__ const pData = (instanceData *) pUsr;
-	pthread_mutex_lock(&amp;pData-&gt;mutWrite);
-	if(pData-&gt;bDynamicName) {
-		janitorChkDynaFiles(pData);
-	} else {
-		if(pData-&gt;pStrm != NULL) {
-			DBGPRINTF("omfile janitor: checking file %s, inactive since %d\n",
-				pData-&gt;fname, pData-&gt;nInactive);
-			if(pData-&gt;nInactive &gt;= pData-&gt;iCloseTimeout) {
-				STATSCOUNTER_INC(pData-&gt;ctrCloseTimeouts, pData-&gt;mutCtrCloseTimeouts);
-				closeFile(pData);
-			} else {
-				pData-&gt;nInactive += runModConf-&gt;pConf-&gt;globals.janitorInterval;
-			}
-		}
-	}
-	pthread_mutex_unlock(&amp;pData-&gt;mutWrite);
-}
-
-
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-	loadModConf = NULL; /* done loading */
-	/* free legacy config vars */
-	free(pszFileDfltTplName);
-	pszFileDfltTplName = NULL;
-ENDendCnfLoad
-
-BEGINcheckCnf
-CODESTARTcheckCnf
-ENDcheckCnf
-
-BEGINactivateCnf
-CODESTARTactivateCnf
-	runModConf = pModConf;
-ENDactivateCnf
-
-BEGINfreeCnf
-CODESTARTfreeCnf
-	free(pModConf-&gt;tplName);
-ENDfreeCnf
-
-
-BEGINcreateInstance
-CODESTARTcreateInstance
-	pData-&gt;pStrm = NULL;
-	pthread_mutex_init(&amp;pData-&gt;mutWrite, NULL);
-ENDcreateInstance
-
-
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-ENDcreateWrkrInstance
-
-
-BEGINfreeInstance
-CODESTARTfreeInstance
-	free(pData-&gt;tplName);
-	free(pData-&gt;fname);
-	if(pData-&gt;iCloseTimeout &gt; 0)
-		janitorDelEtry(pData-&gt;janitorID);
-	if(pData-&gt;bDynamicName) {
-		dynaFileFreeCache(pData);
-	} else if(pData-&gt;pStrm != NULL)
-		closeFile(pData);
-	if(pData-&gt;stats != NULL)
-		statsobj.Destruct(&amp;(pData-&gt;stats));
-	if(pData-&gt;useSigprov) {
-		pData-&gt;sigprov.Destruct(&amp;pData-&gt;sigprovData);
-		obj.ReleaseObj(__FILE__, pData-&gt;sigprovNameFull+2, pData-&gt;sigprovNameFull,
-			       (void*) &amp;pData-&gt;sigprov);
-		free(pData-&gt;sigprovName);
-		free(pData-&gt;sigprovNameFull);
-	}
-	if(pData-&gt;useCryprov) {
-		pData-&gt;cryprov.Destruct(&amp;pData-&gt;cryprovData);
-		obj.ReleaseObj(__FILE__, pData-&gt;cryprovNameFull+2, pData-&gt;cryprovNameFull,
-			       (void*) &amp;pData-&gt;cryprov);
-		free(pData-&gt;cryprovName);
-		free(pData-&gt;cryprovNameFull);
-	}
-	pthread_mutex_destroy(&amp;pData-&gt;mutWrite);
-ENDfreeInstance
-
-
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-ENDfreeWrkrInstance
-
-
-BEGINtryResume
-CODESTARTtryResume
-ENDtryResume
-
-BEGINbeginTransaction
-CODESTARTbeginTransaction
-	/* we have nothing to do to begin a transaction */
-ENDbeginTransaction
-
-
-BEGINcommitTransaction
-	instanceData *__restrict__ const pData = pWrkrData-&gt;pData;
-	unsigned i;
-CODESTARTcommitTransaction
-	pthread_mutex_lock(&amp;pData-&gt;mutWrite);
-
-	for(i = 0 ; i &lt; nParams ; ++i) {
-		CHKiRet(writeFile(pData, pParams, i));
-	}
-	/* Note: pStrm may be NULL if there was an error opening the stream */
-	/* if bFlushOnTXEnd is set, we need to flush on transaction end - in
-	 * any case. It is not relevant if this is using background writes
-	 * (which then become pretty slow) or not. And, similarly, no flush
-	 * happens when it is not set. Please see
-	 * https://github.com/rsyslog/rsyslog/issues/1297
-	 * for a discussion of why we actually need this.
-	 * rgerhards, 2017-01-13
-	 */
-	if(pData-&gt;bFlushOnTXEnd &amp;&amp; pData-&gt;pStrm != NULL) {
-		CHKiRet(strm.Flush(pData-&gt;pStrm));
-	}
-
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		if (runModConf-&gt;bDynafileDoNotSuspend == 0 || !(pData-&gt;bDynamicName)) {
-			LogError(0, iRet, "suspending action");
-			iRet = RS_RET_SUSPENDED;
-		}
-		else {
-			LogError(0, iRet, "discarding message");
-		}
-	}
-	pthread_mutex_unlock(&amp;pData-&gt;mutWrite);
-ENDcommitTransaction
-
-
-static void
-setInstParamDefaults(instanceData *__restrict__ const pData)
-{
-	pData-&gt;fname = NULL;
-	pData-&gt;tplName = NULL;
-	pData-&gt;fileUID = loadModConf-&gt;fileUID;
-	pData-&gt;fileGID = loadModConf-&gt;fileGID;
-	pData-&gt;dirUID = loadModConf-&gt;dirUID;
-	pData-&gt;dirGID = loadModConf-&gt;dirGID;
-	pData-&gt;bFailOnChown = 1;
-	pData-&gt;iDynaFileCacheSize = 10;
-	pData-&gt;fCreateMode = loadModConf-&gt;fCreateMode;
-	pData-&gt;fDirCreateMode = loadModConf-&gt;fDirCreateMode;
-	pData-&gt;bCreateDirs = 1;
-	pData-&gt;bSyncFile = 0;
-	pData-&gt;iZipLevel = 0;
-	pData-&gt;bVeryRobustZip = 0;
-	pData-&gt;bFlushOnTXEnd = FLUSHONTX_DFLT;
-	pData-&gt;iIOBufSize = IOBUF_DFLT_SIZE;
-	pData-&gt;iFlushInterval = FLUSH_INTRVL_DFLT;
-	pData-&gt;bUseAsyncWriter = USE_ASYNCWRITER_DFLT;
-	pData-&gt;sigprovName = NULL;
-	pData-&gt;cryprovName = NULL;
-	pData-&gt;useSigprov = 0;
-	pData-&gt;useCryprov = 0;
-	pData-&gt;iCloseTimeout = -1;
-}
-
-
-static rsRetVal
-setupInstStatsCtrs(instanceData *__restrict__ const pData)
-{
-	uchar ctrName[512];
-	DEFiRet;
-
-	if(!pData-&gt;bDynamicName) {
-		FINALIZE;
-	}
-
-	/* support statistics gathering */
-	snprintf((char*)ctrName, sizeof(ctrName), "dynafile cache %s", pData-&gt;fname);
-	ctrName[sizeof(ctrName)-1] = '\0'; /* be on the save side */
-	CHKiRet(statsobj.Construct(&amp;(pData-&gt;stats)));
-	CHKiRet(statsobj.SetName(pData-&gt;stats, ctrName));
-	CHKiRet(statsobj.SetOrigin(pData-&gt;stats, (uchar*)"omfile"));
-	STATSCOUNTER_INIT(pData-&gt;ctrRequests, pData-&gt;mutCtrRequests);
-	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("requests"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrRequests)));
-	STATSCOUNTER_INIT(pData-&gt;ctrLevel0, pData-&gt;mutCtrLevel0);
-	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("level0"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrLevel0)));
-	STATSCOUNTER_INIT(pData-&gt;ctrMiss, pData-&gt;mutCtrMiss);
-	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("missed"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrMiss)));
-	STATSCOUNTER_INIT(pData-&gt;ctrEvict, pData-&gt;mutCtrEvict);
-	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("evicted"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrEvict)));
-	STATSCOUNTER_INIT(pData-&gt;ctrMax, pData-&gt;mutCtrMax);
-	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("maxused"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrMax)));
-	STATSCOUNTER_INIT(pData-&gt;ctrCloseTimeouts, pData-&gt;mutCtrCloseTimeouts);
-	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("closetimeouts"),
-		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrCloseTimeouts)));
-	CHKiRet(statsobj.ConstructFinalize(pData-&gt;stats));
-
-finalize_it:
-	RETiRet;
-}
-
-static void
-initSigprov(instanceData *__restrict__ const pData, struct nvlst *lst)
-{
-	uchar szDrvrName[1024];
-
-	if(snprintf((char*)szDrvrName, sizeof(szDrvrName), "lmsig_%s", pData-&gt;sigprovName)
-		== sizeof(szDrvrName)) {
-		parser_errmsg("omfile: signature provider "
-				"name is too long: '%s' - signatures disabled",
-				pData-&gt;sigprovName);
-		goto done;
-	}
-	pData-&gt;sigprovNameFull = ustrdup(szDrvrName);
-
-	pData-&gt;sigprov.ifVersion = sigprovCURR_IF_VERSION;
-	/* The pDrvrName+2 below is a hack to obtain the object name. It
-	 * safes us to have yet another variable with the name without "lm" in
-	 * front of it. If we change the module load interface, we may re-think
-	 * about this hack, but for the time being it is efficient and clean enough.
-	 */
-	if(obj.UseObj(__FILE__, szDrvrName, szDrvrName, (void*) &amp;pData-&gt;sigprov)
-		!= RS_RET_OK) {
-		parser_errmsg("omfile: could not load "
-				"signature provider '%s' - signatures disabled",
-				szDrvrName);
-		goto done;
-	}
-
-	if(pData-&gt;sigprov.Construct(&amp;pData-&gt;sigprovData) != RS_RET_OK) {
-		parser_errmsg("omfile: error constructing "
-				"signature provider %s dataset - signatures disabled",
-				szDrvrName);
-		goto done;
-	}
-	pData-&gt;sigprov.SetCnfParam(pData-&gt;sigprovData, lst);
-
-	dbgprintf("loaded signature provider %s, data instance at %p\n",
-		  szDrvrName, pData-&gt;sigprovData);
-	pData-&gt;useSigprov = 1;
-done:	return;
-}
-
-static rsRetVal
-initCryprov(instanceData *__restrict__ const pData, struct nvlst *lst)
-{
-	uchar szDrvrName[1024];
-	DEFiRet;
-
-	if(snprintf((char*)szDrvrName, sizeof(szDrvrName), "lmcry_%s", pData-&gt;cryprovName)
-		== sizeof(szDrvrName)) {
-		parser_errmsg("omfile: crypto provider "
-				"name is too long: '%s' - encryption disabled",
-				pData-&gt;cryprovName);
-		ABORT_FINALIZE(RS_RET_ERR);
-	}
-	pData-&gt;cryprovNameFull = ustrdup(szDrvrName);
-
-	pData-&gt;cryprov.ifVersion = cryprovCURR_IF_VERSION;
-	/* The pDrvrName+2 below is a hack to obtain the object name. It
-	 * safes us to have yet another variable with the name without "lm" in
-	 * front of it. If we change the module load interface, we may re-think
-	 * about this hack, but for the time being it is efficient and clean enough.
-	 */
-	if(obj.UseObj(__FILE__, szDrvrName, szDrvrName, (void*) &amp;pData-&gt;cryprov)
-		!= RS_RET_OK) {
-		parser_errmsg("omfile: could not load "
-				"crypto provider '%s' - encryption disabled",
-				szDrvrName);
-		ABORT_FINALIZE(RS_RET_CRYPROV_ERR);
-	}
-
-	if(pData-&gt;cryprov.Construct(&amp;pData-&gt;cryprovData) != RS_RET_OK) {
-		parser_errmsg("omfile: error constructing "
-				"crypto provider %s dataset - encryption disabled",
-				szDrvrName);
-		ABORT_FINALIZE(RS_RET_CRYPROV_ERR);
-	}
-	CHKiRet(pData-&gt;cryprov.SetCnfParam(pData-&gt;cryprovData, lst, CRYPROV_PARAMTYPE_REGULAR));
-
-	dbgprintf("loaded crypto provider %s, data instance at %p\n",
-		  szDrvrName, pData-&gt;cryprovData);
-	pData-&gt;useCryprov = 1;
-finalize_it:
-	RETiRet;
-}
-
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-	uchar *tplToUse;
-	int i;
-CODESTARTnewActInst
-<a name="0"></a>	DBGPRINTF("newActInst (omfile)\n");
-
-	pvals = nvlstGetParams(lst, &amp;actpblk, NULL);
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if(pvals == NULL) {
-		parser_errmsg("omfile: either the \"file\" or "
-				"\"dynafile\" parameter must be given");
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	if(Debug) {
-		dbgprintf("action param blk in omfile:\n");
-		cnfparamsPrint(&amp;actpblk, pvals);
-	}
-
-	CHKiRet(createInstance(&amp;pData));
-	setInstParamDefaults(pData);
-
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(actpblk.descr[i].name, "dynafilecachesize")) {
-			pData-&gt;iDynaFileCacheSize = (uint) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "ziplevel")) {
-			pData-&gt;iZipLevel = (int) pvals[i].val.d.n;</b></font>
-		} else if(!strcmp(actpblk.descr[i].name, "flushinterval")) {
-			pData-&gt;iFlushInterval = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "veryrobustzip")) {
-			pData-&gt;bVeryRobustZip = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "asyncwriting")) {
-			pData-&gt;bUseAsyncWriter = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "flushontxend")) {
-			pData-&gt;bFlushOnTXEnd = pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "iobuffersize")) {
-			pData-&gt;iIOBufSize = (uint) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "dirowner")) {
-			pData-&gt;dirUID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "dirownernum")) {
-			pData-&gt;dirUID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "dirgroup")) {
-			pData-&gt;dirGID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "dirgroupnum")) {
-			pData-&gt;dirGID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "fileowner")) {
-			pData-&gt;fileUID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "fileownernum")) {
-			pData-&gt;fileUID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "filegroup")) {
-			pData-&gt;fileGID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "filegroupnum")) {
-			pData-&gt;fileGID = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "dircreatemode")) {
-			pData-&gt;fDirCreateMode = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "filecreatemode")) {
-			pData-&gt;fCreateMode = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "failonchownfailure")) {
-			pData-&gt;bFailOnChown = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "sync")) {
-			pData-&gt;bSyncFile = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "createdirs")) {
-			pData-&gt;bCreateDirs = (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "file")) {
-			pData-&gt;fname = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			CODE_STD_STRING_REQUESTnewActInst(1)
-			pData-&gt;bDynamicName = 0;
-		} else if(!strcmp(actpblk.descr[i].name, "dynafile")) {
-			if(pData-&gt;fname != NULL) {
-				parser_errmsg("omfile: both \"file\" and \"dynafile\" set, will use dynafile");
-			}
-			pData-&gt;fname = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-			CODE_STD_STRING_REQUESTnewActInst(2)
-			pData-&gt;bDynamicName = 1;
-		} else if(!strcmp(actpblk.descr[i].name, "template")) {
-			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "sig.provider")) {
-			pData-&gt;sigprovName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "cry.provider")) {
-			pData-&gt;cryprovName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "closetimeout")) {
-			pData-&gt;iCloseTimeout = (int) pvals[i].val.d.n;
-		} else {
-			dbgprintf("omfile: program error, non-handled "
-			  "param '%s'\n", actpblk.descr[i].name);
-		}
-	}
-
-	if(pData-&gt;fname == NULL) {
-		parser_errmsg("omfile: either the \"file\" or "
-				"\"dynafile\" parameter must be given");
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	if(pData-&gt;sigprovName != NULL) {
-		initSigprov(pData, lst);
-	}
-
-	if(pData-&gt;cryprovName != NULL) {
-		CHKiRet(initCryprov(pData, lst));
-	}
-
-	tplToUse = ustrdup((pData-&gt;tplName == NULL) ? getDfltTpl() : pData-&gt;tplName);
-	CHKiRet(OMSRsetEntry(*ppOMSR, 0, tplToUse, OMSR_NO_RQD_TPL_OPTS));
-	pData-&gt;iNumTpls = 1;
-
-	if(pData-&gt;bDynamicName) {
-		/* "filename" is actually a template name, we need this as string 1. So let's add it
-		 * to the pOMSR. -- rgerhards, 2007-07-27
-		 */
-		CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData-&gt;fname), OMSR_NO_RQD_TPL_OPTS));
-		pData-&gt;iNumTpls = 2;
-		// TODO: create unified code for this (legacy+v6 system)
-		/* we now allocate the cache table */
-		CHKmalloc(pData-&gt;dynCache = (dynaFileCacheEntry**)
-				calloc(pData-&gt;iDynaFileCacheSize, sizeof(dynaFileCacheEntry*)));
-		pData-&gt;iCurrElt = -1;		  /* no current element */
-	}
-// TODO: add	pData-&gt;iSizeLimit = 0; /* default value, use outchannels to configure! */
-	setupInstStatsCtrs(pData);
-
-	if(pData-&gt;iCloseTimeout == -1) { /* unset? */
-		pData-&gt;iCloseTimeout = (pData-&gt;bDynamicName) ? 10 : 0;
-	}
-
-	snprintf(pData-&gt;janitorID, sizeof(pData-&gt;janitorID), "omfile:%sfile:%s:%p",
-		(pData-&gt;bDynamicName) ? "dyna" : "", pData-&gt;fname, pData);
-	pData-&gt;janitorID[sizeof(pData-&gt;janitorID)-1] = '\0'; /* just in case... */
-
-	if(pData-&gt;iCloseTimeout &gt; 0)
-		janitorAddEtry(janitorCB, pData-&gt;janitorID, pData);
-
-CODE_STD_FINALIZERnewActInst
-	cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-
-
-BEGINparseSelectorAct
-	uchar fname[MAXFNAME];
-CODESTARTparseSelectorAct
-	/* Note: the indicator sequence permits us to use '$' to signify
-	 * outchannel, what otherwise is not possible due to truely
-	 * unresolvable grammar conflicts (*this time no way around*).
-	 * rgerhards, 2011-07-09
-	 */
-	if(!strncmp((char*) p, ":omfile:", sizeof(":omfile:") - 1)) {
-		p += sizeof(":omfile:") - 1;
-	}
-	if(!(*p == '$' || *p == '?' || *p == '/' || *p == '.' || *p == '-'))
-		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
-
-	CHKiRet(createInstance(&amp;pData));
-
-	if(*p == '-') {
-		pData-&gt;bSyncFile = 0;
-		p++;
-	} else {
-		pData-&gt;bSyncFile = cs.bEnableSync;
-	}
-	pData-&gt;iSizeLimit = 0; /* default value, use outchannels to configure! */
-
-	switch(*p) {
-	case '$':
-		CODE_STD_STRING_REQUESTparseSelectorAct(1)
-		pData-&gt;iNumTpls = 1;
-		/* rgerhards 2005-06-21: this is a special setting for output-channel
-		 * definitions. In the long term, this setting will probably replace
-		 * anything else, but for the time being we must co-exist with the
-		 * traditional mode lines.
-		 * rgerhards, 2007-07-24: output-channels will go away. We keep them
-		 * for compatibility reasons, but seems to have been a bad idea.
-		 */
-		CHKiRet(cflineParseOutchannel(pData, p, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS));
-		pData-&gt;bDynamicName = 0;
-		break;
-
-	case '?': /* This is much like a regular file handle, but we need to obtain
-		   * a template name. rgerhards, 2007-07-03
-		   */
-		CODE_STD_STRING_REQUESTparseSelectorAct(2)
-		pData-&gt;iNumTpls = 2;
-		++p; /* eat '?' */
-		CHKiRet(cflineParseFileName(p, fname, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS, getDfltTpl()));
-		pData-&gt;fname = ustrdup(fname);
-		pData-&gt;bDynamicName = 1;
-		pData-&gt;iCurrElt = -1;		  /* no current element */
-		/* "filename" is actually a template name, we need this as string 1. So let's add it
-		 * to the pOMSR. -- rgerhards, 2007-07-27
-		 */
-		CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData-&gt;fname), OMSR_NO_RQD_TPL_OPTS));
-		/* we now allocate the cache table */
-		CHKmalloc(pData-&gt;dynCache = (dynaFileCacheEntry**)
-				calloc(cs.iDynaFileCacheSize, sizeof(dynaFileCacheEntry*)));
-		break;
-
-	case '/':
-	case '.':
-		CODE_STD_STRING_REQUESTparseSelectorAct(1)
-		pData-&gt;iNumTpls = 1;
-		CHKiRet(cflineParseFileName(p, fname, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS, getDfltTpl()));
-		pData-&gt;fname = ustrdup(fname);
-		pData-&gt;bDynamicName = 0;
-		break;
-	default:
-		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
-	}
-
-	/* freeze current paremeters for this action */
-	pData-&gt;iDynaFileCacheSize = cs.iDynaFileCacheSize;
-	pData-&gt;fCreateMode = cs.fCreateMode;
-	pData-&gt;fDirCreateMode = cs.fDirCreateMode;
-	pData-&gt;bCreateDirs = cs.bCreateDirs;
-	pData-&gt;bFailOnChown = cs.bFailOnChown;
-	pData-&gt;fileUID = cs.fileUID;
-	pData-&gt;fileGID = cs.fileGID;
-	pData-&gt;dirUID = cs.dirUID;
-	pData-&gt;dirGID = cs.dirGID;
-	pData-&gt;iZipLevel = cs.iZipLevel;
-	pData-&gt;bFlushOnTXEnd = cs.bFlushOnTXEnd;
-	pData-&gt;iIOBufSize = (uint) cs.iIOBufSize;
-	pData-&gt;iFlushInterval = cs.iFlushInterval;
-	pData-&gt;bUseAsyncWriter = cs.bUseAsyncWriter;
-	pData-&gt;bVeryRobustZip = 0;	/* cannot be specified via legacy conf */
-	pData-&gt;iCloseTimeout = 0;	/* cannot be specified via legacy conf */
-	setupInstStatsCtrs(pData);
-CODE_STD_FINALIZERparseSelectorAct
-ENDparseSelectorAct
-
-
-/* Reset config variables for this module to default values.
- * rgerhards, 2007-07-17
- */
-static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
-{
-	cs.fileUID = -1;
-	cs.fileGID = -1;
-	cs.dirUID = -1;
-	cs.dirGID = -1;
-	cs.bFailOnChown = 1;
-	cs.iDynaFileCacheSize = 10;
-	cs.fCreateMode = 0644;
-	cs.fDirCreateMode = 0700;
-	cs.bCreateDirs = 1;
-	cs.bEnableSync = 0;
-	cs.iZipLevel = 0;
-	cs.bFlushOnTXEnd = FLUSHONTX_DFLT;
-	cs.iIOBufSize = IOBUF_DFLT_SIZE;
-	cs.iFlushInterval = FLUSH_INTRVL_DFLT;
-	cs.bUseAsyncWriter = USE_ASYNCWRITER_DFLT;
-	free(pszFileDfltTplName);
-	pszFileDfltTplName = NULL;
-	return RS_RET_OK;
-}
-
-
-BEGINdoHUP
-CODESTARTdoHUP
-	pthread_mutex_lock(&amp;pData-&gt;mutWrite);
-	if(pData-&gt;bDynamicName) {
-		dynaFileFreeCacheEntries(pData);
-	} else {
-		if(pData-&gt;pStrm != NULL) {
-			closeFile(pData);
-		}
-	}
-	pthread_mutex_unlock(&amp;pData-&gt;mutWrite);
-ENDdoHUP
-
-
-BEGINmodExit
-CODESTARTmodExit
-	objRelease(glbl, CORE_COMPONENT);
-	objRelease(strm, CORE_COMPONENT);
-	objRelease(statsobj, CORE_COMPONENT);
-	DESTROY_ATOMIC_HELPER_MUT(mutClock);
-ENDmodExit
-
-
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_OMODTX_QUERIES
-CODEqueryEtryPt_STD_OMOD8_QUERIES
-CODEqueryEtryPt_STD_CONF2_QUERIES
-CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
-CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-CODEqueryEtryPt_doHUP
-ENDqueryEtryPt
-
-
-BEGINmodInit(File)
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
-CODEmodInit_QueryRegCFSLineHdlr
-INITLegCnfVars
-	CHKiRet(objUse(strm, CORE_COMPONENT));
-	CHKiRet(objUse(statsobj, CORE_COMPONENT));
-
-	INIT_ATOMIC_HELPER_MUT(mutClock);
-
-	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
-	DBGPRINTF("omfile: %susing transactional output interface.\n", bCoreSupportsBatching ? "" : "not ");
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dynafilecachesize", 0, eCmdHdlrInt, setDynaFileCacheSize,
-		NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileziplevel", 0, eCmdHdlrInt, NULL, &amp;cs.iZipLevel,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileflushinterval", 0, eCmdHdlrInt, NULL, &amp;cs.iFlushInterval,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileasyncwriting", 0, eCmdHdlrBinary, NULL, &amp;cs.bUseAsyncWriter,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileflushontxend", 0, eCmdHdlrBinary, NULL, &amp;cs.bFlushOnTXEnd,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileiobuffersize", 0, eCmdHdlrSize, NULL, &amp;cs.iIOBufSize,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirowner", 0, eCmdHdlrUID, NULL, &amp;cs.dirUID,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirownernum", 0, eCmdHdlrInt, NULL, &amp;cs.dirUID,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirgroup", 0, eCmdHdlrGID, NULL, &amp;cs.dirGID,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirgroupnum", 0, eCmdHdlrInt, NULL, &amp;cs.dirGID,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"fileowner", 0, eCmdHdlrUID, NULL, &amp;cs.fileUID,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"fileownernum", 0, eCmdHdlrInt, NULL, &amp;cs.fileUID,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filegroup", 0, eCmdHdlrGID, NULL, &amp;cs.fileGID,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filegroupnum", 0, eCmdHdlrInt, NULL, &amp;cs.fileGID,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dircreatemode", 0, eCmdHdlrFileCreateMode, NULL,
-		&amp;cs.fDirCreateMode, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filecreatemode", 0, eCmdHdlrFileCreateMode, NULL,
-		&amp;cs.fCreateMode, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"createdirs", 0, eCmdHdlrBinary, NULL, &amp;cs.bCreateDirs,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"failonchownfailure", 0, eCmdHdlrBinary, NULL, &amp;cs.bFailOnChown,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileforcechown", 0, eCmdHdlrGoneAway, NULL, NULL,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionfileenablesync", 0, eCmdHdlrBinary, NULL, &amp;cs.bEnableSync,
-		STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionfiledefaulttemplate", 0, eCmdHdlrGetWord, setLegacyDfltTpl,
-		NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
-		NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-ENDmodInit
+1 #include "config.h"
+2 #include "rsyslog.h"
+3 #include "glbl.h"
+4 #include &lt;stdio.h&gt;
+5 #include &lt;stdarg.h&gt;
+6 #include &lt;stdlib.h&gt;
+7 #include &lt;string.h&gt;
+8 #include &lt;time.h&gt;
+9 #include &lt;assert.h&gt;
+10 #include &lt;errno.h&gt;
+11 #include &lt;ctype.h&gt;
+12 #include &lt;libgen.h&gt;
+13 #include &lt;unistd.h&gt;
+14 #include &lt;sys/file.h&gt;
+15 #include &lt;fcntl.h&gt;
+16 #include &lt;sys/statvfs.h&gt;
+17 #ifdef HAVE_ATOMIC_BUILTINS
+18 #	include &lt;pthread.h&gt;
+19 #endif
+20 #include "conf.h"
+21 #include "syslogd-types.h"
+22 #include "srUtils.h"
+23 #include "template.h"
+24 #include "outchannel.h"
+25 #include "omfile.h"
+26 #include "cfsysline.h"
+27 #include "module-template.h"
+28 #include "errmsg.h"
+29 #include "stream.h"
+30 #include "unicode-helper.h"
+31 #include "atomic.h"
+32 #include "statsobj.h"
+33 #include "sigprov.h"
+34 #include "cryprov.h"
+35 #include "parserif.h"
+36 #include "janitor.h"
+37 #include "rsconf.h"
+38 MODULE_TYPE_OUTPUT
+39 MODULE_TYPE_NOKEEP
+40 MODULE_CNFNAME("omfile")
+41 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal);
+42 DEF_OMOD_STATIC_DATA
+43 DEFobjCurrIf(glbl)
+44 DEFobjCurrIf(strm)
+45 DEFobjCurrIf(statsobj)
+46 #if HAVE_ATOMIC_BUILTINS64
+47 static uint64 clockFileAccess = 0;
+48 #else
+49 static unsigned clockFileAccess = 0;
+50 #endif
+51 #ifndef HAVE_ATOMIC_BUILTINS
+52 static pthread_mutex_t mutClock;
+53 #endif
+54 static uint64
+55 getClockFileAccess(void)
+56 {
+57 #if HAVE_ATOMIC_BUILTINS64
+58 	return ATOMIC_INC_AND_FETCH_uint64(&amp;clockFileAccess, &amp;mutClock);
+59 #else
+60 	return ATOMIC_INC_AND_FETCH_unsigned(&amp;clockFileAccess, &amp;mutClock);
+61 #endif
+62 }
+63 struct s_dynaFileCacheEntry {
+64 	uchar *pName;			strm_t	*pStrm;			void	*sigprovFileData;		uint64	clkTickAccessed;	short nInactive;	};
+65 typedef struct s_dynaFileCacheEntry dynaFileCacheEntry;
+66 #define IOBUF_DFLT_SIZE 4096	#define FLUSH_INTRVL_DFLT 1 	#define USE_ASYNCWRITER_DFLT 0 	#define FLUSHONTX_DFLT 1 	
+67 typedef struct _instanceData {
+68 	pthread_mutex_t mutWrite; 	uchar	*fname;		uchar 	*tplName;		strm_t	*pStrm;			short nInactive;		char	bDynamicName;		int	fCreateMode;		int	fDirCreateMode;		int	bCreateDirs;		int	bSyncFile;		uint8_t iNumTpls;		uid_t	fileUID;		uid_t	dirUID;
+69 	gid_t	fileGID;
+70 	gid_t	dirGID;
+71 	dynaFileCacheEntry **dynCache;
+72 	off_t	iSizeLimit;			uchar	*pszSizeLimitCmd;		int 	iZipLevel;			uint	iIOBufSize;			int	iFlushInterval;			short	iCloseTimeout;			sbool	bFlushOnTXEnd;			sbool	bUseAsyncWriter;		sbool	bVeryRobustZip;
+73 	statsobj_t *stats;			STATSCOUNTER_DEF(ctrRequests, mutCtrRequests);
+74 	STATSCOUNTER_DEF(ctrLevel0, mutCtrLevel0);
+75 	STATSCOUNTER_DEF(ctrEvict, mutCtrEvict);
+76 	STATSCOUNTER_DEF(ctrMiss, mutCtrMiss);
+77 	STATSCOUNTER_DEF(ctrMax, mutCtrMax);
+78 	STATSCOUNTER_DEF(ctrCloseTimeouts, mutCtrCloseTimeouts);
+79 	char janitorID[128];		} instanceData;
+80 typedef struct wrkrInstanceData {
+81 	instanceData *pData;
+82 } wrkrInstanceData_t;
+83 typedef struct configSettings_s {
+84 	uint iDynaFileCacheSize; 	int fCreateMode; 	int fDirCreateMode; 	int	bFailOnChown;		uid_t	fileUID;		uid_t	fileGID;		uid_t	dirUID;			uid_t	dirGID;			int	bCreateDirs;	int	bEnableSync;	int	iZipLevel;		sbool	bFlushOnTXEnd;	int64	iIOBufSize;		int	iFlushInterval; 		int	bUseAsyncWriter;		EMPTY_STRUCT
+85 } configSettings_t;
+86 static configSettings_t cs;
+87 uchar	*pszFileDfltTplName; 
+88 struct modConfData_s {
+89 	rsconf_t *pConf;		uchar 	*tplName;		int fCreateMode; 	int fDirCreateMode; 	uid_t fileUID;		uid_t dirUID;
+90 	gid_t fileGID;
+91 	gid_t dirGID;
+92 	int bDynafileDoNotSuspend;
+93 };
+94 static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;
+95 static struct cnfparamdescr modpdescr[] = {
+96 	{ "template", eCmdHdlrGetWord, 0 },
+97 	{ "dircreatemode", eCmdHdlrFileCreateMode, 0 },
+98 	{ "filecreatemode", eCmdHdlrFileCreateMode, 0 },
+99 	{ "dirowner", eCmdHdlrUID, 0 },
+100 	{ "dirownernum", eCmdHdlrInt, 0 },
+101 <a name="1"></a>	{ "dirgroup", eCmdHdlrGID, 0 },
+102 	{ "dirgroupnum", eCmdHdlrInt, 0 },
+103 	{ "fileowner", eCmdHdlrUID, 0 },
+104 <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "fileownernum", eCmdHdlrInt, 0 },
+105 	{ "filegroup", eCmdHdlrGID, 0 },
+106 	{ "dynafile.donotsuspend", eCmdHdlrBinary, 0 },
+107 	{ "filegroupnum", eCmdHdlrInt, 0 },
+108 };
+109 static struct cnfparamblk modpblk =
+110 	{ CNFPARAMBLK_VERSION,
+111 	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+112 	  modpdescr
+113 	};</b></font>
+114 static struct cnfparamdescr actpdescr[] = {
+115 	{ "dynafilecachesize", eCmdHdlrInt, 0 }, 	{ "ziplevel", eCmdHdlrInt, 0 }, 	{ "flushinterval", eCmdHdlrInt, 0 }, 	{ "asyncwriting", eCmdHdlrBinary, 0 }, 	{ "veryrobustzip", eCmdHdlrBinary, 0 },
+116 	{ "flushontxend", eCmdHdlrBinary, 0 }, 	{ "iobuffersize", eCmdHdlrSize, 0 }, 	{ "dirowner", eCmdHdlrUID, 0 }, 	{ "dirownernum", eCmdHdlrInt, 0 }, 	{ "dirgroup", eCmdHdlrGID, 0 }, 	{ "dirgroupnum", eCmdHdlrInt, 0 }, 	{ "fileowner", eCmdHdlrUID, 0 }, 	{ "fileownernum", eCmdHdlrInt, 0 }, 	{ "filegroup", eCmdHdlrGID, 0 }, 	{ "filegroupnum", eCmdHdlrInt, 0 }, 	{ "dircreatemode", eCmdHdlrFileCreateMode, 0 }, 	{ "filecreatemode", eCmdHdlrFileCreateMode, 0 }, 	{ "failonchownfailure", eCmdHdlrBinary, 0 }, 	{ "createdirs", eCmdHdlrBinary, 0 }, 	{ "sync", eCmdHdlrBinary, 0 }, 	{ "file", eCmdHdlrString, 0 },     	{ "dynafile", eCmdHdlrString, 0 }, 	{ "sig.provider", eCmdHdlrGetWord, 0 },
+117 	{ "cry.provider", eCmdHdlrGetWord, 0 },
+118 	{ "closetimeout", eCmdHdlrPositiveInt, 0 },
+119 	{ "template", eCmdHdlrGetWord, 0 }
+120 };
+121 static struct cnfparamblk actpblk =
+122 	{ CNFPARAMBLK_VERSION,
+123 	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+124 	  actpdescr
+125 	};
+126 static uchar*
+127 getDfltTpl(void)
+128 {
+129 	if(loadModConf != NULL &amp;&amp; loadModConf-&gt;tplName != NULL)
+130 		return loadModConf-&gt;tplName;
+131 	else if(pszFileDfltTplName == NULL)
+132 		return (uchar*)"RSYSLOG_FileFormat";
+133 	else
+134 		return pszFileDfltTplName;
+135 }
+136 BEGINinitConfVars		CODESTARTinitConfVars
+137 	pszFileDfltTplName = NULL; 	iRet = resetConfigVariables(NULL, NULL); ENDinitConfVars
+138 BEGINisCompatibleWithFeature
+139 CODESTARTisCompatibleWithFeature
+140 	if(eFeat == sFEATURERepeatedMsgReduction)
+141 		iRet = RS_RET_OK;
+142 ENDisCompatibleWithFeature
+143 BEGINdbgPrintInstInfo
+144 CODESTARTdbgPrintInstInfo
+145 	if(pData-&gt;bDynamicName) {
+146 		dbgprintf("[dynamic]\n");
+147 	} else { 		dbgprintf("%s%s\n", pData-&gt;fname,
+148 			  (pData-&gt;pStrm == NULL) ? " (closed)" : "");
+149 	}
+150 	dbgprintf("\ttemplate='%s'\n", pData-&gt;fname);
+151 	dbgprintf("\tuse async writer=%d\n", pData-&gt;bUseAsyncWriter);
+152 	dbgprintf("\tflush on TX end=%d\n", pData-&gt;bFlushOnTXEnd);
+153 	dbgprintf("\tflush interval=%d\n", pData-&gt;iFlushInterval);
+154 	dbgprintf("\tfile cache size=%d\n", pData-&gt;iDynaFileCacheSize);
+155 	dbgprintf("\tcreate directories: %s\n", pData-&gt;bCreateDirs ? "on" : "off");
+156 	dbgprintf("\tvery robust zip: %s\n", pData-&gt;bCreateDirs ? "on" : "off");
+157 	dbgprintf("\tfile owner %d, group %d\n", (int) pData-&gt;fileUID, (int) pData-&gt;fileGID);
+158 	dbgprintf("\tdirectory owner %d, group %d\n", (int) pData-&gt;dirUID, (int) pData-&gt;dirGID);
+159 	dbgprintf("\tdir create mode 0%3.3o, file create mode 0%3.3o\n",
+160 		  pData-&gt;fDirCreateMode, pData-&gt;fCreateMode);
+161 	dbgprintf("\tfail if owner/group can not be set: %s\n", pData-&gt;bFailOnChown ? "yes" : "no");
+162 ENDdbgPrintInstInfo
+163 static rsRetVal
+164 setLegacyDfltTpl(void __attribute__((unused)) *pVal, uchar* newVal)
+165 {
+166 	DEFiRet;
+167 	if(loadModConf != NULL &amp;&amp; loadModConf-&gt;tplName != NULL) {
+168 		free(newVal);
+169 		parser_errmsg("omfile: default template already set via module "
+170 			"global parameter - can no longer be changed");
+171 		ABORT_FINALIZE(RS_RET_ERR);
+172 	}
+173 	free(pszFileDfltTplName);
+174 	pszFileDfltTplName = newVal;
+175 finalize_it:
+176 	RETiRet;
+177 }
+178 static rsRetVal setDynaFileCacheSize(void __attribute__((unused)) *pVal, int iNewVal)
+179 {
+180 	DEFiRet;
+181 	if(iNewVal &lt; 1) {
+182 		errno = 0;
+183 		parser_errmsg(
+184 		         "DynaFileCacheSize must be greater 0 (%d given), changed to 1.", iNewVal);
+185 		iRet = RS_RET_VAL_OUT_OF_RANGE;
+186 		iNewVal = 1;
+187 	} else if(iNewVal &gt; 1000) {
+188 		errno = 0;
+189 		parser_errmsg(
+190 		         "DynaFileCacheSize maximum is 1,000 (%d given), changed to 1,000.", iNewVal);
+191 		iRet = RS_RET_VAL_OUT_OF_RANGE;
+192 		iNewVal = 1000;
+193 	}
+194 	cs.iDynaFileCacheSize = iNewVal;
+195 	DBGPRINTF("DynaFileCacheSize changed to %d.\n", iNewVal);
+196 	RETiRet;
+197 }
+198 static rsRetVal cflineParseOutchannel(instanceData *pData, uchar* p, omodStringRequest_t *pOMSR,
+199 	int iEntry, int iTplOpts)
+200 {
+201 	DEFiRet;
+202 	size_t i;
+203 	struct outchannel *pOch;
+204 	char szBuf[128];	
+205 	++p; 	i = 0;
+206 	while(*p &amp;&amp; *p != ';' &amp;&amp; *p != ' ' &amp;&amp;
+207 	      i &lt; (sizeof(szBuf) - 1) ) {
+208 	      szBuf[i++] = *p++;
+209 	}
+210 	szBuf[i] = '\0';
+211 	pOch = ochFind(szBuf, i);
+212 	if(pOch == NULL) {
+213 		parser_errmsg(
+214 			 "outchannel '%s' not found - ignoring action line",
+215 			 szBuf);
+216 		ABORT_FINALIZE(RS_RET_NOT_FOUND);
+217 	}
+218 	if(pOch-&gt;pszFileTemplate == NULL) {
+219 		parser_errmsg(
+220 			 "outchannel '%s' has no file name template - ignoring action line",
+221 			 szBuf);
+222 		ABORT_FINALIZE(RS_RET_ERR);
+223 	}
+224 	pData-&gt;fname = ustrdup(pOch-&gt;pszFileTemplate);
+225 	pData-&gt;iSizeLimit = pOch-&gt;uSizeLimit;
+226 	pData-&gt;pszSizeLimitCmd = pOch-&gt;cmdOnSizeLimit;
+227 	iRet = cflineParseTemplateName(&amp;p, pOMSR, iEntry, iTplOpts, getDfltTpl());
+228 finalize_it:
+229 	RETiRet;
+230 }
+231 static rsRetVal
+232 dynaFileDelCacheEntry(instanceData *__restrict__ const pData, const int iEntry, const int bFreeEntry)
+233 {
+234 	dynaFileCacheEntry **pCache = pData-&gt;dynCache;
+235 	DEFiRet;
+236 	assert(pCache != NULL);
+237 	if(pCache[iEntry] == NULL)
+238 		FINALIZE;
+239 	DBGPRINTF("Removing entry %d for file '%s' from dynaCache.\n", iEntry,
+240 		pCache[iEntry]-&gt;pName == NULL ? UCHAR_CONSTANT("[OPEN FAILED]") : pCache[iEntry]-&gt;pName);
+241 	if(pCache[iEntry]-&gt;pName != NULL) {
+242 		free(pCache[iEntry]-&gt;pName);
+243 		pCache[iEntry]-&gt;pName = NULL;
+244 	}
+245 	if(pCache[iEntry]-&gt;pStrm != NULL) {
+246 		strm.Destruct(&amp;pCache[iEntry]-&gt;pStrm);
+247 		if(pData-&gt;useSigprov) {
+248 			pData-&gt;sigprov.OnFileClose(pCache[iEntry]-&gt;sigprovFileData);
+249 			pCache[iEntry]-&gt;sigprovFileData = NULL;
+250 		}
+251 	}
+252 	if(bFreeEntry) {
+253 		free(pCache[iEntry]);
+254 		pCache[iEntry] = NULL;
+255 	}
+256 finalize_it:
+257 	RETiRet;
+258 }
+259 static void
+260 dynaFileFreeCacheEntries(instanceData *__restrict__ const pData)
+261 {
+262 	register uint i;
+263 	assert(pData != NULL);
+264 	for(i = 0 ; i &lt; pData-&gt;iCurrCacheSize ; ++i) {
+265 		dynaFileDelCacheEntry(pData, i, 1);
+266 	}
+267 	pData-&gt;iCurrElt = -1; }
+268 static void dynaFileFreeCache(instanceData *__restrict__ const pData)
+269 {
+270 	assert(pData != NULL);
+271 	dynaFileFreeCacheEntries(pData);
+272 	if(pData-&gt;dynCache != NULL)
+273 		free(pData-&gt;dynCache);
+274 }
+275 static rsRetVal
+276 closeFile(instanceData *__restrict__ const pData)
+277 {
+278 	DEFiRet;
+279 	if(pData-&gt;useSigprov) {
+280 		pData-&gt;sigprov.OnFileClose(pData-&gt;sigprovFileData);
+281 		pData-&gt;sigprovFileData = NULL;
+282 	}
+283 	strm.Destruct(&amp;pData-&gt;pStrm);
+284 	RETiRet;
+285 }
+286 static rsRetVal
+287 sigprovPrepare(instanceData *__restrict__ const pData, uchar *__restrict__ const fn)
+288 {
+289 	DEFiRet;
+290 	pData-&gt;sigprov.OnFileOpen(pData-&gt;sigprovData, fn, &amp;pData-&gt;sigprovFileData);
+291 	RETiRet;
+292 }
+293 static rsRetVal
+294 prepareFile(instanceData *__restrict__ const pData, const uchar *__restrict__ const newFileName)
+295 {
+296 	int fd;
+297 	char errStr[1024]; 	DEFiRet;
+298 	pData-&gt;pStrm = NULL;
+299 	if(access((char*)newFileName, F_OK) != 0) {
+300 		if(pData-&gt;bCreateDirs) {
+301 			if(makeFileParentDirs(newFileName, ustrlen(newFileName),
+302 			     pData-&gt;fDirCreateMode, pData-&gt;dirUID,
+303 			     pData-&gt;dirGID, pData-&gt;bFailOnChown) != 0) {
+304 				rs_strerror_r(errno, errStr, sizeof(errStr));
+305 				parser_errmsg( "omfile: creating parent "
+306 					"directories for file  '%s' failed: %s",
+307 					newFileName, errStr);
+308 			     	ABORT_FINALIZE(RS_RET_ERR); 			}
+309 		}
+310 		fd = open((char*) newFileName, O_WRONLY|O_APPEND|O_CREAT|O_NOCTTY|O_CLOEXEC,
+311 				pData-&gt;fCreateMode);
+312 		if(fd != -1) {
+313 			if(pData-&gt;fileUID != (uid_t)-1 || pData-&gt;fileGID != (gid_t) -1) {
+314 				if(fchown(fd, pData-&gt;fileUID, pData-&gt;fileGID) != 0) {
+315 					rs_strerror_r(errno, errStr, sizeof(errStr));
+316 					parser_errmsg(
+317 						"omfile: chown for file '%s' failed: %s",
+318 						newFileName, errStr);
+319 					if(pData-&gt;bFailOnChown) {
+320 						close(fd);
+321 						ABORT_FINALIZE(RS_RET_ERR); 					}
+322 				}
+323 			}
+324 			close(fd); 		}
+325 		else {
+326 			ABORT_FINALIZE(RS_RET_ERR);
+327 		}
+328 	}
+329 	uchar szNameBuf[MAXFNAME+1];
+330 	uchar szDirName[MAXFNAME+1];
+331 	uchar szBaseName[MAXFNAME+1];
+332 	ustrncpy(szNameBuf, newFileName, MAXFNAME);
+333 	szNameBuf[MAXFNAME] = '\0';
+334 	ustrncpy(szDirName, (uchar*)dirname((char*)szNameBuf), MAXFNAME);
+335 	szDirName[MAXFNAME] = '\0';
+336 	ustrncpy(szNameBuf, newFileName, MAXFNAME);
+337 	szNameBuf[MAXFNAME] = '\0';
+338 	ustrncpy(szBaseName, (uchar*)basename((char*)szNameBuf), MAXFNAME);
+339 	szBaseName[MAXFNAME] = '\0';
+340 	CHKiRet(strm.Construct(&amp;pData-&gt;pStrm));
+341 	CHKiRet(strm.SetFName(pData-&gt;pStrm, szBaseName, ustrlen(szBaseName)));
+342 	CHKiRet(strm.SetDir(pData-&gt;pStrm, szDirName, ustrlen(szDirName)));
+343 	CHKiRet(strm.SetiZipLevel(pData-&gt;pStrm, pData-&gt;iZipLevel));
+344 	CHKiRet(strm.SetbVeryReliableZip(pData-&gt;pStrm, pData-&gt;bVeryRobustZip));
+345 	CHKiRet(strm.SetsIOBufSize(pData-&gt;pStrm, (size_t) pData-&gt;iIOBufSize));
+346 	CHKiRet(strm.SettOperationsMode(pData-&gt;pStrm, STREAMMODE_WRITE_APPEND));
+347 	CHKiRet(strm.SettOpenMode(pData-&gt;pStrm, cs.fCreateMode));
+348 	CHKiRet(strm.SetbSync(pData-&gt;pStrm, pData-&gt;bSyncFile));
+349 	CHKiRet(strm.SetsType(pData-&gt;pStrm, STREAMTYPE_FILE_SINGLE));
+350 	CHKiRet(strm.SetiSizeLimit(pData-&gt;pStrm, pData-&gt;iSizeLimit));
+351 	if(pData-&gt;useCryprov) {
+352 		CHKiRet(strm.Setcryprov(pData-&gt;pStrm, &amp;pData-&gt;cryprov));
+353 		CHKiRet(strm.SetcryprovData(pData-&gt;pStrm, pData-&gt;cryprovData));
+354 	}
+355 	if(pData-&gt;bUseAsyncWriter)
+356 		CHKiRet(strm.SetiFlushInterval(pData-&gt;pStrm, pData-&gt;iFlushInterval));
+357 	if(pData-&gt;pszSizeLimitCmd != NULL)
+358 		CHKiRet(strm.SetpszSizeLimitCmd(pData-&gt;pStrm, ustrdup(pData-&gt;pszSizeLimitCmd)));
+359 	CHKiRet(strm.ConstructFinalize(pData-&gt;pStrm));
+360 	if(pData-&gt;useSigprov)
+361 		sigprovPrepare(pData, szNameBuf);
+362 finalize_it:
+363 	if(iRet != RS_RET_OK) {
+364 		if(pData-&gt;pStrm != NULL) {
+365 			closeFile(pData);
+366 		}
+367 	}
+368 	RETiRet;
+369 }
+370 static rsRetVal
+371 fsCheck(instanceData *__restrict__ const pData, const uchar *__restrict__ const fileName)
+372 {
+373 	DEFiRet;
+374 	struct statvfs stat;
+375 	char *pathcopy;
+376 	const char *path;
+377 	pathcopy = strdup((char*)fileName);
+378 	path = dirname(pathcopy);
+379 	if (statvfs(path, &amp;stat) != 0) {
+380 		iRet = RS_RET_FILE_NO_STAT;
+381 		LogError(0, iRet, "could not stat %s", path);
+382 		FINALIZE;
+383 	}
+384 	if (stat.f_bsize * stat.f_bavail &lt;
+385 		pData-&gt;iIOBufSize * pData-&gt;iDynaFileCacheSize + (uint)(glbl.GetMaxLine(runModConf-&gt;pConf)))
+386 		{
+387 			iRet = RS_RET_FS_ERR;
+388 			LogError(0, iRet, "too few available blocks in %s", path);
+389 			FINALIZE;
+390 		}
+391 	if (stat.f_favail &lt; 2 &amp;&amp; stat.f_files &gt; 0)
+392 		{
+393 			iRet = RS_RET_FS_ERR;
+394 			LogError(0, iRet, "too few available inodes in %s", path);
+395 			FINALIZE;
+396 		}
+397 	if (stat.f_flag == ST_RDONLY)
+398 		{
+399 			iRet = RS_RET_FS_ERR;
+400 			LogError(0, iRet, "file-system is read-only in %s", path);
+401 			FINALIZE;
+402 		}
+403 	iRet = RS_RET_OK;
+404 finalize_it:
+405 	if (pathcopy != NULL)
+406 		free(pathcopy);
+407 	RETiRet;
+408 }
+409 static rsRetVal
+410 prepareDynFile(instanceData *__restrict__ const pData, const uchar *__restrict__ const newFileName)
+411 {
+412 	uint64 ctOldest; 	int iOldest;
+413 	uint i;
+414 	int iFirstFree;
+415 	rsRetVal localRet;
+416 	dynaFileCacheEntry **pCache;
+417 	DEFiRet;
+418 	assert(pData != NULL);
+419 	assert(newFileName != NULL);
+420 	pCache = pData-&gt;dynCache;
+421 	if(   (pData-&gt;iCurrElt != -1)
+422 	   &amp;&amp; !ustrcmp(newFileName, pCache[pData-&gt;iCurrElt]-&gt;pName)) {
+423 		CHKiRet(fsCheck(pData, newFileName));
+424 		pCache[pData-&gt;iCurrElt]-&gt;clkTickAccessed = getClockFileAccess();
+425 		STATSCOUNTER_INC(pData-&gt;ctrLevel0, pData-&gt;mutCtrLevel0);
+426 		FINALIZE;
+427 	}
+428 	pData-&gt;iCurrElt = -1;		iFirstFree = -1; 	iOldest = 0; 	ctOldest = getClockFileAccess(); 	for(i = 0 ; i &lt; pData-&gt;iCurrCacheSize ; ++i) {
+429 		if(pCache[i] == NULL || pCache[i]-&gt;pName == NULL) {
+430 			if(iFirstFree == -1)
+431 				iFirstFree = i;
+432 		} else { 			if(!ustrcmp(newFileName, pCache[i]-&gt;pName)) {
+433 				CHKiRet(fsCheck(pData, newFileName));
+434 				pData-&gt;pStrm = pCache[i]-&gt;pStrm;
+435 				if(pData-&gt;useSigprov)
+436 					pData-&gt;sigprovFileData = pCache[i]-&gt;sigprovFileData;
+437 				pData-&gt;iCurrElt = i;
+438 				pCache[i]-&gt;clkTickAccessed = getClockFileAccess(); 				FINALIZE;
+439 			}
+440 			if(pCache[i]-&gt;clkTickAccessed &lt; ctOldest) {
+441 				ctOldest = pCache[i]-&gt;clkTickAccessed;
+442 				iOldest = i;
+443 				}
+444 		}
+445 	}
+446 	STATSCOUNTER_INC(pData-&gt;ctrMiss, pData-&gt;mutCtrMiss);
+447 	pData-&gt;pStrm = NULL, pData-&gt;sigprovFileData = NULL;
+448 	if(iFirstFree == -1 &amp;&amp; (pData-&gt;iCurrCacheSize &lt; pData-&gt;iDynaFileCacheSize)) {
+449 		iFirstFree = pData-&gt;iCurrCacheSize++;
+450 		STATSCOUNTER_SETMAX_NOMUT(pData-&gt;ctrMax, (unsigned) pData-&gt;iCurrCacheSize);
+451 	}
+452 	if(iFirstFree == -1) {
+453 		dynaFileDelCacheEntry(pData, iOldest, 0);
+454 		STATSCOUNTER_INC(pData-&gt;ctrEvict, pData-&gt;mutCtrEvict);
+455 		iFirstFree = iOldest; 	} else {
+456 		CHKmalloc(pCache[iFirstFree] = (dynaFileCacheEntry*) calloc(1, sizeof(dynaFileCacheEntry)));
+457 	}
+458 	localRet = prepareFile(pData, newFileName); 
+459 	if(localRet != RS_RET_OK) {
+460 		parser_errmsg("Could not open dynamic file '%s' [state %d]", newFileName, localRet);
+461 		ABORT_FINALIZE(localRet);
+462 	}
+463 	localRet = fsCheck(pData, newFileName);
+464 	if(localRet != RS_RET_OK) {
+465 		parser_errmsg("Invalid file-system condition for dynamic file '%s' [state %d]", newFileName, localRet);
+466 		ABORT_FINALIZE(localRet);
+467 	}
+468 	if((pCache[iFirstFree]-&gt;pName = ustrdup(newFileName)) == NULL) {
+469 		closeFile(pData); 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+470 	}
+471 	pCache[iFirstFree]-&gt;pStrm = pData-&gt;pStrm;
+472 	if(pData-&gt;useSigprov)
+473 		pCache[iFirstFree]-&gt;sigprovFileData = pData-&gt;sigprovFileData;
+474 	pCache[iFirstFree]-&gt;clkTickAccessed = getClockFileAccess();
+475 	pData-&gt;iCurrElt = iFirstFree;
+476 	DBGPRINTF("Added new entry %d for file cache, file '%s'.\n", iFirstFree, newFileName);
+477 finalize_it:
+478 	if(iRet == RS_RET_OK)
+479 		pCache[pData-&gt;iCurrElt]-&gt;nInactive = 0;
+480 	RETiRet;
+481 }
+482 static  rsRetVal
+483 doWrite(instanceData *__restrict__ const pData, uchar *__restrict__ const pszBuf, const int lenBuf)
+484 {
+485 	DEFiRet;
+486 	assert(pData != NULL);
+487 	assert(pszBuf != NULL);
+488 	DBGPRINTF("omfile: write to stream, pData-&gt;pStrm %p, lenBuf %d, strt data %.128s\n",
+489 		  pData-&gt;pStrm, lenBuf, pszBuf);
+490 	if(pData-&gt;pStrm != NULL){
+491 		CHKiRet(strm.Write(pData-&gt;pStrm, pszBuf, lenBuf));
+492 		if(pData-&gt;useSigprov) {
+493 			CHKiRet(pData-&gt;sigprov.OnRecordWrite(pData-&gt;sigprovFileData, pszBuf, lenBuf));
+494 		}
+495 	}
+496 finalize_it:
+497 	RETiRet;
+498 }
+499 static rsRetVal
+500 writeFile(instanceData *__restrict__ const pData,
+501 	  const actWrkrIParams_t *__restrict__ const pParam,
+502 	  const int iMsg)
+503 {
+504 	DEFiRet;
+505 	STATSCOUNTER_INC(pData-&gt;ctrRequests, pData-&gt;mutCtrRequests);
+506 	if(pData-&gt;bDynamicName) {
+507 		DBGPRINTF("omfile: file to log to: %s\n",
+508 			  actParam(pParam, pData-&gt;iNumTpls, iMsg, 1).param);
+509 		CHKiRet(prepareDynFile(pData, actParam(pParam, pData-&gt;iNumTpls, iMsg, 1).param));
+510 	} else { 		if(pData-&gt;pStrm == NULL) {
+511 			CHKiRet(prepareFile(pData, pData-&gt;fname));
+512 			if(pData-&gt;pStrm == NULL) {
+513 				parser_errmsg(
+514 					"Could not open output file '%s'", pData-&gt;fname);
+515 			}
+516 			CHKiRet(fsCheck(pData, pData-&gt;fname));
+517 		}
+518 		pData-&gt;nInactive = 0;
+519 	}
+520 	iRet = doWrite(pData, actParam(pParam, pData-&gt;iNumTpls, iMsg, 0).param,
+521 		actParam(pParam, pData-&gt;iNumTpls, iMsg, 0).lenStr);
+522 finalize_it:
+523 	RETiRet;
+524 }
+525 BEGINbeginCnfLoad
+526 CODESTARTbeginCnfLoad
+527 	loadModConf = pModConf;
+528 	pModConf-&gt;pConf = pConf;
+529 	pModConf-&gt;tplName = NULL;
+530 	pModConf-&gt;fCreateMode = 0644;
+531 	pModConf-&gt;fDirCreateMode = 0700;
+532 	pModConf-&gt;fileUID = -1;
+533 	pModConf-&gt;dirUID = -1;
+534 	pModConf-&gt;fileGID = -1;
+535 	pModConf-&gt;dirGID = -1;
+536 	pModConf-&gt;bDynafileDoNotSuspend = 1;
+537 ENDbeginCnfLoad
+538 BEGINsetModCnf
+539 	struct cnfparamvals *pvals = NULL;
+540 	int i;
+541 CODESTARTsetModCnf
+542 	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
+543 	if(pvals == NULL) {
+544 		parser_errmsg("error processing module "
+545 				"config parameters [module(...)]");
+546 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+547 	}
+548 	if(Debug) {
+549 		dbgprintf("module (global) param blk for omfile:\n");
+550 		cnfparamsPrint(&amp;modpblk, pvals);
+551 	}
+552 	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
+553 		if(!pvals[i].bUsed) {
+554 			continue;
+555 		}
+556 		if(!strcmp(modpblk.descr[i].name, "template")) {
+557 			loadModConf-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+558 			if(pszFileDfltTplName != NULL) {
+559 				parser_errmsg("omfile: warning: default template was already "
+560 					"set via legacy directive - may lead to inconsistent "
+561 					"results.");
+562 			}
+563 		} else if(!strcmp(modpblk.descr[i].name, "dircreatemode")) {
+564 			loadModConf-&gt;fDirCreateMode = (int) pvals[i].val.d.n;
+565 		} else if(!strcmp(modpblk.descr[i].name, "filecreatemode")) {
+566 			loadModConf-&gt;fCreateMode = (int) pvals[i].val.d.n;
+567 		} else if(!strcmp(modpblk.descr[i].name, "dirowner")) {
+568 			loadModConf-&gt;dirUID = (int) pvals[i].val.d.n;
+569 		} else if(!strcmp(modpblk.descr[i].name, "dirownernum")) {
+570 			loadModConf-&gt;dirUID = (int) pvals[i].val.d.n;
+571 		} else if(!strcmp(modpblk.descr[i].name, "dirgroup")) {
+572 			loadModConf-&gt;dirGID = (int) pvals[i].val.d.n;
+573 		} else if(!strcmp(modpblk.descr[i].name, "dirgroupnum")) {
+574 			loadModConf-&gt;dirGID = (int) pvals[i].val.d.n;
+575 		} else if(!strcmp(modpblk.descr[i].name, "fileowner")) {
+576 			loadModConf-&gt;fileUID = (int) pvals[i].val.d.n;
+577 		} else if(!strcmp(modpblk.descr[i].name, "fileownernum")) {
+578 			loadModConf-&gt;fileUID = (int) pvals[i].val.d.n;
+579 		} else if(!strcmp(modpblk.descr[i].name, "filegroup")) {
+580 			loadModConf-&gt;fileGID = (int) pvals[i].val.d.n;
+581 		} else if(!strcmp(modpblk.descr[i].name, "filegroupnum")) {
+582 			loadModConf-&gt;fileGID = (int) pvals[i].val.d.n;
+583 		} else if(!strcmp(modpblk.descr[i].name, "dynafile.donotsuspend")) {
+584 			loadModConf-&gt;bDynafileDoNotSuspend = (int) pvals[i].val.d.n;
+585 		} else {
+586 			dbgprintf("omfile: program error, non-handled "
+587 			  "param '%s' in beginCnfLoad\n", modpblk.descr[i].name);
+588 		}
+589 	}
+590 finalize_it:
+591 	if(pvals != NULL)
+592 		cnfparamvalsDestruct(pvals, &amp;modpblk);
+593 ENDsetModCnf
+594 static void
+595 janitorChkDynaFiles(instanceData *__restrict__ const pData)
+596 {
+597 	uint i;
+598 	dynaFileCacheEntry **pCache = pData-&gt;dynCache;
+599 	for(i = 0 ; i &lt; pData-&gt;iCurrCacheSize ; ++i) {
+600 		if(pCache[i] == NULL)
+601 			continue;
+602 		DBGPRINTF("omfile janitor: checking dynafile %d:%s, inactive since %d\n", i,
+603 			pCache[i]-&gt;pName == NULL ? UCHAR_CONSTANT("[OPEN FAILED]") : pCache[i]-&gt;pName,
+604 			(int) pCache[i]-&gt;nInactive);
+605 		if(pCache[i]-&gt;nInactive &gt;= pData-&gt;iCloseTimeout) {
+606 			STATSCOUNTER_INC(pData-&gt;ctrCloseTimeouts, pData-&gt;mutCtrCloseTimeouts);
+607 			dynaFileDelCacheEntry(pData, i, 1);
+608 			if(pData-&gt;iCurrElt &gt;= 0) {
+609 				if((uint)(pData-&gt;iCurrElt) == i)
+610 				pData-&gt;iCurrElt = -1; 			}
+611 		} else {
+612 			pCache[i]-&gt;nInactive += runModConf-&gt;pConf-&gt;globals.janitorInterval;
+613 		}
+614 	}
+615 }
+616 static void
+617 janitorCB(void *pUsr)
+618 {
+619 	instanceData *__restrict__ const pData = (instanceData *) pUsr;
+620 	pthread_mutex_lock(&amp;pData-&gt;mutWrite);
+621 	if(pData-&gt;bDynamicName) {
+622 		janitorChkDynaFiles(pData);
+623 	} else {
+624 		if(pData-&gt;pStrm != NULL) {
+625 			DBGPRINTF("omfile janitor: checking file %s, inactive since %d\n",
+626 				pData-&gt;fname, pData-&gt;nInactive);
+627 			if(pData-&gt;nInactive &gt;= pData-&gt;iCloseTimeout) {
+628 				STATSCOUNTER_INC(pData-&gt;ctrCloseTimeouts, pData-&gt;mutCtrCloseTimeouts);
+629 				closeFile(pData);
+630 			} else {
+631 				pData-&gt;nInactive += runModConf-&gt;pConf-&gt;globals.janitorInterval;
+632 			}
+633 		}
+634 	}
+635 	pthread_mutex_unlock(&amp;pData-&gt;mutWrite);
+636 }
+637 BEGINendCnfLoad
+638 CODESTARTendCnfLoad
+639 	loadModConf = NULL; 	free(pszFileDfltTplName);
+640 	pszFileDfltTplName = NULL;
+641 ENDendCnfLoad
+642 BEGINcheckCnf
+643 CODESTARTcheckCnf
+644 ENDcheckCnf
+645 BEGINactivateCnf
+646 CODESTARTactivateCnf
+647 	runModConf = pModConf;
+648 ENDactivateCnf
+649 BEGINfreeCnf
+650 CODESTARTfreeCnf
+651 	free(pModConf-&gt;tplName);
+652 ENDfreeCnf
+653 BEGINcreateInstance
+654 CODESTARTcreateInstance
+655 	pData-&gt;pStrm = NULL;
+656 	pthread_mutex_init(&amp;pData-&gt;mutWrite, NULL);
+657 ENDcreateInstance
+658 BEGINcreateWrkrInstance
+659 CODESTARTcreateWrkrInstance
+660 ENDcreateWrkrInstance
+661 BEGINfreeInstance
+662 CODESTARTfreeInstance
+663 	free(pData-&gt;tplName);
+664 	free(pData-&gt;fname);
+665 	if(pData-&gt;iCloseTimeout &gt; 0)
+666 		janitorDelEtry(pData-&gt;janitorID);
+667 	if(pData-&gt;bDynamicName) {
+668 		dynaFileFreeCache(pData);
+669 	} else if(pData-&gt;pStrm != NULL)
+670 		closeFile(pData);
+671 	if(pData-&gt;stats != NULL)
+672 		statsobj.Destruct(&amp;(pData-&gt;stats));
+673 	if(pData-&gt;useSigprov) {
+674 		pData-&gt;sigprov.Destruct(&amp;pData-&gt;sigprovData);
+675 		obj.ReleaseObj(__FILE__, pData-&gt;sigprovNameFull+2, pData-&gt;sigprovNameFull,
+676 			       (void*) &amp;pData-&gt;sigprov);
+677 		free(pData-&gt;sigprovName);
+678 		free(pData-&gt;sigprovNameFull);
+679 	}
+680 	if(pData-&gt;useCryprov) {
+681 		pData-&gt;cryprov.Destruct(&amp;pData-&gt;cryprovData);
+682 		obj.ReleaseObj(__FILE__, pData-&gt;cryprovNameFull+2, pData-&gt;cryprovNameFull,
+683 			       (void*) &amp;pData-&gt;cryprov);
+684 		free(pData-&gt;cryprovName);
+685 		free(pData-&gt;cryprovNameFull);
+686 	}
+687 	pthread_mutex_destroy(&amp;pData-&gt;mutWrite);
+688 ENDfreeInstance
+689 BEGINfreeWrkrInstance
+690 CODESTARTfreeWrkrInstance
+691 ENDfreeWrkrInstance
+692 BEGINtryResume
+693 CODESTARTtryResume
+694 ENDtryResume
+695 BEGINbeginTransaction
+696 CODESTARTbeginTransaction
+697 ENDbeginTransaction
+698 BEGINcommitTransaction
+699 	instanceData *__restrict__ const pData = pWrkrData-&gt;pData;
+700 	unsigned i;
+701 CODESTARTcommitTransaction
+702 	pthread_mutex_lock(&amp;pData-&gt;mutWrite);
+703 	for(i = 0 ; i &lt; nParams ; ++i) {
+704 		CHKiRet(writeFile(pData, pParams, i));
+705 	}
+706 	if(pData-&gt;bFlushOnTXEnd &amp;&amp; pData-&gt;pStrm != NULL) {
+707 		CHKiRet(strm.Flush(pData-&gt;pStrm));
+708 	}
+709 finalize_it:
+710 	if (iRet != RS_RET_OK) {
+711 		if (runModConf-&gt;bDynafileDoNotSuspend == 0 || !(pData-&gt;bDynamicName)) {
+712 			LogError(0, iRet, "suspending action");
+713 			iRet = RS_RET_SUSPENDED;
+714 		}
+715 		else {
+716 			LogError(0, iRet, "discarding message");
+717 		}
+718 	}
+719 	pthread_mutex_unlock(&amp;pData-&gt;mutWrite);
+720 ENDcommitTransaction
+721 static void
+722 setInstParamDefaults(instanceData *__restrict__ const pData)
+723 {
+724 	pData-&gt;fname = NULL;
+725 	pData-&gt;tplName = NULL;
+726 	pData-&gt;fileUID = loadModConf-&gt;fileUID;
+727 	pData-&gt;fileGID = loadModConf-&gt;fileGID;
+728 	pData-&gt;dirUID = loadModConf-&gt;dirUID;
+729 	pData-&gt;dirGID = loadModConf-&gt;dirGID;
+730 	pData-&gt;bFailOnChown = 1;
+731 	pData-&gt;iDynaFileCacheSize = 10;
+732 	pData-&gt;fCreateMode = loadModConf-&gt;fCreateMode;
+733 	pData-&gt;fDirCreateMode = loadModConf-&gt;fDirCreateMode;
+734 	pData-&gt;bCreateDirs = 1;
+735 	pData-&gt;bSyncFile = 0;
+736 	pData-&gt;iZipLevel = 0;
+737 	pData-&gt;bVeryRobustZip = 0;
+738 	pData-&gt;bFlushOnTXEnd = FLUSHONTX_DFLT;
+739 	pData-&gt;iIOBufSize = IOBUF_DFLT_SIZE;
+740 	pData-&gt;iFlushInterval = FLUSH_INTRVL_DFLT;
+741 	pData-&gt;bUseAsyncWriter = USE_ASYNCWRITER_DFLT;
+742 	pData-&gt;sigprovName = NULL;
+743 	pData-&gt;cryprovName = NULL;
+744 	pData-&gt;useSigprov = 0;
+745 	pData-&gt;useCryprov = 0;
+746 	pData-&gt;iCloseTimeout = -1;
+747 }
+748 static rsRetVal
+749 setupInstStatsCtrs(instanceData *__restrict__ const pData)
+750 {
+751 	uchar ctrName[512];
+752 	DEFiRet;
+753 	if(!pData-&gt;bDynamicName) {
+754 		FINALIZE;
+755 	}
+756 	snprintf((char*)ctrName, sizeof(ctrName), "dynafile cache %s", pData-&gt;fname);
+757 	ctrName[sizeof(ctrName)-1] = '\0'; 	CHKiRet(statsobj.Construct(&amp;(pData-&gt;stats)));
+758 	CHKiRet(statsobj.SetName(pData-&gt;stats, ctrName));
+759 	CHKiRet(statsobj.SetOrigin(pData-&gt;stats, (uchar*)"omfile"));
+760 	STATSCOUNTER_INIT(pData-&gt;ctrRequests, pData-&gt;mutCtrRequests);
+761 	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("requests"),
+762 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrRequests)));
+763 	STATSCOUNTER_INIT(pData-&gt;ctrLevel0, pData-&gt;mutCtrLevel0);
+764 	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("level0"),
+765 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrLevel0)));
+766 	STATSCOUNTER_INIT(pData-&gt;ctrMiss, pData-&gt;mutCtrMiss);
+767 	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("missed"),
+768 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrMiss)));
+769 	STATSCOUNTER_INIT(pData-&gt;ctrEvict, pData-&gt;mutCtrEvict);
+770 	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("evicted"),
+771 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrEvict)));
+772 	STATSCOUNTER_INIT(pData-&gt;ctrMax, pData-&gt;mutCtrMax);
+773 	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("maxused"),
+774 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrMax)));
+775 	STATSCOUNTER_INIT(pData-&gt;ctrCloseTimeouts, pData-&gt;mutCtrCloseTimeouts);
+776 	CHKiRet(statsobj.AddCounter(pData-&gt;stats, UCHAR_CONSTANT("closetimeouts"),
+777 		ctrType_IntCtr, CTR_FLAG_RESETTABLE, &amp;(pData-&gt;ctrCloseTimeouts)));
+778 	CHKiRet(statsobj.ConstructFinalize(pData-&gt;stats));
+779 finalize_it:
+780 	RETiRet;
+781 }
+782 static void
+783 initSigprov(instanceData *__restrict__ const pData, struct nvlst *lst)
+784 {
+785 	uchar szDrvrName[1024];
+786 	if(snprintf((char*)szDrvrName, sizeof(szDrvrName), "lmsig_%s", pData-&gt;sigprovName)
+787 		== sizeof(szDrvrName)) {
+788 		parser_errmsg("omfile: signature provider "
+789 				"name is too long: '%s' - signatures disabled",
+790 				pData-&gt;sigprovName);
+791 		goto done;
+792 	}
+793 	pData-&gt;sigprovNameFull = ustrdup(szDrvrName);
+794 	pData-&gt;sigprov.ifVersion = sigprovCURR_IF_VERSION;
+795 	if(obj.UseObj(__FILE__, szDrvrName, szDrvrName, (void*) &amp;pData-&gt;sigprov)
+796 		!= RS_RET_OK) {
+797 		parser_errmsg("omfile: could not load "
+798 				"signature provider '%s' - signatures disabled",
+799 				szDrvrName);
+800 		goto done;
+801 	}
+802 	if(pData-&gt;sigprov.Construct(&amp;pData-&gt;sigprovData) != RS_RET_OK) {
+803 		parser_errmsg("omfile: error constructing "
+804 				"signature provider %s dataset - signatures disabled",
+805 				szDrvrName);
+806 		goto done;
+807 	}
+808 	pData-&gt;sigprov.SetCnfParam(pData-&gt;sigprovData, lst);
+809 	dbgprintf("loaded signature provider %s, data instance at %p\n",
+810 		  szDrvrName, pData-&gt;sigprovData);
+811 	pData-&gt;useSigprov = 1;
+812 done:	return;
+813 }
+814 static rsRetVal
+815 initCryprov(instanceData *__restrict__ const pData, struct nvlst *lst)
+816 {
+817 	uchar szDrvrName[1024];
+818 	DEFiRet;
+819 	if(snprintf((char*)szDrvrName, sizeof(szDrvrName), "lmcry_%s", pData-&gt;cryprovName)
+820 		== sizeof(szDrvrName)) {
+821 		parser_errmsg("omfile: crypto provider "
+822 				"name is too long: '%s' - encryption disabled",
+823 				pData-&gt;cryprovName);
+824 		ABORT_FINALIZE(RS_RET_ERR);
+825 	}
+826 	pData-&gt;cryprovNameFull = ustrdup(szDrvrName);
+827 	pData-&gt;cryprov.ifVersion = cryprovCURR_IF_VERSION;
+828 	if(obj.UseObj(__FILE__, szDrvrName, szDrvrName, (void*) &amp;pData-&gt;cryprov)
+829 		!= RS_RET_OK) {
+830 		parser_errmsg("omfile: could not load "
+831 				"crypto provider '%s' - encryption disabled",
+832 				szDrvrName);
+833 		ABORT_FINALIZE(RS_RET_CRYPROV_ERR);
+834 	}
+835 	if(pData-&gt;cryprov.Construct(&amp;pData-&gt;cryprovData) != RS_RET_OK) {
+836 		parser_errmsg("omfile: error constructing "
+837 				"crypto provider %s dataset - encryption disabled",
+838 				szDrvrName);
+839 		ABORT_FINALIZE(RS_RET_CRYPROV_ERR);
+840 	}
+841 	CHKiRet(pData-&gt;cryprov.SetCnfParam(pData-&gt;cryprovData, lst, CRYPROV_PARAMTYPE_REGULAR));
+842 	dbgprintf("loaded crypto provider %s, data instance at %p\n",
+843 		  szDrvrName, pData-&gt;cryprovData);
+844 	pData-&gt;useCryprov = 1;
+845 finalize_it:
+846 	RETiRet;
+847 }
+848 BEGINnewActInst
+849 	struct cnfparamvals *pvals;
+850 	uchar *tplToUse;
+851 	int i;
+852 CODESTARTnewActInst
+853 <a name="0"></a>	DBGPRINTF("newActInst (omfile)\n");
+854 	pvals = nvlstGetParams(lst, &amp;actpblk, NULL);
+855 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if(pvals == NULL) {
+856 		parser_errmsg("omfile: either the \"file\" or "
+857 				"\"dynafile\" parameter must be given");
+858 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+859 	}
+860 	if(Debug) {
+861 		dbgprintf("action param blk in omfile:\n");
+862 		cnfparamsPrint(&amp;actpblk, pvals);
+863 	}
+864 	CHKiRet(createInstance(&amp;pData));
+865 	setInstParamDefaults(pData);
+866 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+867 		if(!pvals[i].bUsed)
+868 			continue;
+869 		if(!strcmp(actpblk.descr[i].name, "dynafilecachesize")) {
+870 			pData-&gt;iDynaFileCacheSize = (uint) pvals[i].val.d.n;
+871 		} else if(!strcmp(actpblk.descr[i].name, "ziplevel")) {
+872 			pData-&gt;iZipLevel = (int) pvals[i].val.d.n;</b></font>
+873 		} else if(!strcmp(actpblk.descr[i].name, "flushinterval")) {
+874 			pData-&gt;iFlushInterval = pvals[i].val.d.n;
+875 		} else if(!strcmp(actpblk.descr[i].name, "veryrobustzip")) {
+876 			pData-&gt;bVeryRobustZip = pvals[i].val.d.n;
+877 		} else if(!strcmp(actpblk.descr[i].name, "asyncwriting")) {
+878 			pData-&gt;bUseAsyncWriter = pvals[i].val.d.n;
+879 		} else if(!strcmp(actpblk.descr[i].name, "flushontxend")) {
+880 			pData-&gt;bFlushOnTXEnd = pvals[i].val.d.n;
+881 		} else if(!strcmp(actpblk.descr[i].name, "iobuffersize")) {
+882 			pData-&gt;iIOBufSize = (uint) pvals[i].val.d.n;
+883 		} else if(!strcmp(actpblk.descr[i].name, "dirowner")) {
+884 			pData-&gt;dirUID = (int) pvals[i].val.d.n;
+885 		} else if(!strcmp(actpblk.descr[i].name, "dirownernum")) {
+886 			pData-&gt;dirUID = (int) pvals[i].val.d.n;
+887 		} else if(!strcmp(actpblk.descr[i].name, "dirgroup")) {
+888 			pData-&gt;dirGID = (int) pvals[i].val.d.n;
+889 		} else if(!strcmp(actpblk.descr[i].name, "dirgroupnum")) {
+890 			pData-&gt;dirGID = (int) pvals[i].val.d.n;
+891 		} else if(!strcmp(actpblk.descr[i].name, "fileowner")) {
+892 			pData-&gt;fileUID = (int) pvals[i].val.d.n;
+893 		} else if(!strcmp(actpblk.descr[i].name, "fileownernum")) {
+894 			pData-&gt;fileUID = (int) pvals[i].val.d.n;
+895 		} else if(!strcmp(actpblk.descr[i].name, "filegroup")) {
+896 			pData-&gt;fileGID = (int) pvals[i].val.d.n;
+897 		} else if(!strcmp(actpblk.descr[i].name, "filegroupnum")) {
+898 			pData-&gt;fileGID = (int) pvals[i].val.d.n;
+899 		} else if(!strcmp(actpblk.descr[i].name, "dircreatemode")) {
+900 			pData-&gt;fDirCreateMode = (int) pvals[i].val.d.n;
+901 		} else if(!strcmp(actpblk.descr[i].name, "filecreatemode")) {
+902 			pData-&gt;fCreateMode = (int) pvals[i].val.d.n;
+903 		} else if(!strcmp(actpblk.descr[i].name, "failonchownfailure")) {
+904 			pData-&gt;bFailOnChown = (int) pvals[i].val.d.n;
+905 		} else if(!strcmp(actpblk.descr[i].name, "sync")) {
+906 			pData-&gt;bSyncFile = (int) pvals[i].val.d.n;
+907 		} else if(!strcmp(actpblk.descr[i].name, "createdirs")) {
+908 			pData-&gt;bCreateDirs = (int) pvals[i].val.d.n;
+909 		} else if(!strcmp(actpblk.descr[i].name, "file")) {
+910 			pData-&gt;fname = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+911 			CODE_STD_STRING_REQUESTnewActInst(1)
+912 			pData-&gt;bDynamicName = 0;
+913 		} else if(!strcmp(actpblk.descr[i].name, "dynafile")) {
+914 			if(pData-&gt;fname != NULL) {
+915 				parser_errmsg("omfile: both \"file\" and \"dynafile\" set, will use dynafile");
+916 			}
+917 			pData-&gt;fname = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+918 			CODE_STD_STRING_REQUESTnewActInst(2)
+919 			pData-&gt;bDynamicName = 1;
+920 		} else if(!strcmp(actpblk.descr[i].name, "template")) {
+921 			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+922 		} else if(!strcmp(actpblk.descr[i].name, "sig.provider")) {
+923 			pData-&gt;sigprovName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+924 		} else if(!strcmp(actpblk.descr[i].name, "cry.provider")) {
+925 			pData-&gt;cryprovName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+926 		} else if(!strcmp(actpblk.descr[i].name, "closetimeout")) {
+927 			pData-&gt;iCloseTimeout = (int) pvals[i].val.d.n;
+928 		} else {
+929 			dbgprintf("omfile: program error, non-handled "
+930 			  "param '%s'\n", actpblk.descr[i].name);
+931 		}
+932 	}
+933 	if(pData-&gt;fname == NULL) {
+934 		parser_errmsg("omfile: either the \"file\" or "
+935 				"\"dynafile\" parameter must be given");
+936 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+937 	}
+938 	if(pData-&gt;sigprovName != NULL) {
+939 		initSigprov(pData, lst);
+940 	}
+941 	if(pData-&gt;cryprovName != NULL) {
+942 		CHKiRet(initCryprov(pData, lst));
+943 	}
+944 	tplToUse = ustrdup((pData-&gt;tplName == NULL) ? getDfltTpl() : pData-&gt;tplName);
+945 	CHKiRet(OMSRsetEntry(*ppOMSR, 0, tplToUse, OMSR_NO_RQD_TPL_OPTS));
+946 	pData-&gt;iNumTpls = 1;
+947 	if(pData-&gt;bDynamicName) {
+948 		CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData-&gt;fname), OMSR_NO_RQD_TPL_OPTS));
+949 		pData-&gt;iNumTpls = 2;
+950 		CHKmalloc(pData-&gt;dynCache = (dynaFileCacheEntry**)
+951 				calloc(pData-&gt;iDynaFileCacheSize, sizeof(dynaFileCacheEntry*)));
+952 		pData-&gt;iCurrElt = -1;		  	}
+953 	setupInstStatsCtrs(pData);
+954 	if(pData-&gt;iCloseTimeout == -1) { 		pData-&gt;iCloseTimeout = (pData-&gt;bDynamicName) ? 10 : 0;
+955 	}
+956 	snprintf(pData-&gt;janitorID, sizeof(pData-&gt;janitorID), "omfile:%sfile:%s:%p",
+957 		(pData-&gt;bDynamicName) ? "dyna" : "", pData-&gt;fname, pData);
+958 	pData-&gt;janitorID[sizeof(pData-&gt;janitorID)-1] = '\0'; 
+959 	if(pData-&gt;iCloseTimeout &gt; 0)
+960 		janitorAddEtry(janitorCB, pData-&gt;janitorID, pData);
+961 CODE_STD_FINALIZERnewActInst
+962 	cnfparamvalsDestruct(pvals, &amp;actpblk);
+963 ENDnewActInst
+964 BEGINparseSelectorAct
+965 	uchar fname[MAXFNAME];
+966 CODESTARTparseSelectorAct
+967 	if(!strncmp((char*) p, ":omfile:", sizeof(":omfile:") - 1)) {
+968 		p += sizeof(":omfile:") - 1;
+969 	}
+970 	if(!(*p == '$' || *p == '?' || *p == '/' || *p == '.' || *p == '-'))
+971 		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
+972 	CHKiRet(createInstance(&amp;pData));
+973 	if(*p == '-') {
+974 		pData-&gt;bSyncFile = 0;
+975 		p++;
+976 	} else {
+977 		pData-&gt;bSyncFile = cs.bEnableSync;
+978 	}
+979 	pData-&gt;iSizeLimit = 0; 
+980 	switch(*p) {
+981 	case '$':
+982 		CODE_STD_STRING_REQUESTparseSelectorAct(1)
+983 		pData-&gt;iNumTpls = 1;
+984 		CHKiRet(cflineParseOutchannel(pData, p, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS));
+985 		pData-&gt;bDynamicName = 0;
+986 		break;
+987 		CODE_STD_STRING_REQUESTparseSelectorAct(2)
+988 		pData-&gt;iNumTpls = 2;
+989 		++p; 		CHKiRet(cflineParseFileName(p, fname, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS, getDfltTpl()));
+990 		pData-&gt;fname = ustrdup(fname);
+991 		pData-&gt;bDynamicName = 1;
+992 		CHKiRet(OMSRsetEntry(*ppOMSR, 1, ustrdup(pData-&gt;fname), OMSR_NO_RQD_TPL_OPTS));
+993 		CHKmalloc(pData-&gt;dynCache = (dynaFileCacheEntry**)
+994 				calloc(cs.iDynaFileCacheSize, sizeof(dynaFileCacheEntry*)));
+995 		break;
+996 	case '/':
+997 	case '.':
+998 		CODE_STD_STRING_REQUESTparseSelectorAct(1)
+999 		pData-&gt;iNumTpls = 1;
+1000 		CHKiRet(cflineParseFileName(p, fname, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS, getDfltTpl()));
+1001 		pData-&gt;fname = ustrdup(fname);
+1002 		pData-&gt;bDynamicName = 0;
+1003 		break;
+1004 	default:
+1005 		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
+1006 	}
+1007 	pData-&gt;iDynaFileCacheSize = cs.iDynaFileCacheSize;
+1008 	pData-&gt;fCreateMode = cs.fCreateMode;
+1009 	pData-&gt;fDirCreateMode = cs.fDirCreateMode;
+1010 	pData-&gt;bCreateDirs = cs.bCreateDirs;
+1011 	pData-&gt;bFailOnChown = cs.bFailOnChown;
+1012 	pData-&gt;fileUID = cs.fileUID;
+1013 	pData-&gt;fileGID = cs.fileGID;
+1014 	pData-&gt;dirUID = cs.dirUID;
+1015 	pData-&gt;dirGID = cs.dirGID;
+1016 	pData-&gt;iZipLevel = cs.iZipLevel;
+1017 	pData-&gt;bFlushOnTXEnd = cs.bFlushOnTXEnd;
+1018 	pData-&gt;iIOBufSize = (uint) cs.iIOBufSize;
+1019 	pData-&gt;iFlushInterval = cs.iFlushInterval;
+1020 	pData-&gt;bUseAsyncWriter = cs.bUseAsyncWriter;
+1021 	pData-&gt;bVeryRobustZip = 0;		pData-&gt;iCloseTimeout = 0;		setupInstStatsCtrs(pData);
+1022 CODE_STD_FINALIZERparseSelectorAct
+1023 ENDparseSelectorAct
+1024 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
+1025 {
+1026 	cs.fileUID = -1;
+1027 	cs.fileGID = -1;
+1028 	cs.dirUID = -1;
+1029 	cs.dirGID = -1;
+1030 	cs.bFailOnChown = 1;
+1031 	cs.iDynaFileCacheSize = 10;
+1032 	cs.fCreateMode = 0644;
+1033 	cs.fDirCreateMode = 0700;
+1034 	cs.bCreateDirs = 1;
+1035 	cs.bEnableSync = 0;
+1036 	cs.iZipLevel = 0;
+1037 	cs.bFlushOnTXEnd = FLUSHONTX_DFLT;
+1038 	cs.iIOBufSize = IOBUF_DFLT_SIZE;
+1039 	cs.iFlushInterval = FLUSH_INTRVL_DFLT;
+1040 	cs.bUseAsyncWriter = USE_ASYNCWRITER_DFLT;
+1041 	free(pszFileDfltTplName);
+1042 	pszFileDfltTplName = NULL;
+1043 	return RS_RET_OK;
+1044 }
+1045 BEGINdoHUP
+1046 CODESTARTdoHUP
+1047 	pthread_mutex_lock(&amp;pData-&gt;mutWrite);
+1048 	if(pData-&gt;bDynamicName) {
+1049 		dynaFileFreeCacheEntries(pData);
+1050 	} else {
+1051 		if(pData-&gt;pStrm != NULL) {
+1052 			closeFile(pData);
+1053 		}
+1054 	}
+1055 	pthread_mutex_unlock(&amp;pData-&gt;mutWrite);
+1056 ENDdoHUP
+1057 BEGINmodExit
+1058 CODESTARTmodExit
+1059 	objRelease(glbl, CORE_COMPONENT);
+1060 	objRelease(strm, CORE_COMPONENT);
+1061 	objRelease(statsobj, CORE_COMPONENT);
+1062 	DESTROY_ATOMIC_HELPER_MUT(mutClock);
+1063 ENDmodExit
+1064 BEGINqueryEtryPt
+1065 CODESTARTqueryEtryPt
+1066 CODEqueryEtryPt_STD_OMODTX_QUERIES
+1067 CODEqueryEtryPt_STD_OMOD8_QUERIES
+1068 CODEqueryEtryPt_STD_CONF2_QUERIES
+1069 CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+1070 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+1071 CODEqueryEtryPt_doHUP
+1072 ENDqueryEtryPt
+1073 BEGINmodInit(File)
+1074 CODESTARTmodInit
+1075 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+1076 INITLegCnfVars
+1077 	CHKiRet(objUse(strm, CORE_COMPONENT));
+1078 	CHKiRet(objUse(statsobj, CORE_COMPONENT));
+1079 	INIT_ATOMIC_HELPER_MUT(mutClock);
+1080 	INITChkCoreFeature(bCoreSupportsBatching, CORE_FEATURE_BATCHING);
+1081 	DBGPRINTF("omfile: %susing transactional output interface.\n", bCoreSupportsBatching ? "" : "not ");
+1082 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dynafilecachesize", 0, eCmdHdlrInt, setDynaFileCacheSize,
+1083 		NULL, STD_LOADABLE_MODULE_ID));
+1084 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileziplevel", 0, eCmdHdlrInt, NULL, &amp;cs.iZipLevel,
+1085 		STD_LOADABLE_MODULE_ID));
+1086 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileflushinterval", 0, eCmdHdlrInt, NULL, &amp;cs.iFlushInterval,
+1087 		STD_LOADABLE_MODULE_ID));
+1088 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileasyncwriting", 0, eCmdHdlrBinary, NULL, &amp;cs.bUseAsyncWriter,
+1089 		STD_LOADABLE_MODULE_ID));
+1090 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileflushontxend", 0, eCmdHdlrBinary, NULL, &amp;cs.bFlushOnTXEnd,
+1091 		STD_LOADABLE_MODULE_ID));
+1092 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileiobuffersize", 0, eCmdHdlrSize, NULL, &amp;cs.iIOBufSize,
+1093 		STD_LOADABLE_MODULE_ID));
+1094 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirowner", 0, eCmdHdlrUID, NULL, &amp;cs.dirUID,
+1095 		STD_LOADABLE_MODULE_ID));
+1096 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirownernum", 0, eCmdHdlrInt, NULL, &amp;cs.dirUID,
+1097 		STD_LOADABLE_MODULE_ID));
+1098 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirgroup", 0, eCmdHdlrGID, NULL, &amp;cs.dirGID,
+1099 		STD_LOADABLE_MODULE_ID));
+1100 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dirgroupnum", 0, eCmdHdlrInt, NULL, &amp;cs.dirGID,
+1101 		STD_LOADABLE_MODULE_ID));
+1102 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"fileowner", 0, eCmdHdlrUID, NULL, &amp;cs.fileUID,
+1103 		STD_LOADABLE_MODULE_ID));
+1104 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"fileownernum", 0, eCmdHdlrInt, NULL, &amp;cs.fileUID,
+1105 		STD_LOADABLE_MODULE_ID));
+1106 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filegroup", 0, eCmdHdlrGID, NULL, &amp;cs.fileGID,
+1107 		STD_LOADABLE_MODULE_ID));
+1108 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filegroupnum", 0, eCmdHdlrInt, NULL, &amp;cs.fileGID,
+1109 		STD_LOADABLE_MODULE_ID));
+1110 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"dircreatemode", 0, eCmdHdlrFileCreateMode, NULL,
+1111 		&amp;cs.fDirCreateMode, STD_LOADABLE_MODULE_ID));
+1112 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"filecreatemode", 0, eCmdHdlrFileCreateMode, NULL,
+1113 		&amp;cs.fCreateMode, STD_LOADABLE_MODULE_ID));
+1114 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"createdirs", 0, eCmdHdlrBinary, NULL, &amp;cs.bCreateDirs,
+1115 		STD_LOADABLE_MODULE_ID));
+1116 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"failonchownfailure", 0, eCmdHdlrBinary, NULL, &amp;cs.bFailOnChown,
+1117 		STD_LOADABLE_MODULE_ID));
+1118 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"omfileforcechown", 0, eCmdHdlrGoneAway, NULL, NULL,
+1119 		STD_LOADABLE_MODULE_ID));
+1120 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionfileenablesync", 0, eCmdHdlrBinary, NULL, &amp;cs.bEnableSync,
+1121 		STD_LOADABLE_MODULE_ID));
+1122 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"actionfiledefaulttemplate", 0, eCmdHdlrGetWord, setLegacyDfltTpl,
+1123 		NULL, STD_LOADABLE_MODULE_ID));
+1124 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables,
+1125 		NULL, STD_LOADABLE_MODULE_ID));
+1126 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+1127 ENDmodInit
 </pre>
 </div>
 </div>

@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for query.py &amp; test_mysql_1.py</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -41,562 +40,342 @@ Matches for query.py &amp; test_mysql_1.py
 </h3>
 <hr/>
 <pre>
-#
-# Copyright 2015 SUSE LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
-import logging
-import os
-import time
-
-import salt.utils.files
-import salt.utils.fsutils
-import salt.utils.network
-from salt.modules.inspectlib import EnvLoader
-from salt.modules.inspectlib.entities import Package, PackageCfgFile, PayloadFile
-from salt.modules.inspectlib.exceptions import InspectorQueryException, SIException
-
-log = logging.getLogger(__name__)
-
-
-class SysInfo:
-    """
-    System information.
-    """
-
-    def __init__(self, systype):
-        if systype.lower() == "solaris":
-            raise SIException("Platform {} not (yet) supported.".format(systype))
-
-    def _grain(self, grain):
-        """
-        An alias for grains getter.
-        """
-        return __grains__.get(grain, "N/A")
-
-    def _get_disk_size(self, device):
-        """
-        Get a size of a disk.
-        """
-        out = __salt__["cmd.run_all"]("df {}".format(device))
-        if out["retcode"]:
-            msg = "Disk size info error: {}".format(out["stderr"])
-            log.error(msg)
-            raise SIException(msg)
-
-        devpath, blocks, used, available, used_p, mountpoint = (
-            elm for elm in out["stdout"].split(os.linesep)[-1].split(" ") if elm
-        )
-        return {
-            "device": devpath,
-            "blocks": blocks,
-            "used": used,
-            "available": available,
-            "used (%)": used_p,
-            "mounted": mountpoint,
-        }
-
-    def _get_fs(self):
-        """
-        Get available file systems and their types.
-        """
-
-        data = dict()
-        for dev, dev_data in salt.utils.fsutils._blkid().items():
-            dev = self._get_disk_size(dev)
-            device = dev.pop("device")
-            dev["type"] = dev_data["type"]
-            data[device] = dev
-
-        return data
-
-    def _get_mounts(self):
-        """
-        Get mounted FS on the system.
-        """
-        return salt.utils.fsutils._get_mounts()
-
-    def _get_cpu(self):
-        """
-        Get available CPU information.
-        """
-        # CPU data in grains is OK-ish, but lscpu is still better in this case
-        out = __salt__["cmd.run_all"]("lscpu")
-        salt.utils.fsutils._verify_run(out)
-        data = dict()
-        for descr, value in [
-            elm.split(":", 1) for elm in out["stdout"].split(os.linesep)
-        ]:
-            data[descr.strip()] = value.strip()
-
-        return data
-
-    def _get_mem(self):
-        """
-        Get memory.
-        """
-        out = __salt__["cmd.run_all"]("vmstat -s")
-        if out["retcode"]:
-            raise SIException("Memory info error: {}".format(out["stderr"]))
-
-        ret = dict()
-        for line in out["stdout"].split(os.linesep):
-            line = line.strip()
-            if not line:
-                continue
-            size, descr = line.split(" ", 1)
-            if descr.startswith("K "):
-                descr = descr[2:]
-                size = size + "K"
-            ret[descr] = size
-        return ret
-
-    def _get_network(self):
-        """
-        Get network configuration.
-        """
-        data = dict()
-        data["interfaces"] = salt.utils.network.interfaces()
-        data["subnets"] = salt.utils.network.subnets()
-
-        return data
-
-    def _get_os(self):
-        """
-        Get operating system summary
-        """
-        return {
-            "name": self._grain("os"),
-            "family": self._grain("os_family"),
-            "arch": self._grain("osarch"),
-            "release": self._grain("osrelease"),
-        }
-
-
-class Query(EnvLoader):
-    """
-    Query the system.
-    This class is actually puts all Salt features together,
-    so there would be no need to pick it from various places.
-    """
-
-    # Configuration: config files
-    # Identity: users/groups
-    # Software: packages, patterns, repositories
-    # Services
-    # System: distro, RAM etc
-    # Changes: all files that are managed and were changed from the original
-    # all: include all scopes (scary!)
-    # payload: files that are not managed
-
-    SCOPES = [
-        "changes",
-        "configuration",
-        "identity",
-        "system",
-        "software",
-        "services",
-        "payload",
-        "all",
-    ]
-
-    def __init__(self, scope, cachedir=None):
-        """
-        Constructor.
-
-        :param scope:
-        :return:
-        """
-        if scope and scope not in self.SCOPES:
-            raise InspectorQueryException(
-                "Unknown scope: {}. Must be one of: {}".format(
-                    repr(scope), ", ".join(self.SCOPES)
-                )
-            )
-        elif not scope:
-            raise InspectorQueryException(
-                "Scope cannot be empty. Must be one of: {}".format(
-                    ", ".join(self.SCOPES)
-                )
-            )
-        EnvLoader.__init__(self, cachedir=cachedir)
-        self.scope = "_" + scope
-        self.local_identity = dict()
-
-    def __call__(self, *args, **kwargs):
-        """
-        Call the query with the defined scope.
-
-        :param args:
-        :param kwargs:
-        :return:
-        """
-
-        return getattr(self, self.scope)(*args, **kwargs)
-
-    def _changes(self, *args, **kwargs):
-        """
-        Returns all diffs to the configuration files.
-        """
-        raise Exception("Not yet implemented")
-
-    def _configuration(self, *args, **kwargs):
-        """
-        Return configuration files.
-        """
-
-        data = dict()
-        self.db.open()
-        for pkg in self.db.get(Package):
-            configs = list()
-            for pkg_cfg in self.db.get(PackageCfgFile, eq={"pkgid": pkg.id}):
-                configs.append(pkg_cfg.path)
-            data[pkg.name] = configs
-
-        if not data:
-            raise InspectorQueryException("No inspected configuration yet available.")
-
-        return data
-
-    def _get_local_users(self, disabled=None):
-        """
-        Return all known local accounts to the system.
-        """
-        users = dict()
-        path = "/etc/passwd"
-        with salt.utils.files.fopen(path, "r") as fp_:
-            for line in fp_:
-                line = line.strip()
-                if ":" not in line:
-                    continue
-                name, password, uid, gid, gecos, directory, shell = line.split(":")
-                active = not (password == "*" or password.startswith("!"))
-                if (
-                    (disabled is False and active)
-                    or (disabled is True and not active)
-                    or disabled is None
-                ):
-                    users[name] = {
-                        "uid": uid,
-                        "git": gid,
-                        "info": gecos,
-                        "home": directory,
-                        "shell": shell,
-                        "disabled": not active,
-                    }
-
-        return users
-
-    def _get_local_groups(self):
-        """
-        Return all known local groups to the system.
-        """
-        groups = dict()
-        path = "/etc/group"
-        with salt.utils.files.fopen(path, "r") as fp_:
-            for line in fp_:
-                line = line.strip()
-                if ":" not in line:
-                    continue
-                name, password, gid, users = line.split(":")
-                groups[name] = {
-                    "gid": gid,
-                }
-
-                if users:
-                    groups[name]["users"] = users.split(",")
-
-        return groups
-
-    def _get_external_accounts(self, locals):
-        """
-        Return all known accounts, excluding local accounts.
-        """
-        users = dict()
-        out = __salt__["cmd.run_all"]("passwd -S -a")
-        if out["retcode"]:
-            # System does not supports all accounts descriptions, just skipping.
-            return users
-        status = {
-            "L": "Locked",
-            "NP": "No password",
-            "P": "Usable password",
-            "LK": "Locked",
-        }
-        for data in [
-            elm.strip().split(" ")
-            for elm in out["stdout"].split(os.linesep)
-            if elm.strip()
-        ]:
-            if len(data) &lt; 2:
-                continue
-            name, login = data[:2]
-            if name not in locals:
-                users[name] = {"login": login, "status": status.get(login, "N/A")}
-
-        return users
-
-    def _identity(self, *args, **kwargs):
-        """
-        Local users and groups.
-
-        accounts
-            Can be either 'local', 'remote' or 'all' (equal to "local,remote").
-            Remote accounts cannot be resolved on all systems, but only
-            those, which supports 'passwd -S -a'.
-
-        disabled
-            True (or False, default) to return only disabled accounts.
-        """
-        LOCAL = "local accounts"
-<a name="0"></a>        EXT = "external accounts"
-
-        data = dict()
-        data[LOCAL] = self<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>._get_local_users(disabled=kwargs.get("disabled"))
-        data[EXT] = self._get_external_accounts(data[LOCAL].keys(</b></font>)) or "N/A"
-        data["local groups"] = self._get_local_groups()
-
-        return data
-
-    def _system(self, *args, **kwargs):
-        """
-        This basically calls grains items and picks out only
-        necessary information in a certain structure.
-
-        :param args:
-        :param kwargs:
-        :return:
-        """
-        sysinfo = SysInfo(__grains__.get("kernel"))
-
-        data = dict()
-        data["cpu"] = sysinfo._get_cpu()
-        data["disks"] = sysinfo._get_fs()
-        data["mounts"] = sysinfo._get_mounts()
-        data["memory"] = sysinfo._get_mem()
-        data["network"] = sysinfo._get_network()
-        data["os"] = sysinfo._get_os()
-
-        return data
-
-    def _software(self, *args, **kwargs):
-        """
-        Return installed software.
-        """
-        data = dict()
-        if "exclude" in kwargs:
-            excludes = kwargs["exclude"].split(",")
-        else:
-            excludes = list()
-
-        os_family = __grains__.get("os_family").lower()
-
-        # Get locks
-        if os_family == "suse":
-            LOCKS = "pkg.list_locks"
-            if "products" not in excludes:
-                products = __salt__["pkg.list_products"]()
-                if products:
-                    data["products"] = products
-        elif os_family == "redhat":
-            LOCKS = "pkg.get_locked_packages"
-        else:
-            LOCKS = None
-
-        if LOCKS and "locks" not in excludes:
-            locks = __salt__[LOCKS]()
-            if locks:
-                data["locks"] = locks
-
-        # Get patterns
-        if os_family == "suse":
-            PATTERNS = "pkg.list_installed_patterns"
-        elif os_family == "redhat":
-            PATTERNS = "pkg.group_list"
-        else:
-            PATTERNS = None
-
-        if PATTERNS and "patterns" not in excludes:
-            patterns = __salt__[PATTERNS]()
-            if patterns:
-                data["patterns"] = patterns
-
-        # Get packages
-        if "packages" not in excludes:
-            data["packages"] = __salt__["pkg.list_pkgs"]()
-
-        # Get repositories
-        if "repositories" not in excludes:
-            repos = __salt__["pkg.list_repos"]()
-            if repos:
-                data["repositories"] = repos
-
-        return data
-
-    def _services(self, *args, **kwargs):
-        """
-        Get list of enabled and disabled services on the particular system.
-        """
-        return {
-            "enabled": __salt__["service.get_enabled"](),
-            "disabled": __salt__["service.get_disabled"](),
-        }
-
-    def _id_resolv(self, iid, named=True, uid=True):
-        """
-        Resolve local users and groups.
-
-        :param iid:
-        :param named:
-        :param uid:
-        :return:
-        """
-
-        if not self.local_identity:
-            self.local_identity["users"] = self._get_local_users()
-            self.local_identity["groups"] = self._get_local_groups()
-
-        if not named:
-            return iid
-
-        for name, meta in self.local_identity[uid and "users" or "groups"].items():
-            if (uid and int(meta.get("uid", -1)) == iid) or (
-                not uid and int(meta.get("gid", -1)) == iid
-            ):
-                return name
-
-        return iid
-
-    def _payload(self, *args, **kwargs):
-        """
-        Find all unmanaged files. Returns maximum 1000 values.
-
-        Parameters:
-
-        * **filter**: Include only results which path starts from the filter string.
-        * **time**: Display time in Unix ticks or format according to the configured TZ (default)
-                    Values: ticks, tz (default)
-        * **size**: Format size. Values: B, KB, MB, GB
-        * **owners**: Resolve UID/GID to an actual names or leave them numeric (default).
-                      Values: name (default), id
-        * **type**: Comma-separated type of included payload: dir (or directory), link and/or file.
-        * **brief**: Return just a list of matches, if True. Default: False
-        * **offset**: Offset of the files
-        * **max**: Maximum returned values. Default 1000.
-
-        Options:
-
-        * **total**: Return a total amount of found payload files
-        """
-
-        def _size_format(size, fmt):
-            if fmt is None:
-                return size
-
-            fmt = fmt.lower()
-            if fmt == "b":
-                return "{} Bytes".format(size)
-            elif fmt == "kb":
-                return "{} Kb".format(round((float(size) / 0x400), 2))
-            elif fmt == "mb":
-                return "{} Mb".format(round((float(size) / 0x400 / 0x400), 2))
-            elif fmt == "gb":
-                return "{} Gb".format(round((float(size) / 0x400 / 0x400 / 0x400), 2))
-
-        filter = kwargs.get("filter")
-        offset = kwargs.get("offset", 0)
-
-        timeformat = kwargs.get("time", "tz")
-        if timeformat not in ["ticks", "tz"]:
-            raise InspectorQueryException(
-                'Unknown "{}" value for parameter "time"'.format(timeformat)
-            )
-        tfmt = (
-            lambda param: timeformat == "tz"
-            and time.strftime("%b %d %Y %H:%M:%S", time.gmtime(param))
-            or int(param)
-        )
-
-        size_fmt = kwargs.get("size")
-        if size_fmt is not None and size_fmt.lower() not in ["b", "kb", "mb", "gb"]:
-            raise InspectorQueryException(
-                'Unknown "{}" value for parameter "size". '
-                "Should be either B, Kb, Mb or Gb".format(timeformat)
-            )
-
-        owners = kwargs.get("owners", "id")
-        if owners not in ["name", "id"]:
-            raise InspectorQueryException(
-                'Unknown "{}" value for parameter "owners". '
-                "Should be either name or id (default)".format(owners)
-            )
-
-        incl_type = [prm for prm in kwargs.get("type", "").lower().split(",") if prm]
-        if not incl_type:
-            incl_type.append("file")
-
-        for i_type in incl_type:
-            if i_type not in ["directory", "dir", "d", "file", "f", "link", "l"]:
-                raise InspectorQueryException(
-                    'Unknown "{}" values for parameter "type". '
-                    "Should be comma separated one or more of "
-                    "dir, file and/or link.".format(", ".join(incl_type))
-                )
-        self.db.open()
-
-        if "total" in args:
-            return {"total": len(self.db.get(PayloadFile))}
-
-        brief = kwargs.get("brief")
-        pld_files = list() if brief else dict()
-        for pld_data in self.db.get(PayloadFile)[
-            offset : offset + kwargs.get("max", 1000)
-        ]:
-            if brief:
-                pld_files.append(pld_data.path)
-            else:
-                pld_files[pld_data.path] = {
-                    "uid": self._id_resolv(pld_data.uid, named=(owners == "id")),
-                    "gid": self._id_resolv(
-                        pld_data.gid, named=(owners == "id"), uid=False
-                    ),
-                    "size": _size_format(pld_data.p_size, fmt=size_fmt),
-                    "mode": oct(pld_data.mode),
-                    "accessed": tfmt(pld_data.atime),
-                    "modified": tfmt(pld_data.mtime),
-                    "created": tfmt(pld_data.ctime),
-                }
-
-        return pld_files
-
-    def _all(self, *args, **kwargs):
-        """
-        Return all the summary of the particular system.
-        """
-        data = dict()
-        data["software"] = self._software(**kwargs)
-        data["system"] = self._system(**kwargs)
-        data["services"] = self._services(**kwargs)
-        try:
-            data["configuration"] = self._configuration(**kwargs)
-        except InspectorQueryException as ex:
-            data["configuration"] = "N/A"
-            log.error(ex)
-        data["payload"] = self._payload(**kwargs) or "N/A"
-
-        return data
+1 import logging
+2 import os
+3 import time
+4 import salt.utils.files
+5 import salt.utils.fsutils
+6 import salt.utils.network
+7 from salt.modules.inspectlib import EnvLoader
+8 from salt.modules.inspectlib.entities import Package, PackageCfgFile, PayloadFile
+9 from salt.modules.inspectlib.exceptions import InspectorQueryException, SIException
+10 log = logging.getLogger(__name__)
+11 class SysInfo:
+12     def __init__(self, systype):
+13         if systype.lower() == "solaris":
+14             raise SIException("Platform {} not (yet) supported.".format(systype))
+15     def _grain(self, grain):
+16         return __grains__.get(grain, "N/A")
+17     def _get_disk_size(self, device):
+18         out = __salt__["cmd.run_all"]("df {}".format(device))
+19         if out["retcode"]:
+20             msg = "Disk size info error: {}".format(out["stderr"])
+21             log.error(msg)
+22             raise SIException(msg)
+23         devpath, blocks, used, available, used_p, mountpoint = (
+24             elm for elm in out["stdout"].split(os.linesep)[-1].split(" ") if elm
+25         )
+26         return {
+27             "device": devpath,
+28             "blocks": blocks,
+29             "used": used,
+30             "available": available,
+31             "used (%)": used_p,
+32             "mounted": mountpoint,
+33         }
+34     def _get_fs(self):
+35         data = dict()
+36         for dev, dev_data in salt.utils.fsutils._blkid().items():
+37             dev = self._get_disk_size(dev)
+38             device = dev.pop("device")
+39             dev["type"] = dev_data["type"]
+40             data[device] = dev
+41         return data
+42     def _get_mounts(self):
+43         return salt.utils.fsutils._get_mounts()
+44     def _get_cpu(self):
+45         out = __salt__["cmd.run_all"]("lscpu")
+46         salt.utils.fsutils._verify_run(out)
+47         data = dict()
+48         for descr, value in [
+49             elm.split(":", 1) for elm in out["stdout"].split(os.linesep)
+50         ]:
+51             data[descr.strip()] = value.strip()
+52         return data
+53     def _get_mem(self):
+54         out = __salt__["cmd.run_all"]("vmstat -s")
+55         if out["retcode"]:
+56             raise SIException("Memory info error: {}".format(out["stderr"]))
+57         ret = dict()
+58         for line in out["stdout"].split(os.linesep):
+59             line = line.strip()
+60             if not line:
+61                 continue
+62             size, descr = line.split(" ", 1)
+63             if descr.startswith("K "):
+64                 descr = descr[2:]
+65                 size = size + "K"
+66             ret[descr] = size
+67         return ret
+68     def _get_network(self):
+69         data = dict()
+70         data["interfaces"] = salt.utils.network.interfaces()
+71         data["subnets"] = salt.utils.network.subnets()
+72         return data
+73     def _get_os(self):
+74         return {
+75             "name": self._grain("os"),
+76             "family": self._grain("os_family"),
+77             "arch": self._grain("osarch"),
+78             "release": self._grain("osrelease"),
+79         }
+80 class Query(EnvLoader):
+81     SCOPES = [
+82         "changes",
+83         "configuration",
+84         "identity",
+85         "system",
+86         "software",
+87         "services",
+88         "payload",
+89         "all",
+90     ]
+91     def __init__(self, scope, cachedir=None):
+92         if scope and scope not in self.SCOPES:
+93             raise InspectorQueryException(
+94                 "Unknown scope: {}. Must be one of: {}".format(
+95                     repr(scope), ", ".join(self.SCOPES)
+96                 )
+97             )
+98         elif not scope:
+99             raise InspectorQueryException(
+100                 "Scope cannot be empty. Must be one of: {}".format(
+101                     ", ".join(self.SCOPES)
+102                 )
+103             )
+104         EnvLoader.__init__(self, cachedir=cachedir)
+105         self.scope = "_" + scope
+106         self.local_identity = dict()
+107     def __call__(self, *args, **kwargs):
+108         return getattr(self, self.scope)(*args, **kwargs)
+109     def _changes(self, *args, **kwargs):
+110         raise Exception("Not yet implemented")
+111     def _configuration(self, *args, **kwargs):
+112         data = dict()
+113         self.db.open()
+114         for pkg in self.db.get(Package):
+115             configs = list()
+116             for pkg_cfg in self.db.get(PackageCfgFile, eq={"pkgid": pkg.id}):
+117                 configs.append(pkg_cfg.path)
+118             data[pkg.name] = configs
+119         if not data:
+120             raise InspectorQueryException("No inspected configuration yet available.")
+121         return data
+122     def _get_local_users(self, disabled=None):
+123         users = dict()
+124         path = "/etc/passwd"
+125         with salt.utils.files.fopen(path, "r") as fp_:
+126             for line in fp_:
+127                 line = line.strip()
+128                 if ":" not in line:
+129                     continue
+130                 name, password, uid, gid, gecos, directory, shell = line.split(":")
+131                 active = not (password == "*" or password.startswith("!"))
+132                 if (
+133                     (disabled is False and active)
+134                     or (disabled is True and not active)
+135                     or disabled is None
+136                 ):
+137                     users[name] = {
+138                         "uid": uid,
+139                         "git": gid,
+140                         "info": gecos,
+141                         "home": directory,
+142                         "shell": shell,
+143                         "disabled": not active,
+144                     }
+145         return users
+146     def _get_local_groups(self):
+147         groups = dict()
+148         path = "/etc/group"
+149         with salt.utils.files.fopen(path, "r") as fp_:
+150             for line in fp_:
+151                 line = line.strip()
+152                 if ":" not in line:
+153                     continue
+154                 name, password, gid, users = line.split(":")
+155                 groups[name] = {
+156                     "gid": gid,
+157                 }
+158                 if users:
+159                     groups[name]["users"] = users.split(",")
+160         return groups
+161     def _get_external_accounts(self, locals):
+162         users = dict()
+163         out = __salt__["cmd.run_all"]("passwd -S -a")
+164         if out["retcode"]:
+165             return users
+166         status = {
+167             "L": "Locked",
+168             "NP": "No password",
+169             "P": "Usable password",
+170             "LK": "Locked",
+171         }
+172         for data in [
+173             elm.strip().split(" ")
+174             for elm in out["stdout"].split(os.linesep)
+175             if elm.strip()
+176         ]:
+177             if len(data) &lt; 2:
+178                 continue
+179             name, login = data[:2]
+180             if name not in locals:
+181                 users[name] = {"login": login, "status": status.get(login, "N/A")}
+182         return users
+183     def _identity(self, *args, **kwargs):
+184         LOCAL = "local accounts"
+185         data = dict()
+186         data[LOCAL] = self<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>._get_local_users(disabled=kwargs.get("disabled"))
+187         data[EXT] = self._get_external_accounts(data[LOCAL].keys(</b></font>)) or "N/A"
+188         data["local groups"] = self._get_local_groups()
+189         return data
+190     def _system(self, *args, **kwargs):
+191         sysinfo = SysInfo(__grains__.get("kernel"))
+192         data = dict()
+193         data["cpu"] = sysinfo._get_cpu()
+194         data["disks"] = sysinfo._get_fs()
+195         data["mounts"] = sysinfo._get_mounts()
+196         data["memory"] = sysinfo._get_mem()
+197         data["network"] = sysinfo._get_network()
+198         data["os"] = sysinfo._get_os()
+199         return data
+200     def _software(self, *args, **kwargs):
+201         data = dict()
+202         if "exclude" in kwargs:
+203             excludes = kwargs["exclude"].split(",")
+204         else:
+205             excludes = list()
+206         os_family = __grains__.get("os_family").lower()
+207         if os_family == "suse":
+208             LOCKS = "pkg.list_locks"
+209             if "products" not in excludes:
+210                 products = __salt__["pkg.list_products"]()
+211                 if products:
+212                     data["products"] = products
+213         elif os_family == "redhat":
+214             LOCKS = "pkg.get_locked_packages"
+215         else:
+216             LOCKS = None
+217         if LOCKS and "locks" not in excludes:
+218             locks = __salt__[LOCKS]()
+219             if locks:
+220                 data["locks"] = locks
+221         if os_family == "suse":
+222             PATTERNS = "pkg.list_installed_patterns"
+223         elif os_family == "redhat":
+224             PATTERNS = "pkg.group_list"
+225         else:
+226             PATTERNS = None
+227         if PATTERNS and "patterns" not in excludes:
+228             patterns = __salt__[PATTERNS]()
+229             if patterns:
+230                 data["patterns"] = patterns
+231         if "packages" not in excludes:
+232             data["packages"] = __salt__["pkg.list_pkgs"]()
+233         if "repositories" not in excludes:
+234             repos = __salt__["pkg.list_repos"]()
+235             if repos:
+236                 data["repositories"] = repos
+237         return data
+238     def _services(self, *args, **kwargs):
+239         return {
+240             "enabled": __salt__["service.get_enabled"](),
+241             "disabled": __salt__["service.get_disabled"](),
+242         }
+243     def _id_resolv(self, iid, named=True, uid=True):
+244         if not self.local_identity:
+245             self.local_identity["users"] = self._get_local_users()
+246             self.local_identity["groups"] = self._get_local_groups()
+247         if not named:
+248             return iid
+249         for name, meta in self.local_identity[uid and "users" or "groups"].items():
+250             if (uid and int(meta.get("uid", -1)) == iid) or (
+251                 not uid and int(meta.get("gid", -1)) == iid
+252             ):
+253                 return name
+254         return iid
+255     def _payload(self, *args, **kwargs):
+256         def _size_format(size, fmt):
+257             if fmt is None:
+258                 return size
+259             fmt = fmt.lower()
+260             if fmt == "b":
+261                 return "{} Bytes".format(size)
+262             elif fmt == "kb":
+263                 return "{} Kb".format(round((float(size) / 0x400), 2))
+264             elif fmt == "mb":
+265                 return "{} Mb".format(round((float(size) / 0x400 / 0x400), 2))
+266             elif fmt == "gb":
+267                 return "{} Gb".format(round((float(size) / 0x400 / 0x400 / 0x400), 2))
+268         filter = kwargs.get("filter")
+269         offset = kwargs.get("offset", 0)
+270         timeformat = kwargs.get("time", "tz")
+271         if timeformat not in ["ticks", "tz"]:
+272             raise InspectorQueryException(
+273                 'Unknown "{}" value for parameter "time"'.format(timeformat)
+274             )
+275         tfmt = (
+276             lambda param: timeformat == "tz"
+277             and time.strftime("%b %d %Y %H:%M:%S", time.gmtime(param))
+278             or int(param)
+279         )
+280         size_fmt = kwargs.get("size")
+281         if size_fmt is not None and size_fmt.lower() not in ["b", "kb", "mb", "gb"]:
+282             raise InspectorQueryException(
+283                 'Unknown "{}" value for parameter "size". '
+284                 "Should be either B, Kb, Mb or Gb".format(timeformat)
+285             )
+286         owners = kwargs.get("owners", "id")
+287         if owners not in ["name", "id"]:
+288             raise InspectorQueryException(
+289                 'Unknown "{}" value for parameter "owners". '
+290                 "Should be either name or id (default)".format(owners)
+291             )
+292         incl_type = [prm for prm in kwargs.get("type", "").lower().split(",") if prm]
+293         if not incl_type:
+294             incl_type.append("file")
+295         for i_type in incl_type:
+296             if i_type not in ["directory", "dir", "d", "file", "f", "link", "l"]:
+297                 raise InspectorQueryException(
+298                     'Unknown "{}" values for parameter "type". '
+299                     "Should be comma separated one or more of "
+300                     "dir, file and/or link.".format(", ".join(incl_type))
+301                 )
+302         self.db.open()
+303         if "total" in args:
+304             return {"total": len(self.db.get(PayloadFile))}
+305         brief = kwargs.get("brief")
+306         pld_files = list() if brief else dict()
+307         for pld_data in self.db.get(PayloadFile)[
+308             offset : offset + kwargs.get("max", 1000)
+309         ]:
+310             if brief:
+311                 pld_files.append(pld_data.path)
+312             else:
+313                 pld_files[pld_data.path] = {
+314                     "uid": self._id_resolv(pld_data.uid, named=(owners == "id")),
+315                     "gid": self._id_resolv(
+316                         pld_data.gid, named=(owners == "id"), uid=False
+317                     ),
+318                     "size": _size_format(pld_data.p_size, fmt=size_fmt),
+319                     "mode": oct(pld_data.mode),
+320                     "accessed": tfmt(pld_data.atime),
+321                     "modified": tfmt(pld_data.mtime),
+322                     "created": tfmt(pld_data.ctime),
+323                 }
+324         return pld_files
+325     def _all(self, *args, **kwargs):
+326         data = dict()
+327         data["software"] = self._software(**kwargs)
+328         data["system"] = self._system(**kwargs)
+329         data["services"] = self._services(**kwargs)
+330         try:
+331             data["configuration"] = self._configuration(**kwargs)
+332         except InspectorQueryException as ex:
+333             data["configuration"] = "N/A"
+334             log.error(ex)
+335         data["payload"] = self._payload(**kwargs) or "N/A"
+336         return data
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -609,1807 +388,1521 @@ class Query(EnvLoader):
 </h3>
 <hr/>
 <pre>
-import logging
-
-import pytest
-import salt.utils.path
-from salt.modules import mysql as mysqlmod
-from tests.support.case import ModuleCase
-from tests.support.mixins import SaltReturnAssertsMixin
-from tests.support.unit import skipIf
-
-log = logging.getLogger(__name__)
-
-NO_MYSQL = False
-try:
-    import MySQLdb  # pylint: disable=import-error,unused-import
-except Exception:  # pylint: disable=broad-except
-    NO_MYSQL = True
-
-if not salt.utils.path.which("mysqladmin"):
-    NO_MYSQL = True
-
-
-@skipIf(
-    NO_MYSQL,
-    "Please install MySQL bindings and a MySQL Server before running"
-    "MySQL integration tests.",
-)
-@pytest.mark.windows_whitelisted
-class MysqlModuleDbTest(ModuleCase, SaltReturnAssertsMixin):
-    """
-    Module testing database creation on a real MySQL Server.
-    """
-
-    user = "root"
-    password = "poney"
-
-    @pytest.mark.destructive_test
-    def setUp(self):
-        """
-        Test presence of MySQL server, enforce a root password
-        """
-        super().setUp()
-        NO_MYSQL_SERVER = True
-        # now ensure we know the mysql root password
-        # one of theses two at least should work
-        ret1 = self.run_state(
-            "cmd.run",
-            name='mysqladmin --host="localhost" -u '
-            + self.user
-            + ' flush-privileges password "'
-            + self.password
-            + '"',
-        )
-        ret2 = self.run_state(
-            "cmd.run",
-            name='mysqladmin --host="localhost" -u '
-            + self.user
-            + ' --password="'
-            + self.password
-            + '" flush-privileges password "'
-            + self.password
-            + '"',
-        )
-        key, value = ret2.popitem()
-        if value["result"]:
-            NO_MYSQL_SERVER = False
-        else:
-            self.skipTest("No MySQL Server running, or no root access on it.")
-
-    def _db_creation_loop(self, db_name, returning_name, test_conn=False, **kwargs):
-        """
-        Used in db testCase, create, check exists, check in list and removes.
-        """
-        ret = self.run_function("mysql.db_create", name=db_name, **kwargs)
-        self.assertEqual(
-            True, ret, "Problem while creating db for db name: '{}'".format(db_name)
-        )
-        # test db exists
-        ret = self.run_function("mysql.db_exists", name=db_name, **kwargs)
-        self.assertEqual(
-            True,
-            ret,
-            "Problem while testing db exists for db name: '{}'".format(db_name),
-        )
-        # List db names to ensure db is created with the right utf8 string
-        ret = self.run_function("mysql.db_list", **kwargs)
-        if not isinstance(ret, list):
-            raise AssertionError(
-                (
-                    "Unexpected query result while retrieving databases list"
-                    " '{}' for '{}' test"
-                ).format(ret, db_name)
-            )
-        self.assertIn(
-            returning_name,
-            ret,
-            (
-                "Problem while testing presence of db name in db lists"
-                " for db name: '{}' in list '{}'"
-            ).format(db_name, ret),
-        )
-
-        if test_conn:
-            # test connections on database with root user
-            ret = self.run_function(
-                "mysql.query", database=db_name, query="SELECT 1", **kwargs
-            )
-            if not isinstance(ret, dict) or "results" not in ret:
-                raise AssertionError(
-                    "Unexpected result while testing connection on database : {}".format(
-                        repr(db_name)
-                    )
-                )
-            self.assertEqual([["1"]], ret["results"])
-
-        # Now remove database
-        ret = self.run_function("mysql.db_remove", name=db_name, **kwargs)
-        self.assertEqual(
-            True, ret, "Problem while removing db for db name: '{}'".format(db_name)
-        )
-
-    @pytest.mark.destructive_test
-    def test_database_creation_level1(self):
-        """
-        Create database, test presence, then drop db. All theses with complex names.
-        """
-        # name with space
-        db_name = "foo 1"
-        self._db_creation_loop(
-            db_name=db_name,
-            returning_name=db_name,
-            test_conn=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-
-        # ```````
-        # create
-        # also with character_set and collate only
-        ret = self.run_function(
-            "mysql.db_create",
-            name="foo`2",
-            character_set="utf8",
-            collate="utf8_general_ci",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-        # test db exists
-        ret = self.run_function(
-            "mysql.db_exists",
-            name="foo`2",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-        # redoing the same should fail
-        # even with other character sets or collations
-        ret = self.run_function(
-            "mysql.db_create",
-            name="foo`2",
-            character_set="utf8",
-            collate="utf8_general_ci",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(False, ret)
-        # redoing the same should fail
-        ret = self.run_function(
-            "mysql.db_create",
-            name="foo`2",
-            character_set="utf8",
-            collate="utf8_general_ci",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(False, ret)
-        # Now remove database
-        ret = self.run_function(
-            "mysql.db_remove",
-            name="foo`2",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-
-        # '''''''
-        # create
-        # also with character_set only
-        db_name = "foo'3"
-        self._db_creation_loop(
-            db_name=db_name,
-            returning_name=db_name,
-            test_conn=True,
-            character_set="utf8",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-
-        # """"""""
-        # also with collate only
-        db_name = 'foo"4'
-        self._db_creation_loop(
-            db_name=db_name,
-            returning_name=db_name,
-            test_conn=True,
-            collate="utf8_general_ci",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        # fuzzy
-        db_name = '&lt;foo` --"5&gt;'
-        self._db_creation_loop(
-            db_name=db_name,
-            returning_name=db_name,
-            test_conn=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-
-    @pytest.mark.destructive_test
-    def test_mysql_dbname_character_percent(self):
-        """
-        Play with the '%' character problems
-
-        This character should be escaped in the form '%%' on queries, but only
-        when theses queries have arguments. It is also a special character
-        in LIKE SQL queries. Finally it is used to indicate query arguments.
-        """
-        db_name1 = "foo%1_"
-        db_name2 = "foo%12"
-        ret = self.run_function(
-            "mysql.db_create",
-            name=db_name1,
-            character_set="utf8",
-            collate="utf8_general_ci",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-        ret = self.run_function(
-            "mysql.db_create",
-            name=db_name2,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-        ret = self.run_function(
-            "mysql.db_remove",
-            name=db_name1,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-        ret = self.run_function(
-            "mysql.db_exists",
-            name=db_name1,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(False, ret)
-        ret = self.run_function(
-            "mysql.db_exists",
-            name=db_name2,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-        ret = self.run_function(
-            "mysql.db_remove",
-            name=db_name2,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-
-    @pytest.mark.destructive_test
-    def test_database_creation_utf8(self):
-        """
-        Test support of utf8 in database names
-        """
-        # Simple accents : using utf8 string
-        db_name_unicode = "notam\xe9rican"
-        # same as 'notamérican' because of file encoding
-        # but ensure it on this test
-        db_name_utf8 = "notam\xc3\xa9rican"
-        # FIXME: MySQLdb problems on conn strings containing
-        # utf-8 on user name of db name prevent conn test
-        self._db_creation_loop(
-            db_name=db_name_utf8,
-            returning_name=db_name_utf8,
-            test_conn=False,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        # test unicode entry will also return utf8 name
-        self._db_creation_loop(
-            db_name=db_name_unicode,
-            returning_name=db_name_utf8,
-            test_conn=False,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        # Using more complex unicode characters:
-        db_name_unicode = "\u6a19\u6e96\u8a9e"
-        # same as '標準語' because of file encoding
-        # but ensure it on this test
-        db_name_utf8 = "\xe6\xa8\x99\xe6\xba\x96\xe8\xaa\x9e"
-        self._db_creation_loop(
-            db_name=db_name_utf8,
-            returning_name=db_name_utf8,
-            test_conn=False,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        # test unicode entry will also return utf8 name
-        self._db_creation_loop(
-            db_name=db_name_unicode,
-            returning_name=db_name_utf8,
-            test_conn=False,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-
-    @pytest.mark.destructive_test
-    def test_database_maintenance(self):
-        """
-        Test maintenance operations on a created database
-        """
-        dbname = "foo%'-- `\"'"
-        # create database
-        # but first silently try to remove it
-        # in case of previous tests failures
-        ret = self.run_function(
-            "mysql.db_remove",
-            name=dbname,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        ret = self.run_function(
-            "mysql.db_create",
-            name=dbname,
-            character_set="utf8",
-            collate="utf8_general_ci",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-        # test db exists
-        ret = self.run_function(
-            "mysql.db_exists",
-            name=dbname,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-        # Create 3 tables
-        tablenames = {
-            'A%table "`1': "MYISAM",
-            "B%table '`2": "InnoDB",
-            "Ctable --`3": "MEMORY",
-        }
-        for tablename, engine in sorted(tablenames.items()):
-            # prepare queries
-            create_query = (
-                "CREATE TABLE {tblname} ("
-                " id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,"
-                " data VARCHAR(100)) ENGINE={engine};".format(
-                    tblname=mysqlmod.quote_identifier(tablename),
-                    engine=engine,
-                )
-            )
-            insert_query = "INSERT INTO {tblname} (data) VALUES ".format(
-                tblname=mysqlmod.quote_identifier(tablename)
-            )
-            delete_query = "DELETE from  {tblname} order by rand() limit 50;".format(
-                tblname=mysqlmod.quote_identifier(tablename)
-            )
-            for x in range(100):
-                insert_query += "('foo" + str(x) + "'),"
-            insert_query += "('bar');"
-
-            # populate database
-            log.info("Adding table '%s'", tablename)
-            ret = self.run_function(
-                "mysql.query",
-                database=dbname,
-                query=create_query,
-                connection_user=self.user,
-                connection_pass=self.password,
-            )
-            if not isinstance(ret, dict) or "rows affected" not in ret:
-                raise AssertionError(
-                    (
-                        "Unexpected query result while populating test table"
-                        " '{}' : '{}'"
-                    ).format(
-                        tablename,
-                        ret,
-                    )
-                )
-            self.assertEqual(ret["rows affected"], 0)
-            log.info("Populating table '%s'", tablename)
-            ret = self.run_function(
-                "mysql.query",
-                database=dbname,
-                query=insert_query,
-                connection_user=self.user,
-                connection_pass=self.password,
-            )
-            if not isinstance(ret, dict) or "rows affected" not in ret:
-                raise AssertionError(
-                    (
-                        "Unexpected query result while populating test table"
-                        " '{}' : '{}'"
-                    ).format(
-                        tablename,
-                        ret,
-                    )
-                )
-            self.assertEqual(ret["rows affected"], 101)
-            log.info("Removing some rows on table'%s'", tablename)
-            ret = self.run_function(
-                "mysql.query",
-                database=dbname,
-                query=delete_query,
-                connection_user=self.user,
-                connection_pass=self.password,
-            )
-            if not isinstance(ret, dict) or "rows affected" not in ret:
-                raise AssertionError(
-                    (
-                        "Unexpected query result while removing rows on test table"
-                        " '{}' : '{}'"
-                    ).format(
-                        tablename,
-                        ret,
-                    )
-                )
-            self.assertEqual(ret["rows affected"], 50)
-        # test check/repair/opimize on 1 table
-        tablename = 'A%table "`1'
-        ret = self.run_function(
-            "mysql.db_check",
-            name=dbname,
-            table=tablename,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        # Note that returned result does not quote_identifier of table and db
-        self.assertEqual(
-            ret,
-            [
-                {
-                    "Table": dbname + "." + tablename,
-                    "Msg_text": "OK",
-                    "Msg_type": "status",
-                    "Op": "check",
-                }
-            ],
-        )
-        ret = self.run_function(
-            "mysql.db_repair",
-            name=dbname,
-            table=tablename,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        # Note that returned result does not quote_identifier of table and db
-        self.assertEqual(
-            ret,
-            [
-                {
-                    "Table": dbname + "." + tablename,
-                    "Msg_text": "OK",
-                    "Msg_type": "status",
-                    "Op": "repair",
-                }
-            ],
-        )
-        ret = self.run_function(
-            "mysql.db_optimize",
-            name=dbname,
-            table=tablename,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        # Note that returned result does not quote_identifier of table and db
-        self.assertEqual(
-            ret,
-            [
-                {
-                    "Table": dbname + "." + tablename,
-                    "Msg_text": "OK",
-                    "Msg_type": "status",
-                    "Op": "optimize",
-                }
-            ],
-        )
-
-        # test check/repair/opimize on all tables
-        ret = self.run_function(
-            "mysql.db_check",
-            name=dbname,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        expected = []
-        for tablename, engine in sorted(tablenames.items()):
-            if engine == "MEMORY":
-                expected.append(
-                    [
-                        {
-                            "Table": dbname + "." + tablename,
-                            "Msg_text": (
-                                "The storage engine for the table doesn't support check"
-                            ),
-                            "Msg_type": "note",
-                            "Op": "check",
-                        }
-                    ]
-                )
-            else:
-                expected.append(
-                    [
-                        {
-                            "Table": dbname + "." + tablename,
-                            "Msg_text": "OK",
-                            "Msg_type": "status",
-                            "Op": "check",
-                        }
-                    ]
-                )
-        self.assertEqual(ret, expected)
-
-        ret = self.run_function(
-            "mysql.db_repair",
-            name=dbname,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        expected = []
-        for tablename, engine in sorted(tablenames.items()):
-            if engine == "MYISAM":
-                expected.append(
-                    [
-                        {
-                            "Table": dbname + "." + tablename,
-                            "Msg_text": "OK",
-                            "Msg_type": "status",
-                            "Op": "repair",
-                        }
-                    ]
-                )
-            else:
-                expected.append(
-                    [
-                        {
-                            "Table": dbname + "." + tablename,
-                            "Msg_text": (
-                                "The storage engine for the table doesn't"
-                                " support repair"
-                            ),
-                            "Msg_type": "note",
-                            "Op": "repair",
-                        }
-                    ]
-                )
-        self.assertEqual(ret, expected)
-
-        ret = self.run_function(
-            "mysql.db_optimize",
-            name=dbname,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-
-        expected = []
-        for tablename, engine in sorted(tablenames.items()):
-            if engine == "MYISAM":
-                expected.append(
-                    [
-                        {
-                            "Table": dbname + "." + tablename,
-                            "Msg_text": "OK",
-                            "Msg_type": "status",
-                            "Op": "optimize",
-                        }
-                    ]
-                )
-            elif engine == "InnoDB":
-                expected.append(
-                    [
-                        {
-                            "Table": dbname + "." + tablename,
-                            "Msg_text": (
-                                "Table does not support optimize, "
-                                "doing recreate + analyze instead"
-                            ),
-                            "Msg_type": "note",
-                            "Op": "optimize",
-                        },
-                        {
-                            "Table": dbname + "." + tablename,
-                            "Msg_text": "OK",
-                            "Msg_type": "status",
-                            "Op": "optimize",
-                        },
-                    ]
-                )
-            elif engine == "MEMORY":
-                expected.append(
-                    [
-                        {
-                            "Table": dbname + "." + tablename,
-                            "Msg_text": (
-                                "The storage engine for the table doesn't"
-                                " support optimize"
-                            ),
-                            "Msg_type": "note",
-                            "Op": "optimize",
-                        }
-                    ]
-                )
-        self.assertEqual(ret, expected)
-        # Teardown, remove database
-        ret = self.run_function(
-            "mysql.db_remove",
-            name=dbname,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(True, ret)
-
-
-@skipIf(
-    NO_MYSQL,
-    "Please install MySQL bindings and a MySQL Server before running"
-    "MySQL integration tests.",
-)
-@pytest.mark.windows_whitelisted
-class MysqlModuleUserTest(ModuleCase, SaltReturnAssertsMixin):
-    """
-    User Creation and connection tests
-    """
-
-    user = "root"
-    password = "poney"
-
-    @pytest.mark.destructive_test
-    def setUp(self):
-        """
-        Test presence of MySQL server, enforce a root password
-        """
-        super().setUp()
-        NO_MYSQL_SERVER = True
-        # now ensure we know the mysql root password
-        # one of theses two at least should work
-        ret1 = self.run_state(
-            "cmd.run",
-            name='mysqladmin --host="localhost" -u '
-            + self.user
-            + ' flush-privileges password "'
-            + self.password
-            + '"',
-        )
-        ret2 = self.run_state(
-            "cmd.run",
-            name='mysqladmin --host="localhost" -u '
-            + self.user
-            + ' --password="'
-            + self.password
-            + '" flush-privileges password "'
-            + self.password
-            + '"',
-        )
-        key, value = ret2.popitem()
-        if value["result"]:
-            NO_MYSQL_SERVER = False
-        else:
-            self.skipTest("No MySQL Server running, or no root access on it.")
-
-    def _userCreationLoop(
-        self,
-        uname,
-        host,
-        password=None,
-        new_password=None,
-        new_password_hash=None,
-        **kwargs
-    ):
-        """
-        Perform some tests around creation of the given user
-        """
-        # First silently remove it, in case of
-        ret = self.run_function("mysql.user_remove", user=uname, host=host, **kwargs)
-        # creation
-        ret = self.run_function(
-            "mysql.user_create", user=uname, host=host, password=password, **kwargs
-        )
-        self.assertEqual(
-            True,
-            ret,
-            "Calling user_create on user '{}' did not return True: {}".format(
-                uname, repr(ret)
-            ),
-        )
-        # double creation failure
-        ret = self.run_function(
-            "mysql.user_create", user=uname, host=host, password=password, **kwargs
-        )
-        self.assertEqual(
-            False,
-            ret,
-            (
-                "Calling user_create a second time on"
-                " user '{}' did not return False: {}"
-            ).format(uname, repr(ret)),
-        )
-        # Alter password
-        if new_password is not None or new_password_hash is not None:
-            ret = self.run_function(
-                "mysql.user_chpass",
-                user=uname,
-                host=host,
-                password=new_password,
-                password_hash=new_password_hash,
-                connection_user=self.user,
-                connection_pass=self.password,
-                connection_charset="utf8",
-                saltenv={"LC_ALL": "en_US.utf8"},
-            )
-            self.assertEqual(
-                True,
-                ret,
-                "Calling user_chpass on user '{}' did not return True: {}".format(
-                    uname, repr(ret)
-                ),
-            )
-
-    def _chck_userinfo(self, user, host, check_user, check_hash):
-        """
-        Internal routine to check user_info returned results
-        """
-        ret = self.run_function(
-            "mysql.user_info",
-            user=user,
-            host=host,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        if not isinstance(ret, dict):
-            raise AssertionError(
-                "Unexpected result while retrieving user_info for '{}'".format(user)
-            )
-        self.assertEqual(ret["Host"], host)
-        self.assertEqual(ret["Password"], check_hash)
-        self.assertEqual(ret["User"], check_user)
-
-    def _chk_remove_user(self, user, host, **kwargs):
-        """
-        Internal routine to check user_remove
-        """
-        ret = self.run_function("mysql.user_remove", user=user, host=host, **kwargs)
-        self.assertEqual(
-            True,
-            ret,
-            "Assertion failed  while removing user '{}' on host '{}': {}".format(
-                user, host, repr(ret)
-            ),
-        )
-
-    @pytest.mark.destructive_test
-    def test_user_management(self):
-        """
-        Test various users creation settings
-        """
-        # Create users with rights on this database
-        # and rights on other databases
-        user1 = "user '1"
-        user1_pwd = "pwd`'\"1b"
-        user1_pwd_hash = "*4DF33B3B12E43384677050A818327877FAB2F4BA"
-        # this is : user "2'標
-        user2 = "user \"2'\xe6\xa8\x99"
-        user2_pwd = "user \"2'\xe6\xa8\x99b"
-        user2_pwd_hash = "*3A38A7B94B024B983687BB9B44FB60B7AA38FE61"
-        user3 = 'user "3;,?:@=&amp;/'
-        user3_pwd = 'user "3;,?:@=&amp;/'
-        user3_pwd_hash = "*AA3B1D4105A45D381C23A5C221C47EA349E1FD7D"
-        # this is : user ":=;4標 in unicode instead of utf-8
-        # if unicode char is counted as 1 char we hit the max user
-        # size (16)
-        user4 = 'user":;,?:@=&amp;/4\u6a19'
-        user4_utf8 = 'user":;,?:@=&amp;/4\xe6\xa8\x99'
-        user4_pwd = 'user "4;,?:@=&amp;/'
-        user4_pwd_hash = "*FC8EF8DBF27628E4E113359F8E7478D5CF3DD57C"
-        user5 = 'user ``"5'
-        user5_utf8 = 'user ``"5'
-        # this is 標標標\
-        user5_pwd = "\xe6\xa8\x99\xe6\xa8\x99\\"
-        # this is password('標標\\')
-        user5_pwd_hash = "*3752E65CDD8751AF8D889C62CFFC6C998B12C376"
-        user6 = 'user %--"6'
-        user6_utf8 = 'user %--"6'
-        # this is : --'"% SIX標b
-        user6_pwd_u = " --'\"% SIX\u6a19b"
-        user6_pwd_utf8 = " --'\"% SIX\xe6\xa8\x99b"
-        # this is password(' --\'"% SIX標b')
-        user6_pwd_hash = "*90AE800593E2D407CD9E28CCAFBE42D17EEA5369"
-        self._userCreationLoop(
-            uname=user1,
-            host="localhost",
-            password="pwd`'\"1",
-            new_password="pwd`'\"1b",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        # Now check for results
-        ret = self.run_function(
-            "mysql.user_exists",
-            user=user1,
-            host="localhost",
-            password=user1_pwd,
-            password_hash=None,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self.assertEqual(
-            True,
-            ret,
-            "Testing final user '{}' on host '{}' existence failed".format(
-                user1, "localhost"
-            ),
-        )
-
-        self._userCreationLoop(
-            uname=user2,
-            host="localhost",
-            password=None,
-            # this is his name hash : user "2'標
-            password_hash="*EEF6F854748ACF841226BB1C2422BEC70AE7F1FF",
-            # and this is the same with a 'b' added
-            new_password_hash=user2_pwd_hash,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        # user2 can connect from other places with other password
-        self._userCreationLoop(
-            uname=user2,
-            host="10.0.0.1",
-            allow_passwordless=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self._userCreationLoop(
-            uname=user2,
-            host="10.0.0.2",
-            allow_passwordless=True,
-            unix_socket=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        # Now check for results
-        ret = self.run_function(
-            "mysql.user_exists",
-            user=user2,
-            host="localhost",
-            password=None,
-            password_hash=user2_pwd_hash,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self.assertEqual(
-            True,
-            ret,
-            "Testing final user '{}' on host '{}' failed".format(user2, "localhost"),
-        )
-        ret = self.run_function(
-            "mysql.user_exists",
-            user=user2,
-            host="10.0.0.1",
-            allow_passwordless=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self.assertEqual(
-            True,
-            ret,
-            "Testing final user '{}' on host '{}' without password failed".format(
-                user2, "10.0.0.1"
-            ),
-        )
-        ret = self.run_function(
-            "mysql.user_exists",
-            user=user2,
-            host="10.0.0.2",
-            allow_passwordless=True,
-            unix_socket=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self.assertEqual(
-            True,
-            ret,
-            "Testing final user '{}' on host '{}' without password failed".format(
-                user2, "10.0.0.2"
-            ),
-        )
-
-        # Empty password is not passwordless (or is it a bug?)
-        self._userCreationLoop(
-            uname=user3,
-            host="localhost",
-            password="",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        # user 3 on another host with a password
-        self._userCreationLoop(
-            uname=user3,
-            host="%",
-            password="foo",
-            new_password=user3_pwd,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        # Now check for results
-        ret = self.run_function(
-            "mysql.user_exists",
-            user=user3,
-            host="localhost",
-            password="",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(
-            True,
-            ret,
-            "Testing final user '{}' on host '{}' without empty password failed".format(
-                user3, "localhost"
-            ),
-        )
-        ret = self.run_function(
-            "mysql.user_exists",
-            user=user3,
-            host="%",
-            password=user3_pwd,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(
-            True,
-            ret,
-            "Testing final user '{}' on host '{}' with password failed".format(
-                user3, "%"
-            ),
-        )
-
-        # check unicode name, and password &gt; password_hash
-        self._userCreationLoop(
-            uname=user4,
-            host="%",
-            password=user4_pwd,
-            # this is password('foo')
-            password_hash="*F3A2A51A9B0F2BE2468926B4132313728C250DBF",
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        # Now check for results
-        ret = self.run_function(
-            "mysql.user_exists",
-            user=user4_utf8,
-            host="%",
-            password=user4_pwd,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self.assertEqual(
-            True,
-            ret,
-            (
-                "Testing final user '{}' on host '{}'"
-                " with password take from password and not password_hash"
-                " failed"
-            ).format(user4_utf8, "%"),
-        )
-        self._userCreationLoop(
-            uname=user5,
-            host="localhost",
-            password="\xe6\xa8\x99\xe6\xa8\x99",
-            new_password=user5_pwd,
-            unix_socket=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        ret = self.run_function(
-            "mysql.user_exists",
-            user=user5_utf8,
-            host="localhost",
-            password=user5_pwd,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self.assertEqual(
-            True,
-            ret,
-            "Testing final user '{}' on host '{}' with utf8 password failed".format(
-                user5_utf8, "localhost"
-            ),
-        )
-        # for this one we give password in unicode and check it in utf-8
-        self._userCreationLoop(
-            uname=user6,
-            host="10.0.0.1",
-            password=" foobar",
-            new_password=user6_pwd_u,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        # Now check for results
-        ret = self.run_function(
-            "mysql.user_exists",
-            user=user6_utf8,
-            host="10.0.0.1",
-            password=user6_pwd_utf8,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self.assertEqual(
-            True,
-            ret,
-            "Testing final user '{}' on host '{}' with unicode password failed".format(
-                user6_utf8, "10.0.0.1"
-            ),
-        )
-        # Final result should be:
-        # mysql&gt; select Host, User, Password from user where user like 'user%';
-        # +--------------------+-----------+-------------------------------+
-        # | User               | Host      | Password                      |
-        # +--------------------+-----------+-------------------------------+
-        # | user "2'標         | 10.0.0.1  |                               |
-        # | user "2'標         | 10.0.0.2  |                               |
-        # | user "2'標         | localhost | *3A38A7B94B0(...)60B7AA38FE61 |
-        # | user "3;,?:@=&amp;/    | %         | *AA3B1D4105(...)47EA349E1FD7D |
-        # | user "3;,?:@=&amp;/    | localhost |                               |
-        # | user %--"6         | 10.0.0.1  | *90AE800593(...)E42D17EEA5369 |
-        # | user '1            | localhost | *4DF33B3B1(...)327877FAB2F4BA |
-        # | user ``"5          | localhost | *3752E65CD(...)FC6C998B12C376 |
-        # | user":;,?:@=&amp;/4標  | %         | *FC8EF8DBF(...)7478D5CF3DD57C |
-        # +--------------------+-----------+-------------------------------+
-        self._chck_userinfo(
-            user=user2, host="10.0.0.1", check_user=user2, check_hash=""
-        )
-        self._chck_userinfo(
-            user=user2, host="10.0.0.2", check_user=user2, check_hash=""
-        )
-        self._chck_userinfo(
-            user=user2, host="localhost", check_user=user2, check_hash=user2_pwd_hash
-        )
-        self._chck_userinfo(
-            user=user3, host="%", check_user=user3, check_hash=user3_pwd_hash
-        )
-        self._chck_userinfo(
-            user=user3, host="localhost", check_user=user3, check_hash=""
-        )
-        self._chck_userinfo(
-            user=user4, host="%", check_user=user4_utf8, check_hash=user4_pwd_hash
-        )
-        self._chck_userinfo(
-            user=user6,
-            host="10.0.0.1",
-            check_user=user6_utf8,
-            check_hash=user6_pwd_hash,
-        )
-        self._chck_userinfo(
-            user=user1, host="localhost", check_user=user1, check_hash=user1_pwd_hash
-        )
-        self._chck_userinfo(
-            user=user5,
-            host="localhost",
-            check_user=user5_utf8,
-            check_hash=user5_pwd_hash,
-        )
-        # check user_list function
-        ret = self.run_function(
-            "mysql.user_list",
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self.assertIn({"Host": "localhost", "User": user1}, ret)
-        self.assertIn({"Host": "localhost", "User": user2}, ret)
-        self.assertIn({"Host": "10.0.0.1", "User": user2}, ret)
-        self.assertIn({"Host": "10.0.0.2", "User": user2}, ret)
-        self.assertIn({"Host": "%", "User": user3}, ret)
-        self.assertIn({"Host": "localhost", "User": user3}, ret)
-        self.assertIn({"Host": "%", "User": user4_utf8}, ret)
-        self.assertIn({"Host": "localhost", "User": user5_utf8}, ret)
-        self.assertIn({"Host": "10.0.0.1", "User": user6_utf8}, ret)
-
-        # And finally, test connections on MySQL with theses users
-        ret = self.run_function(
-            "mysql.query",
-            database="information_schema",
-            query="SELECT 1",
-            connection_user=user1,
-            connection_pass="pwd`'\"1b",
-            connection_host="localhost",
-        )
-        if not isinstance(ret, dict) or "results" not in ret:
-            raise AssertionError(
-                "Unexpected result while testing connection with user '{}': {}".format(
-                    user1, repr(ret)
-                )
-            )
-        self.assertEqual([["1"]], ret["results"])
-
-        # FIXME: still failing, but works by hand...
-        # mysql --user="user \"2'標" --password="user \"2'標b" information_schema
-        # Seems to be a python-mysql library problem with user names containing
-        # utf8 characters
-        # @see https://github.com/farcepest/MySQLdb1/issues/40
-        # import urllib
-        # ret = self.run_function(
-        #    'mysql.query',
-        #    database='information_schema',
-        #    query='SELECT 1',
-        #    connection_user=urllib.quote_plus(user2),
-        #    connection_pass=urllib.quote_plus(user2_pwd),
-        #    connection_host='localhost',
-        #    connection_charset='utf8',
-        #    saltenv={"LC_ALL": "en_US.utf8"}
-        # )
-        # if not isinstance(ret, dict) or 'results' not in ret:
-        #    raise AssertionError(
-        #        ('Unexpected result while testing connection'
-        #        ' with user \'{0}\': {1}').format(
-        #            user2,
-        #            repr(ret)
-        #        )
-        #    )
-        # self.assertEqual([['1']], ret['results'])
-        ret = self.run_function(
-            "mysql.query",
-            database="information_schema",
-            query="SELECT 1",
-            connection_user=user3,
-            connection_pass="",
-            connection_host="localhost",
-        )
-        if not isinstance(ret, dict) or "results" not in ret:
-            raise AssertionError(
-                "Unexpected result while testing connection with user '{}': {}".format(
-                    user3, repr(ret)
-                )
-            )
-        self.assertEqual([["1"]], ret["results"])
-        # FIXME: Failing
-        # ret = self.run_function(
-        #    'mysql.query',
-        #    database='information_schema',
-        #    query='SELECT 1',
-        #    connection_user=user4_utf8,
-        #    connection_pass=user4_pwd,
-        #    connection_host='localhost',
-        #    connection_charset='utf8',
-        #    saltenv={"LC_ALL": "en_US.utf8"}
-        # )
-        # if not isinstance(ret, dict) or 'results' not in ret:
-        #    raise AssertionError(
-        #        ('Unexpected result while testing connection'
-        #        ' with user \'{0}\': {1}').format(
-        #            user4_utf8,
-        #            repr(ret)
-        #        )
-        #    )
-        # self.assertEqual([['1']], ret['results'])
-        ret = self.run_function(
-            "mysql.query",
-            database="information_schema",
-            query="SELECT 1",
-            connection_user=user5_utf8,
-            connection_pass=user5_pwd,
-            connection_host="localhost",
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        if not isinstance(ret, dict) or "results" not in ret:
-            raise AssertionError(
-                "Unexpected result while testing connection with user '{}': {}".format(
-                    user5_utf8, repr(ret)
-                )
-            )
-        self.assertEqual([["1"]], ret["results"])
-
-        # Teardown by deleting with user_remove
-        self._chk_remove_user(
-            user=user2,
-            host="10.0.0.1",
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self._chk_remove_user(
-            user=user2,
-            host="10.0.0.2",
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self._chk_remove_user(
-            user=user2,
-            host="localhost",
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self._chk_remove_user(
-            user=user3,
-            host="%",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self._chk_remove_user(
-            user=user3,
-            host="localhost",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self._chk_remove_user(
-            user=user4,
-            host="%",
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self._chk_remove_user(
-            user=user6,
-            host="10.0.0.1",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self._chk_remove_user(
-            user=user1,
-            host="localhost",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self._chk_remove_user(
-            user=user5,
-            host="localhost",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        # Final verification of the cleanup
-        ret = self.run_function(
-            "mysql.user_list",
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-        self.assertNotIn({"Host": "localhost", "User": user1}, ret)
-        self.assertNotIn({"Host": "localhost", "User": user2}, ret)
-        self.assertNotIn({"Host": "10.0.0.1", "User": user2}, ret)
-        self.assertNotIn({"Host": "10.0.0.2", "User": user2}, ret)
-        self.assertNotIn({"Host": "%", "User": user3}, ret)
-        self.assertNotIn({"Host": "localhost", "User": user3}, ret)
-        self.assertNotIn({"Host": "%", "User": user4_utf8}, ret)
-        self.assertNotIn({"Host": "localhost", "User": user5_utf8}, ret)
-        self.assertNotIn({"Host": "10.0.0.1", "User": user6_utf8}, ret)
-
-
-@skipIf(
-    NO_MYSQL,
-    "Please install MySQL bindings and a MySQL Server before running"
-    "MySQL integration tests.",
-)
-@pytest.mark.windows_whitelisted
-class MysqlModuleUserGrantTest(ModuleCase, SaltReturnAssertsMixin):
-    """
-    User Creation and connection tests
-    """
-
-    user = "root"
-    password = "poney"
-    # yep, theses are valid MySQL db names
-    # very special chars are _ % and .
-    testdb1 = "tes.t'\"saltdb"
-    testdb2 = "t_st `(:=salt%b)"
-    testdb3 = "test `(:=salteeb)"
-    test_file_query_db = "test_query"
-    table1 = "foo"
-    table2 = "foo `'%_bar"
-    users = {
-        "user1": {"name": "foo", "pwd": "bar"},
-        "user2": {"name": 'user ";--,?:&amp;/\\', "pwd": '";--(),?:@=&amp;/\\'},
-        # this is : passwd 標標
-        "user3": {"name": "user( @ )=foobar", "pwd": "\xe6\xa8\x99\xe6\xa8\x99"},
-        # this is : user/password containing 標標
-        "user4": {"name": "user \xe6\xa8\x99", "pwd": "\xe6\xa8\x99\xe6\xa8\x99"},
-    }
-
-    @pytest.mark.destructive_test
-    def setUp(self):
-        """
-        Test presence of MySQL server, enforce a root password, create users
-        """
-        super().setUp()
-        NO_MYSQL_SERVER = True
-        # now ensure we know the mysql root password
-        # one of theses two at least should work
-        ret1 = self.run_state(
-            "cmd.run",
-            name='mysqladmin --host="localhost" -u '
-            + self.user
-            + ' flush-privileges password "'
-            + self.password
-            + '"',
-        )
-        ret2 = self.run_state(
-            "cmd.run",
-            name='mysqladmin --host="localhost" -u '
-            + self.user
-            + ' --password="'
-            + self.password
-            + '" flush-privileges password "'
-            + self.password
-            + '"',
-        )
-        key, value = ret2.popitem()
-        if value["result"]:
-            NO_MYSQL_SERVER = False
-        else:
-            self.skipTest("No MySQL Server running, or no root access on it.")
-        # Create some users and a test db
-        for user, userdef in self.users.items():
-            self._userCreation(uname=userdef["name"], password=userdef["pwd"])
-        self.run_function(
-            "mysql.db_create",
-            name=self.testdb1,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.run_function(
-            "mysql.db_create",
-            name=self.testdb2,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-<a name="0"></a>        create_query = (
-            "CREATE TABLE {tblname} ("
-            " id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,"
-            " data VARCHAR(100)) ENGINE={engine};"<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.format(
-                tblname=mysqlmod.quote_identifier(self.table1),
-                engine="MYISAM",
-            )
-        )
-        log.info("Adding table '%s'", self.table1)
-        self.run_function(</b></font>
-            "mysql.query",
-            database=self.testdb2,
-            query=create_query,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        create_query = (
-            "CREATE TABLE {tblname} ("
-            " id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,"
-            " data VARCHAR(100)) ENGINE={engine};".format(
-                tblname=mysqlmod.quote_identifier(self.table2),
-                engine="MYISAM",
-            )
-        )
-        log.info("Adding table '%s'", self.table2)
-        self.run_function(
-            "mysql.query",
-            database=self.testdb2,
-            query=create_query,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-
-    @pytest.mark.destructive_test
-    def tearDown(self):
-        """
-        Removes created users and db
-        """
-        for user, userdef in self.users.items():
-            self._userRemoval(uname=userdef["name"], password=userdef["pwd"])
-        self.run_function(
-            "mysql.db_remove",
-            name=self.testdb1,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.run_function(
-            "mysql.db_remove",
-            name=self.testdb2,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.run_function(
-            "mysql.db_remove",
-            name=self.test_file_query_db,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-
-    def _userCreation(self, uname, password=None):
-        """
-        Create a test user
-        """
-        self.run_function(
-            "mysql.user_create",
-            user=uname,
-            host="localhost",
-            password=password,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-
-    def _userRemoval(self, uname, password=None):
-        """
-        Removes a test user
-        """
-        self.run_function(
-            "mysql.user_remove",
-            user=uname,
-            host="localhost",
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-            saltenv={"LC_ALL": "en_US.utf8"},
-        )
-
-    def _addGrantRoutine(
-        self, grant, user, db, grant_option=False, escape=True, **kwargs
-    ):
-        """
-        Perform some tests around creation of the given grants
-        """
-        ret = self.run_function(
-            "mysql.grant_add",
-            grant=grant,
-            database=db,
-            user=user,
-            grant_option=grant_option,
-            escape=escape,
-            **kwargs
-        )
-        self.assertEqual(
-            True,
-            ret,
-            (
-                "Calling grant_add on user '{}' and grants '{}' did not return True: {}"
-            ).format(user, grant, repr(ret)),
-        )
-        ret = self.run_function(
-            "mysql.grant_exists",
-            grant=grant,
-            database=db,
-            user=user,
-            grant_option=grant_option,
-            escape=escape,
-            **kwargs
-        )
-        self.assertEqual(
-            True,
-            ret,
-            (
-                "Calling grant_exists on"
-                " user '{}' and grants '{}' did not return True: {}"
-            ).format(user, grant, repr(ret)),
-        )
-
-    @pytest.mark.destructive_test
-    def testGrants(self):
-        """
-        Test user grant methods
-        """
-        self._addGrantRoutine(
-            grant="SELECT, INSERT,UPDATE, CREATE",
-            user=self.users["user1"]["name"],
-            db=self.testdb1 + ".*",
-            grant_option=True,
-            escape=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self._addGrantRoutine(
-            grant="INSERT, SELECT",
-            user=self.users["user1"]["name"],
-            db=self.testdb2 + "." + self.table1,
-            grant_option=True,
-            escape=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self._addGrantRoutine(
-            grant="  SELECT, UPDATE,DELETE, CREATE TEMPORARY TABLES",
-            user=self.users["user2"]["name"],
-            db=self.testdb1 + ".*",
-            grant_option=True,
-            escape=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self._addGrantRoutine(
-            grant="select, ALTER,CREATE TEMPORARY TABLES, EXECUTE ",
-            user=self.users["user3"]["name"],
-            db=self.testdb1 + ".*",
-            grant_option=True,
-            escape=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self._addGrantRoutine(
-            grant="SELECT, INSERT",
-            user=self.users["user4"]["name"],
-            db=self.testdb2 + "." + self.table2,
-            grant_option=False,
-            escape=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-        )
-        self._addGrantRoutine(
-            grant="CREATE",
-            user=self.users["user4"]["name"],
-            db=self.testdb2 + ".*",
-            grant_option=False,
-            escape=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-        )
-        self._addGrantRoutine(
-            grant="SELECT, INSERT",
-            user=self.users["user4"]["name"],
-            db=self.testdb2 + "." + self.table1,
-            grant_option=False,
-            escape=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-        )
-        # '' is valid for anonymous users
-        self._addGrantRoutine(
-            grant="DELETE",
-            user="",
-            db=self.testdb3 + ".*",
-            grant_option=False,
-            escape=True,
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        # Check result for users
-        ret = self.run_function(
-            "mysql.user_grants",
-            user=self.users["user1"]["name"],
-            host="localhost",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(
-            ret,
-            [
-                "GRANT USAGE ON *.* TO 'foo'@'localhost'",
-                "GRANT SELECT, INSERT, UPDATE, CREATE ON "
-                "`tes.t'\"saltdb`.* TO 'foo'@'localhost' WITH GRANT OPTION",
-                "GRANT SELECT, INSERT ON `t_st ``(:=salt%b)`.`foo`"
-                " TO 'foo'@'localhost' WITH GRANT OPTION",
-            ],
-        )
-
-        ret = self.run_function(
-            "mysql.user_grants",
-            user=self.users["user2"]["name"],
-            host="localhost",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(
-            ret,
-            [
-                "GRANT USAGE ON *.* TO 'user \";--,?:&amp;/\\'@'localhost'",
-                "GRANT SELECT, UPDATE, DELETE, CREATE TEMPORARY TABLES ON `tes.t'"
-                "\"saltdb`.* TO 'user \";--,?:&amp;/\\'@'localhost'"
-                " WITH GRANT OPTION",
-            ],
-        )
-
-        ret = self.run_function(
-            "mysql.user_grants",
-            user=self.users["user3"]["name"],
-            host="localhost",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(
-            ret,
-            [
-                "GRANT USAGE ON *.* TO 'user( @ )=foobar'@'localhost'",
-                "GRANT SELECT, ALTER, CREATE TEMPORARY TABLES, EXECUTE ON "
-                "`tes.t'\"saltdb`.* TO 'user( @ )=foobar'@'localhost' "
-                "WITH GRANT OPTION",
-            ],
-        )
-
-        ret = self.run_function(
-            "mysql.user_grants",
-            user=self.users["user4"]["name"],
-            host="localhost",
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_charset="utf8",
-        )
-        self.assertEqual(
-            ret,
-            [
-                "GRANT USAGE ON *.* TO 'user \xe6\xa8\x99'@'localhost'",
-                (
-                    r"GRANT CREATE ON `t\_st ``(:=salt\%b)`.* TO "
-                    "'user \xe6\xa8\x99'@'localhost'"
-                ),
-                "GRANT SELECT, INSERT ON `t_st ``(:=salt%b)`.`foo ``'%_bar` TO "
-                "'user \xe6\xa8\x99'@'localhost'",
-                "GRANT SELECT, INSERT ON `t_st ``(:=salt%b)`.`foo` TO "
-                "'user \xe6\xa8\x99'@'localhost'",
-            ],
-        )
-
-        ret = self.run_function(
-            "mysql.user_grants",
-            user="",
-            host="localhost",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertEqual(
-            ret,
-            [
-                "GRANT USAGE ON *.* TO ''@'localhost'",
-                "GRANT DELETE ON `test ``(:=salteeb)`.* TO ''@'localhost'",
-            ],
-        )
-
-
-@skipIf(
-    NO_MYSQL,
-    "Please install MySQL bindings and a MySQL Server before running"
-    "MySQL integration tests.",
-)
-@pytest.mark.windows_whitelisted
-class MysqlModuleFileQueryTest(ModuleCase, SaltReturnAssertsMixin):
-    """
-    Test file query module
-    """
-
-    user = "root"
-    password = "poney"
-    testdb = "test_file_query"
-
-    @pytest.mark.destructive_test
-    def setUp(self):
-        """
-        Test presence of MySQL server, enforce a root password, create users
-        """
-        super().setUp()
-        NO_MYSQL_SERVER = True
-        # now ensure we know the mysql root password
-        # one of theses two at least should work
-        ret1 = self.run_state(
-            "cmd.run",
-            name='mysqladmin --host="localhost" -u '
-            + self.user
-            + ' flush-privileges password "'
-            + self.password
-            + '"',
-        )
-        ret2 = self.run_state(
-            "cmd.run",
-            name='mysqladmin --host="localhost" -u '
-            + self.user
-            + ' --password="'
-            + self.password
-            + '" flush-privileges password "'
-            + self.password
-            + '"',
-        )
-        key, value = ret2.popitem()
-        if value["result"]:
-            NO_MYSQL_SERVER = False
-        else:
-            self.skipTest("No MySQL Server running, or no root access on it.")
-        # Create some users and a test db
-        self.run_function(
-            "mysql.db_create",
-            name=self.testdb,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_db="mysql",
-        )
-
-    @pytest.mark.destructive_test
-    def tearDown(self):
-        """
-        Removes created users and db
-        """
-        self.run_function(
-            "mysql.db_remove",
-            name=self.testdb,
-            connection_user=self.user,
-            connection_pass=self.password,
-            connection_db="mysql",
-        )
-
-    @pytest.mark.destructive_test
-    def test_update_file_query(self):
-        """
-        Test query without any output
-        """
-        ret = self.run_function(
-            "mysql.file_query",
-            database=self.testdb,
-            file_name="salt://mysql/update_query.sql",
-            character_set="utf8",
-            collate="utf8_general_ci",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        self.assertTrue("query time" in ret)
-        ret.pop("query time")
-        self.assertEqual(ret, {"rows affected": 2})
-
-    @pytest.mark.destructive_test
-    def test_select_file_query(self):
-        """
-        Test query with table output
-        """
-        ret = self.run_function(
-            "mysql.file_query",
-            database=self.testdb,
-            file_name="salt://mysql/select_query.sql",
-            character_set="utf8",
-            collate="utf8_general_ci",
-            connection_user=self.user,
-            connection_pass=self.password,
-        )
-        expected = {
-            "rows affected": 5,
-            "rows returned": 4,
-            "results": [[["2"], ["3"], ["4"], ["5"]]],
-            "columns": [["a"]],
-        }
-        self.assertTrue("query time" in ret)
-        ret.pop("query time")
-        self.assertEqual(ret, expected)
+1 import logging
+2 import pytest
+3 import salt.utils.path
+4 from salt.modules import mysql as mysqlmod
+5 from tests.support.case import ModuleCase
+6 from tests.support.mixins import SaltReturnAssertsMixin
+7 from tests.support.unit import skipIf
+8 log = logging.getLogger(__name__)
+9 NO_MYSQL = False
+10 try:
+11     import MySQLdb  # pylint: disable=import-error,unused-import
+12 except Exception:  # pylint: disable=broad-except
+13     NO_MYSQL = True
+14 if not salt.utils.path.which("mysqladmin"):
+15     NO_MYSQL = True
+16 @skipIf(
+17     NO_MYSQL,
+18     "Please install MySQL bindings and a MySQL Server before running"
+19     "MySQL integration tests.",
+20 )
+21 @pytest.mark.windows_whitelisted
+22 class MysqlModuleDbTest(ModuleCase, SaltReturnAssertsMixin):
+23     user = "root"
+24     password = "poney"
+25     @pytest.mark.destructive_test
+26     def setUp(self):
+27         super().setUp()
+28         NO_MYSQL_SERVER = True
+29         ret1 = self.run_state(
+30             "cmd.run",
+31             name='mysqladmin --host="localhost" -u '
+32             + self.user
+33             + ' flush-privileges password "'
+34             + self.password
+35             + '"',
+36         )
+37         ret2 = self.run_state(
+38             "cmd.run",
+39             name='mysqladmin --host="localhost" -u '
+40             + self.user
+41             + ' --password="'
+42             + self.password
+43             + '" flush-privileges password "'
+44             + self.password
+45             + '"',
+46         )
+47         key, value = ret2.popitem()
+48         if value["result"]:
+49             NO_MYSQL_SERVER = False
+50         else:
+51             self.skipTest("No MySQL Server running, or no root access on it.")
+52     def _db_creation_loop(self, db_name, returning_name, test_conn=False, **kwargs):
+53         ret = self.run_function("mysql.db_create", name=db_name, **kwargs)
+54         self.assertEqual(
+55             True, ret, "Problem while creating db for db name: '{}'".format(db_name)
+56         )
+57         ret = self.run_function("mysql.db_exists", name=db_name, **kwargs)
+58         self.assertEqual(
+59             True,
+60             ret,
+61             "Problem while testing db exists for db name: '{}'".format(db_name),
+62         )
+63         ret = self.run_function("mysql.db_list", **kwargs)
+64         if not isinstance(ret, list):
+65             raise AssertionError(
+66                 (
+67                     "Unexpected query result while retrieving databases list"
+68                     " '{}' for '{}' test"
+69                 ).format(ret, db_name)
+70             )
+71         self.assertIn(
+72             returning_name,
+73             ret,
+74             (
+75                 "Problem while testing presence of db name in db lists"
+76                 " for db name: '{}' in list '{}'"
+77             ).format(db_name, ret),
+78         )
+79         if test_conn:
+80             ret = self.run_function(
+81                 "mysql.query", database=db_name, query="SELECT 1", **kwargs
+82             )
+83             if not isinstance(ret, dict) or "results" not in ret:
+84                 raise AssertionError(
+85                     "Unexpected result while testing connection on database : {}".format(
+86                         repr(db_name)
+87                     )
+88                 )
+89             self.assertEqual([["1"]], ret["results"])
+90         ret = self.run_function("mysql.db_remove", name=db_name, **kwargs)
+91         self.assertEqual(
+92             True, ret, "Problem while removing db for db name: '{}'".format(db_name)
+93         )
+94     @pytest.mark.destructive_test
+95     def test_database_creation_level1(self):
+96         db_name = "foo 1"
+97         self._db_creation_loop(
+98             db_name=db_name,
+99             returning_name=db_name,
+100             test_conn=True,
+101             connection_user=self.user,
+102             connection_pass=self.password,
+103         )
+104         ret = self.run_function(
+105             "mysql.db_create",
+106             name="foo`2",
+107             character_set="utf8",
+108             collate="utf8_general_ci",
+109             connection_user=self.user,
+110             connection_pass=self.password,
+111         )
+112         self.assertEqual(True, ret)
+113         ret = self.run_function(
+114             "mysql.db_exists",
+115             name="foo`2",
+116             connection_user=self.user,
+117             connection_pass=self.password,
+118         )
+119         self.assertEqual(True, ret)
+120         ret = self.run_function(
+121             "mysql.db_create",
+122             name="foo`2",
+123             character_set="utf8",
+124             collate="utf8_general_ci",
+125             connection_user=self.user,
+126             connection_pass=self.password,
+127         )
+128         self.assertEqual(False, ret)
+129         ret = self.run_function(
+130             "mysql.db_create",
+131             name="foo`2",
+132             character_set="utf8",
+133             collate="utf8_general_ci",
+134             connection_user=self.user,
+135             connection_pass=self.password,
+136         )
+137         self.assertEqual(False, ret)
+138         ret = self.run_function(
+139             "mysql.db_remove",
+140             name="foo`2",
+141             connection_user=self.user,
+142             connection_pass=self.password,
+143         )
+144         self.assertEqual(True, ret)
+145         db_name = "foo'3"
+146         self._db_creation_loop(
+147             db_name=db_name,
+148             returning_name=db_name,
+149             test_conn=True,
+150             character_set="utf8",
+151             connection_user=self.user,
+152             connection_pass=self.password,
+153         )
+154         db_name = 'foo"4'
+155         self._db_creation_loop(
+156             db_name=db_name,
+157             returning_name=db_name,
+158             test_conn=True,
+159             collate="utf8_general_ci",
+160             connection_user=self.user,
+161             connection_pass=self.password,
+162         )
+163         db_name = '&lt;foo` --"5&gt;'
+164         self._db_creation_loop(
+165             db_name=db_name,
+166             returning_name=db_name,
+167             test_conn=True,
+168             connection_user=self.user,
+169             connection_pass=self.password,
+170         )
+171     @pytest.mark.destructive_test
+172     def test_mysql_dbname_character_percent(self):
+173         db_name1 = "foo%1_"
+174         db_name2 = "foo%12"
+175         ret = self.run_function(
+176             "mysql.db_create",
+177             name=db_name1,
+178             character_set="utf8",
+179             collate="utf8_general_ci",
+180             connection_user=self.user,
+181             connection_pass=self.password,
+182         )
+183         self.assertEqual(True, ret)
+184         ret = self.run_function(
+185             "mysql.db_create",
+186             name=db_name2,
+187             connection_user=self.user,
+188             connection_pass=self.password,
+189         )
+190         self.assertEqual(True, ret)
+191         ret = self.run_function(
+192             "mysql.db_remove",
+193             name=db_name1,
+194             connection_user=self.user,
+195             connection_pass=self.password,
+196         )
+197         self.assertEqual(True, ret)
+198         ret = self.run_function(
+199             "mysql.db_exists",
+200             name=db_name1,
+201             connection_user=self.user,
+202             connection_pass=self.password,
+203         )
+204         self.assertEqual(False, ret)
+205         ret = self.run_function(
+206             "mysql.db_exists",
+207             name=db_name2,
+208             connection_user=self.user,
+209             connection_pass=self.password,
+210         )
+211         self.assertEqual(True, ret)
+212         ret = self.run_function(
+213             "mysql.db_remove",
+214             name=db_name2,
+215             connection_user=self.user,
+216             connection_pass=self.password,
+217         )
+218         self.assertEqual(True, ret)
+219     @pytest.mark.destructive_test
+220     def test_database_creation_utf8(self):
+221         db_name_unicode = "notam\xe9rican"
+222         db_name_utf8 = "notam\xc3\xa9rican"
+223         self._db_creation_loop(
+224             db_name=db_name_utf8,
+225             returning_name=db_name_utf8,
+226             test_conn=False,
+227             connection_user=self.user,
+228             connection_pass=self.password,
+229             connection_charset="utf8",
+230             saltenv={"LC_ALL": "en_US.utf8"},
+231         )
+232         self._db_creation_loop(
+233             db_name=db_name_unicode,
+234             returning_name=db_name_utf8,
+235             test_conn=False,
+236             connection_user=self.user,
+237             connection_pass=self.password,
+238             connection_charset="utf8",
+239             saltenv={"LC_ALL": "en_US.utf8"},
+240         )
+241         db_name_unicode = "\u6a19\u6e96\u8a9e"
+242         db_name_utf8 = "\xe6\xa8\x99\xe6\xba\x96\xe8\xaa\x9e"
+243         self._db_creation_loop(
+244             db_name=db_name_utf8,
+245             returning_name=db_name_utf8,
+246             test_conn=False,
+247             connection_user=self.user,
+248             connection_pass=self.password,
+249             connection_charset="utf8",
+250             saltenv={"LC_ALL": "en_US.utf8"},
+251         )
+252         self._db_creation_loop(
+253             db_name=db_name_unicode,
+254             returning_name=db_name_utf8,
+255             test_conn=False,
+256             connection_user=self.user,
+257             connection_pass=self.password,
+258             connection_charset="utf8",
+259             saltenv={"LC_ALL": "en_US.utf8"},
+260         )
+261     @pytest.mark.destructive_test
+262     def test_database_maintenance(self):
+263         dbname = "foo%'-- `\"'"
+264         ret = self.run_function(
+265             "mysql.db_remove",
+266             name=dbname,
+267             connection_user=self.user,
+268             connection_pass=self.password,
+269         )
+270         ret = self.run_function(
+271             "mysql.db_create",
+272             name=dbname,
+273             character_set="utf8",
+274             collate="utf8_general_ci",
+275             connection_user=self.user,
+276             connection_pass=self.password,
+277         )
+278         self.assertEqual(True, ret)
+279         ret = self.run_function(
+280             "mysql.db_exists",
+281             name=dbname,
+282             connection_user=self.user,
+283             connection_pass=self.password,
+284         )
+285         self.assertEqual(True, ret)
+286         tablenames = {
+287             'A%table "`1': "MYISAM",
+288             "B%table '`2": "InnoDB",
+289             "Ctable --`3": "MEMORY",
+290         }
+291         for tablename, engine in sorted(tablenames.items()):
+292             create_query = (
+293                 "CREATE TABLE {tblname} ("
+294                 " id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,"
+295                 " data VARCHAR(100)) ENGINE={engine};".format(
+296                     tblname=mysqlmod.quote_identifier(tablename),
+297                     engine=engine,
+298                 )
+299             )
+300             insert_query = "INSERT INTO {tblname} (data) VALUES ".format(
+301                 tblname=mysqlmod.quote_identifier(tablename)
+302             )
+303             delete_query = "DELETE from  {tblname} order by rand() limit 50;".format(
+304                 tblname=mysqlmod.quote_identifier(tablename)
+305             )
+306             for x in range(100):
+307                 insert_query += "('foo" + str(x) + "'),"
+308             insert_query += "('bar');"
+309             log.info("Adding table '%s'", tablename)
+310             ret = self.run_function(
+311                 "mysql.query",
+312                 database=dbname,
+313                 query=create_query,
+314                 connection_user=self.user,
+315                 connection_pass=self.password,
+316             )
+317             if not isinstance(ret, dict) or "rows affected" not in ret:
+318                 raise AssertionError(
+319                     (
+320                         "Unexpected query result while populating test table"
+321                         " '{}' : '{}'"
+322                     ).format(
+323                         tablename,
+324                         ret,
+325                     )
+326                 )
+327             self.assertEqual(ret["rows affected"], 0)
+328             log.info("Populating table '%s'", tablename)
+329             ret = self.run_function(
+330                 "mysql.query",
+331                 database=dbname,
+332                 query=insert_query,
+333                 connection_user=self.user,
+334                 connection_pass=self.password,
+335             )
+336             if not isinstance(ret, dict) or "rows affected" not in ret:
+337                 raise AssertionError(
+338                     (
+339                         "Unexpected query result while populating test table"
+340                         " '{}' : '{}'"
+341                     ).format(
+342                         tablename,
+343                         ret,
+344                     )
+345                 )
+346             self.assertEqual(ret["rows affected"], 101)
+347             log.info("Removing some rows on table'%s'", tablename)
+348             ret = self.run_function(
+349                 "mysql.query",
+350                 database=dbname,
+351                 query=delete_query,
+352                 connection_user=self.user,
+353                 connection_pass=self.password,
+354             )
+355             if not isinstance(ret, dict) or "rows affected" not in ret:
+356                 raise AssertionError(
+357                     (
+358                         "Unexpected query result while removing rows on test table"
+359                         " '{}' : '{}'"
+360                     ).format(
+361                         tablename,
+362                         ret,
+363                     )
+364                 )
+365             self.assertEqual(ret["rows affected"], 50)
+366         tablename = 'A%table "`1'
+367         ret = self.run_function(
+368             "mysql.db_check",
+369             name=dbname,
+370             table=tablename,
+371             connection_user=self.user,
+372             connection_pass=self.password,
+373         )
+374         self.assertEqual(
+375             ret,
+376             [
+377                 {
+378                     "Table": dbname + "." + tablename,
+379                     "Msg_text": "OK",
+380                     "Msg_type": "status",
+381                     "Op": "check",
+382                 }
+383             ],
+384         )
+385         ret = self.run_function(
+386             "mysql.db_repair",
+387             name=dbname,
+388             table=tablename,
+389             connection_user=self.user,
+390             connection_pass=self.password,
+391         )
+392         self.assertEqual(
+393             ret,
+394             [
+395                 {
+396                     "Table": dbname + "." + tablename,
+397                     "Msg_text": "OK",
+398                     "Msg_type": "status",
+399                     "Op": "repair",
+400                 }
+401             ],
+402         )
+403         ret = self.run_function(
+404             "mysql.db_optimize",
+405             name=dbname,
+406             table=tablename,
+407             connection_user=self.user,
+408             connection_pass=self.password,
+409         )
+410         self.assertEqual(
+411             ret,
+412             [
+413                 {
+414                     "Table": dbname + "." + tablename,
+415                     "Msg_text": "OK",
+416                     "Msg_type": "status",
+417                     "Op": "optimize",
+418                 }
+419             ],
+420         )
+421         ret = self.run_function(
+422             "mysql.db_check",
+423             name=dbname,
+424             connection_user=self.user,
+425             connection_pass=self.password,
+426         )
+427         expected = []
+428         for tablename, engine in sorted(tablenames.items()):
+429             if engine == "MEMORY":
+430                 expected.append(
+431                     [
+432                         {
+433                             "Table": dbname + "." + tablename,
+434                             "Msg_text": (
+435                                 "The storage engine for the table doesn't support check"
+436                             ),
+437                             "Msg_type": "note",
+438                             "Op": "check",
+439                         }
+440                     ]
+441                 )
+442             else:
+443                 expected.append(
+444                     [
+445                         {
+446                             "Table": dbname + "." + tablename,
+447                             "Msg_text": "OK",
+448                             "Msg_type": "status",
+449                             "Op": "check",
+450                         }
+451                     ]
+452                 )
+453         self.assertEqual(ret, expected)
+454         ret = self.run_function(
+455             "mysql.db_repair",
+456             name=dbname,
+457             connection_user=self.user,
+458             connection_pass=self.password,
+459         )
+460         expected = []
+461         for tablename, engine in sorted(tablenames.items()):
+462             if engine == "MYISAM":
+463                 expected.append(
+464                     [
+465                         {
+466                             "Table": dbname + "." + tablename,
+467                             "Msg_text": "OK",
+468                             "Msg_type": "status",
+469                             "Op": "repair",
+470                         }
+471                     ]
+472                 )
+473             else:
+474                 expected.append(
+475                     [
+476                         {
+477                             "Table": dbname + "." + tablename,
+478                             "Msg_text": (
+479                                 "The storage engine for the table doesn't"
+480                                 " support repair"
+481                             ),
+482                             "Msg_type": "note",
+483                             "Op": "repair",
+484                         }
+485                     ]
+486                 )
+487         self.assertEqual(ret, expected)
+488         ret = self.run_function(
+489             "mysql.db_optimize",
+490             name=dbname,
+491             connection_user=self.user,
+492             connection_pass=self.password,
+493         )
+494         expected = []
+495         for tablename, engine in sorted(tablenames.items()):
+496             if engine == "MYISAM":
+497                 expected.append(
+498                     [
+499                         {
+500                             "Table": dbname + "." + tablename,
+501                             "Msg_text": "OK",
+502                             "Msg_type": "status",
+503                             "Op": "optimize",
+504                         }
+505                     ]
+506                 )
+507             elif engine == "InnoDB":
+508                 expected.append(
+509                     [
+510                         {
+511                             "Table": dbname + "." + tablename,
+512                             "Msg_text": (
+513                                 "Table does not support optimize, "
+514                                 "doing recreate + analyze instead"
+515                             ),
+516                             "Msg_type": "note",
+517                             "Op": "optimize",
+518                         },
+519                         {
+520                             "Table": dbname + "." + tablename,
+521                             "Msg_text": "OK",
+522                             "Msg_type": "status",
+523                             "Op": "optimize",
+524                         },
+525                     ]
+526                 )
+527             elif engine == "MEMORY":
+528                 expected.append(
+529                     [
+530                         {
+531                             "Table": dbname + "." + tablename,
+532                             "Msg_text": (
+533                                 "The storage engine for the table doesn't"
+534                                 " support optimize"
+535                             ),
+536                             "Msg_type": "note",
+537                             "Op": "optimize",
+538                         }
+539                     ]
+540                 )
+541         self.assertEqual(ret, expected)
+542         ret = self.run_function(
+543             "mysql.db_remove",
+544             name=dbname,
+545             connection_user=self.user,
+546             connection_pass=self.password,
+547         )
+548         self.assertEqual(True, ret)
+549 @skipIf(
+550     NO_MYSQL,
+551     "Please install MySQL bindings and a MySQL Server before running"
+552     "MySQL integration tests.",
+553 )
+554 @pytest.mark.windows_whitelisted
+555 class MysqlModuleUserTest(ModuleCase, SaltReturnAssertsMixin):
+556     user = "root"
+557     password = "poney"
+558     @pytest.mark.destructive_test
+559     def setUp(self):
+560         super().setUp()
+561         NO_MYSQL_SERVER = True
+562         ret1 = self.run_state(
+563             "cmd.run",
+564             name='mysqladmin --host="localhost" -u '
+565             + self.user
+566             + ' flush-privileges password "'
+567             + self.password
+568             + '"',
+569         )
+570         ret2 = self.run_state(
+571             "cmd.run",
+572             name='mysqladmin --host="localhost" -u '
+573             + self.user
+574             + ' --password="'
+575             + self.password
+576             + '" flush-privileges password "'
+577             + self.password
+578             + '"',
+579         )
+580         key, value = ret2.popitem()
+581         if value["result"]:
+582             NO_MYSQL_SERVER = False
+583         else:
+584             self.skipTest("No MySQL Server running, or no root access on it.")
+585     def _userCreationLoop(
+586         self,
+587         uname,
+588         host,
+589         password=None,
+590         new_password=None,
+591         new_password_hash=None,
+592         **kwargs
+593     ):
+594         ret = self.run_function("mysql.user_remove", user=uname, host=host, **kwargs)
+595         ret = self.run_function(
+596             "mysql.user_create", user=uname, host=host, password=password, **kwargs
+597         )
+598         self.assertEqual(
+599             True,
+600             ret,
+601             "Calling user_create on user '{}' did not return True: {}".format(
+602                 uname, repr(ret)
+603             ),
+604         )
+605         ret = self.run_function(
+606             "mysql.user_create", user=uname, host=host, password=password, **kwargs
+607         )
+608         self.assertEqual(
+609             False,
+610             ret,
+611             (
+612                 "Calling user_create a second time on"
+613                 " user '{}' did not return False: {}"
+614             ).format(uname, repr(ret)),
+615         )
+616         if new_password is not None or new_password_hash is not None:
+617             ret = self.run_function(
+618                 "mysql.user_chpass",
+619                 user=uname,
+620                 host=host,
+621                 password=new_password,
+622                 password_hash=new_password_hash,
+623                 connection_user=self.user,
+624                 connection_pass=self.password,
+625                 connection_charset="utf8",
+626                 saltenv={"LC_ALL": "en_US.utf8"},
+627             )
+628             self.assertEqual(
+629                 True,
+630                 ret,
+631                 "Calling user_chpass on user '{}' did not return True: {}".format(
+632                     uname, repr(ret)
+633                 ),
+634             )
+635     def _chck_userinfo(self, user, host, check_user, check_hash):
+636         ret = self.run_function(
+637             "mysql.user_info",
+638             user=user,
+639             host=host,
+640             connection_user=self.user,
+641             connection_pass=self.password,
+642             connection_charset="utf8",
+643             saltenv={"LC_ALL": "en_US.utf8"},
+644         )
+645         if not isinstance(ret, dict):
+646             raise AssertionError(
+647                 "Unexpected result while retrieving user_info for '{}'".format(user)
+648             )
+649         self.assertEqual(ret["Host"], host)
+650         self.assertEqual(ret["Password"], check_hash)
+651         self.assertEqual(ret["User"], check_user)
+652     def _chk_remove_user(self, user, host, **kwargs):
+653         ret = self.run_function("mysql.user_remove", user=user, host=host, **kwargs)
+654         self.assertEqual(
+655             True,
+656             ret,
+657             "Assertion failed  while removing user '{}' on host '{}': {}".format(
+658                 user, host, repr(ret)
+659             ),
+660         )
+661     @pytest.mark.destructive_test
+662     def test_user_management(self):
+663         user1 = "user '1"
+664         user1_pwd = "pwd`'\"1b"
+665         user1_pwd_hash = "*4DF33B3B12E43384677050A818327877FAB2F4BA"
+666         user2 = "user \"2'\xe6\xa8\x99"
+667         user2_pwd = "user \"2'\xe6\xa8\x99b"
+668         user2_pwd_hash = "*3A38A7B94B024B983687BB9B44FB60B7AA38FE61"
+669         user3 = 'user "3;,?:@=&amp;/'
+670         user3_pwd = 'user "3;,?:@=&amp;/'
+671         user3_pwd_hash = "*AA3B1D4105A45D381C23A5C221C47EA349E1FD7D"
+672         user4 = 'user":;,?:@=&amp;/4\u6a19'
+673         user4_utf8 = 'user":;,?:@=&amp;/4\xe6\xa8\x99'
+674         user4_pwd = 'user "4;,?:@=&amp;/'
+675         user4_pwd_hash = "*FC8EF8DBF27628E4E113359F8E7478D5CF3DD57C"
+676         user5 = 'user ``"5'
+677         user5_utf8 = 'user ``"5'
+678         user5_pwd = "\xe6\xa8\x99\xe6\xa8\x99\\"
+679         user5_pwd_hash = "*3752E65CDD8751AF8D889C62CFFC6C998B12C376"
+680         user6 = 'user %--"6'
+681         user6_utf8 = 'user %--"6'
+682         user6_pwd_u = " --'\"% SIX\u6a19b"
+683         user6_pwd_utf8 = " --'\"% SIX\xe6\xa8\x99b"
+684         user6_pwd_hash = "*90AE800593E2D407CD9E28CCAFBE42D17EEA5369"
+685         self._userCreationLoop(
+686             uname=user1,
+687             host="localhost",
+688             password="pwd`'\"1",
+689             new_password="pwd`'\"1b",
+690             connection_user=self.user,
+691             connection_pass=self.password,
+692         )
+693         ret = self.run_function(
+694             "mysql.user_exists",
+695             user=user1,
+696             host="localhost",
+697             password=user1_pwd,
+698             password_hash=None,
+699             connection_user=self.user,
+700             connection_pass=self.password,
+701             connection_charset="utf8",
+702             saltenv={"LC_ALL": "en_US.utf8"},
+703         )
+704         self.assertEqual(
+705             True,
+706             ret,
+707             "Testing final user '{}' on host '{}' existence failed".format(
+708                 user1, "localhost"
+709             ),
+710         )
+711         self._userCreationLoop(
+712             uname=user2,
+713             host="localhost",
+714             password=None,
+715             password_hash="*EEF6F854748ACF841226BB1C2422BEC70AE7F1FF",
+716             new_password_hash=user2_pwd_hash,
+717             connection_user=self.user,
+718             connection_pass=self.password,
+719             connection_charset="utf8",
+720             saltenv={"LC_ALL": "en_US.utf8"},
+721         )
+722         self._userCreationLoop(
+723             uname=user2,
+724             host="10.0.0.1",
+725             allow_passwordless=True,
+726             connection_user=self.user,
+727             connection_pass=self.password,
+728             connection_charset="utf8",
+729             saltenv={"LC_ALL": "en_US.utf8"},
+730         )
+731         self._userCreationLoop(
+732             uname=user2,
+733             host="10.0.0.2",
+734             allow_passwordless=True,
+735             unix_socket=True,
+736             connection_user=self.user,
+737             connection_pass=self.password,
+738             connection_charset="utf8",
+739             saltenv={"LC_ALL": "en_US.utf8"},
+740         )
+741         ret = self.run_function(
+742             "mysql.user_exists",
+743             user=user2,
+744             host="localhost",
+745             password=None,
+746             password_hash=user2_pwd_hash,
+747             connection_user=self.user,
+748             connection_pass=self.password,
+749             connection_charset="utf8",
+750             saltenv={"LC_ALL": "en_US.utf8"},
+751         )
+752         self.assertEqual(
+753             True,
+754             ret,
+755             "Testing final user '{}' on host '{}' failed".format(user2, "localhost"),
+756         )
+757         ret = self.run_function(
+758             "mysql.user_exists",
+759             user=user2,
+760             host="10.0.0.1",
+761             allow_passwordless=True,
+762             connection_user=self.user,
+763             connection_pass=self.password,
+764             connection_charset="utf8",
+765             saltenv={"LC_ALL": "en_US.utf8"},
+766         )
+767         self.assertEqual(
+768             True,
+769             ret,
+770             "Testing final user '{}' on host '{}' without password failed".format(
+771                 user2, "10.0.0.1"
+772             ),
+773         )
+774         ret = self.run_function(
+775             "mysql.user_exists",
+776             user=user2,
+777             host="10.0.0.2",
+778             allow_passwordless=True,
+779             unix_socket=True,
+780             connection_user=self.user,
+781             connection_pass=self.password,
+782             connection_charset="utf8",
+783             saltenv={"LC_ALL": "en_US.utf8"},
+784         )
+785         self.assertEqual(
+786             True,
+787             ret,
+788             "Testing final user '{}' on host '{}' without password failed".format(
+789                 user2, "10.0.0.2"
+790             ),
+791         )
+792         self._userCreationLoop(
+793             uname=user3,
+794             host="localhost",
+795             password="",
+796             connection_user=self.user,
+797             connection_pass=self.password,
+798         )
+799         self._userCreationLoop(
+800             uname=user3,
+801             host="%",
+802             password="foo",
+803             new_password=user3_pwd,
+804             connection_user=self.user,
+805             connection_pass=self.password,
+806         )
+807         ret = self.run_function(
+808             "mysql.user_exists",
+809             user=user3,
+810             host="localhost",
+811             password="",
+812             connection_user=self.user,
+813             connection_pass=self.password,
+814         )
+815         self.assertEqual(
+816             True,
+817             ret,
+818             "Testing final user '{}' on host '{}' without empty password failed".format(
+819                 user3, "localhost"
+820             ),
+821         )
+822         ret = self.run_function(
+823             "mysql.user_exists",
+824             user=user3,
+825             host="%",
+826             password=user3_pwd,
+827             connection_user=self.user,
+828             connection_pass=self.password,
+829         )
+830         self.assertEqual(
+831             True,
+832             ret,
+833             "Testing final user '{}' on host '{}' with password failed".format(
+834                 user3, "%"
+835             ),
+836         )
+837         self._userCreationLoop(
+838             uname=user4,
+839             host="%",
+840             password=user4_pwd,
+841             password_hash="*F3A2A51A9B0F2BE2468926B4132313728C250DBF",
+842             connection_user=self.user,
+843             connection_pass=self.password,
+844             connection_charset="utf8",
+845             saltenv={"LC_ALL": "en_US.utf8"},
+846         )
+847         ret = self.run_function(
+848             "mysql.user_exists",
+849             user=user4_utf8,
+850             host="%",
+851             password=user4_pwd,
+852             connection_user=self.user,
+853             connection_pass=self.password,
+854             connection_charset="utf8",
+855             saltenv={"LC_ALL": "en_US.utf8"},
+856         )
+857         self.assertEqual(
+858             True,
+859             ret,
+860             (
+861                 "Testing final user '{}' on host '{}'"
+862                 " with password take from password and not password_hash"
+863                 " failed"
+864             ).format(user4_utf8, "%"),
+865         )
+866         self._userCreationLoop(
+867             uname=user5,
+868             host="localhost",
+869             password="\xe6\xa8\x99\xe6\xa8\x99",
+870             new_password=user5_pwd,
+871             unix_socket=True,
+872             connection_user=self.user,
+873             connection_pass=self.password,
+874             connection_charset="utf8",
+875             saltenv={"LC_ALL": "en_US.utf8"},
+876         )
+877         ret = self.run_function(
+878             "mysql.user_exists",
+879             user=user5_utf8,
+880             host="localhost",
+881             password=user5_pwd,
+882             connection_user=self.user,
+883             connection_pass=self.password,
+884             connection_charset="utf8",
+885             saltenv={"LC_ALL": "en_US.utf8"},
+886         )
+887         self.assertEqual(
+888             True,
+889             ret,
+890             "Testing final user '{}' on host '{}' with utf8 password failed".format(
+891                 user5_utf8, "localhost"
+892             ),
+893         )
+894         self._userCreationLoop(
+895             uname=user6,
+896             host="10.0.0.1",
+897             password=" foobar",
+898             new_password=user6_pwd_u,
+899             connection_user=self.user,
+900             connection_pass=self.password,
+901             connection_charset="utf8",
+902             saltenv={"LC_ALL": "en_US.utf8"},
+903         )
+904         ret = self.run_function(
+905             "mysql.user_exists",
+906             user=user6_utf8,
+907             host="10.0.0.1",
+908             password=user6_pwd_utf8,
+909             connection_user=self.user,
+910             connection_pass=self.password,
+911             connection_charset="utf8",
+912             saltenv={"LC_ALL": "en_US.utf8"},
+913         )
+914         self.assertEqual(
+915             True,
+916             ret,
+917             "Testing final user '{}' on host '{}' with unicode password failed".format(
+918                 user6_utf8, "10.0.0.1"
+919             ),
+920         )
+921         self._chck_userinfo(
+922             user=user2, host="10.0.0.1", check_user=user2, check_hash=""
+923         )
+924         self._chck_userinfo(
+925             user=user2, host="10.0.0.2", check_user=user2, check_hash=""
+926         )
+927         self._chck_userinfo(
+928             user=user2, host="localhost", check_user=user2, check_hash=user2_pwd_hash
+929         )
+930         self._chck_userinfo(
+931             user=user3, host="%", check_user=user3, check_hash=user3_pwd_hash
+932         )
+933         self._chck_userinfo(
+934             user=user3, host="localhost", check_user=user3, check_hash=""
+935         )
+936         self._chck_userinfo(
+937             user=user4, host="%", check_user=user4_utf8, check_hash=user4_pwd_hash
+938         )
+939         self._chck_userinfo(
+940             user=user6,
+941             host="10.0.0.1",
+942             check_user=user6_utf8,
+943             check_hash=user6_pwd_hash,
+944         )
+945         self._chck_userinfo(
+946             user=user1, host="localhost", check_user=user1, check_hash=user1_pwd_hash
+947         )
+948         self._chck_userinfo(
+949             user=user5,
+950             host="localhost",
+951             check_user=user5_utf8,
+952             check_hash=user5_pwd_hash,
+953         )
+954         ret = self.run_function(
+955             "mysql.user_list",
+956             connection_user=self.user,
+957             connection_pass=self.password,
+958             connection_charset="utf8",
+959             saltenv={"LC_ALL": "en_US.utf8"},
+960         )
+961         self.assertIn({"Host": "localhost", "User": user1}, ret)
+962         self.assertIn({"Host": "localhost", "User": user2}, ret)
+963         self.assertIn({"Host": "10.0.0.1", "User": user2}, ret)
+964         self.assertIn({"Host": "10.0.0.2", "User": user2}, ret)
+965         self.assertIn({"Host": "%", "User": user3}, ret)
+966         self.assertIn({"Host": "localhost", "User": user3}, ret)
+967         self.assertIn({"Host": "%", "User": user4_utf8}, ret)
+968         self.assertIn({"Host": "localhost", "User": user5_utf8}, ret)
+969         self.assertIn({"Host": "10.0.0.1", "User": user6_utf8}, ret)
+970         ret = self.run_function(
+971             "mysql.query",
+972             database="information_schema",
+973             query="SELECT 1",
+974             connection_user=user1,
+975             connection_pass="pwd`'\"1b",
+976             connection_host="localhost",
+977         )
+978         if not isinstance(ret, dict) or "results" not in ret:
+979             raise AssertionError(
+980                 "Unexpected result while testing connection with user '{}': {}".format(
+981                     user1, repr(ret)
+982                 )
+983             )
+984         self.assertEqual([["1"]], ret["results"])
+985         ret = self.run_function(
+986             "mysql.query",
+987             database="information_schema",
+988             query="SELECT 1",
+989             connection_user=user3,
+990             connection_pass="",
+991             connection_host="localhost",
+992         )
+993         if not isinstance(ret, dict) or "results" not in ret:
+994             raise AssertionError(
+995                 "Unexpected result while testing connection with user '{}': {}".format(
+996                     user3, repr(ret)
+997                 )
+998             )
+999         self.assertEqual([["1"]], ret["results"])
+1000         ret = self.run_function(
+1001             "mysql.query",
+1002             database="information_schema",
+1003             query="SELECT 1",
+1004             connection_user=user5_utf8,
+1005             connection_pass=user5_pwd,
+1006             connection_host="localhost",
+1007             connection_charset="utf8",
+1008             saltenv={"LC_ALL": "en_US.utf8"},
+1009         )
+1010         if not isinstance(ret, dict) or "results" not in ret:
+1011             raise AssertionError(
+1012                 "Unexpected result while testing connection with user '{}': {}".format(
+1013                     user5_utf8, repr(ret)
+1014                 )
+1015             )
+1016         self.assertEqual([["1"]], ret["results"])
+1017         self._chk_remove_user(
+1018             user=user2,
+1019             host="10.0.0.1",
+1020             connection_user=self.user,
+1021             connection_pass=self.password,
+1022             connection_charset="utf8",
+1023             saltenv={"LC_ALL": "en_US.utf8"},
+1024         )
+1025         self._chk_remove_user(
+1026             user=user2,
+1027             host="10.0.0.2",
+1028             connection_user=self.user,
+1029             connection_pass=self.password,
+1030             connection_charset="utf8",
+1031             saltenv={"LC_ALL": "en_US.utf8"},
+1032         )
+1033         self._chk_remove_user(
+1034             user=user2,
+1035             host="localhost",
+1036             connection_user=self.user,
+1037             connection_pass=self.password,
+1038             connection_charset="utf8",
+1039             saltenv={"LC_ALL": "en_US.utf8"},
+1040         )
+1041         self._chk_remove_user(
+1042             user=user3,
+1043             host="%",
+1044             connection_user=self.user,
+1045             connection_pass=self.password,
+1046         )
+1047         self._chk_remove_user(
+1048             user=user3,
+1049             host="localhost",
+1050             connection_user=self.user,
+1051             connection_pass=self.password,
+1052         )
+1053         self._chk_remove_user(
+1054             user=user4,
+1055             host="%",
+1056             connection_user=self.user,
+1057             connection_pass=self.password,
+1058             connection_charset="utf8",
+1059             saltenv={"LC_ALL": "en_US.utf8"},
+1060         )
+1061         self._chk_remove_user(
+1062             user=user6,
+1063             host="10.0.0.1",
+1064             connection_user=self.user,
+1065             connection_pass=self.password,
+1066         )
+1067         self._chk_remove_user(
+1068             user=user1,
+1069             host="localhost",
+1070             connection_user=self.user,
+1071             connection_pass=self.password,
+1072         )
+1073         self._chk_remove_user(
+1074             user=user5,
+1075             host="localhost",
+1076             connection_user=self.user,
+1077             connection_pass=self.password,
+1078         )
+1079         ret = self.run_function(
+1080             "mysql.user_list",
+1081             connection_user=self.user,
+1082             connection_pass=self.password,
+1083             connection_charset="utf8",
+1084             saltenv={"LC_ALL": "en_US.utf8"},
+1085         )
+1086         self.assertNotIn({"Host": "localhost", "User": user1}, ret)
+1087         self.assertNotIn({"Host": "localhost", "User": user2}, ret)
+1088         self.assertNotIn({"Host": "10.0.0.1", "User": user2}, ret)
+1089         self.assertNotIn({"Host": "10.0.0.2", "User": user2}, ret)
+1090         self.assertNotIn({"Host": "%", "User": user3}, ret)
+1091         self.assertNotIn({"Host": "localhost", "User": user3}, ret)
+1092         self.assertNotIn({"Host": "%", "User": user4_utf8}, ret)
+1093         self.assertNotIn({"Host": "localhost", "User": user5_utf8}, ret)
+1094         self.assertNotIn({"Host": "10.0.0.1", "User": user6_utf8}, ret)
+1095 @skipIf(
+1096     NO_MYSQL,
+1097     "Please install MySQL bindings and a MySQL Server before running"
+1098     "MySQL integration tests.",
+1099 )
+1100 @pytest.mark.windows_whitelisted
+1101 class MysqlModuleUserGrantTest(ModuleCase, SaltReturnAssertsMixin):
+1102     user = "root"
+1103     password = "poney"
+1104     testdb1 = "tes.t'\"saltdb"
+1105     testdb2 = "t_st `(:=salt%b)"
+1106     testdb3 = "test `(:=salteeb)"
+1107     test_file_query_db = "test_query"
+1108     table1 = "foo"
+1109     table2 = "foo `'%_bar"
+1110     users = {
+1111         "user1": {"name": "foo", "pwd": "bar"},
+1112         "user2": {"name": 'user ";--,?:&amp;/\\', "pwd": '";--(),?:@=&amp;/\\'},
+1113         "user3": {"name": "user( @ )=foobar", "pwd": "\xe6\xa8\x99\xe6\xa8\x99"},
+1114         "user4": {"name": "user \xe6\xa8\x99", "pwd": "\xe6\xa8\x99\xe6\xa8\x99"},
+1115     }
+1116     @pytest.mark.destructive_test
+1117     def setUp(self):
+1118         super().setUp()
+1119         NO_MYSQL_SERVER = True
+1120         ret1 = self.run_state(
+1121             "cmd.run",
+1122             name='mysqladmin --host="localhost" -u '
+1123             + self.user
+1124             + ' flush-privileges password "'
+1125             + self.password
+1126             + '"',
+1127         )
+1128         ret2 = self.run_state(
+1129             "cmd.run",
+1130             name='mysqladmin --host="localhost" -u '
+1131             + self.user
+1132             + ' --password="'
+1133             + self.password
+1134             + '" flush-privileges password "'
+1135             + self.password
+1136             + '"',
+1137         )
+1138         key, value = ret2.popitem()
+1139         if value["result"]:
+1140             NO_MYSQL_SERVER = False
+1141         else:
+1142             self.skipTest("No MySQL Server running, or no root access on it.")
+1143         for user, userdef in self.users.items():
+1144             self._userCreation(uname=userdef["name"], password=userdef["pwd"])
+1145         self.run_function(
+1146             "mysql.db_create",
+1147             name=self.testdb1,
+1148             connection_user=self.user,
+1149             connection_pass=self.password,
+1150         )
+1151         self.run_function(
+1152             "mysql.db_create",
+1153             name=self.testdb2,
+1154             connection_user=self.user,
+1155             connection_pass=self.password,
+1156         )
+1157             "CREATE TABLE {tblname} ("
+1158             " id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,"
+1159             " data VARCHAR(100)) ENGINE={engine};"<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.format(
+1160                 tblname=mysqlmod.quote_identifier(self.table1),
+1161                 engine="MYISAM",
+1162             )
+1163         )
+1164         log.info("Adding table '%s'", self.table1)
+1165         self.run_function(</b></font>
+1166             "mysql.query",
+1167             database=self.testdb2,
+1168             query=create_query,
+1169             connection_user=self.user,
+1170             connection_pass=self.password,
+1171         )
+1172         create_query = (
+1173             "CREATE TABLE {tblname} ("
+1174             " id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,"
+1175             " data VARCHAR(100)) ENGINE={engine};".format(
+1176                 tblname=mysqlmod.quote_identifier(self.table2),
+1177                 engine="MYISAM",
+1178             )
+1179         )
+1180         log.info("Adding table '%s'", self.table2)
+1181         self.run_function(
+1182             "mysql.query",
+1183             database=self.testdb2,
+1184             query=create_query,
+1185             connection_user=self.user,
+1186             connection_pass=self.password,
+1187         )
+1188     @pytest.mark.destructive_test
+1189     def tearDown(self):
+1190         for user, userdef in self.users.items():
+1191             self._userRemoval(uname=userdef["name"], password=userdef["pwd"])
+1192         self.run_function(
+1193             "mysql.db_remove",
+1194             name=self.testdb1,
+1195             connection_user=self.user,
+1196             connection_pass=self.password,
+1197         )
+1198         self.run_function(
+1199             "mysql.db_remove",
+1200             name=self.testdb2,
+1201             connection_user=self.user,
+1202             connection_pass=self.password,
+1203         )
+1204         self.run_function(
+1205             "mysql.db_remove",
+1206             name=self.test_file_query_db,
+1207             connection_user=self.user,
+1208             connection_pass=self.password,
+1209         )
+1210     def _userCreation(self, uname, password=None):
+1211         self.run_function(
+1212             "mysql.user_create",
+1213             user=uname,
+1214             host="localhost",
+1215             password=password,
+1216             connection_user=self.user,
+1217             connection_pass=self.password,
+1218             connection_charset="utf8",
+1219             saltenv={"LC_ALL": "en_US.utf8"},
+1220         )
+1221     def _userRemoval(self, uname, password=None):
+1222         self.run_function(
+1223             "mysql.user_remove",
+1224             user=uname,
+1225             host="localhost",
+1226             connection_user=self.user,
+1227             connection_pass=self.password,
+1228             connection_charset="utf8",
+1229             saltenv={"LC_ALL": "en_US.utf8"},
+1230         )
+1231     def _addGrantRoutine(
+1232         self, grant, user, db, grant_option=False, escape=True, **kwargs
+1233     ):
+1234         ret = self.run_function(
+1235             "mysql.grant_add",
+1236             grant=grant,
+1237             database=db,
+1238             user=user,
+1239             grant_option=grant_option,
+1240             escape=escape,
+1241             **kwargs
+1242         )
+1243         self.assertEqual(
+1244             True,
+1245             ret,
+1246             (
+1247                 "Calling grant_add on user '{}' and grants '{}' did not return True: {}"
+1248             ).format(user, grant, repr(ret)),
+1249         )
+1250         ret = self.run_function(
+1251             "mysql.grant_exists",
+1252             grant=grant,
+1253             database=db,
+1254             user=user,
+1255             grant_option=grant_option,
+1256             escape=escape,
+1257             **kwargs
+1258         )
+1259         self.assertEqual(
+1260             True,
+1261             ret,
+1262             (
+1263                 "Calling grant_exists on"
+1264                 " user '{}' and grants '{}' did not return True: {}"
+1265             ).format(user, grant, repr(ret)),
+1266         )
+1267     @pytest.mark.destructive_test
+1268     def testGrants(self):
+1269         self._addGrantRoutine(
+1270             grant="SELECT, INSERT,UPDATE, CREATE",
+1271             user=self.users["user1"]["name"],
+1272             db=self.testdb1 + ".*",
+1273             grant_option=True,
+1274             escape=True,
+1275             connection_user=self.user,
+1276             connection_pass=self.password,
+1277         )
+1278         self._addGrantRoutine(
+1279             grant="INSERT, SELECT",
+1280             user=self.users["user1"]["name"],
+1281             db=self.testdb2 + "." + self.table1,
+1282             grant_option=True,
+1283             escape=True,
+1284             connection_user=self.user,
+1285             connection_pass=self.password,
+1286         )
+1287         self._addGrantRoutine(
+1288             grant="  SELECT, UPDATE,DELETE, CREATE TEMPORARY TABLES",
+1289             user=self.users["user2"]["name"],
+1290             db=self.testdb1 + ".*",
+1291             grant_option=True,
+1292             escape=True,
+1293             connection_user=self.user,
+1294             connection_pass=self.password,
+1295         )
+1296         self._addGrantRoutine(
+1297             grant="select, ALTER,CREATE TEMPORARY TABLES, EXECUTE ",
+1298             user=self.users["user3"]["name"],
+1299             db=self.testdb1 + ".*",
+1300             grant_option=True,
+1301             escape=True,
+1302             connection_user=self.user,
+1303             connection_pass=self.password,
+1304         )
+1305         self._addGrantRoutine(
+1306             grant="SELECT, INSERT",
+1307             user=self.users["user4"]["name"],
+1308             db=self.testdb2 + "." + self.table2,
+1309             grant_option=False,
+1310             escape=True,
+1311             connection_user=self.user,
+1312             connection_pass=self.password,
+1313             connection_charset="utf8",
+1314         )
+1315         self._addGrantRoutine(
+1316             grant="CREATE",
+1317             user=self.users["user4"]["name"],
+1318             db=self.testdb2 + ".*",
+1319             grant_option=False,
+1320             escape=True,
+1321             connection_user=self.user,
+1322             connection_pass=self.password,
+1323             connection_charset="utf8",
+1324         )
+1325         self._addGrantRoutine(
+1326             grant="SELECT, INSERT",
+1327             user=self.users["user4"]["name"],
+1328             db=self.testdb2 + "." + self.table1,
+1329             grant_option=False,
+1330             escape=True,
+1331             connection_user=self.user,
+1332             connection_pass=self.password,
+1333             connection_charset="utf8",
+1334         )
+1335         self._addGrantRoutine(
+1336             grant="DELETE",
+1337             user="",
+1338             db=self.testdb3 + ".*",
+1339             grant_option=False,
+1340             escape=True,
+1341             connection_user=self.user,
+1342             connection_pass=self.password,
+1343         )
+1344         ret = self.run_function(
+1345             "mysql.user_grants",
+1346             user=self.users["user1"]["name"],
+1347             host="localhost",
+1348             connection_user=self.user,
+1349             connection_pass=self.password,
+1350         )
+1351         self.assertEqual(
+1352             ret,
+1353             [
+1354                 "GRANT USAGE ON *.* TO 'foo'@'localhost'",
+1355                 "GRANT SELECT, INSERT, UPDATE, CREATE ON "
+1356                 "`tes.t'\"saltdb`.* TO 'foo'@'localhost' WITH GRANT OPTION",
+1357                 "GRANT SELECT, INSERT ON `t_st ``(:=salt%b)`.`foo`"
+1358                 " TO 'foo'@'localhost' WITH GRANT OPTION",
+1359             ],
+1360         )
+1361         ret = self.run_function(
+1362             "mysql.user_grants",
+1363             user=self.users["user2"]["name"],
+1364             host="localhost",
+1365             connection_user=self.user,
+1366             connection_pass=self.password,
+1367         )
+1368         self.assertEqual(
+1369             ret,
+1370             [
+1371                 "GRANT USAGE ON *.* TO 'user \";--,?:&amp;/\\'@'localhost'",
+1372                 "GRANT SELECT, UPDATE, DELETE, CREATE TEMPORARY TABLES ON `tes.t'"
+1373                 "\"saltdb`.* TO 'user \";--,?:&amp;/\\'@'localhost'"
+1374                 " WITH GRANT OPTION",
+1375             ],
+1376         )
+1377         ret = self.run_function(
+1378             "mysql.user_grants",
+1379             user=self.users["user3"]["name"],
+1380             host="localhost",
+1381             connection_user=self.user,
+1382             connection_pass=self.password,
+1383         )
+1384         self.assertEqual(
+1385             ret,
+1386             [
+1387                 "GRANT USAGE ON *.* TO 'user( @ )=foobar'@'localhost'",
+1388                 "GRANT SELECT, ALTER, CREATE TEMPORARY TABLES, EXECUTE ON "
+1389                 "`tes.t'\"saltdb`.* TO 'user( @ )=foobar'@'localhost' "
+1390                 "WITH GRANT OPTION",
+1391             ],
+1392         )
+1393         ret = self.run_function(
+1394             "mysql.user_grants",
+1395             user=self.users["user4"]["name"],
+1396             host="localhost",
+1397             connection_user=self.user,
+1398             connection_pass=self.password,
+1399             connection_charset="utf8",
+1400         )
+1401         self.assertEqual(
+1402             ret,
+1403             [
+1404                 "GRANT USAGE ON *.* TO 'user \xe6\xa8\x99'@'localhost'",
+1405                 (
+1406                     r"GRANT CREATE ON `t\_st ``(:=salt\%b)`.* TO "
+1407                     "'user \xe6\xa8\x99'@'localhost'"
+1408                 ),
+1409                 "GRANT SELECT, INSERT ON `t_st ``(:=salt%b)`.`foo ``'%_bar` TO "
+1410                 "'user \xe6\xa8\x99'@'localhost'",
+1411                 "GRANT SELECT, INSERT ON `t_st ``(:=salt%b)`.`foo` TO "
+1412                 "'user \xe6\xa8\x99'@'localhost'",
+1413             ],
+1414         )
+1415         ret = self.run_function(
+1416             "mysql.user_grants",
+1417             user="",
+1418             host="localhost",
+1419             connection_user=self.user,
+1420             connection_pass=self.password,
+1421         )
+1422         self.assertEqual(
+1423             ret,
+1424             [
+1425                 "GRANT USAGE ON *.* TO ''@'localhost'",
+1426                 "GRANT DELETE ON `test ``(:=salteeb)`.* TO ''@'localhost'",
+1427             ],
+1428         )
+1429 @skipIf(
+1430     NO_MYSQL,
+1431     "Please install MySQL bindings and a MySQL Server before running"
+1432     "MySQL integration tests.",
+1433 )
+1434 @pytest.mark.windows_whitelisted
+1435 class MysqlModuleFileQueryTest(ModuleCase, SaltReturnAssertsMixin):
+1436     user = "root"
+1437     password = "poney"
+1438     testdb = "test_file_query"
+1439     @pytest.mark.destructive_test
+1440     def setUp(self):
+1441         super().setUp()
+1442         NO_MYSQL_SERVER = True
+1443         ret1 = self.run_state(
+1444             "cmd.run",
+1445             name='mysqladmin --host="localhost" -u '
+1446             + self.user
+1447             + ' flush-privileges password "'
+1448             + self.password
+1449             + '"',
+1450         )
+1451         ret2 = self.run_state(
+1452             "cmd.run",
+1453             name='mysqladmin --host="localhost" -u '
+1454             + self.user
+1455             + ' --password="'
+1456             + self.password
+1457             + '" flush-privileges password "'
+1458             + self.password
+1459             + '"',
+1460         )
+1461         key, value = ret2.popitem()
+1462         if value["result"]:
+1463             NO_MYSQL_SERVER = False
+1464         else:
+1465             self.skipTest("No MySQL Server running, or no root access on it.")
+1466         self.run_function(
+1467             "mysql.db_create",
+1468             name=self.testdb,
+1469             connection_user=self.user,
+1470             connection_pass=self.password,
+1471             connection_db="mysql",
+1472         )
+1473     @pytest.mark.destructive_test
+1474     def tearDown(self):
+1475         self.run_function(
+1476             "mysql.db_remove",
+1477             name=self.testdb,
+1478             connection_user=self.user,
+1479             connection_pass=self.password,
+1480             connection_db="mysql",
+1481         )
+1482     @pytest.mark.destructive_test
+1483     def test_update_file_query(self):
+1484         ret = self.run_function(
+1485             "mysql.file_query",
+1486             database=self.testdb,
+1487             file_name="salt://mysql/update_query.sql",
+1488             character_set="utf8",
+1489             collate="utf8_general_ci",
+1490             connection_user=self.user,
+1491             connection_pass=self.password,
+1492         )
+1493         self.assertTrue("query time" in ret)
+1494         ret.pop("query time")
+1495         self.assertEqual(ret, {"rows affected": 2})
+1496     @pytest.mark.destructive_test
+1497     def test_select_file_query(self):
+1498         ret = self.run_function(
+1499             "mysql.file_query",
+1500             database=self.testdb,
+1501             file_name="salt://mysql/select_query.sql",
+1502             character_set="utf8",
+1503             collate="utf8_general_ci",
+1504             connection_user=self.user,
+1505             connection_pass=self.password,
+1506         )
+1507         expected = {
+1508             "rows affected": 5,
+1509             "rows returned": 4,
+1510             "results": [[["2"], ["3"], ["4"], ["5"]]],
+1511             "columns": [["a"]],
+1512         }
+1513         self.assertTrue("query time" in ret)
+1514         ret.pop("query time")
+1515         self.assertEqual(ret, expected)
 </pre>
 </div>
 </div>

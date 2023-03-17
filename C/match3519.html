@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for svgload.c &amp; magick7load.c</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -45,900 +44,520 @@ Matches for svgload.c &amp; magick7load.c
 </h3>
 <hr/>
 <pre>
-/* load SVG with librsvg
- *
- * 7/2/16
- * 	- from svgload.c
- * 1/8/16 felixbuenemann
- * 	- add svgz support
- * 18/1/17
- * 	- invalidate operation on read error
- * 8/7/17
- * 	- fix DPI mixup, thanks Fosk
- * 9/9/17
- * 	- limit max tile width to 30k pixels to prevent overflow in render
- * 17/9/17 lovell
- * 	- handle scaling of svg files missing width and height attributes
- * 22/3/18 lovell
- * 	- svgload was missing is_a
- * 28/6/19
- * 	- add "unlimited"
- * 	- requires us to use the gio API to librsvg
- * 11/9/19
- * 	- rework as a sequential loader to reduce overcomputation
- * 11/6/21
- * 	- switch to rsvg_handle_render_document()
- * 	- librsvg can no longer render very large images :( 
- */
-
-/*
-
-    This file is part of VIPS.
-    
-    VIPS is free software; you can redistribute it and/or modify
-    it under the terms of the GNU Lesser General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Lesser General Public License for more details.
-
-    You should have received a copy of the GNU Lesser General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
-
- */
-
-/*
-
-    These files are distributed with VIPS - http://www.vips.ecs.soton.ac.uk
-
- */
-
-/*
-#define DEBUG
- */
-
-#ifdef HAVE_CONFIG_H
-#include &lt;config.h&gt;
-#endif /*HAVE_CONFIG_H*/
-#include &lt;vips/intl.h&gt;
-
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;ctype.h&gt;
-
-#include &lt;vips/vips.h&gt;
-#include &lt;vips/internal.h&gt;
-#include &lt;vips/debug.h&gt;
-
-#if defined(HAVE_RSVG)
-
-#include &lt;cairo.h&gt;
-#include &lt;librsvg/rsvg.h&gt;
-
-/* The &lt;svg tag must appear within this many bytes of the start of the file.
- */
-#define SVG_HEADER_SIZE (1000)
-
-/* A handy #define for we-will-handle-svgz.
- */
-#if LIBRSVG_CHECK_FEATURE(SVGZ) &amp;&amp; defined(HAVE_ZLIB)
-#define HANDLE_SVGZ
-#endif
-
-#ifdef HANDLE_SVGZ
-#include &lt;zlib.h&gt;
-#endif
-
-typedef struct _VipsForeignLoadSvg {
-	VipsForeignLoad parent_object;
-
-	/* Render at this DPI.
-	 */
-	double dpi;
-
-	/* Calculate this from DPI. At 72 DPI, we render 1:1 with cairo.
-	 */
-	double scale;
-
-	/* Scale using cairo when SVG has no width and height attributes.
-	 */
-	double cairo_scale;
-
-	/* Allow SVGs of any size.
-	 */
-	gboolean unlimited;
-
-	RsvgHandle *page;
-
-} VipsForeignLoadSvg;
-
-typedef VipsForeignLoadClass VipsForeignLoadSvgClass;
-
-G_DEFINE_ABSTRACT_TYPE( VipsForeignLoadSvg, vips_foreign_load_svg, 
-	VIPS_TYPE_FOREIGN_LOAD );
-
-#ifdef HANDLE_SVGZ
-static void *
-vips_foreign_load_svg_zalloc( void *opaque, unsigned items, unsigned size )
-{
-	return( g_malloc0_n( items, size ) );
-}
-
-static void
-vips_foreign_load_svg_zfree( void *opaque, void *ptr )
-{
-	return( g_free( ptr ) );
-}
-#endif /*HANDLE_SVGZ*/
-
-/* This is used by both the file and buffer subclasses.
- */
-static gboolean
-vips_foreign_load_svg_is_a( const void *buf, size_t len )
-{
-	char *str;
-
-#ifdef HANDLE_SVGZ
-	/* If the buffer looks like a zip, deflate to here and then search
-	 * that for &lt;svg.
-	 */
-	char obuf[SVG_HEADER_SIZE];
-#endif /*HANDLE_SVGZ*/
-
-	int i;
-
-	/* Start with str pointing at the argument buffer, swap to it pointing
-	 * into obuf if we see zip data.
-	 */
-	str = (char *) buf;
-
-#ifdef HANDLE_SVGZ
-	/* Check for SVGZ gzip signature and inflate.
-	 *
-	 * Minimum gzip size is 18 bytes, starting with 1F 8B.
-	 */
-	if( len &gt;= 18 &amp;&amp; 
-		str[0] == '\037' &amp;&amp; 
-		str[1] == '\213' ) {
-		z_stream zs;
-		size_t opos;
-
-		zs.zalloc = (alloc_func) vips_foreign_load_svg_zalloc;
-		zs.zfree = (free_func) vips_foreign_load_svg_zfree;
-		zs.opaque = Z_NULL;
-		zs.next_in = (unsigned char *) str;
-		zs.avail_in = len;
-
-		/* There isn't really an error return from is_a_buffer()
-		 */
-		if( inflateInit2( &amp;zs, 15 | 32 ) != Z_OK ) 
-			return( FALSE );
-
-		opos = 0;
-		do {
-			zs.avail_out = sizeof( obuf ) - opos;
-			zs.next_out = (unsigned char *) obuf + opos;
-			if( inflate( &amp;zs, Z_NO_FLUSH ) &lt; Z_OK ) {
-				inflateEnd( &amp;zs );
-				return( FALSE );
-			}
-			opos = sizeof( obuf ) - zs.avail_out;
-		} while( opos &lt; sizeof( obuf ) &amp;&amp; 
-			zs.avail_in &gt; 0 );
-
-		inflateEnd( &amp;zs );
-
-		str = obuf;
-		len = opos;
-	}
-#endif /*HANDLE_SVGZ*/
-
-	/* SVG documents are very freeform. They normally look like:
-	 *
-	 * &lt;?xml version="1.0" encoding="UTF-8"?&gt;
-	 * &lt;svg xmlns="http://www.w3.org/2000/svg" ...
-	 *
-	 * But there can be a doctype in there too. And case and whitespace can
-	 * vary a lot. And the &lt;?xml can be missing. And you can have a comment
-	 * before the &lt;svg line.
-	 *
-	 * Simple rules:
-	 * - first 24 chars are plain ascii (x09-x7F)
-	 * - first SVG_HEADER_SIZE chars contain "&lt;svg", upper or lower case.
-	 *
-	 * We could rsvg_handle_new_from_data() on the buffer, but that can be
-	 * horribly slow for large documents. 
-	 */
-	if( len &lt; 24 )
-		return( 0 );
-	for( i = 0; i &lt; 24; i++ )
-		if( !isascii( str[i] ) || str[i] &lt; 9 )
-			return( FALSE );
-	for( i = 0; i &lt; SVG_HEADER_SIZE &amp;&amp; i &lt; len - 5; i++ )
-		if( g_ascii_strncasecmp( str + i, "&lt;svg", 4 ) == 0 )
-			return( TRUE );
-
-	return( FALSE );
-}
-
-static void
-vips_foreign_load_svg_dispose( GObject *gobject )
-{
-	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) gobject;
-
-	VIPS_UNREF( svg-&gt;page );
-<a name="4"></a>
-	G_OBJECT_CLASS( vips_foreign_load_svg_parent_class )-&gt;
-		dispose( gobject );
-<font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>}
-
-static VipsForeignFlags
-vips_foreign_load_svg_get_flags_filename( const char *filename )
-{
-	return( VIPS_FOREIGN_SEQUENTIAL );
-}
-
-static VipsForeignFlags
-vips_foreign_load_svg_get_flags( VipsForeignLoad *load )
-{
-	return( VIPS_FOREIGN_SEQUENTIAL );
-}
-
-static int</b></font>
-vips_foreign_load_svg_parse( VipsForeignLoadSvg *svg, VipsImage *out )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( svg );
-
-	RsvgDimensionData dimensions;
-	int width;
-	int height;
-	double scale;
-	double res;
-
-	/* Calculate dimensions at default dpi/scale.
-	 */
-	rsvg_handle_set_dpi( svg-&gt;page, 72.0 );
-	rsvg_handle_get_dimensions( svg-&gt;page, &amp;dimensions );
-	width = dimensions.width;
-	height = dimensions.height;
-
-	if( width &lt;= 0 || height &lt;= 0 ) {
-		vips_error( class-&gt;nickname, "%s", _( "bad dimensions" ) );
-		return( -1 );
-	}
-
-	/* Calculate dimensions at required dpi/scale.
-	 */
-	scale = svg-&gt;scale * svg-&gt;dpi / 72.0;
-	if( scale != 1.0 ) {
-		rsvg_handle_set_dpi( svg-&gt;page, svg-&gt;dpi * svg-&gt;scale );
-		rsvg_handle_get_dimensions( svg-&gt;page, &amp;dimensions );
-
-		if( width == dimensions.width &amp;&amp; 
-			height == dimensions.height ) {
-			/* SVG without width and height always reports the same 
-			 * dimensions regardless of dpi. Apply dpi/scale using 
-			 * cairo instead.
-			 */
-			svg-&gt;cairo_scale = scale;
-			width = VIPS_ROUND_UINT( width * scale );
-			height = VIPS_ROUND_UINT( height * scale );
-		} 
-		else {
-			/* SVG with width and height reports correctly scaled 
-			 * dimensions.
-			 */
-			width = dimensions.width;
-			height = dimensions.height;
-		}
-	}
-
-	/* We need pixels/mm for vips.
-	 */
-	res = svg-&gt;dpi / 25.4;
-
-	vips_image_init_fields( out, 
-		width, height,
-		4, VIPS_FORMAT_UCHAR,
-		VIPS_CODING_NONE, VIPS_INTERPRETATION_sRGB, res, res );
-
-	/* We render to a linecache, so fat strips work well.
-	 */
-        if( vips_image_pipelinev( out, VIPS_DEMAND_STYLE_FATSTRIP, NULL ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static int
-vips_foreign_load_svg_header( VipsForeignLoad *load )
-{
-	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) load;
-
-	return vips_foreign_load_svg_parse( svg, load-&gt;out );
-}
-
-static int
-vips_foreign_load_svg_generate( VipsRegion *or, 
-	void *seq, void *a, void *b, gboolean *stop )
-{
-	const VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) a;
-	const VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( svg );
-	const VipsRect *r = &amp;or-&gt;valid;
-
-	cairo_surface_t *surface;
-	cairo_t *cr;
-	int y;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_svg_generate:\n     "
-		"left = %d, top = %d, width = %d, height = %d\n", 
-		r-&gt;left, r-&gt;top, r-&gt;width, r-&gt;height ); 
-#endif /*DEBUG*/
-
-	/* rsvg won't always paint the background.
-	 */
-	vips_region_black( or ); 
-
-	surface = cairo_image_surface_create_for_data( 
-		VIPS_REGION_ADDR( or, r-&gt;left, r-&gt;top ), 
-		CAIRO_FORMAT_ARGB32, 
-		r-&gt;width, r-&gt;height, 
-		VIPS_REGION_LSKIP( or ) );
-	cr = cairo_create( surface );
-	cairo_surface_destroy( surface );
-
-	/* rsvg is single-threaded, but we don't need to lock since we're
-	 * running inside a non-threaded tilecache.
-	 */
-#ifdef HAVE_RSVG_HANDLE_RENDER_DOCUMENT
-{
-	RsvgRectangle viewport;
-	GError *error = NULL;
-
-	cairo_translate( cr, -r-&gt;left, -r-&gt;top );
-	viewport.x = 0;
-	viewport.y = 0;
-	viewport.width = or-&gt;im-&gt;Xsize;
-	viewport.height = or-&gt;im-&gt;Ysize;
-
-	if( !rsvg_handle_render_document( svg-&gt;page, cr, &amp;viewport, &amp;error ) ) {
-		cairo_destroy( cr );
-		vips_operation_invalidate( VIPS_OPERATION( svg ) );
-		vips_error( class-&gt;nickname, 
-			"%s", _( "SVG rendering failed" ) );
-		vips_g_error( &amp;error );
-		return( -1 );
-	}
-
-	cairo_destroy( cr );
-}
-#else /*!HAVE_RSVG_HANDLE_RENDER_DOCUMENT*/
-	cairo_scale( cr, svg-&gt;cairo_scale, svg-&gt;cairo_scale );
-	cairo_translate( cr, -r-&gt;left / svg-&gt;cairo_scale,
-		-r-&gt;top / svg-&gt;cairo_scale );
-
-	if( !rsvg_handle_render_cairo( svg-&gt;page, cr ) ) {
-		cairo_destroy( cr );
-		vips_operation_invalidate( VIPS_OPERATION( svg ) );
-		vips_error( class-&gt;nickname,
-			"%s", _( "SVG rendering failed" ) );
-		return( -1 );
-	}
-
-	cairo_destroy( cr );
-#endif /*HAVE_RSVG_HANDLE_RENDER_DOCUMENT*/
-
-	/* Cairo makes pre-multipled BRGA -- we must byteswap and unpremultiply.
-	 */
-	for( y = 0; y &lt; r-&gt;height; y++ ) 
-                vips__premultiplied_bgra2rgba( 
-			(guint32 *) VIPS_REGION_ADDR( or, r-&gt;left, r-&gt;top + y ),
-			r-&gt;width ); 
-
-	return( 0 ); 
-}
-
-static int
-vips_foreign_load_svg_load( VipsForeignLoad *load )
-{
-	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) load;
-	VipsImage **t = (VipsImage **) 
-		vips_object_local_array( (VipsObject *) load, 3 );
-
-	/* Make tiles 2000 pixels high to limit overcomputation. 
-	 */
-	t[0] = vips_image_new(); 
-	if( vips_foreign_load_svg_parse( svg, t[0] ) ||
-		vips_image_generate( t[0], NULL,
-			vips_foreign_load_svg_generate, NULL, svg, NULL ) ||
-		vips_tilecache( t[0], &amp;t[1],
-			"tile_width", t[0]-&gt;Xsize,
-			"tile_height", 2000,
-			"max_tiles", 1,
-			NULL ) ||
-		vips_sequential( t[1], &amp;t[2], 
-<a name="1"></a>			"tile_height", 2000, 
-			NULL ) ||
-		vips_image_write( t[2], load-&gt;real ) ) 
-<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		return( -1 );
-
-	return( 0 );
-}
-
-static void
-vips_foreign_load_svg_class_init( VipsForeignLoadSvgClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;dispose = vips_foreign_load_svg_dispose;
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "svgload_base";
-	object_class-&gt;description = _( "load SVG with rsvg" );
-
-	/* is_a() is not that quick ... lower the priority.
-	 */
-	foreign_class-&gt;priority = -5;
-
-	load_class-&gt;get_flags_filename = 
-		vips_foreign_load_svg_get_flags_filename;
-	load_class-&gt;get_flags = vips_foreign_load_svg_get_flags;
-	load_class-&gt;load = vips_foreign_load_svg_load;
-
-	VIPS_ARG_DOUBLE( class, "dpi", 21,</b></font>
-		_( "DPI" ),
-		_( "Render at this DPI" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT,
-		G_STRUCT_OFFSET( VipsForeignLoadSvg, dpi ),
-		0.001, 100000.0, 72.0 );
-
-	VIPS_ARG_DOUBLE( class, "scale", 22,
-		_( "Scale" ),
-		_( "Scale output by this factor" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT,
-		G_STRUCT_OFFSET( VipsForeignLoadSvg, scale ),
-		0.001, 100000.0, 1.0 );
-
-	VIPS_ARG_BOOL( class, "unlimited", 23,
-		_( "Unlimited" ),
-		_( "Allow SVG of any size" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT,
-		G_STRUCT_OFFSET( VipsForeignLoadSvg, unlimited ),
-		FALSE );
-
-}
-
-static void
-vips_foreign_load_svg_init( VipsForeignLoadSvg *svg )
-{
-	svg-&gt;dpi = 72.0;
-	svg-&gt;scale = 1.0;
-	svg-&gt;cairo_scale = 1.0;
-}
-
-typedef struct _VipsForeignLoadSvgSource {
-	VipsForeignLoadSvg parent_object;
-
-	/* Load from a source.
-	 */
-	VipsSource *source;
-
-} VipsForeignLoadSvgSource;
-
-typedef VipsForeignLoadClass VipsForeignLoadSvgSourceClass;
-
-G_DEFINE_TYPE( VipsForeignLoadSvgSource, vips_foreign_load_svg_source, 
-	vips_foreign_load_svg_get_type() );
-
-gboolean
-vips_foreign_load_svg_source_is_a_source( VipsSource *source )
-{
-	unsigned char *data;
-	size_t bytes_read;
-
-	if( (bytes_read = vips_source_sniff_at_most( source, 
-		&amp;data, SVG_HEADER_SIZE )) &lt;= 0 )
-		return( FALSE );
-
-	return( vips_foreign_load_svg_is_a( data, bytes_read ) );
-}
-
-static int
-vips_foreign_load_svg_source_header( VipsForeignLoad *load )
-{
-	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) load;
-	VipsForeignLoadSvgSource *source = 
-		(VipsForeignLoadSvgSource *) load;
-	RsvgHandleFlags flags = svg-&gt;unlimited ? RSVG_HANDLE_FLAG_UNLIMITED : 0;
-
-	GError *error = NULL;
-
-	GInputStream *gstream;
-
-	if( vips_source_rewind( source-&gt;source ) )
-		return( -1 );
-
-	gstream = vips_g_input_stream_new_from_source( source-&gt;source );
-	if( !(svg-&gt;page = rsvg_handle_new_from_stream_sync( 
-		gstream, NULL, flags, NULL, &amp;error )) ) {
-		g_object_unref( gstream );
-		vips_g_error( &amp;error );
-		return( -1 ); 
-	}
-	g_object_unref( gstream );
-
-	return( vips_foreign_load_svg_header( load ) );
-}
-
-static int
-vips_foreign_load_svg_source_load( VipsForeignLoad *load )
-<a name="2"></a>{
-	VipsForeignLoadSvgSource *source = (VipsForeignLoadSvgSource *) load;
-
-<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if( vips_source_rewind( source-&gt;source ) ||
-		vips_foreign_load_svg_load( load ) ||
-		vips_source_decode( source-&gt;source ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static void
-vips_foreign_load_svg_source_class_init( VipsForeignLoadSvgSourceClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "svgload_source";
-	object_class-&gt;description = _( "load svg from source" );
-
-	load_class-&gt;is_a_source = vips_foreign_load_svg_source_is_a_source;
-	load_class-&gt;header = vips_foreign_load_svg_source_header;</b></font>
-	load_class-&gt;load = vips_foreign_load_svg_source_load;
-
-	VIPS_ARG_OBJECT( class, "source", 1,
-		_( "Source" ),
-		_( "Source to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadSvgSource, source ),
-		VIPS_TYPE_SOURCE );
-
-}
-
-<a name="3"></a>static void
-vips_foreign_load_svg_source_init( VipsForeignLoadSvgSource *source )
-{
-<font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>}
-
-typedef struct _VipsForeignLoadSvgFile {
-	VipsForeignLoadSvg parent_object;
-
-	/* Filename for load.
-	 */
-	char *filename; 
-
-} VipsForeignLoadSvgFile;
-
-typedef VipsForeignLoadSvgClass VipsForeignLoadSvgFileClass;
-
-G_DEFINE_TYPE( VipsForeignLoadSvgFile, vips_foreign_load_svg_file, 
-	vips_foreign_load_svg_get_type() );
-
-static gboolean
-vips_foreign_load_svg_file_is_a( const char *filename )
-{
-	unsigned char buf[SVG_HEADER_SIZE];</b></font>
-	guint64 bytes;
-
-	return( (bytes = vips__get_bytes( filename, 
-			buf, SVG_HEADER_SIZE )) &gt; 0 &amp;&amp;
-		vips_foreign_load_svg_is_a( buf, bytes ) );
-}
-
-static int
-vips_foreign_load_svg_file_header( VipsForeignLoad *load )
-{
-	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) load;
-	VipsForeignLoadSvgFile *file = (VipsForeignLoadSvgFile *) load;
-	RsvgHandleFlags flags = svg-&gt;unlimited ? RSVG_HANDLE_FLAG_UNLIMITED : 0;
-
-	GError *error = NULL;
-
-	GFile *gfile;
-
-	gfile = g_file_new_for_path( file-&gt;filename );
-	if( !(svg-&gt;page = rsvg_handle_new_from_gfile_sync( 
-		gfile, flags, NULL, &amp;error )) ) { 
-		g_object_unref( gfile );
-		vips_g_error( &amp;error );
-		return( -1 ); 
-	}
-	g_object_unref( gfile );
-
-	VIPS_SETSTR( load-&gt;out-&gt;filename, file-&gt;filename );
-
-	return( vips_foreign_load_svg_header( load ) );
-}
-
-static const char *vips_foreign_svg_suffs[] = {
-	".svg",
-	/* librsvg supports svgz directly, no need to check for zlib here.
-	 */
-#if LIBRSVG_CHECK_FEATURE(SVGZ)
-	".svgz",
-	".svg.gz",
-#endif
-	NULL
-};
-
-static void
-vips_foreign_load_svg_file_class_init( 
-<a name="0"></a>	VipsForeignLoadSvgFileClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "svgload";
-
-	foreign_class-&gt;suffs = vips_foreign_svg_suffs;
-
-	load_class-&gt;is_a = vips_foreign_load_svg_file_is_a;
-	load_class-&gt;header = vips_foreign_load_svg_file_header;
-
-	VIPS_ARG_STRING( class, "filename", 1, 
-		_( "Filename" ),
-		_( "Filename to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadSvgFile, filename ),
-		NULL );
-
-}
-
-static void
-vips_foreign_load_svg_file_init( VipsForeignLoadSvgFile *file )
-{
-}
-
-typedef struct _VipsForeignLoadSvgBuffer {
-	VipsForeignLoadSvg parent_object;
-
-	/* Load from a buffer.
-	 */
-	VipsArea *buf;
-
-} VipsForeignLoadSvgBuffer;
-
-typedef VipsForeignLoadSvgClass VipsForeignLoadSvgBufferClass;
-
-G_DEFINE_TYPE( VipsForeignLoadSvgBuffer, vips_foreign_load_svg_buffer, 
-	vips_foreign_load_svg_get_type() );
-
-static int</b></font>
-vips_foreign_load_svg_buffer_header( VipsForeignLoad *load )
-{
-	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) load;
-	VipsForeignLoadSvgBuffer *buffer = 
-		(VipsForeignLoadSvgBuffer *) load;
-	RsvgHandleFlags flags = svg-&gt;unlimited ? RSVG_HANDLE_FLAG_UNLIMITED : 0;
-
-	GError *error = NULL;
-
-	GInputStream *gstream;
-
-	gstream = g_memory_input_stream_new_from_data( 
-		buffer-&gt;buf-&gt;data, buffer-&gt;buf-&gt;length, NULL );
-	if( !(svg-&gt;page = rsvg_handle_new_from_stream_sync( 
-		gstream, NULL, flags, NULL, &amp;error )) ) { 
-		g_object_unref( gstream );
-		vips_g_error( &amp;error );
-		return( -1 ); 
-	}
-	g_object_unref( gstream );
-
-	return( vips_foreign_load_svg_header( load ) );
-}
-
-static void
-vips_foreign_load_svg_buffer_class_init( 
-	VipsForeignLoadSvgBufferClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "svgload_buffer";
-
-	load_class-&gt;is_a_buffer = vips_foreign_load_svg_is_a;
-	load_class-&gt;header = vips_foreign_load_svg_buffer_header;
-
-	VIPS_ARG_BOXED( class, "buffer", 1, 
-		_( "Buffer" ),
-		_( "Buffer to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadSvgBuffer, buf ),
-		VIPS_TYPE_BLOB );
-
-}
-
-static void
-vips_foreign_load_svg_buffer_init( VipsForeignLoadSvgBuffer *buffer )
-{
-}
-
-#endif /*HAVE_RSVG*/
-
-/**
- * vips_svgload:
- * @filename: file to load
- * @out: (out): output image
- * @...: %NULL-terminated list of optional named arguments
- *
- * Optional arguments:
- *
- * * @dpi: %gdouble, render at this DPI
- * * @scale: %gdouble, scale render by this factor
- * * @unlimited: %gboolean, allow SVGs of any size
- *
- * Render a SVG file into a VIPS image.  Rendering uses the librsvg library
- * and should be fast.
- *
- * Use @dpi to set the rendering resolution. The default is 72. You can also
- * scale the rendering by @scale. 
- *
- * This function only reads the image header and does not render any pixel
- * data. Rendering occurs when pixels are accessed.
- *
- * SVGs larger than 10MB are normally blocked for security. Set @unlimited to
- * allow SVGs of any size.
- *
- * See also: vips_image_new_from_file().
- *
- * Returns: 0 on success, -1 on error.
- */
-int
-vips_svgload( const char *filename, VipsImage **out, ... )
-{
-	va_list ap;
-	int result;
-
-	va_start( ap, out );
-	result = vips_call_split( "svgload", ap, filename, out );
-	va_end( ap );
-
-	return( result );
-}
-
-/**
- * vips_svgload_buffer:
- * @buf: (array length=len) (element-type guint8): memory area to load
- * @len: (type gsize): size of memory area
- * @out: (out): image to write
- * @...: %NULL-terminated list of optional named arguments
- *
- * Optional arguments:
- *
- * * @dpi: %gdouble, render at this DPI
- * * @scale: %gdouble, scale render by this factor
- * * @unlimited: %gboolean, allow SVGs of any size
- *
- * Read a SVG-formatted memory block into a VIPS image. Exactly as
- * vips_svgload(), but read from a memory buffer. 
- *
- * You must not free the buffer while @out is active. The 
- * #VipsObject::postclose signal on @out is a good place to free. 
- *
- * See also: vips_svgload().
- *
- * Returns: 0 on success, -1 on error.
- */
-int
-vips_svgload_buffer( void *buf, size_t len, VipsImage **out, ... )
-{
-	va_list ap;
-	VipsBlob *blob;
-	int result;
-
-	/* We don't take a copy of the data or free it.
-	 */
-	blob = vips_blob_new( NULL, buf, len );
-
-	va_start( ap, out );
-	result = vips_call_split( "svgload_buffer", ap, blob, out );
-	va_end( ap );
-
-	vips_area_unref( VIPS_AREA( blob ) );
-
-	return( result );
-}
-
-/**
- * vips_svgload_string:
- * @str: string to load
- * @out: (out): image to write
- * @...: %NULL-terminated list of optional named arguments
- *
- * Optional arguments:
- *
- * * @dpi: %gdouble, render at this DPI
- * * @scale: %gdouble, scale render by this factor
- * * @unlimited: %gboolean, allow SVGs of any size
- *
- * Exactly as vips_svgload(), but read from a string. This function takes a
- * copy of the string.
- *
- * See also: vips_svgload().
- *
- * Returns: 0 on success, -1 on error.
- */
-int
-vips_svgload_string( const char *str, VipsImage **out, ... )
-{
-	va_list ap;
-	VipsBlob *blob;
-	int result;
-
-	/* Copy the string.
-	 */
-	blob = vips_blob_copy( (const void *) str, strlen( str ) );
-
-	va_start( ap, out );
-	result = vips_call_split( "svgload_buffer", ap, blob, out );
-	va_end( ap );
-
-	vips_area_unref( VIPS_AREA( blob ) );
-
-	return( result );
-}
-
-/**
- * vips_svgload_source:
- * @source: source to load from
- * @out: (out): image to write
- * @...: %NULL-terminated list of optional named arguments
- *
- * Exactly as vips_svgload(), but read from a source. 
- *
- * See also: vips_svgload().
- *
- * Returns: 0 on success, -1 on error.
- */
-int
-vips_svgload_source( VipsSource *source, VipsImage **out, ... )
-{
-	va_list ap;
-	int result;
-
-	va_start( ap, out );
-	result = vips_call_split( "svgload_source", ap, source, out );
-	va_end( ap );
-
-	return( result );
-}
-
+1 #ifdef HAVE_CONFIG_H
+2 #include &lt;config.h&gt;
+3 #include &lt;vips/intl.h&gt;
+4 #include &lt;stdio.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;errno.h&gt;
+8 #include &lt;ctype.h&gt;
+9 #include &lt;vips/vips.h&gt;
+10 #include &lt;vips/internal.h&gt;
+11 #include &lt;vips/debug.h&gt;
+12 #if defined(HAVE_RSVG)
+13 #include &lt;cairo.h&gt;
+14 #include &lt;librsvg/rsvg.h&gt;
+15 #define SVG_HEADER_SIZE (1000)
+16 #if LIBRSVG_CHECK_FEATURE(SVGZ) &amp;&amp; defined(HAVE_ZLIB)
+17 #define HANDLE_SVGZ
+18 #endif
+19 #ifdef HANDLE_SVGZ
+20 #include &lt;zlib.h&gt;
+21 #endif
+22 typedef struct _VipsForeignLoadSvg {
+23 	VipsForeignLoad parent_object;
+24 	double dpi;
+25 	double scale;
+26 	double cairo_scale;
+27 	gboolean unlimited;
+28 	RsvgHandle *page;
+29 } VipsForeignLoadSvg;
+30 typedef VipsForeignLoadClass VipsForeignLoadSvgClass;
+31 G_DEFINE_ABSTRACT_TYPE( VipsForeignLoadSvg, vips_foreign_load_svg, 
+32 	VIPS_TYPE_FOREIGN_LOAD );
+33 #ifdef HANDLE_SVGZ
+34 static void *
+35 vips_foreign_load_svg_zalloc( void *opaque, unsigned items, unsigned size )
+36 {
+37 	return( g_malloc0_n( items, size ) );
+38 }
+39 static void
+40 vips_foreign_load_svg_zfree( void *opaque, void *ptr )
+41 {
+42 	return( g_free( ptr ) );
+43 }
+44 static gboolean
+45 vips_foreign_load_svg_is_a( const void *buf, size_t len )
+46 {
+47 	char *str;
+48 #ifdef HANDLE_SVGZ
+49 	char obuf[SVG_HEADER_SIZE];
+50 	int i;
+51 	str = (char *) buf;
+52 #ifdef HANDLE_SVGZ
+53 	if( len &gt;= 18 &amp;&amp; 
+54 		str[0] == '\037' &amp;&amp; 
+55 		str[1] == '\213' ) {
+56 		z_stream zs;
+57 		size_t opos;
+58 		zs.zalloc = (alloc_func) vips_foreign_load_svg_zalloc;
+59 		zs.zfree = (free_func) vips_foreign_load_svg_zfree;
+60 		zs.opaque = Z_NULL;
+61 		zs.next_in = (unsigned char *) str;
+62 		zs.avail_in = len;
+63 		if( inflateInit2( &amp;zs, 15 | 32 ) != Z_OK ) 
+64 			return( FALSE );
+65 		opos = 0;
+66 		do {
+67 			zs.avail_out = sizeof( obuf ) - opos;
+68 			zs.next_out = (unsigned char *) obuf + opos;
+69 			if( inflate( &amp;zs, Z_NO_FLUSH ) &lt; Z_OK ) {
+70 				inflateEnd( &amp;zs );
+71 				return( FALSE );
+72 			}
+73 			opos = sizeof( obuf ) - zs.avail_out;
+74 		} while( opos &lt; sizeof( obuf ) &amp;&amp; 
+75 			zs.avail_in &gt; 0 );
+76 		inflateEnd( &amp;zs );
+77 		str = obuf;
+78 		len = opos;
+79 	}
+80 	if( len &lt; 24 )
+81 		return( 0 );
+82 	for( i = 0; i &lt; 24; i++ )
+83 		if( !isascii( str[i] ) || str[i] &lt; 9 )
+84 			return( FALSE );
+85 	for( i = 0; i &lt; SVG_HEADER_SIZE &amp;&amp; i &lt; len - 5; i++ )
+86 		if( g_ascii_strncasecmp( str + i, "&lt;svg", 4 ) == 0 )
+87 			return( TRUE );
+88 	return( FALSE );
+89 }
+90 static void
+91 vips_foreign_load_svg_dispose( GObject *gobject )
+92 {
+93 	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) gobject;
+94 	VIPS_UNREF( svg-&gt;page );
+95 <a name="4"></a>
+96 	G_OBJECT_CLASS( vips_foreign_load_svg_parent_class )-&gt;
+97 		dispose( gobject );
+98 <font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>}
+99 static VipsForeignFlags
+100 vips_foreign_load_svg_get_flags_filename( const char *filename )
+101 {
+102 	return( VIPS_FOREIGN_SEQUENTIAL );
+103 }
+104 static VipsForeignFlags
+105 vips_foreign_load_svg_get_flags( VipsForeignLoad *load )
+106 {
+107 	return( VIPS_FOREIGN_SEQUENTIAL );
+108 }
+109 static int</b></font>
+110 vips_foreign_load_svg_parse( VipsForeignLoadSvg *svg, VipsImage *out )
+111 {
+112 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( svg );
+113 	RsvgDimensionData dimensions;
+114 	int width;
+115 	int height;
+116 	double scale;
+117 	double res;
+118 	rsvg_handle_set_dpi( svg-&gt;page, 72.0 );
+119 	rsvg_handle_get_dimensions( svg-&gt;page, &amp;dimensions );
+120 	width = dimensions.width;
+121 	height = dimensions.height;
+122 	if( width &lt;= 0 || height &lt;= 0 ) {
+123 		vips_error( class-&gt;nickname, "%s", _( "bad dimensions" ) );
+124 		return( -1 );
+125 	}
+126 	scale = svg-&gt;scale * svg-&gt;dpi / 72.0;
+127 	if( scale != 1.0 ) {
+128 		rsvg_handle_set_dpi( svg-&gt;page, svg-&gt;dpi * svg-&gt;scale );
+129 		rsvg_handle_get_dimensions( svg-&gt;page, &amp;dimensions );
+130 		if( width == dimensions.width &amp;&amp; 
+131 			height == dimensions.height ) {
+132 			svg-&gt;cairo_scale = scale;
+133 			width = VIPS_ROUND_UINT( width * scale );
+134 			height = VIPS_ROUND_UINT( height * scale );
+135 		} 
+136 		else {
+137 			width = dimensions.width;
+138 			height = dimensions.height;
+139 		}
+140 	}
+141 	res = svg-&gt;dpi / 25.4;
+142 	vips_image_init_fields( out, 
+143 		width, height,
+144 		4, VIPS_FORMAT_UCHAR,
+145 		VIPS_CODING_NONE, VIPS_INTERPRETATION_sRGB, res, res );
+146         if( vips_image_pipelinev( out, VIPS_DEMAND_STYLE_FATSTRIP, NULL ) )
+147 		return( -1 );
+148 	return( 0 );
+149 }
+150 static int
+151 vips_foreign_load_svg_header( VipsForeignLoad *load )
+152 {
+153 	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) load;
+154 	return vips_foreign_load_svg_parse( svg, load-&gt;out );
+155 }
+156 static int
+157 vips_foreign_load_svg_generate( VipsRegion *or, 
+158 	void *seq, void *a, void *b, gboolean *stop )
+159 {
+160 	const VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) a;
+161 	const VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( svg );
+162 	const VipsRect *r = &amp;or-&gt;valid;
+163 	cairo_surface_t *surface;
+164 	cairo_t *cr;
+165 	int y;
+166 #ifdef DEBUG
+167 	printf( "vips_foreign_load_svg_generate:\n     "
+168 		"left = %d, top = %d, width = %d, height = %d\n", 
+169 		r-&gt;left, r-&gt;top, r-&gt;width, r-&gt;height ); 
+170 	vips_region_black( or ); 
+171 	surface = cairo_image_surface_create_for_data( 
+172 		VIPS_REGION_ADDR( or, r-&gt;left, r-&gt;top ), 
+173 		CAIRO_FORMAT_ARGB32, 
+174 		r-&gt;width, r-&gt;height, 
+175 		VIPS_REGION_LSKIP( or ) );
+176 	cr = cairo_create( surface );
+177 	cairo_surface_destroy( surface );
+178 #ifdef HAVE_RSVG_HANDLE_RENDER_DOCUMENT
+179 {
+180 	RsvgRectangle viewport;
+181 	GError *error = NULL;
+182 	cairo_translate( cr, -r-&gt;left, -r-&gt;top );
+183 	viewport.x = 0;
+184 	viewport.y = 0;
+185 	viewport.width = or-&gt;im-&gt;Xsize;
+186 	viewport.height = or-&gt;im-&gt;Ysize;
+187 	if( !rsvg_handle_render_document( svg-&gt;page, cr, &amp;viewport, &amp;error ) ) {
+188 		cairo_destroy( cr );
+189 		vips_operation_invalidate( VIPS_OPERATION( svg ) );
+190 		vips_error( class-&gt;nickname, 
+191 			"%s", _( "SVG rendering failed" ) );
+192 		vips_g_error( &amp;error );
+193 		return( -1 );
+194 	}
+195 	cairo_destroy( cr );
+196 }
+197 	cairo_scale( cr, svg-&gt;cairo_scale, svg-&gt;cairo_scale );
+198 	cairo_translate( cr, -r-&gt;left / svg-&gt;cairo_scale,
+199 		-r-&gt;top / svg-&gt;cairo_scale );
+200 	if( !rsvg_handle_render_cairo( svg-&gt;page, cr ) ) {
+201 		cairo_destroy( cr );
+202 		vips_operation_invalidate( VIPS_OPERATION( svg ) );
+203 		vips_error( class-&gt;nickname,
+204 			"%s", _( "SVG rendering failed" ) );
+205 		return( -1 );
+206 	}
+207 	cairo_destroy( cr );
+208 	for( y = 0; y &lt; r-&gt;height; y++ ) 
+209                 vips__premultiplied_bgra2rgba( 
+210 			(guint32 *) VIPS_REGION_ADDR( or, r-&gt;left, r-&gt;top + y ),
+211 			r-&gt;width ); 
+212 	return( 0 ); 
+213 }
+214 static int
+215 vips_foreign_load_svg_load( VipsForeignLoad *load )
+216 {
+217 	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) load;
+218 	VipsImage **t = (VipsImage **) 
+219 		vips_object_local_array( (VipsObject *) load, 3 );
+220 	t[0] = vips_image_new(); 
+221 	if( vips_foreign_load_svg_parse( svg, t[0] ) ||
+222 		vips_image_generate( t[0], NULL,
+223 			vips_foreign_load_svg_generate, NULL, svg, NULL ) ||
+224 		vips_tilecache( t[0], &amp;t[1],
+225 			"tile_width", t[0]-&gt;Xsize,
+226 			"tile_height", 2000,
+227 			"max_tiles", 1,
+228 			NULL ) ||
+229 		vips_sequential( t[1], &amp;t[2], 
+230 <a name="1"></a>			"tile_height", 2000, 
+231 			NULL ) ||
+232 		vips_image_write( t[2], load-&gt;real ) ) 
+233 <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>		return( -1 );
+234 	return( 0 );
+235 }
+236 static void
+237 vips_foreign_load_svg_class_init( VipsForeignLoadSvgClass *class )
+238 {
+239 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+240 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+241 	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
+242 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+243 	gobject_class-&gt;dispose = vips_foreign_load_svg_dispose;
+244 	gobject_class-&gt;set_property = vips_object_set_property;
+245 	gobject_class-&gt;get_property = vips_object_get_property;
+246 	object_class-&gt;nickname = "svgload_base";
+247 	object_class-&gt;description = _( "load SVG with rsvg" );
+248 	foreign_class-&gt;priority = -5;
+249 	load_class-&gt;get_flags_filename = 
+250 		vips_foreign_load_svg_get_flags_filename;
+251 	load_class-&gt;get_flags = vips_foreign_load_svg_get_flags;
+252 	load_class-&gt;load = vips_foreign_load_svg_load;
+253 	VIPS_ARG_DOUBLE( class, "dpi", 21,</b></font>
+254 		_( "DPI" ),
+255 		_( "Render at this DPI" ),
+256 		VIPS_ARGUMENT_OPTIONAL_INPUT,
+257 		G_STRUCT_OFFSET( VipsForeignLoadSvg, dpi ),
+258 		0.001, 100000.0, 72.0 );
+259 	VIPS_ARG_DOUBLE( class, "scale", 22,
+260 		_( "Scale" ),
+261 		_( "Scale output by this factor" ),
+262 		VIPS_ARGUMENT_OPTIONAL_INPUT,
+263 		G_STRUCT_OFFSET( VipsForeignLoadSvg, scale ),
+264 		0.001, 100000.0, 1.0 );
+265 	VIPS_ARG_BOOL( class, "unlimited", 23,
+266 		_( "Unlimited" ),
+267 		_( "Allow SVG of any size" ),
+268 		VIPS_ARGUMENT_OPTIONAL_INPUT,
+269 		G_STRUCT_OFFSET( VipsForeignLoadSvg, unlimited ),
+270 		FALSE );
+271 }
+272 static void
+273 vips_foreign_load_svg_init( VipsForeignLoadSvg *svg )
+274 {
+275 	svg-&gt;dpi = 72.0;
+276 	svg-&gt;scale = 1.0;
+277 	svg-&gt;cairo_scale = 1.0;
+278 }
+279 typedef struct _VipsForeignLoadSvgSource {
+280 	VipsForeignLoadSvg parent_object;
+281 	VipsSource *source;
+282 } VipsForeignLoadSvgSource;
+283 typedef VipsForeignLoadClass VipsForeignLoadSvgSourceClass;
+284 G_DEFINE_TYPE( VipsForeignLoadSvgSource, vips_foreign_load_svg_source, 
+285 	vips_foreign_load_svg_get_type() );
+286 gboolean
+287 vips_foreign_load_svg_source_is_a_source( VipsSource *source )
+288 {
+289 	unsigned char *data;
+290 	size_t bytes_read;
+291 	if( (bytes_read = vips_source_sniff_at_most( source, 
+292 		&amp;data, SVG_HEADER_SIZE )) &lt;= 0 )
+293 		return( FALSE );
+294 	return( vips_foreign_load_svg_is_a( data, bytes_read ) );
+295 }
+296 static int
+297 vips_foreign_load_svg_source_header( VipsForeignLoad *load )
+298 {
+299 	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) load;
+300 	VipsForeignLoadSvgSource *source = 
+301 		(VipsForeignLoadSvgSource *) load;
+302 	RsvgHandleFlags flags = svg-&gt;unlimited ? RSVG_HANDLE_FLAG_UNLIMITED : 0;
+303 	GError *error = NULL;
+304 	GInputStream *gstream;
+305 	if( vips_source_rewind( source-&gt;source ) )
+306 		return( -1 );
+307 	gstream = vips_g_input_stream_new_from_source( source-&gt;source );
+308 	if( !(svg-&gt;page = rsvg_handle_new_from_stream_sync( 
+309 		gstream, NULL, flags, NULL, &amp;error )) ) {
+310 		g_object_unref( gstream );
+311 		vips_g_error( &amp;error );
+312 		return( -1 ); 
+313 	}
+314 	g_object_unref( gstream );
+315 	return( vips_foreign_load_svg_header( load ) );
+316 }
+317 static int
+318 vips_foreign_load_svg_source_load( VipsForeignLoad *load )
+319 <a name="2"></a>{
+320 	VipsForeignLoadSvgSource *source = (VipsForeignLoadSvgSource *) load;
+321 <font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if( vips_source_rewind( source-&gt;source ) ||
+322 		vips_foreign_load_svg_load( load ) ||
+323 		vips_source_decode( source-&gt;source ) )
+324 		return( -1 );
+325 	return( 0 );
+326 }
+327 static void
+328 vips_foreign_load_svg_source_class_init( VipsForeignLoadSvgSourceClass *class )
+329 {
+330 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+331 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+332 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+333 	gobject_class-&gt;set_property = vips_object_set_property;
+334 	gobject_class-&gt;get_property = vips_object_get_property;
+335 	object_class-&gt;nickname = "svgload_source";
+336 	object_class-&gt;description = _( "load svg from source" );
+337 	load_class-&gt;is_a_source = vips_foreign_load_svg_source_is_a_source;
+338 	load_class-&gt;header = vips_foreign_load_svg_source_header;</b></font>
+339 	load_class-&gt;load = vips_foreign_load_svg_source_load;
+340 	VIPS_ARG_OBJECT( class, "source", 1,
+341 		_( "Source" ),
+342 		_( "Source to load from" ),
+343 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+344 		G_STRUCT_OFFSET( VipsForeignLoadSvgSource, source ),
+345 		VIPS_TYPE_SOURCE );
+346 }
+347 <a name="3"></a>static void
+348 vips_foreign_load_svg_source_init( VipsForeignLoadSvgSource *source )
+349 {
+350 <font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>}
+351 typedef struct _VipsForeignLoadSvgFile {
+352 	VipsForeignLoadSvg parent_object;
+353 	char *filename; 
+354 } VipsForeignLoadSvgFile;
+355 typedef VipsForeignLoadSvgClass VipsForeignLoadSvgFileClass;
+356 G_DEFINE_TYPE( VipsForeignLoadSvgFile, vips_foreign_load_svg_file, 
+357 	vips_foreign_load_svg_get_type() );
+358 static gboolean
+359 vips_foreign_load_svg_file_is_a( const char *filename )
+360 {
+361 	unsigned char buf[SVG_HEADER_SIZE];</b></font>
+362 	guint64 bytes;
+363 	return( (bytes = vips__get_bytes( filename, 
+364 			buf, SVG_HEADER_SIZE )) &gt; 0 &amp;&amp;
+365 		vips_foreign_load_svg_is_a( buf, bytes ) );
+366 }
+367 static int
+368 vips_foreign_load_svg_file_header( VipsForeignLoad *load )
+369 {
+370 	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) load;
+371 	VipsForeignLoadSvgFile *file = (VipsForeignLoadSvgFile *) load;
+372 	RsvgHandleFlags flags = svg-&gt;unlimited ? RSVG_HANDLE_FLAG_UNLIMITED : 0;
+373 	GError *error = NULL;
+374 	GFile *gfile;
+375 	gfile = g_file_new_for_path( file-&gt;filename );
+376 	if( !(svg-&gt;page = rsvg_handle_new_from_gfile_sync( 
+377 		gfile, flags, NULL, &amp;error )) ) { 
+378 		g_object_unref( gfile );
+379 		vips_g_error( &amp;error );
+380 		return( -1 ); 
+381 	}
+382 	g_object_unref( gfile );
+383 	VIPS_SETSTR( load-&gt;out-&gt;filename, file-&gt;filename );
+384 	return( vips_foreign_load_svg_header( load ) );
+385 }
+386 static const char *vips_foreign_svg_suffs[] = {
+387 	".svg",
+388 #if LIBRSVG_CHECK_FEATURE(SVGZ)
+389 	".svgz",
+390 	".svg.gz",
+391 #endif
+392 	NULL
+393 };
+394 static void
+395 vips_foreign_load_svg_file_class_init( 
+396 <a name="0"></a>	VipsForeignLoadSvgFileClass *class )
+397 {
+398 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+399 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	VipsObjectClass *object_class = (VipsObjectClass *) class;
+400 	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
+401 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+402 	gobject_class-&gt;set_property = vips_object_set_property;
+403 	gobject_class-&gt;get_property = vips_object_get_property;
+404 	object_class-&gt;nickname = "svgload";
+405 	foreign_class-&gt;suffs = vips_foreign_svg_suffs;
+406 	load_class-&gt;is_a = vips_foreign_load_svg_file_is_a;
+407 	load_class-&gt;header = vips_foreign_load_svg_file_header;
+408 	VIPS_ARG_STRING( class, "filename", 1, 
+409 		_( "Filename" ),
+410 		_( "Filename to load from" ),
+411 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+412 		G_STRUCT_OFFSET( VipsForeignLoadSvgFile, filename ),
+413 		NULL );
+414 }
+415 static void
+416 vips_foreign_load_svg_file_init( VipsForeignLoadSvgFile *file )
+417 {
+418 }
+419 typedef struct _VipsForeignLoadSvgBuffer {
+420 	VipsForeignLoadSvg parent_object;
+421 	VipsArea *buf;
+422 } VipsForeignLoadSvgBuffer;
+423 typedef VipsForeignLoadSvgClass VipsForeignLoadSvgBufferClass;
+424 G_DEFINE_TYPE( VipsForeignLoadSvgBuffer, vips_foreign_load_svg_buffer, 
+425 	vips_foreign_load_svg_get_type() );
+426 static int</b></font>
+427 vips_foreign_load_svg_buffer_header( VipsForeignLoad *load )
+428 {
+429 	VipsForeignLoadSvg *svg = (VipsForeignLoadSvg *) load;
+430 	VipsForeignLoadSvgBuffer *buffer = 
+431 		(VipsForeignLoadSvgBuffer *) load;
+432 	RsvgHandleFlags flags = svg-&gt;unlimited ? RSVG_HANDLE_FLAG_UNLIMITED : 0;
+433 	GError *error = NULL;
+434 	GInputStream *gstream;
+435 	gstream = g_memory_input_stream_new_from_data( 
+436 		buffer-&gt;buf-&gt;data, buffer-&gt;buf-&gt;length, NULL );
+437 	if( !(svg-&gt;page = rsvg_handle_new_from_stream_sync( 
+438 		gstream, NULL, flags, NULL, &amp;error )) ) { 
+439 		g_object_unref( gstream );
+440 		vips_g_error( &amp;error );
+441 		return( -1 ); 
+442 	}
+443 	g_object_unref( gstream );
+444 	return( vips_foreign_load_svg_header( load ) );
+445 }
+446 static void
+447 vips_foreign_load_svg_buffer_class_init( 
+448 	VipsForeignLoadSvgBufferClass *class )
+449 {
+450 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+451 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+452 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+453 	gobject_class-&gt;set_property = vips_object_set_property;
+454 	gobject_class-&gt;get_property = vips_object_get_property;
+455 	object_class-&gt;nickname = "svgload_buffer";
+456 	load_class-&gt;is_a_buffer = vips_foreign_load_svg_is_a;
+457 	load_class-&gt;header = vips_foreign_load_svg_buffer_header;
+458 	VIPS_ARG_BOXED( class, "buffer", 1, 
+459 		_( "Buffer" ),
+460 		_( "Buffer to load from" ),
+461 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+462 		G_STRUCT_OFFSET( VipsForeignLoadSvgBuffer, buf ),
+463 		VIPS_TYPE_BLOB );
+464 }
+465 static void
+466 vips_foreign_load_svg_buffer_init( VipsForeignLoadSvgBuffer *buffer )
+467 {
+468 }
+469 int
+470 vips_svgload( const char *filename, VipsImage **out, ... )
+471 {
+472 	va_list ap;
+473 	int result;
+474 	va_start( ap, out );
+475 	result = vips_call_split( "svgload", ap, filename, out );
+476 	va_end( ap );
+477 	return( result );
+478 }
+479 int
+480 vips_svgload_buffer( void *buf, size_t len, VipsImage **out, ... )
+481 {
+482 	va_list ap;
+483 	VipsBlob *blob;
+484 	int result;
+485 	blob = vips_blob_new( NULL, buf, len );
+486 	va_start( ap, out );
+487 	result = vips_call_split( "svgload_buffer", ap, blob, out );
+488 	va_end( ap );
+489 	vips_area_unref( VIPS_AREA( blob ) );
+490 	return( result );
+491 }
+492 int
+493 vips_svgload_string( const char *str, VipsImage **out, ... )
+494 {
+495 	va_list ap;
+496 	VipsBlob *blob;
+497 	int result;
+498 	blob = vips_blob_copy( (const void *) str, strlen( str ) );
+499 	va_start( ap, out );
+500 	result = vips_call_split( "svgload_buffer", ap, blob, out );
+501 	va_end( ap );
+502 	vips_area_unref( VIPS_AREA( blob ) );
+503 	return( result );
+504 }
+505 int
+506 vips_svgload_source( VipsSource *source, VipsImage **out, ... )
+507 {
+508 	va_list ap;
+509 	int result;
+510 	va_start( ap, out );
+511 	result = vips_call_split( "svgload_source", ap, source, out );
+512 	va_end( ap );
+513 	return( result );
+514 }
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -951,931 +570,639 @@ vips_svgload_source( VipsSource *source, VipsImage **out, ... )
 </h3>
 <hr/>
 <pre>
-/* load with libMagick7
- *
- * 8/7/16
- * 	- from magickload
- * 25/11/16
- * 	- add @n, deprecate @all_frames (just sets n = -1)
- * 24/7/18
- * 	- sniff extra filetypes
- * 4/2/19
- * 	- add profile (xmp, ipct, etc.) read
- */
-
-/*
-
-    This file is part of VIPS.
-    
-    VIPS is free software; you can redistribute it and/or modify
-    it under the terms of the GNU Lesser General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Lesser General Public License for more details.
-
-    You should have received a copy of the GNU Lesser General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
-
- */
-
-/*
-
-    These files are distributed with VIPS - http://www.vips.ecs.soton.ac.uk
-
- */
-
-/*
-#define DEBUG
- */
-
-#ifdef HAVE_CONFIG_H
-#include &lt;config.h&gt;
-#endif /*HAVE_CONFIG_H*/
-#include &lt;vips/intl.h&gt;
-
-#include &lt;stdio.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-
-#include &lt;vips/vips.h&gt;
-#include &lt;vips/buf.h&gt;
-#include &lt;vips/internal.h&gt;
-
-#ifdef ENABLE_MAGICKLOAD
-
-#ifdef HAVE_MAGICK7
-
-#include &lt;MagickCore/MagickCore.h&gt;
-
-#include "magick.h"
-
-typedef struct _VipsForeignLoadMagick7 {
-	VipsForeignLoad parent_object;
-
-	/* Deprecated. Just sets n = -1.
-	 */
-	gboolean all_frames;
-
-	char *density;			/* Load at this resolution */
-	int page;			/* Load this page (frame) */
-	int n;				/* Load this many pages */
-
-	Image *image;
-	ImageInfo *image_info;
-	ExceptionInfo *exception;
-
-	/* Number of pages in image.
-	 */
-	int n_pages;
-
-	int n_frames;			/* Number of frames we will read */
-	Image **frames;			/* An Image* for each frame */
-	CacheView **cache_view; 	/* A CacheView for each frame */
-	int frame_height;	
-
-	/* Mutex to serialise calls to libMagick during threaded read.
-	 */
-	GMutex *lock;
-
-} VipsForeignLoadMagick7;
-
-typedef VipsForeignLoadClass VipsForeignLoadMagick7Class;
-
-G_DEFINE_ABSTRACT_TYPE( VipsForeignLoadMagick7, vips_foreign_load_magick7, 
-	VIPS_TYPE_FOREIGN_LOAD );
-
-#ifdef DEBUG
-static void
-vips_magick7_print_traits( Image *image ) 
-{
-	static const int trait_bits[] = {
-		CopyPixelTrait,
-		UpdatePixelTrait,
-		BlendPixelTrait
-	};
-	static const char *trait_names[] = {
-		"CopyPixelTrait",
-		"UpdatePixelTrait",
-		"BlendPixelTrait"
-	};
-
-	int b; 
-	int i; 
-
-	printf( "vips_magick7_print_traits: channel traits:\n" ); 
-	for( b = 0; b &lt; GetPixelChannels( image ); b++ ) { 
-		PixelChannel channel = 
-			GetPixelChannelChannel( image, b ); 
-		PixelTrait traits = 
-			GetPixelChannelTraits( image, channel );
-		
-		printf( "\t%d) ", b ); 
-		for( i = 0; i &lt; VIPS_NUMBER( trait_bits ); i++ )
-			if( traits &amp; trait_bits[i] )
-				printf( "%s ", trait_names[i] ); 
-		if( traits == 0 )
-			printf( "undefined" ); 
-		printf( "\n" ); 
-	} 
-}
-
-static void
-vips_magick7_print_channel_names( Image *image )
-{
-	static const int pixel_channels[] = {
-		UndefinedPixelChannel, 
-		RedPixelChannel, 
-		CyanPixelChannel, 
-		GrayPixelChannel, 
-		LPixelChannel, 
-		LabelPixelChannel, 
-		YPixelChannel, 
-		aPixelChannel, 
-		GreenPixelChannel, 
-		MagentaPixelChannel, 
-		CbPixelChannel, 
-		bPixelChannel, 
-		BluePixelChannel, 
-		YellowPixelChannel, 
-		CrPixelChannel, 
-		BlackPixelChannel, 
-		AlphaPixelChannel, 
-		IndexPixelChannel, 
-		ReadMaskPixelChannel, 
-		WriteMaskPixelChannel, 
-		MetaPixelChannel, 
-		IntensityPixelChannel, 
-		CompositePixelChannel, 
-		SyncPixelChannel
-	};
-	static const char *pixel_channel_names[] = {
-		"UndefinedPixelChannel", 
-		"RedPixelChannel", 
-		"CyanPixelChannel", 
-		"GrayPixelChannel", 
-		"LPixelChannel", 
-		"LabelPixelChannel", 
-		"YPixelChannel", 
-		"aPixelChannel", 
-		"GreenPixelChannel", 
-		"MagentaPixelChannel", 
-		"CbPixelChannel", 
-		"bPixelChannel", 
-		"BluePixelChannel", 
-		"YellowPixelChannel", 
-		"CrPixelChannel", 
-		"BlackPixelChannel", 
-		"AlphaPixelChannel", 
-		"IndexPixelChannel", 
-		"ReadMaskPixelChannel", 
-		"WriteMaskPixelChannel", 
-		"MetaPixelChannel", 
-		"IntensityPixelChannel", 
-		"CompositePixelChannel", 
-		"SyncPixelChannel", 
-	};
-
-	int b; 
-	int i; 
-
-	printf( "vips_magick7_print_channel_names: channel names:\n" ); 
-	for( b = 0; b &lt; GetPixelChannels( image ); b++ ) { 
-		PixelChannel channel = 
-			GetPixelChannelChannel( image, b ); 
-		
-		printf( "\t%d) ", b ); 
-		for( i = 0; i &lt; VIPS_NUMBER( pixel_channels ); i++ )
-			/* Don't break on found, many channel names repeat.
-			 */
-			if( channel == pixel_channels[i] ) 
-				printf( "%s ", pixel_channel_names[i] );
-		printf( "\n" ); 
-	} 
-}
-
-static void
-vips_magick7_print_image_type( Image *image )
-{
-	static const int image_types[] = {
-		UndefinedType,
-		BilevelType,
-		GrayscaleType,
-		GrayscaleAlphaType, 
-		PaletteType,
-		PaletteAlphaType,
-		TrueColorType,
-		TrueColorAlphaType,
-		ColorSeparationType,
-		ColorSeparationAlphaType,
-		OptimizeType,
-		PaletteBilevelAlphaType
-	};
-
-	static const char *image_type_names[] = {
-		"UndefinedType",
-		"BilevelType",
-		"GrayscaleType",
-		"GrayscaleAlphaType", 
-		"PaletteType",
-		"PaletteAlphaType",
-		"TrueColorType",
-		"TrueColorAlphaType",
-		"ColorSeparationType",
-		"ColorSeparationAlphaType",
-		"OptimizeType",
-		"PaletteBilevelAlphaType"
-	};
-
-	int i;
-
-	for( i = 0; i &lt; VIPS_NUMBER( image_types ); i++ ) 
-		if( GetImageType( image ) == image_types[i] ) {
-			printf( "\t%s\n", image_type_names[i] );
-			break;
-<a name="4"></a>		}
-	if( i == VIPS_NUMBER( image_types ) )
-		printf( "\tunknown GetImageType()\n" ); 
-<font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>}
-#endif /*DEBUG*/
-
-static VipsForeignFlags
-vips_foreign_load_magick7_get_flags_filename( const char *filename )
-{
-	return( VIPS_FOREIGN_PARTIAL );
-}
-
-static VipsForeignFlags
-vips_foreign_load_magick7_get_flags( VipsForeignLoad *load )
-{
-	return( VIPS_FOREIGN_PARTIAL );
-}
-
-static void</b></font>
-vips_foreign_load_magick7_dispose( GObject *gobject )
-{
-	VipsForeignLoadMagick7 *magick7 = (VipsForeignLoadMagick7 *) gobject;
-
-	int i;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_magick7_dispose: %p\n", gobject ); 
-#endif /*DEBUG*/
-
-	for( i = 0; i &lt; magick7-&gt;n_frames; i++ ) {
-		VIPS_FREEF( DestroyCacheView, magick7-&gt;cache_view[i] ); 
-	}
-	VIPS_FREEF( DestroyImageList, magick7-&gt;image );
-	VIPS_FREEF( DestroyImageInfo, magick7-&gt;image_info ); 
-	VIPS_FREE( magick7-&gt;frames );
-	VIPS_FREE( magick7-&gt;cache_view );
-	VIPS_FREEF( magick_destroy_exception, magick7-&gt;exception ); 
-	VIPS_FREEF( vips_g_mutex_free, magick7-&gt;lock );
-
-	G_OBJECT_CLASS( vips_foreign_load_magick7_parent_class )-&gt;
-		dispose( gobject );
-}
-
-static int
-vips_foreign_load_magick7_build( VipsObject *object )
-{
-	VipsForeignLoadMagick7 *magick7 = (VipsForeignLoadMagick7 *) object;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_magick7_build: %p\n", object ); 
-#endif /*DEBUG*/
-
-	magick_genesis();
-
-	magick7-&gt;image_info = CloneImageInfo( NULL );
-	magick7-&gt;exception = magick_acquire_exception();
-	magick7-&gt;lock = vips_g_mutex_new();
-
-	if( !magick7-&gt;image_info ) 
-		return( -1 );
-
-	if( magick7-&gt;all_frames )
-		magick7-&gt;n = -1;
-
-	/* Canvas resolution for rendering vector formats like SVG.
-	 */
-	VIPS_SETSTR( magick7-&gt;image_info-&gt;density, magick7-&gt;density );
-
-	/* When reading DICOM images, we want to ignore any
-	 * window_center/_width setting, since it may put pixels outside the
-	 * 0-65535 range and lose data. 
-	 *
-	 * These window settings are attached as vips metadata, so our caller
-	 * can interpret them if it wants.
-	 */
-  	magick_set_image_option( magick7-&gt;image_info, 
-		"dcm:display-range", "reset" );
-
-	if( magick7-&gt;page &gt; 0 ) 
-		magick_set_number_scenes( magick7-&gt;image_info,
-			magick7-&gt;page, magick7-&gt;n );
-<a name="1"></a>
-	if( VIPS_OBJECT_CLASS( vips_foreign_load_magick7_parent_class )-&gt;
-		build( object ) )
-<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		return( -1 );
-
-	return( 0 );
-}
-
-static void
-vips_foreign_load_magick7_class_init( VipsForeignLoadMagick7Class *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;dispose = vips_foreign_load_magick7_dispose;
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "magickload_base";
-	object_class-&gt;description = _( "load with ImageMagick7" );
-	object_class-&gt;build = vips_foreign_load_magick7_build;
-
-	/* We need to be well to the back of the queue since vips's
-	 * dedicated loaders are usually preferable.
-	 */
-	foreign_class-&gt;priority = -100;
-
-	load_class-&gt;get_flags_filename = 
-		vips_foreign_load_magick7_get_flags_filename;
-	load_class-&gt;get_flags = vips_foreign_load_magick7_get_flags;
-
-	VIPS_ARG_STRING( class, "density", 20,</b></font>
-		_( "Density" ),
-		_( "Canvas resolution for rendering vector formats like SVG" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT,
-		G_STRUCT_OFFSET( VipsForeignLoadMagick7, density ),
-		NULL );
-
-	VIPS_ARG_INT( class, "page", 21,
-		_( "Page" ),
-		_( "Load this page from the file" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT,
-		G_STRUCT_OFFSET( VipsForeignLoadMagick7, page ),
-		0, 100000, 0 );
-
-	VIPS_ARG_INT( class, "n", 22,
-		_( "n" ),
-		_( "Load this many pages" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT,
-		G_STRUCT_OFFSET( VipsForeignLoadMagick7, n ),
-		-1, 100000, 1 );
-
-	VIPS_ARG_BOOL( class, "all_frames", 23, 
-		_( "all_frames" ), 
-		_( "Read all frames from an image" ),
-		VIPS_ARGUMENT_OPTIONAL_INPUT | VIPS_ARGUMENT_DEPRECATED,
-		G_STRUCT_OFFSET( VipsForeignLoadMagick7, all_frames ),
-		FALSE );
-
-}
-
-static void
-vips_foreign_load_magick7_init( VipsForeignLoadMagick7 *magick7 )
-{
-	magick7-&gt;n = 1;
-}
-
-static void
-vips_foreign_load_magick7_error( VipsForeignLoadMagick7 *magick7 )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( magick7 );
-
-	vips_error( class-&gt;nickname, _( "Magick: %s %s" ),
-		magick7-&gt;exception-&gt;reason, 
-		magick7-&gt;exception-&gt;description );
-}
-
-static int
-magick7_get_bands( Image *image )
-{
-	int bands;
-	int i;
-
-	/* We skip all index channels. Lots of images can have these, it's not
-	 * just the palette ones.
-	 */
-	bands = 0;
-	for( i = 0; i &lt; GetPixelChannels( image ); i++ ) { 
-		PixelChannel channel = GetPixelChannelChannel( image, i ); 
-
-		if( channel != IndexPixelChannel ) 
-			bands += 1;
-	} 
-
-	return( bands );
-}
-
-static int
-vips_foreign_load_magick7_parse( VipsForeignLoadMagick7 *magick7, 
-	Image *image, VipsImage *out )
-{
-	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( magick7 );
-
-	const char *key;
-	Image *p;
-
-#ifdef DEBUG
-	printf( "image-&gt;depth = %zd\n", image-&gt;depth ); 
-	printf( "GetImageType() = %d\n", GetImageType( image ) );
-	vips_magick7_print_image_type( image ); 
-	printf( "GetPixelChannels() = %zd\n", GetPixelChannels( image ) ); 
-	printf( "image-&gt;columns = %zd\n", image-&gt;columns ); 
-	printf( "image-&gt;rows = %zd\n", image-&gt;rows ); 
-#endif /*DEBUG*/
-
-	/* Ysize updated below once we have worked out how many frames to load.
-	 */
-	out-&gt;Xsize = image-&gt;columns;
-	out-&gt;Ysize = image-&gt;rows;
-	magick7-&gt;frame_height = image-&gt;rows;
-	out-&gt;Bands = magick7_get_bands( image ); 
-	if( out-&gt;Xsize &lt;= 0 ||
-		out-&gt;Ysize &lt;= 0 ||
-		out-&gt;Bands &lt;= 0 ||
-		out-&gt;Xsize &gt;= VIPS_MAX_COORD ||
-		out-&gt;Ysize &gt;= VIPS_MAX_COORD ||
-		out-&gt;Bands &gt;= VIPS_MAX_COORD ) {
-		vips_error( class-&gt;nickname, 
-			_( "bad image dimensions %d x %d pixels, %d bands" ),
-			out-&gt;Xsize, out-&gt;Ysize, out-&gt;Bands );
-		return( -1 );
-	}
-
-	/* Depth can be 'fractional'. You'd think we should use
-	 * GetImageDepth() but that seems to compute something very complex. 
-	 */
-	out-&gt;BandFmt = -1;
-	if( image-&gt;depth &gt;= 1 &amp;&amp; image-&gt;depth &lt;= 8 ) 
-		out-&gt;BandFmt = VIPS_FORMAT_UCHAR;
-	if( image-&gt;depth &gt;= 9 &amp;&amp; image-&gt;depth &lt;= 16 ) 
-		out-&gt;BandFmt = VIPS_FORMAT_USHORT;
-	if( image-&gt;depth == 32 )
-		out-&gt;BandFmt = VIPS_FORMAT_FLOAT;
-	if( image-&gt;depth == 64 )
-		out-&gt;BandFmt = VIPS_FORMAT_DOUBLE;
-
-	if( out-&gt;BandFmt == -1 ) {
-		vips_error( class-&gt;nickname, 
-			_( "unsupported bit depth %zd" ), image-&gt;depth );
-		return( -1 );
-	}
-
-	switch( image-&gt;colorspace ) {
-	case GRAYColorspace:
-		if( out-&gt;BandFmt == VIPS_FORMAT_USHORT )
-			out-&gt;Type = VIPS_INTERPRETATION_GREY16;
-		else
-			out-&gt;Type = VIPS_INTERPRETATION_B_W;
-		break;
-
-	case sRGBColorspace:
-	case RGBColorspace:
-		if( out-&gt;BandFmt == VIPS_FORMAT_USHORT )
-			out-&gt;Type = VIPS_INTERPRETATION_RGB16;
-		else
-			out-&gt;Type = VIPS_INTERPRETATION_sRGB;
-		break;
-
-	case CMYKColorspace:
-		out-&gt;Type = VIPS_INTERPRETATION_CMYK;
-		break;
-
-	default:
-		vips_error( class-&gt;nickname, 
-			_( "unsupported colorspace %s" ), 
-			magick_ColorspaceType2str( image-&gt;colorspace ) );
-		return( -1 );
-	}
-
-	switch( image-&gt;units ) {
-	case PixelsPerInchResolution:
-		out-&gt;Xres = image-&gt;resolution.x / 25.4;
-		out-&gt;Yres = image-&gt;resolution.y / 25.4;
-		vips_image_set_string( out, VIPS_META_RESOLUTION_UNIT, "in" );
-		break;
-
-	case PixelsPerCentimeterResolution:
-		out-&gt;Xres = image-&gt;resolution.x / 10.0;
-		out-&gt;Yres = image-&gt;resolution.y / 10.0;
-		vips_image_set_string( out, VIPS_META_RESOLUTION_UNIT, "cm" );
-		break;
-
-	default:
-		/* Things like GIF have no resolution info.
-		 */
-		out-&gt;Xres = 1.0;
-		out-&gt;Yres = 1.0;
-		break;
-	}
-
-	/* Other fields.
-	 */
-	out-&gt;Coding = VIPS_CODING_NONE;
-
-	if( vips_image_pipelinev( out, VIPS_DEMAND_STYLE_SMALLTILE, NULL ) )
-		return( -1 );
-
-	/* Get all the string metadata.
-	 */
-	ResetImagePropertyIterator( image );
-	while( (key = GetNextImageProperty( image )) ) {
-		char name_text[256];
-		VipsBuf name = VIPS_BUF_STATIC( name_text );
-		const char *value;
-
-		value = GetImageProperty( image, key, magick7-&gt;exception );
-		if( !value ) {
-			vips_foreign_load_magick7_error( magick7 );
-			return( -1 ); 
-		}
-		vips_buf_appendf( &amp;name, "magick-%s", key );
-		vips_image_set_string( out, vips_buf_all( &amp;name ), value );
-	}
-
-	/* Set vips metadata from ImageMagick profiles.
-	 */
-	if( magick_set_vips_profile( out, image ) )
-		return( -1 );
-
-	magick7-&gt;n_pages = GetImageListLength( GetFirstImageInList( image ) );
-#ifdef DEBUG
-	printf( "image has %d pages\n", magick7-&gt;n_pages );
-#endif /*DEBUG*/
-
-	/* Do we have a set of equal-sized frames? Append them.
-
-	   	FIXME ... there must be an attribute somewhere from dicom read 
-		which says this is a volumetric image
-
-	 */
-	magick7-&gt;n_frames = 0;
-	for( p = image; p; (p = GetNextImageInList( p )) ) {
-		if( p-&gt;columns != (unsigned int) out-&gt;Xsize ||
-			p-&gt;rows != (unsigned int) out-&gt;Ysize ||
-			magick7_get_bands( p ) != out-&gt;Bands ||
-			p-&gt;depth != image-&gt;depth ) {
-#ifdef DEBUG
-			printf( "frame %d differs\n", magick7-&gt;n_frames );
-			printf( "%zdx%zd, %d bands\n", 
-				p-&gt;columns, p-&gt;rows, magick7_get_bands( p ) );
-			printf( "first frame is %dx%d, %d bands\n", 
-				out-&gt;Xsize, out-&gt;Ysize, out-&gt;Bands );
-#endif /*DEBUG*/
-
-			break;
-		}
-
-		magick7-&gt;n_frames += 1;
-	}
-	if( p ) 
-		/* Nope ... just do the first image in the list.
-		 */
-		magick7-&gt;n_frames = 1;
-
-#ifdef DEBUG
-	printf( "will read %d frames\n", magick7-&gt;n_frames );
-#endif /*DEBUG*/
-
-	if( magick7-&gt;n != -1 )
-		magick7-&gt;n_frames = VIPS_MIN( magick7-&gt;n_frames, magick7-&gt;n );
-
-	/* So we can finally set the height.
-	 */
-	if( vips_object_argument_isset( VIPS_OBJECT( magick7 ), "n" ) ) {
-		vips_image_set_int( out, VIPS_META_PAGE_HEIGHT, out-&gt;Ysize );
-		out-&gt;Ysize *= magick7-&gt;n_frames;
-	}
-
-	vips_image_set_int( out, VIPS_META_N_PAGES, magick7-&gt;n_pages );
-
-	return( 0 );
-}
-
-/* We don't bother with GetPixelReadMask(), assume it's everywhere. Don't
- * bother with traits, assume that's always updated.
- *
- * We do skip index channels. Palette images add extra index channels
- * containing the index value from the file before colourmap lookup.
- */
-#define UNPACK( TYPE ) { \
-	TYPE * restrict tq = (TYPE *) q; \
-	int x; \
-	int b; \
-	\
-	for( x = 0; x &lt; r-&gt;width; x++ ) { \
-		for( b = 0; b &lt; GetPixelChannels( image ); b++ ) { \
-			PixelChannel channel = \
-				GetPixelChannelChannel( image, b ); \
-			\
-			if( channel != IndexPixelChannel ) \
-				*tq++ = p[b]; \
-		} \
-		\
-		p += GetPixelChannels( image ); \
-	} \
-}
-
-static int
-vips_foreign_load_magick7_fill_region( VipsRegion *or, 
-	void *seq, void *a, void *b, gboolean *stop )
-{
-	VipsForeignLoadMagick7 *magick7 = (VipsForeignLoadMagick7 *) a;
-	VipsRect *r = &amp;or-&gt;valid;
-	VipsImage *im = or-&gt;im;
-
-	int y;
-
-	for( y = 0; y &lt; r-&gt;height; y++ ) {
-		int top = r-&gt;top + y;
-		int frame = top / magick7-&gt;frame_height;
-		int line = top % magick7-&gt;frame_height;
-		Image *image = magick7-&gt;frames[frame];
-
-		Quantum * restrict p;
-		VipsPel * restrict q;
-
-		g_mutex_lock( magick7-&gt;lock );
-		p = GetCacheViewAuthenticPixels( magick7-&gt;cache_view[frame],
-			r-&gt;left, line, r-&gt;width, 1, 
-			magick7-&gt;exception );
-		g_mutex_unlock( magick7-&gt;lock );
-
-		if( !p ) 
-			/* This can happen if, for example, some frames of a
-			 * gif are shorter than others. It's not always
-			 * an error.
-			 */
-			continue;
-
-		q = VIPS_REGION_ADDR( or, r-&gt;left, top ); 
-
-		switch( im-&gt;BandFmt ) {
-		case VIPS_FORMAT_UCHAR:
-			UNPACK( unsigned char ); 
-			break;
-
-		case VIPS_FORMAT_USHORT:
-			UNPACK( unsigned short ); 
-			break;
-
-		case VIPS_FORMAT_FLOAT:
-			UNPACK( float ); 
-			break;
-
-		case VIPS_FORMAT_DOUBLE:
-			UNPACK( double ); 
-			break;
-
-		default:
-			g_assert_not_reached();
-		}
-	}
-
-	return( 0 );
-}
-
-static int
-vips_foreign_load_magick7_load( VipsForeignLoadMagick7 *magick7 )
-{
-	VipsForeignLoad *load = (VipsForeignLoad *) magick7;
-
-	Image *p;
-	int i;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_magick7_load: %p\n", magick7 ); 
-#endif /*DEBUG*/
-
-	if( vips_foreign_load_magick7_parse( magick7, 
-		magick7-&gt;image, load-&gt;out ) )
-		return( -1 );
-
-	/* Record frame pointers.
-	 */
-	g_assert( !magick7-&gt;frames ); 
-	if( !(magick7-&gt;frames = 
-		VIPS_ARRAY( NULL, magick7-&gt;n_frames, Image * )) )
-		return( -1 );
-	p = magick7-&gt;image;
-	for( i = 0; i &lt; magick7-&gt;n_frames; i++ ) {
-		magick7-&gt;frames[i] = p;
-		p = GetNextImageInList( p );
-	}
-
-	/* And a cache_view for each frame.
-	 */
-	g_assert( !magick7-&gt;cache_view ); 
-	if( !(magick7-&gt;cache_view = VIPS_ARRAY( NULL, 
-		magick7-&gt;n_frames, CacheView * )) )
-		return( -1 );
-	for( i = 0; i &lt; magick7-&gt;n_frames; i++ ) {
-		magick7-&gt;cache_view[i] = AcquireAuthenticCacheView( 
-			magick7-&gt;frames[i], magick7-&gt;exception );
-	}
-
-#ifdef DEBUG
-	/* Only display the traits from frame0, they should all be the same.
-	 */
-	vips_magick7_print_traits( magick7-&gt;frames[0] ); 
-	vips_magick7_print_channel_names( magick7-&gt;frames[0] );
-#endif /*DEBUG*/
-
-	if( vips_image_generate( load-&gt;out, 
-		NULL, vips_foreign_load_magick7_fill_region, NULL, 
-		magick7, NULL ) )
-<a name="3"></a>		return( -1 );
-
-	return( 0 );
-<font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>}
-
-typedef struct _VipsForeignLoadMagick7File {
-	VipsForeignLoadMagick7 parent_object;
-
-	char *filename; 
-
-} VipsForeignLoadMagick7File;
-
-typedef VipsForeignLoadMagick7Class VipsForeignLoadMagick7FileClass;
-
-G_DEFINE_TYPE( VipsForeignLoadMagick7File, vips_foreign_load_magick7_file, 
-	vips_foreign_load_magick7_get_type() );
-
-static gboolean
-ismagick7( const char *filename )
-{
-	/* Fetch up to the first 100 bytes. Hopefully that'll be enough.
-	 */
-	unsigned char buf[100];</b></font>
-	int len;
-
-	return( (len = vips__get_bytes( filename, buf, 100 )) &gt; 10 &amp;&amp;
-		magick_ismagick( buf, len ) );
-}
-
-static int
-vips_foreign_load_magick7_file_header( VipsForeignLoad *load )
-{
-	VipsForeignLoadMagick7 *magick7 = (VipsForeignLoadMagick7 *) load;
-	VipsForeignLoadMagick7File *file = (VipsForeignLoadMagick7File *) load;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_magick7_file_header: %p\n", load ); 
-#endif /*DEBUG*/
-
-	vips_strncpy( magick7-&gt;image_info-&gt;filename, file-&gt;filename, 
-		MagickPathExtent );
-
-	magick_sniff_file( magick7-&gt;image_info, file-&gt;filename );
-
-	/* It would be great if we could PingImage and just read the header,
-	 * but sadly many IM coders do not support ping. The critical one for
-	 * us is DICOM.
-	 * 
-	 * We have to read the whole image in _header.
-	 */
-	magick7-&gt;image = ReadImage( magick7-&gt;image_info, magick7-&gt;exception );
-	if( !magick7-&gt;image ) {
-		vips_foreign_load_magick7_error( magick7 ); 
-		return( -1 );
-	}
-
-	if( vips_foreign_load_magick7_load( magick7 ) )
-		return( -1 );
-
-	VIPS_SETSTR( load-&gt;out-&gt;filename, file-&gt;filename );
-
-	return( 0 );
-}
-
-static void
-<a name="0"></a>vips_foreign_load_magick7_file_class_init( 
-	VipsForeignLoadMagick7FileClass *class )
-{
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "magickload";
-	object_class-&gt;description = _( "load file with ImageMagick7" );
-
-	load_class-&gt;is_a = ismagick7;
-	load_class-&gt;header = vips_foreign_load_magick7_file_header;
-
-	VIPS_ARG_STRING( class, "filename", 1, 
-		_( "Filename" ),
-		_( "Filename to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadMagick7File, filename ),
-		NULL );
-
-}
-
-static void
-vips_foreign_load_magick7_file_init( VipsForeignLoadMagick7File *magick7_file )
-{
-}
-
-typedef struct _VipsForeignLoadMagick7Buffer {
-	VipsForeignLoadMagick7 parent_object;
-
-	VipsArea *buf;
-
-} VipsForeignLoadMagick7Buffer;
-
-typedef VipsForeignLoadMagick7Class VipsForeignLoadMagick7BufferClass;
-
-G_DEFINE_TYPE( VipsForeignLoadMagick7Buffer, vips_foreign_load_magick7_buffer, 
-	vips_foreign_load_magick7_get_type() );
-
-static gboolean</b></font>
-vips_foreign_load_magick7_buffer_is_a_buffer( const void *buf, size_t len )
-{
-	return( len &gt; 10 &amp;&amp; magick_ismagick( (const unsigned char *) buf, len ) );
-}
-
-static int
-vips_foreign_load_magick7_buffer_header( VipsForeignLoad *load )
-{
-	VipsForeignLoadMagick7 *magick7 = (VipsForeignLoadMagick7 *) load;
-	VipsForeignLoadMagick7Buffer *magick7_buffer = 
-		(VipsForeignLoadMagick7Buffer *) load;
-
-#ifdef DEBUG
-	printf( "vips_foreign_load_magick7_buffer_header: %p\n", load ); 
-#endif /*DEBUG*/
-
-	/* It would be great if we could PingBlob and just read the header,
-	 * but sadly many IM coders do not support ping. The critical one for
-	 * us is DICOM.
-	 * 
-	 * We have to read the whole image in _header.
-	 */
-	magick_sniff_bytes( magick7-&gt;image_info, 
-		magick7_buffer-&gt;buf-&gt;data, magick7_buffer-&gt;buf-&gt;length );
-	magick7-&gt;image = BlobToImage( magick7-&gt;image_info, 
-		magick7_buffer-&gt;buf-&gt;data, magick7_buffer-&gt;buf-&gt;length,
-		magick7-&gt;exception );
-	if( !magick7-&gt;image ) {
-		vips_foreign_load_magick7_error( magick7 ); 
-<a name="2"></a>		return( -1 );
-	}
-
-<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if( vips_foreign_load_magick7_load( magick7 ) )
-		return( -1 );
-
-	return( 0 );
-}
-
-static void
-vips_foreign_load_magick7_buffer_class_init( 
-	VipsForeignLoadMagick7BufferClass *class )
-{
-	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
-	VipsObjectClass *object_class = (VipsObjectClass *) class;
-	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
-
-	gobject_class-&gt;set_property = vips_object_set_property;
-	gobject_class-&gt;get_property = vips_object_get_property;
-
-	object_class-&gt;nickname = "magickload_buffer";
-	object_class-&gt;description = _( "load buffer with ImageMagick7" );
-
-	load_class-&gt;is_a_buffer = vips_foreign_load_magick7_buffer_is_a_buffer;
-	load_class-&gt;header = vips_foreign_load_magick7_buffer_header;</b></font>
-
-	VIPS_ARG_BOXED( class, "buffer", 1, 
-		_( "Buffer" ),
-		_( "Buffer to load from" ),
-		VIPS_ARGUMENT_REQUIRED_INPUT, 
-		G_STRUCT_OFFSET( VipsForeignLoadMagick7Buffer, buf ),
-		VIPS_TYPE_BLOB );
-
-}
-
-static void
-vips_foreign_load_magick7_buffer_init( VipsForeignLoadMagick7Buffer *buffer )
-{
-}
-
-#endif /*HAVE_MAGICK7*/
-
-#endif /*ENABLE_MAGICKLOAD*/
+1 #ifdef HAVE_CONFIG_H
+2 #include &lt;config.h&gt;
+3 #include &lt;vips/intl.h&gt;
+4 #include &lt;stdio.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;vips/vips.h&gt;
+8 #include &lt;vips/buf.h&gt;
+9 #include &lt;vips/internal.h&gt;
+10 #ifdef ENABLE_MAGICKLOAD
+11 #ifdef HAVE_MAGICK7
+12 #include &lt;MagickCore/MagickCore.h&gt;
+13 #include "magick.h"
+14 typedef struct _VipsForeignLoadMagick7 {
+15 	VipsForeignLoad parent_object;
+16 	gboolean all_frames;
+17 	char *density;				int page;				int n;				
+18 	Image *image;
+19 	ImageInfo *image_info;
+20 	ExceptionInfo *exception;
+21 	int n_pages;
+22 	int n_frames;				Image **frames;				CacheView **cache_view; 		int frame_height;	
+23 	GMutex *lock;
+24 } VipsForeignLoadMagick7;
+25 typedef VipsForeignLoadClass VipsForeignLoadMagick7Class;
+26 G_DEFINE_ABSTRACT_TYPE( VipsForeignLoadMagick7, vips_foreign_load_magick7, 
+27 	VIPS_TYPE_FOREIGN_LOAD );
+28 #ifdef DEBUG
+29 static void
+30 vips_magick7_print_traits( Image *image ) 
+31 {
+32 	static const int trait_bits[] = {
+33 		CopyPixelTrait,
+34 		UpdatePixelTrait,
+35 		BlendPixelTrait
+36 	};
+37 	static const char *trait_names[] = {
+38 		"CopyPixelTrait",
+39 		"UpdatePixelTrait",
+40 		"BlendPixelTrait"
+41 	};
+42 	int b; 
+43 	int i; 
+44 	printf( "vips_magick7_print_traits: channel traits:\n" ); 
+45 	for( b = 0; b &lt; GetPixelChannels( image ); b++ ) { 
+46 		PixelChannel channel = 
+47 			GetPixelChannelChannel( image, b ); 
+48 		PixelTrait traits = 
+49 			GetPixelChannelTraits( image, channel );
+50 		printf( "\t%d) ", b ); 
+51 		for( i = 0; i &lt; VIPS_NUMBER( trait_bits ); i++ )
+52 			if( traits &amp; trait_bits[i] )
+53 				printf( "%s ", trait_names[i] ); 
+54 		if( traits == 0 )
+55 			printf( "undefined" ); 
+56 		printf( "\n" ); 
+57 	} 
+58 }
+59 static void
+60 vips_magick7_print_channel_names( Image *image )
+61 {
+62 	static const int pixel_channels[] = {
+63 		UndefinedPixelChannel, 
+64 		RedPixelChannel, 
+65 		CyanPixelChannel, 
+66 		GrayPixelChannel, 
+67 		LPixelChannel, 
+68 		LabelPixelChannel, 
+69 		YPixelChannel, 
+70 		aPixelChannel, 
+71 		GreenPixelChannel, 
+72 		MagentaPixelChannel, 
+73 		CbPixelChannel, 
+74 		bPixelChannel, 
+75 		BluePixelChannel, 
+76 		YellowPixelChannel, 
+77 		CrPixelChannel, 
+78 		BlackPixelChannel, 
+79 		AlphaPixelChannel, 
+80 		IndexPixelChannel, 
+81 		ReadMaskPixelChannel, 
+82 		WriteMaskPixelChannel, 
+83 		MetaPixelChannel, 
+84 		IntensityPixelChannel, 
+85 		CompositePixelChannel, 
+86 		SyncPixelChannel
+87 	};
+88 	static const char *pixel_channel_names[] = {
+89 		"UndefinedPixelChannel", 
+90 		"RedPixelChannel", 
+91 		"CyanPixelChannel", 
+92 		"GrayPixelChannel", 
+93 		"LPixelChannel", 
+94 		"LabelPixelChannel", 
+95 		"YPixelChannel", 
+96 		"aPixelChannel", 
+97 		"GreenPixelChannel", 
+98 		"MagentaPixelChannel", 
+99 		"CbPixelChannel", 
+100 		"bPixelChannel", 
+101 		"BluePixelChannel", 
+102 		"YellowPixelChannel", 
+103 		"CrPixelChannel", 
+104 		"BlackPixelChannel", 
+105 		"AlphaPixelChannel", 
+106 		"IndexPixelChannel", 
+107 		"ReadMaskPixelChannel", 
+108 		"WriteMaskPixelChannel", 
+109 		"MetaPixelChannel", 
+110 		"IntensityPixelChannel", 
+111 		"CompositePixelChannel", 
+112 		"SyncPixelChannel", 
+113 	};
+114 	int b; 
+115 	int i; 
+116 	printf( "vips_magick7_print_channel_names: channel names:\n" ); 
+117 	for( b = 0; b &lt; GetPixelChannels( image ); b++ ) { 
+118 		PixelChannel channel = 
+119 			GetPixelChannelChannel( image, b ); 
+120 		printf( "\t%d) ", b ); 
+121 		for( i = 0; i &lt; VIPS_NUMBER( pixel_channels ); i++ )
+122 			if( channel == pixel_channels[i] ) 
+123 				printf( "%s ", pixel_channel_names[i] );
+124 		printf( "\n" ); 
+125 	} 
+126 }
+127 static void
+128 vips_magick7_print_image_type( Image *image )
+129 {
+130 	static const int image_types[] = {
+131 		UndefinedType,
+132 		BilevelType,
+133 		GrayscaleType,
+134 		GrayscaleAlphaType, 
+135 		PaletteType,
+136 		PaletteAlphaType,
+137 		TrueColorType,
+138 		TrueColorAlphaType,
+139 		ColorSeparationType,
+140 		ColorSeparationAlphaType,
+141 		OptimizeType,
+142 		PaletteBilevelAlphaType
+143 	};
+144 	static const char *image_type_names[] = {
+145 		"UndefinedType",
+146 		"BilevelType",
+147 		"GrayscaleType",
+148 		"GrayscaleAlphaType", 
+149 		"PaletteType",
+150 		"PaletteAlphaType",
+151 		"TrueColorType",
+152 		"TrueColorAlphaType",
+153 		"ColorSeparationType",
+154 		"ColorSeparationAlphaType",
+155 		"OptimizeType",
+156 		"PaletteBilevelAlphaType"
+157 	};
+158 	int i;
+159 	for( i = 0; i &lt; VIPS_NUMBER( image_types ); i++ ) 
+160 		if( GetImageType( image ) == image_types[i] ) {
+161 			printf( "\t%s\n", image_type_names[i] );
+162 			break;
+163 <a name="4"></a>		}
+164 	if( i == VIPS_NUMBER( image_types ) )
+165 		printf( "\tunknown GetImageType()\n" ); 
+166 <font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>}
+167 static VipsForeignFlags
+168 vips_foreign_load_magick7_get_flags_filename( const char *filename )
+169 {
+170 	return( VIPS_FOREIGN_PARTIAL );
+171 }
+172 static VipsForeignFlags
+173 vips_foreign_load_magick7_get_flags( VipsForeignLoad *load )
+174 {
+175 	return( VIPS_FOREIGN_PARTIAL );
+176 }
+177 static void</b></font>
+178 vips_foreign_load_magick7_dispose( GObject *gobject )
+179 {
+180 	VipsForeignLoadMagick7 *magick7 = (VipsForeignLoadMagick7 *) gobject;
+181 	int i;
+182 #ifdef DEBUG
+183 	printf( "vips_foreign_load_magick7_dispose: %p\n", gobject ); 
+184 	for( i = 0; i &lt; magick7-&gt;n_frames; i++ ) {
+185 		VIPS_FREEF( DestroyCacheView, magick7-&gt;cache_view[i] ); 
+186 	}
+187 	VIPS_FREEF( DestroyImageList, magick7-&gt;image );
+188 	VIPS_FREEF( DestroyImageInfo, magick7-&gt;image_info ); 
+189 	VIPS_FREE( magick7-&gt;frames );
+190 	VIPS_FREE( magick7-&gt;cache_view );
+191 	VIPS_FREEF( magick_destroy_exception, magick7-&gt;exception ); 
+192 	VIPS_FREEF( vips_g_mutex_free, magick7-&gt;lock );
+193 	G_OBJECT_CLASS( vips_foreign_load_magick7_parent_class )-&gt;
+194 		dispose( gobject );
+195 }
+196 static int
+197 vips_foreign_load_magick7_build( VipsObject *object )
+198 {
+199 	VipsForeignLoadMagick7 *magick7 = (VipsForeignLoadMagick7 *) object;
+200 #ifdef DEBUG
+201 	printf( "vips_foreign_load_magick7_build: %p\n", object ); 
+202 	magick_genesis();
+203 	magick7-&gt;image_info = CloneImageInfo( NULL );
+204 	magick7-&gt;exception = magick_acquire_exception();
+205 	magick7-&gt;lock = vips_g_mutex_new();
+206 	if( !magick7-&gt;image_info ) 
+207 		return( -1 );
+208 	if( magick7-&gt;all_frames )
+209 		magick7-&gt;n = -1;
+210 	VIPS_SETSTR( magick7-&gt;image_info-&gt;density, magick7-&gt;density );
+211   	magick_set_image_option( magick7-&gt;image_info, 
+212 		"dcm:display-range", "reset" );
+213 	if( magick7-&gt;page &gt; 0 ) 
+214 		magick_set_number_scenes( magick7-&gt;image_info,
+215 			magick7-&gt;page, magick7-&gt;n );
+216 <a name="1"></a>
+217 	if( VIPS_OBJECT_CLASS( vips_foreign_load_magick7_parent_class )-&gt;
+218 		build( object ) )
+219 <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>		return( -1 );
+220 	return( 0 );
+221 }
+222 static void
+223 vips_foreign_load_magick7_class_init( VipsForeignLoadMagick7Class *class )
+224 {
+225 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+226 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+227 	VipsForeignClass *foreign_class = (VipsForeignClass *) class;
+228 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+229 	gobject_class-&gt;dispose = vips_foreign_load_magick7_dispose;
+230 	gobject_class-&gt;set_property = vips_object_set_property;
+231 	gobject_class-&gt;get_property = vips_object_get_property;
+232 	object_class-&gt;nickname = "magickload_base";
+233 	object_class-&gt;description = _( "load with ImageMagick7" );
+234 	object_class-&gt;build = vips_foreign_load_magick7_build;
+235 	foreign_class-&gt;priority = -100;
+236 	load_class-&gt;get_flags_filename = 
+237 		vips_foreign_load_magick7_get_flags_filename;
+238 	load_class-&gt;get_flags = vips_foreign_load_magick7_get_flags;
+239 	VIPS_ARG_STRING( class, "density", 20,</b></font>
+240 		_( "Density" ),
+241 		_( "Canvas resolution for rendering vector formats like SVG" ),
+242 		VIPS_ARGUMENT_OPTIONAL_INPUT,
+243 		G_STRUCT_OFFSET( VipsForeignLoadMagick7, density ),
+244 		NULL );
+245 	VIPS_ARG_INT( class, "page", 21,
+246 		_( "Page" ),
+247 		_( "Load this page from the file" ),
+248 		VIPS_ARGUMENT_OPTIONAL_INPUT,
+249 		G_STRUCT_OFFSET( VipsForeignLoadMagick7, page ),
+250 		0, 100000, 0 );
+251 	VIPS_ARG_INT( class, "n", 22,
+252 		_( "n" ),
+253 		_( "Load this many pages" ),
+254 		VIPS_ARGUMENT_OPTIONAL_INPUT,
+255 		G_STRUCT_OFFSET( VipsForeignLoadMagick7, n ),
+256 		-1, 100000, 1 );
+257 	VIPS_ARG_BOOL( class, "all_frames", 23, 
+258 		_( "all_frames" ), 
+259 		_( "Read all frames from an image" ),
+260 		VIPS_ARGUMENT_OPTIONAL_INPUT | VIPS_ARGUMENT_DEPRECATED,
+261 		G_STRUCT_OFFSET( VipsForeignLoadMagick7, all_frames ),
+262 		FALSE );
+263 }
+264 static void
+265 vips_foreign_load_magick7_init( VipsForeignLoadMagick7 *magick7 )
+266 {
+267 	magick7-&gt;n = 1;
+268 }
+269 static void
+270 vips_foreign_load_magick7_error( VipsForeignLoadMagick7 *magick7 )
+271 {
+272 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( magick7 );
+273 	vips_error( class-&gt;nickname, _( "Magick: %s %s" ),
+274 		magick7-&gt;exception-&gt;reason, 
+275 		magick7-&gt;exception-&gt;description );
+276 }
+277 static int
+278 magick7_get_bands( Image *image )
+279 {
+280 	int bands;
+281 	int i;
+282 	bands = 0;
+283 	for( i = 0; i &lt; GetPixelChannels( image ); i++ ) { 
+284 		PixelChannel channel = GetPixelChannelChannel( image, i ); 
+285 		if( channel != IndexPixelChannel ) 
+286 			bands += 1;
+287 	} 
+288 	return( bands );
+289 }
+290 static int
+291 vips_foreign_load_magick7_parse( VipsForeignLoadMagick7 *magick7, 
+292 	Image *image, VipsImage *out )
+293 {
+294 	VipsObjectClass *class = VIPS_OBJECT_GET_CLASS( magick7 );
+295 	const char *key;
+296 	Image *p;
+297 #ifdef DEBUG
+298 	printf( "image-&gt;depth = %zd\n", image-&gt;depth ); 
+299 	printf( "GetImageType() = %d\n", GetImageType( image ) );
+300 	vips_magick7_print_image_type( image ); 
+301 	printf( "GetPixelChannels() = %zd\n", GetPixelChannels( image ) ); 
+302 	printf( "image-&gt;columns = %zd\n", image-&gt;columns ); 
+303 	printf( "image-&gt;rows = %zd\n", image-&gt;rows ); 
+304 	out-&gt;Xsize = image-&gt;columns;
+305 	out-&gt;Ysize = image-&gt;rows;
+306 	magick7-&gt;frame_height = image-&gt;rows;
+307 	out-&gt;Bands = magick7_get_bands( image ); 
+308 	if( out-&gt;Xsize &lt;= 0 ||
+309 		out-&gt;Ysize &lt;= 0 ||
+310 		out-&gt;Bands &lt;= 0 ||
+311 		out-&gt;Xsize &gt;= VIPS_MAX_COORD ||
+312 		out-&gt;Ysize &gt;= VIPS_MAX_COORD ||
+313 		out-&gt;Bands &gt;= VIPS_MAX_COORD ) {
+314 		vips_error( class-&gt;nickname, 
+315 			_( "bad image dimensions %d x %d pixels, %d bands" ),
+316 			out-&gt;Xsize, out-&gt;Ysize, out-&gt;Bands );
+317 		return( -1 );
+318 	}
+319 	out-&gt;BandFmt = -1;
+320 	if( image-&gt;depth &gt;= 1 &amp;&amp; image-&gt;depth &lt;= 8 ) 
+321 		out-&gt;BandFmt = VIPS_FORMAT_UCHAR;
+322 	if( image-&gt;depth &gt;= 9 &amp;&amp; image-&gt;depth &lt;= 16 ) 
+323 		out-&gt;BandFmt = VIPS_FORMAT_USHORT;
+324 	if( image-&gt;depth == 32 )
+325 		out-&gt;BandFmt = VIPS_FORMAT_FLOAT;
+326 	if( image-&gt;depth == 64 )
+327 		out-&gt;BandFmt = VIPS_FORMAT_DOUBLE;
+328 	if( out-&gt;BandFmt == -1 ) {
+329 		vips_error( class-&gt;nickname, 
+330 			_( "unsupported bit depth %zd" ), image-&gt;depth );
+331 		return( -1 );
+332 	}
+333 	switch( image-&gt;colorspace ) {
+334 	case GRAYColorspace:
+335 		if( out-&gt;BandFmt == VIPS_FORMAT_USHORT )
+336 			out-&gt;Type = VIPS_INTERPRETATION_GREY16;
+337 		else
+338 			out-&gt;Type = VIPS_INTERPRETATION_B_W;
+339 		break;
+340 	case sRGBColorspace:
+341 	case RGBColorspace:
+342 		if( out-&gt;BandFmt == VIPS_FORMAT_USHORT )
+343 			out-&gt;Type = VIPS_INTERPRETATION_RGB16;
+344 		else
+345 			out-&gt;Type = VIPS_INTERPRETATION_sRGB;
+346 		break;
+347 	case CMYKColorspace:
+348 		out-&gt;Type = VIPS_INTERPRETATION_CMYK;
+349 		break;
+350 	default:
+351 		vips_error( class-&gt;nickname, 
+352 			_( "unsupported colorspace %s" ), 
+353 			magick_ColorspaceType2str( image-&gt;colorspace ) );
+354 		return( -1 );
+355 	}
+356 	switch( image-&gt;units ) {
+357 	case PixelsPerInchResolution:
+358 		out-&gt;Xres = image-&gt;resolution.x / 25.4;
+359 		out-&gt;Yres = image-&gt;resolution.y / 25.4;
+360 		vips_image_set_string( out, VIPS_META_RESOLUTION_UNIT, "in" );
+361 		break;
+362 	case PixelsPerCentimeterResolution:
+363 		out-&gt;Xres = image-&gt;resolution.x / 10.0;
+364 		out-&gt;Yres = image-&gt;resolution.y / 10.0;
+365 		vips_image_set_string( out, VIPS_META_RESOLUTION_UNIT, "cm" );
+366 		break;
+367 	default:
+368 		out-&gt;Xres = 1.0;
+369 		out-&gt;Yres = 1.0;
+370 		break;
+371 	}
+372 	out-&gt;Coding = VIPS_CODING_NONE;
+373 	if( vips_image_pipelinev( out, VIPS_DEMAND_STYLE_SMALLTILE, NULL ) )
+374 		return( -1 );
+375 	ResetImagePropertyIterator( image );
+376 	while( (key = GetNextImageProperty( image )) ) {
+377 		char name_text[256];
+378 		VipsBuf name = VIPS_BUF_STATIC( name_text );
+379 		const char *value;
+380 		value = GetImageProperty( image, key, magick7-&gt;exception );
+381 		if( !value ) {
+382 			vips_foreign_load_magick7_error( magick7 );
+383 			return( -1 ); 
+384 		}
+385 		vips_buf_appendf( &amp;name, "magick-%s", key );
+386 		vips_image_set_string( out, vips_buf_all( &amp;name ), value );
+387 	}
+388 	if( magick_set_vips_profile( out, image ) )
+389 		return( -1 );
+390 	magick7-&gt;n_pages = GetImageListLength( GetFirstImageInList( image ) );
+391 #ifdef DEBUG
+392 	printf( "image has %d pages\n", magick7-&gt;n_pages );
+393 	magick7-&gt;n_frames = 0;
+394 	for( p = image; p; (p = GetNextImageInList( p )) ) {
+395 		if( p-&gt;columns != (unsigned int) out-&gt;Xsize ||
+396 			p-&gt;rows != (unsigned int) out-&gt;Ysize ||
+397 			magick7_get_bands( p ) != out-&gt;Bands ||
+398 			p-&gt;depth != image-&gt;depth ) {
+399 #ifdef DEBUG
+400 			printf( "frame %d differs\n", magick7-&gt;n_frames );
+401 			printf( "%zdx%zd, %d bands\n", 
+402 				p-&gt;columns, p-&gt;rows, magick7_get_bands( p ) );
+403 			printf( "first frame is %dx%d, %d bands\n", 
+404 				out-&gt;Xsize, out-&gt;Ysize, out-&gt;Bands );
+405 			break;
+406 		}
+407 		magick7-&gt;n_frames += 1;
+408 	}
+409 	if( p ) 
+410 		magick7-&gt;n_frames = 1;
+411 #ifdef DEBUG
+412 	printf( "will read %d frames\n", magick7-&gt;n_frames );
+413 	if( magick7-&gt;n != -1 )
+414 		magick7-&gt;n_frames = VIPS_MIN( magick7-&gt;n_frames, magick7-&gt;n );
+415 	if( vips_object_argument_isset( VIPS_OBJECT( magick7 ), "n" ) ) {
+416 		vips_image_set_int( out, VIPS_META_PAGE_HEIGHT, out-&gt;Ysize );
+417 		out-&gt;Ysize *= magick7-&gt;n_frames;
+418 	}
+419 	vips_image_set_int( out, VIPS_META_N_PAGES, magick7-&gt;n_pages );
+420 	return( 0 );
+421 }
+422 #define UNPACK( TYPE ) { \
+423 	TYPE * restrict tq = (TYPE *) q; \
+424 	int x; \
+425 	int b; \
+426 	\
+427 	for( x = 0; x &lt; r-&gt;width; x++ ) { \
+428 		for( b = 0; b &lt; GetPixelChannels( image ); b++ ) { \
+429 			PixelChannel channel = \
+430 				GetPixelChannelChannel( image, b ); \
+431 			\
+432 			if( channel != IndexPixelChannel ) \
+433 				*tq++ = p[b]; \
+434 		} \
+435 		\
+436 		p += GetPixelChannels( image ); \
+437 	} \
+438 }
+439 static int
+440 vips_foreign_load_magick7_fill_region( VipsRegion *or, 
+441 	void *seq, void *a, void *b, gboolean *stop )
+442 {
+443 	VipsForeignLoadMagick7 *magick7 = (VipsForeignLoadMagick7 *) a;
+444 	VipsRect *r = &amp;or-&gt;valid;
+445 	VipsImage *im = or-&gt;im;
+446 	int y;
+447 	for( y = 0; y &lt; r-&gt;height; y++ ) {
+448 		int top = r-&gt;top + y;
+449 		int frame = top / magick7-&gt;frame_height;
+450 		int line = top % magick7-&gt;frame_height;
+451 		Image *image = magick7-&gt;frames[frame];
+452 		Quantum * restrict p;
+453 		VipsPel * restrict q;
+454 		g_mutex_lock( magick7-&gt;lock );
+455 		p = GetCacheViewAuthenticPixels( magick7-&gt;cache_view[frame],
+456 			r-&gt;left, line, r-&gt;width, 1, 
+457 			magick7-&gt;exception );
+458 		g_mutex_unlock( magick7-&gt;lock );
+459 		if( !p ) 
+460 			continue;
+461 		q = VIPS_REGION_ADDR( or, r-&gt;left, top ); 
+462 		switch( im-&gt;BandFmt ) {
+463 		case VIPS_FORMAT_UCHAR:
+464 			UNPACK( unsigned char ); 
+465 			break;
+466 		case VIPS_FORMAT_USHORT:
+467 			UNPACK( unsigned short ); 
+468 			break;
+469 		case VIPS_FORMAT_FLOAT:
+470 			UNPACK( float ); 
+471 			break;
+472 		case VIPS_FORMAT_DOUBLE:
+473 			UNPACK( double ); 
+474 			break;
+475 		default:
+476 			g_assert_not_reached();
+477 		}
+478 	}
+479 	return( 0 );
+480 }
+481 static int
+482 vips_foreign_load_magick7_load( VipsForeignLoadMagick7 *magick7 )
+483 {
+484 	VipsForeignLoad *load = (VipsForeignLoad *) magick7;
+485 	Image *p;
+486 	int i;
+487 #ifdef DEBUG
+488 	printf( "vips_foreign_load_magick7_load: %p\n", magick7 ); 
+489 	if( vips_foreign_load_magick7_parse( magick7, 
+490 		magick7-&gt;image, load-&gt;out ) )
+491 		return( -1 );
+492 	g_assert( !magick7-&gt;frames ); 
+493 	if( !(magick7-&gt;frames = 
+494 		VIPS_ARRAY( NULL, magick7-&gt;n_frames, Image * )) )
+495 		return( -1 );
+496 	p = magick7-&gt;image;
+497 	for( i = 0; i &lt; magick7-&gt;n_frames; i++ ) {
+498 		magick7-&gt;frames[i] = p;
+499 		p = GetNextImageInList( p );
+500 	}
+501 	g_assert( !magick7-&gt;cache_view ); 
+502 	if( !(magick7-&gt;cache_view = VIPS_ARRAY( NULL, 
+503 		magick7-&gt;n_frames, CacheView * )) )
+504 		return( -1 );
+505 	for( i = 0; i &lt; magick7-&gt;n_frames; i++ ) {
+506 		magick7-&gt;cache_view[i] = AcquireAuthenticCacheView( 
+507 			magick7-&gt;frames[i], magick7-&gt;exception );
+508 	}
+509 #ifdef DEBUG
+510 	vips_magick7_print_traits( magick7-&gt;frames[0] ); 
+511 	vips_magick7_print_channel_names( magick7-&gt;frames[0] );
+512 	if( vips_image_generate( load-&gt;out, 
+513 		NULL, vips_foreign_load_magick7_fill_region, NULL, 
+514 		magick7, NULL ) )
+515 <a name="3"></a>		return( -1 );
+516 	return( 0 );
+517 <font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>}
+518 typedef struct _VipsForeignLoadMagick7File {
+519 	VipsForeignLoadMagick7 parent_object;
+520 	char *filename; 
+521 } VipsForeignLoadMagick7File;
+522 typedef VipsForeignLoadMagick7Class VipsForeignLoadMagick7FileClass;
+523 G_DEFINE_TYPE( VipsForeignLoadMagick7File, vips_foreign_load_magick7_file, 
+524 	vips_foreign_load_magick7_get_type() );
+525 static gboolean
+526 ismagick7( const char *filename )
+527 {
+528 	unsigned char buf[100];</b></font>
+529 	int len;
+530 	return( (len = vips__get_bytes( filename, buf, 100 )) &gt; 10 &amp;&amp;
+531 		magick_ismagick( buf, len ) );
+532 }
+533 static int
+534 vips_foreign_load_magick7_file_header( VipsForeignLoad *load )
+535 {
+536 	VipsForeignLoadMagick7 *magick7 = (VipsForeignLoadMagick7 *) load;
+537 	VipsForeignLoadMagick7File *file = (VipsForeignLoadMagick7File *) load;
+538 #ifdef DEBUG
+539 	printf( "vips_foreign_load_magick7_file_header: %p\n", load ); 
+540 	vips_strncpy( magick7-&gt;image_info-&gt;filename, file-&gt;filename, 
+541 		MagickPathExtent );
+542 	magick_sniff_file( magick7-&gt;image_info, file-&gt;filename );
+543 	magick7-&gt;image = ReadImage( magick7-&gt;image_info, magick7-&gt;exception );
+544 	if( !magick7-&gt;image ) {
+545 		vips_foreign_load_magick7_error( magick7 ); 
+546 		return( -1 );
+547 	}
+548 	if( vips_foreign_load_magick7_load( magick7 ) )
+549 		return( -1 );
+550 	VIPS_SETSTR( load-&gt;out-&gt;filename, file-&gt;filename );
+551 	return( 0 );
+552 }
+553 static void
+554 <a name="0"></a>vips_foreign_load_magick7_file_class_init( 
+555 	VipsForeignLoadMagick7FileClass *class )
+556 {
+557 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+558 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+559 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+560 	gobject_class-&gt;set_property = vips_object_set_property;
+561 	gobject_class-&gt;get_property = vips_object_get_property;
+562 	object_class-&gt;nickname = "magickload";
+563 	object_class-&gt;description = _( "load file with ImageMagick7" );
+564 	load_class-&gt;is_a = ismagick7;
+565 	load_class-&gt;header = vips_foreign_load_magick7_file_header;
+566 	VIPS_ARG_STRING( class, "filename", 1, 
+567 		_( "Filename" ),
+568 		_( "Filename to load from" ),
+569 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+570 		G_STRUCT_OFFSET( VipsForeignLoadMagick7File, filename ),
+571 		NULL );
+572 }
+573 static void
+574 vips_foreign_load_magick7_file_init( VipsForeignLoadMagick7File *magick7_file )
+575 {
+576 }
+577 typedef struct _VipsForeignLoadMagick7Buffer {
+578 	VipsForeignLoadMagick7 parent_object;
+579 	VipsArea *buf;
+580 } VipsForeignLoadMagick7Buffer;
+581 typedef VipsForeignLoadMagick7Class VipsForeignLoadMagick7BufferClass;
+582 G_DEFINE_TYPE( VipsForeignLoadMagick7Buffer, vips_foreign_load_magick7_buffer, 
+583 	vips_foreign_load_magick7_get_type() );
+584 static gboolean</b></font>
+585 vips_foreign_load_magick7_buffer_is_a_buffer( const void *buf, size_t len )
+586 {
+587 	return( len &gt; 10 &amp;&amp; magick_ismagick( (const unsigned char *) buf, len ) );
+588 }
+589 static int
+590 vips_foreign_load_magick7_buffer_header( VipsForeignLoad *load )
+591 {
+592 	VipsForeignLoadMagick7 *magick7 = (VipsForeignLoadMagick7 *) load;
+593 	VipsForeignLoadMagick7Buffer *magick7_buffer = 
+594 		(VipsForeignLoadMagick7Buffer *) load;
+595 #ifdef DEBUG
+596 	printf( "vips_foreign_load_magick7_buffer_header: %p\n", load ); 
+597 	magick_sniff_bytes( magick7-&gt;image_info, 
+598 		magick7_buffer-&gt;buf-&gt;data, magick7_buffer-&gt;buf-&gt;length );
+599 	magick7-&gt;image = BlobToImage( magick7-&gt;image_info, 
+600 		magick7_buffer-&gt;buf-&gt;data, magick7_buffer-&gt;buf-&gt;length,
+601 		magick7-&gt;exception );
+602 	if( !magick7-&gt;image ) {
+603 		vips_foreign_load_magick7_error( magick7 ); 
+604 <a name="2"></a>		return( -1 );
+605 	}
+606 <font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if( vips_foreign_load_magick7_load( magick7 ) )
+607 		return( -1 );
+608 	return( 0 );
+609 }
+610 static void
+611 vips_foreign_load_magick7_buffer_class_init( 
+612 	VipsForeignLoadMagick7BufferClass *class )
+613 {
+614 	GObjectClass *gobject_class = G_OBJECT_CLASS( class );
+615 	VipsObjectClass *object_class = (VipsObjectClass *) class;
+616 	VipsForeignLoadClass *load_class = (VipsForeignLoadClass *) class;
+617 	gobject_class-&gt;set_property = vips_object_set_property;
+618 	gobject_class-&gt;get_property = vips_object_get_property;
+619 	object_class-&gt;nickname = "magickload_buffer";
+620 	object_class-&gt;description = _( "load buffer with ImageMagick7" );
+621 	load_class-&gt;is_a_buffer = vips_foreign_load_magick7_buffer_is_a_buffer;
+622 	load_class-&gt;header = vips_foreign_load_magick7_buffer_header;</b></font>
+623 	VIPS_ARG_BOXED( class, "buffer", 1, 
+624 		_( "Buffer" ),
+625 		_( "Buffer to load from" ),
+626 		VIPS_ARGUMENT_REQUIRED_INPUT, 
+627 		G_STRUCT_OFFSET( VipsForeignLoadMagick7Buffer, buf ),
+628 		VIPS_TYPE_BLOB );
+629 }
+630 static void
+631 vips_foreign_load_magick7_buffer_init( VipsForeignLoadMagick7Buffer *buffer )
+632 {
+633 }
 </pre>
 </div>
 </div>

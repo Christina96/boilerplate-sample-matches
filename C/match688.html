@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for imklog.c &amp; ommail.c</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -43,556 +42,377 @@ Matches for imklog.c &amp; ommail.c
 </h3>
 <hr/>
 <pre>
-/* The kernel log module.
- *
- * This is an abstracted module. As Linux and BSD kernel log is conceptually the
- * same, we do not do different input plugins for them but use
- * imklog in both cases, just with different "backend drivers" for
- * the different platforms. This also enables a rsyslog.conf to
- * be used on multiple platforms without the need to take care of
- * what the kernel log is coming from.
- *
- * See platform-specific files (e.g. linux.c, bsd.c) in the plugin's
- * working directory. For other systems with similar kernel logging
- * functionality, no new input plugin shall be written but rather a
- * driver be developed for imklog. Please note that imklog itself is
- * mostly concerned with handling the interface. Any real action happens
- * in the drivers, as things may be pretty different on different
- * platforms.
- *
- * Please note that this file replaces the klogd daemon that was
- * also present in pre-v3 versions of rsyslog.
- *
- * To test under Linux:
- * echo test1 &gt; /dev/kmsg
- *
- * Copyright (C) 2008-2020 Adiscon GmbH
- *
- * This file is part of rsyslog.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *       http://www.apache.org/licenses/LICENSE-2.0
- *       -or-
- *       see COPYING.ASL20 in the source distribution
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-#include "config.h"
-#include "rsyslog.h"
-#include &lt;stdio.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;string.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;ctype.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;sys/socket.h&gt;
-
-#include "dirty.h"
-#include "cfsysline.h"
-#include "parserif.h"
-#include "obj.h"
-#include "msg.h"
-#include "module-template.h"
-#include "datetime.h"
-#include "imklog.h"
-#include "net.h"
-#include "glbl.h"
-#include "prop.h"
-#include "errmsg.h"
-#include "unicode-helper.h"
-#include "ruleset.h"
-
-
-MODULE_TYPE_INPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("imklog")
-
-/* Module static data */
-DEF_IMOD_STATIC_DATA
-DEFobjCurrIf(datetime)
-DEFobjCurrIf(ruleset)
-DEFobjCurrIf(glbl)
-DEFobjCurrIf(prop)
-DEFobjCurrIf(net)
-
-/* config settings */
-typedef struct configSettings_s {
-	int bPermitNonKernel; /* permit logging of messages not having LOG_KERN facility */
-	int bParseKernelStamp; /* if try to parse kernel timestamps for message time */
-	int bKeepKernelStamp; /* keep the kernel timestamp in the message */
-	int iFacilIntMsg; /* the facility to use for internal messages (set by driver) */
-	uchar *pszPath;
-	int console_log_level; /* still used for BSD */
-	unsigned int ratelimitInterval;
-	unsigned int ratelimitBurst;
-} configSettings_t;
-static configSettings_t cs;
-
-static modConfData_t *loadModConf = NULL;/* modConf ptr to use for the current load process */
-static modConfData_t *runModConf = NULL;/* modConf ptr to use for the current load process */
-static int bLegacyCnfModGlobalsPermitted;/* are legacy module-global config parameters permitted? */
-
-<a name="0"></a>/* module-global parameters */
-static struct cnfparamdescr modpdescr[] = {
-	{ "ruleset", eCmdHdlrString, 0 },
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "logpath", eCmdHdlrGetWord, 0 },
-	{ "permitnonkernelfacility", eCmdHdlrBinary, 0 },
-	{ "consoleloglevel", eCmdHdlrInt, 0 },
-	{ "parsekerneltimestamp", eCmdHdlrBinary, 0 },
-	{ "keepkerneltimestamp", eCmdHdlrBinary, 0 },
-	{ "internalmsgfacility", eCmdHdlrFacility, 0 },
-	{ "ratelimitinterval", eCmdHdlrInt, 0 },
-	{ "ratelimitburst", eCmdHdlrInt, 0 }
-};
-static struct cnfparamblk modpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
-	  modpdescr
-	};</b></font>
-
-static prop_t *pInputName = NULL;
-/* there is only one global inputName for all messages generated by this module */
-static prop_t *pLocalHostIP = NULL;
-
-/** POTENTIAL COMMON CODE FOR RULESET CHECK **/
-static inline void std_mod_checkRuleset_genErrMsg(const modConfData_t *const modConf);
-static inline rsRetVal
-std_mod_checkRuleset(modConfData_t *const modConf)
-{
-	ruleset_t *pRuleset;
-	rsRetVal localRet;
-	DEFiRet;
-
-	modConf-&gt;pBindRuleset = NULL;	/* assume default ruleset */
-
-	if(modConf-&gt;pszBindRuleset == NULL)
-		FINALIZE;
-
-	localRet = ruleset.GetRuleset(modConf-&gt;pConf, &amp;pRuleset, modConf-&gt;pszBindRuleset);
-	if(localRet == RS_RET_NOT_FOUND) {
-		std_mod_checkRuleset_genErrMsg(modConf);
-	}
-	CHKiRet(localRet);
-	modConf-&gt;pBindRuleset = pRuleset;
-
-finalize_it:
-	RETiRet;
-}
-/** END POTENTIAL COMMON CODE FOR RULESET CHECK **/
-static inline void
-std_mod_checkRuleset_genErrMsg(const modConfData_t *const modConf)
-{
-	LogError(0, NO_ERRCODE, "imklog: ruleset '%s' not found - "
-			"using default ruleset instead", modConf-&gt;pszBindRuleset);
-}
-
-static void
-initConfigSettings(void)
-{
-	cs.bPermitNonKernel = 0;
-	cs.bParseKernelStamp = 0;
-	cs.bKeepKernelStamp = 0;
-	cs.console_log_level = -1;
-	cs.pszPath = NULL;
-	cs.iFacilIntMsg = klogFacilIntMsg();
-}
-
-
-/* enqueue the the kernel message into the message queue.
- * The provided msg string is not freed - thus must be done
- * by the caller.
- * rgerhards, 2008-04-12
- */
-static rsRetVal
-enqMsg(uchar *const __restrict__ msg,
-	uchar* pszTag,
-	const syslog_pri_t pri,
-	struct timeval *tp,
-	ratelimit_t *ratelimiter)
-{
-	struct syslogTime st;
-	smsg_t *pMsg;
-	DEFiRet;
-
-	assert(msg != NULL);
-	assert(pszTag != NULL);
-
-	if(tp == NULL) {
-		CHKiRet(msgConstruct(&amp;pMsg));
-	} else {
-		datetime.timeval2syslogTime(tp, &amp;st, TIME_IN_LOCALTIME);
-		CHKiRet(msgConstructWithTime(&amp;pMsg, &amp;st, tp-&gt;tv_sec));
-	}
-	MsgSetFlowControlType(pMsg, eFLOWCTL_LIGHT_DELAY);
-	MsgSetInputName(pMsg, pInputName);
-	MsgSetRawMsgWOSize(pMsg, (char*)msg);
-	MsgSetRuleset(pMsg, runModConf-&gt;pBindRuleset);
-	MsgSetMSGoffs(pMsg, 0);	/* we do not have a header... */
-	MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
-	MsgSetRcvFromIP(pMsg, pLocalHostIP);
-	MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
-	MsgSetTAG(pMsg, pszTag, ustrlen(pszTag));
-	msgSetPRI(pMsg, pri);
-	ratelimitAddMsg(ratelimiter, NULL, pMsg);
-finalize_it:
-	RETiRet;
-}
-
-/* parse the PRI from a kernel message. At least BSD seems to have
- * non-kernel messages inside the kernel log...
- * Expected format: "&lt;pri&gt;". piPri is only valid if the function
- * successfully returns. If there was a proper pri ppSz is advanced to the
- * position right after "&gt;".
- * rgerhards, 2008-04-14
- */
-static rsRetVal
-parsePRI(uchar **ppSz, syslog_pri_t *piPri)
-{
-	DEFiRet;
-	syslog_pri_t i;
-	uchar *pSz;
-
-	assert(ppSz != NULL);
-	pSz = *ppSz;
-	assert(pSz != NULL);
-	assert(piPri != NULL);
-
-	if(*pSz != '&lt;' || !isdigit(*(pSz+1)))
-		ABORT_FINALIZE(RS_RET_INVALID_PRI);
-
-	++pSz;
-	i = 0;
-	while(isdigit(*pSz) &amp;&amp; i &lt;= LOG_MAXPRI) {
-		i = i * 10 + *pSz++ - '0';
-	}
-
-	if(*pSz != '&gt;' || i &gt; LOG_MAXPRI)
-		ABORT_FINALIZE(RS_RET_INVALID_PRI);
-
-	/* OK, we have a valid PRI */
-	*piPri = i;
-	*ppSz = pSz + 1; /* update msg ptr to position after PRI */
-
-finalize_it:
-	RETiRet;
-}
-
-
-/* log an imklog-internal message
- * rgerhards, 2008-04-14
- */
-rsRetVal imklogLogIntMsg(syslog_pri_t priority, const char *fmt, ...)
-{
-	DEFiRet;
-	va_list ap;
-	uchar msgBuf[2048]; /* we use the same size as sysklogd to remain compatible */
-
-	va_start(ap, fmt);
-	vsnprintf((char*)msgBuf, sizeof(msgBuf), fmt, ap);
-	va_end(ap);
-
-	logmsgInternal(NO_ERRCODE, priority, msgBuf, 0);
-
-	RETiRet;
-}
-
-
-/* log a kernel message. If tp is non-NULL, it contains the message creation
- * time to use.
- * rgerhards, 2008-04-14
- */
-rsRetVal Syslog(modConfData_t *pModConf, syslog_pri_t priority, uchar *pMsg, struct timeval *tp)
-{
-	syslog_pri_t pri;
-	int bPRISet = 0;
-	rsRetVal localRet;
-	DEFiRet;
-
-	/* then check if we have two PRIs. This can happen in case of systemd,
-	 * in which case the second PRI is the right one.
-	 */
-	if(pMsg[3] == '&lt;' || (pMsg[3] == ' ' &amp;&amp; pMsg[4] == '&lt;')) { /* could be a pri... */
-		uchar *pMsgTmp = pMsg + ((pMsg[3] == '&lt;') ? 3 : 4);
-		localRet = parsePRI(&amp;pMsgTmp, &amp;pri);
-		if(localRet == RS_RET_OK &amp;&amp; pri &gt;= 8 &amp;&amp; pri &lt;= LOG_MAXPRI) {
-			/* *this* is our PRI */
-			DBGPRINTF("imklog detected secondary PRI(%d) in klog msg\n", pri);
-			pMsg = pMsgTmp;
-			priority = pri;
-			bPRISet = 1;
-		}
-	}
-	if(!bPRISet) {
-		localRet = parsePRI(&amp;pMsg, &amp;priority);
-		if(localRet != RS_RET_INVALID_PRI &amp;&amp; localRet != RS_RET_OK)
-			FINALIZE;
-	}
-	/* if we don't get the pri, we use whatever we were supplied */
-
-	/* ignore non-kernel messages if not permitted */
-	if(pModConf-&gt;bPermitNonKernel == 0 &amp;&amp; pri2fac(priority) != LOG_KERN)
-		FINALIZE; /* silently ignore */
-
-	iRet = enqMsg((uchar*)pMsg, (uchar*) "kernel:", priority, tp, pModConf-&gt;ratelimiter);
-
-finalize_it:
-	RETiRet;
-}
-
-
-/* helper for some klog drivers which need to know the MaxLine global setting. They can
- * not obtain it themselfs, because they are no modules and can not query the object hander.
- * It would probably be a good idea to extend the interface to support it, but so far
- * we create a (sufficiently valid) work-around. -- rgerhards, 2008-11-24
- */
-int klog_getMaxLine(void)
-{
-	return glbl.GetMaxLine(runConf);
-}
-
-
-BEGINrunInput
-CODESTARTrunInput
-	/* this is an endless loop - it is terminated when the thread is
-	 * signalled to do so. This, however, is handled by the framework,
-	 * right into the sleep below.
-	 */
-	while(!pThrd-&gt;bShallStop) {
-		/* klogLogKMsg() waits for the next kernel message, obtains it
-		 * and then submits it to the rsyslog main queue.
-	   	 * rgerhards, 2008-04-09
-	   	 */
-		CHKiRet(klogLogKMsg(runModConf));
-	}
-finalize_it:
-ENDrunInput
-
-
-BEGINbeginCnfLoad
-CODESTARTbeginCnfLoad
-	loadModConf = pModConf;
-	pModConf-&gt;pConf = pConf;
-	/* init our settings */
-	pModConf-&gt;pszPath = NULL;
-	pModConf-&gt;bPermitNonKernel = 0;
-	pModConf-&gt;bParseKernelStamp = 0;
-	pModConf-&gt;bKeepKernelStamp = 0;
-	pModConf-&gt;console_log_level = -1;
-	pModConf-&gt;bKeepKernelStamp = 0;
-	pModConf-&gt;iFacilIntMsg = klogFacilIntMsg();
-	loadModConf-&gt;configSetViaV2Method = 0;
-	pModConf-&gt;ratelimiter = NULL;
-	pModConf-&gt;ratelimitBurst = 10000; /* arbitrary high limit */
-	pModConf-&gt;ratelimitInterval = 0; /* off */
-	bLegacyCnfModGlobalsPermitted = 1;
-	/* init legacy config vars */
-	initConfigSettings();
-ENDbeginCnfLoad
-
-
-BEGINsetModCnf
-	struct cnfparamvals *pvals = NULL;
-	int i;
-CODESTARTsetModCnf
-	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
-	if(pvals == NULL) {
-		LogError(0, RS_RET_MISSING_CNFPARAMS, "error processing module "
-				"config parameters [module(...)]");
-<a name="1"></a>		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if(Debug) {
-		dbgprintf("module (global) param blk for imklog:\n");
-		cnfparamsPrint(&amp;modpblk, pvals);
-	}
-
-	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(modpblk.descr[i].name, "logpath")) {
-			loadModConf-&gt;pszPath = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(modpblk.descr[i].name, "permitnonkernelfacility")) {
-			loadModConf-&gt;bPermitNonKernel = (int) pvals[i].val.d.n;</b></font>
-		} else if(!strcmp(modpblk.descr[i].name, "parsekerneltimestamp")) {
-			loadModConf-&gt;bParseKernelStamp = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "keepkerneltimestamp")) {
-			loadModConf-&gt;bKeepKernelStamp = (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "consoleloglevel")) {
-			loadModConf-&gt;console_log_level= (int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "internalmsgfacility")) {
-			loadModConf-&gt;iFacilIntMsg = (int) pvals[i].val.d.n;
-<a name="2"></a>		} else if(!strcmp(modpblk.descr[i].name, "ratelimitburst")) {
-			loadModConf-&gt;ratelimitBurst = (unsigned int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "ratelimitinterval")) {
-<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>			loadModConf-&gt;ratelimitInterval = (unsigned int) pvals[i].val.d.n;
-		} else if(!strcmp(modpblk.descr[i].name, "ruleset")) {
-			loadModConf-&gt;pszBindRuleset = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else {
-			LogMsg(0, RS_RET_INTERNAL_ERROR, LOG_WARNING,
-				"imklog: RSYSLOG BUG, non-handled param '%s' in "
-				"beginCnfLoad\n", modpblk.descr[i].name);
-		}
-	}</b></font>
-
-	/* disable legacy module-global config directives */
-	bLegacyCnfModGlobalsPermitted = 0;
-	loadModConf-&gt;configSetViaV2Method = 1;
-
-finalize_it:
-	if(pvals != NULL)
-		cnfparamvalsDestruct(pvals, &amp;modpblk);
-ENDsetModCnf
-
-
-BEGINendCnfLoad
-CODESTARTendCnfLoad
-	if(!loadModConf-&gt;configSetViaV2Method) {
-		/* persist module-specific settings from legacy config system */
-		loadModConf-&gt;bPermitNonKernel = cs.bPermitNonKernel;
-		loadModConf-&gt;bParseKernelStamp = cs.bParseKernelStamp;
-		loadModConf-&gt;bKeepKernelStamp = cs.bKeepKernelStamp;
-		loadModConf-&gt;iFacilIntMsg = cs.iFacilIntMsg;
-		loadModConf-&gt;console_log_level = cs.console_log_level;
-		if((cs.pszPath == NULL) || (cs.pszPath[0] == '\0')) {
-			loadModConf-&gt;pszPath = NULL;
-			if(cs.pszPath != NULL)
-				free(cs.pszPath);
-		} else {
-			loadModConf-&gt;pszPath = cs.pszPath;
-		}
-		cs.pszPath = NULL;
-	}
-
-	loadModConf = NULL; /* done loading */
-ENDendCnfLoad
-
-
-BEGINcheckCnf
-CODESTARTcheckCnf
-	std_mod_checkRuleset(pModConf);
-ENDcheckCnf
-
-
-BEGINactivateCnfPrePrivDrop
-CODESTARTactivateCnfPrePrivDrop
-	runModConf = pModConf;
-	iRet = klogWillRunPrePrivDrop(runModConf);
-ENDactivateCnfPrePrivDrop
-
-
-BEGINactivateCnf
-CODESTARTactivateCnf
-	CHKiRet(ratelimitNew(&amp;runModConf-&gt;ratelimiter, "imklog", NULL));
-	ratelimitSetLinuxLike(runModConf-&gt;ratelimiter,
-			      runModConf-&gt;ratelimitInterval,
-			      runModConf-&gt;ratelimitBurst);
-finalize_it:
-ENDactivateCnf
-
-
-BEGINfreeCnf
-CODESTARTfreeCnf
-	free(pModConf-&gt;pszBindRuleset);
-ENDfreeCnf
-
-
-BEGINwillRun
-CODESTARTwillRun
-	pLocalHostIP = glbl.GetLocalHostIP();
-	iRet = klogWillRunPostPrivDrop(runModConf);
-ENDwillRun
-
-
-BEGINafterRun
-CODESTARTafterRun
-	ratelimitDestruct(runModConf-&gt;ratelimiter);
-	iRet = klogAfterRun(runModConf);
-ENDafterRun
-
-
-BEGINmodExit
-CODESTARTmodExit
-	if(pInputName != NULL)
-		prop.Destruct(&amp;pInputName);
-
-	/* release objects we used */
-	objRelease(glbl, CORE_COMPONENT);
-	objRelease(net, CORE_COMPONENT);
-	objRelease(datetime, CORE_COMPONENT);
-	objRelease(ruleset, CORE_COMPONENT);
-	objRelease(prop, CORE_COMPONENT);
-ENDmodExit
-
-
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_IMOD_QUERIES
-CODEqueryEtryPt_STD_CONF2_QUERIES
-CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
-CODEqueryEtryPt_STD_CONF2_PREPRIVDROP_QUERIES
-ENDqueryEtryPt
-
-static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
-{
-	cs.bPermitNonKernel = 0;
-	cs.bParseKernelStamp = 0;
-	cs.bKeepKernelStamp = 0;
-	if(cs.pszPath != NULL) {
-		free(cs.pszPath);
-		cs.pszPath = NULL;
-	}
-	cs.iFacilIntMsg = klogFacilIntMsg();
-	return RS_RET_OK;
-}
-
-BEGINmodInit()
-CODESTARTmodInit
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
-CODEmodInit_QueryRegCFSLineHdlr
-	CHKiRet(objUse(datetime, CORE_COMPONENT));
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-	CHKiRet(objUse(prop, CORE_COMPONENT));
-	CHKiRet(objUse(ruleset, CORE_COMPONENT));
-	CHKiRet(objUse(net, CORE_COMPONENT));
-
-	/* we need to create the inputName property (only once during our lifetime) */
-	CHKiRet(prop.CreateStringProp(&amp;pInputName, UCHAR_CONSTANT("imklog"), sizeof("imklog") - 1));
-
-	/* init legacy config settings */
-	initConfigSettings();
-
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"klogLocalipif", 0, eCmdHdlrGoneAway,
-			NULL, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"debugprintkernelsymbols", 0, eCmdHdlrGoneAway,
-			NULL, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"klogpath", 0, eCmdHdlrGetWord,
-			NULL, &amp;cs.pszPath, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"klogsymbollookup", 0, eCmdHdlrGoneAway,
-			NULL, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"klogsymbolstwice", 0, eCmdHdlrGoneAway,
-			NULL, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"klogusesyscallinterface", 0, eCmdHdlrGoneAway,
-			NULL, NULL, STD_LOADABLE_MODULE_ID));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"klogpermitnonkernelfacility", 0, eCmdHdlrBinary,
-			NULL, &amp;cs.bPermitNonKernel, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"klogconsoleloglevel", 0, eCmdHdlrInt,
-			NULL, &amp;cs.console_log_level, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"kloginternalmsgfacility", 0, eCmdHdlrFacility,
-			NULL, &amp;cs.iFacilIntMsg, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"klogparsekerneltimestamp", 0, eCmdHdlrBinary,
-			NULL, &amp;cs.bParseKernelStamp, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(regCfSysLineHdlr2((uchar *)"klogkeepkerneltimestamp", 0, eCmdHdlrBinary,
-			NULL, &amp;cs.bKeepKernelStamp, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
-	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler,
-			resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
-ENDmodInit
+1 #include "config.h"
+2 #include "rsyslog.h"
+3 #include &lt;stdio.h&gt;
+4 #include &lt;assert.h&gt;
+5 #include &lt;string.h&gt;
+6 #include &lt;stdarg.h&gt;
+7 #include &lt;ctype.h&gt;
+8 #include &lt;stdlib.h&gt;
+9 #include &lt;sys/socket.h&gt;
+10 #include "dirty.h"
+11 #include "cfsysline.h"
+12 #include "parserif.h"
+13 #include "obj.h"
+14 #include "msg.h"
+15 #include "module-template.h"
+16 #include "datetime.h"
+17 #include "imklog.h"
+18 #include "net.h"
+19 #include "glbl.h"
+20 #include "prop.h"
+21 #include "errmsg.h"
+22 #include "unicode-helper.h"
+23 #include "ruleset.h"
+24 MODULE_TYPE_INPUT
+25 MODULE_TYPE_NOKEEP
+26 MODULE_CNFNAME("imklog")
+27 DEF_IMOD_STATIC_DATA
+28 DEFobjCurrIf(datetime)
+29 DEFobjCurrIf(ruleset)
+30 DEFobjCurrIf(glbl)
+31 DEFobjCurrIf(prop)
+32 DEFobjCurrIf(net)
+33 typedef struct configSettings_s {
+34 	int bPermitNonKernel; 	int bParseKernelStamp; 	int bKeepKernelStamp; 	int iFacilIntMsg; 	uchar *pszPath;
+35 	int console_log_level; 	unsigned int ratelimitInterval;
+36 	unsigned int ratelimitBurst;
+37 } configSettings_t;
+38 static configSettings_t cs;
+39 static modConfData_t *loadModConf = NULL;static modConfData_t *runModConf = NULL;static int bLegacyCnfModGlobalsPermitted;
+40 <a name="0"></a>static struct cnfparamdescr modpdescr[] = {
+41 	{ "ruleset", eCmdHdlrString, 0 },
+42 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	{ "logpath", eCmdHdlrGetWord, 0 },
+43 	{ "permitnonkernelfacility", eCmdHdlrBinary, 0 },
+44 	{ "consoleloglevel", eCmdHdlrInt, 0 },
+45 	{ "parsekerneltimestamp", eCmdHdlrBinary, 0 },
+46 	{ "keepkerneltimestamp", eCmdHdlrBinary, 0 },
+47 	{ "internalmsgfacility", eCmdHdlrFacility, 0 },
+48 	{ "ratelimitinterval", eCmdHdlrInt, 0 },
+49 	{ "ratelimitburst", eCmdHdlrInt, 0 }
+50 };
+51 static struct cnfparamblk modpblk =
+52 	{ CNFPARAMBLK_VERSION,
+53 	  sizeof(modpdescr)/sizeof(struct cnfparamdescr),
+54 	  modpdescr
+55 	};</b></font>
+56 static prop_t *pInputName = NULL;
+57 static prop_t *pLocalHostIP = NULL;
+58 static inline void std_mod_checkRuleset_genErrMsg(const modConfData_t *const modConf);
+59 static inline rsRetVal
+60 std_mod_checkRuleset(modConfData_t *const modConf)
+61 {
+62 	ruleset_t *pRuleset;
+63 	rsRetVal localRet;
+64 	DEFiRet;
+65 	modConf-&gt;pBindRuleset = NULL;	
+66 	if(modConf-&gt;pszBindRuleset == NULL)
+67 		FINALIZE;
+68 	localRet = ruleset.GetRuleset(modConf-&gt;pConf, &amp;pRuleset, modConf-&gt;pszBindRuleset);
+69 	if(localRet == RS_RET_NOT_FOUND) {
+70 		std_mod_checkRuleset_genErrMsg(modConf);
+71 	}
+72 	CHKiRet(localRet);
+73 	modConf-&gt;pBindRuleset = pRuleset;
+74 finalize_it:
+75 	RETiRet;
+76 }
+77 static inline void
+78 std_mod_checkRuleset_genErrMsg(const modConfData_t *const modConf)
+79 {
+80 	LogError(0, NO_ERRCODE, "imklog: ruleset '%s' not found - "
+81 			"using default ruleset instead", modConf-&gt;pszBindRuleset);
+82 }
+83 static void
+84 initConfigSettings(void)
+85 {
+86 	cs.bPermitNonKernel = 0;
+87 	cs.bParseKernelStamp = 0;
+88 	cs.bKeepKernelStamp = 0;
+89 	cs.console_log_level = -1;
+90 	cs.pszPath = NULL;
+91 	cs.iFacilIntMsg = klogFacilIntMsg();
+92 }
+93 static rsRetVal
+94 enqMsg(uchar *const __restrict__ msg,
+95 	uchar* pszTag,
+96 	const syslog_pri_t pri,
+97 	struct timeval *tp,
+98 	ratelimit_t *ratelimiter)
+99 {
+100 	struct syslogTime st;
+101 	smsg_t *pMsg;
+102 	DEFiRet;
+103 	assert(msg != NULL);
+104 	assert(pszTag != NULL);
+105 	if(tp == NULL) {
+106 		CHKiRet(msgConstruct(&amp;pMsg));
+107 	} else {
+108 		datetime.timeval2syslogTime(tp, &amp;st, TIME_IN_LOCALTIME);
+109 		CHKiRet(msgConstructWithTime(&amp;pMsg, &amp;st, tp-&gt;tv_sec));
+110 	}
+111 	MsgSetFlowControlType(pMsg, eFLOWCTL_LIGHT_DELAY);
+112 	MsgSetInputName(pMsg, pInputName);
+113 	MsgSetRawMsgWOSize(pMsg, (char*)msg);
+114 	MsgSetRuleset(pMsg, runModConf-&gt;pBindRuleset);
+115 	MsgSetMSGoffs(pMsg, 0);		MsgSetRcvFrom(pMsg, glbl.GetLocalHostNameProp());
+116 	MsgSetRcvFromIP(pMsg, pLocalHostIP);
+117 	MsgSetHOSTNAME(pMsg, glbl.GetLocalHostName(), ustrlen(glbl.GetLocalHostName()));
+118 	MsgSetTAG(pMsg, pszTag, ustrlen(pszTag));
+119 	msgSetPRI(pMsg, pri);
+120 	ratelimitAddMsg(ratelimiter, NULL, pMsg);
+121 finalize_it:
+122 	RETiRet;
+123 }
+124 static rsRetVal
+125 parsePRI(uchar **ppSz, syslog_pri_t *piPri)
+126 {
+127 	DEFiRet;
+128 	syslog_pri_t i;
+129 	uchar *pSz;
+130 	assert(ppSz != NULL);
+131 	pSz = *ppSz;
+132 	assert(pSz != NULL);
+133 	assert(piPri != NULL);
+134 	if(*pSz != '&lt;' || !isdigit(*(pSz+1)))
+135 		ABORT_FINALIZE(RS_RET_INVALID_PRI);
+136 	++pSz;
+137 	i = 0;
+138 	while(isdigit(*pSz) &amp;&amp; i &lt;= LOG_MAXPRI) {
+139 		i = i * 10 + *pSz++ - '0';
+140 	}
+141 	if(*pSz != '&gt;' || i &gt; LOG_MAXPRI)
+142 		ABORT_FINALIZE(RS_RET_INVALID_PRI);
+143 	*piPri = i;
+144 	*ppSz = pSz + 1; 
+145 finalize_it:
+146 	RETiRet;
+147 }
+148 rsRetVal imklogLogIntMsg(syslog_pri_t priority, const char *fmt, ...)
+149 {
+150 	DEFiRet;
+151 	va_list ap;
+152 	uchar msgBuf[2048]; 
+153 	va_start(ap, fmt);
+154 	vsnprintf((char*)msgBuf, sizeof(msgBuf), fmt, ap);
+155 	va_end(ap);
+156 	logmsgInternal(NO_ERRCODE, priority, msgBuf, 0);
+157 	RETiRet;
+158 }
+159 rsRetVal Syslog(modConfData_t *pModConf, syslog_pri_t priority, uchar *pMsg, struct timeval *tp)
+160 {
+161 	syslog_pri_t pri;
+162 	int bPRISet = 0;
+163 	rsRetVal localRet;
+164 	DEFiRet;
+165 	if(pMsg[3] == '&lt;' || (pMsg[3] == ' ' &amp;&amp; pMsg[4] == '&lt;')) { 		uchar *pMsgTmp = pMsg + ((pMsg[3] == '&lt;') ? 3 : 4);
+166 		localRet = parsePRI(&amp;pMsgTmp, &amp;pri);
+167 		if(localRet == RS_RET_OK &amp;&amp; pri &gt;= 8 &amp;&amp; pri &lt;= LOG_MAXPRI) {
+168 			DBGPRINTF("imklog detected secondary PRI(%d) in klog msg\n", pri);
+169 			pMsg = pMsgTmp;
+170 			priority = pri;
+171 			bPRISet = 1;
+172 		}
+173 	}
+174 	if(!bPRISet) {
+175 		localRet = parsePRI(&amp;pMsg, &amp;priority);
+176 		if(localRet != RS_RET_INVALID_PRI &amp;&amp; localRet != RS_RET_OK)
+177 			FINALIZE;
+178 	}
+179 	if(pModConf-&gt;bPermitNonKernel == 0 &amp;&amp; pri2fac(priority) != LOG_KERN)
+180 		FINALIZE; 
+181 	iRet = enqMsg((uchar*)pMsg, (uchar*) "kernel:", priority, tp, pModConf-&gt;ratelimiter);
+182 finalize_it:
+183 	RETiRet;
+184 }
+185 int klog_getMaxLine(void)
+186 {
+187 	return glbl.GetMaxLine(runConf);
+188 }
+189 BEGINrunInput
+190 CODESTARTrunInput
+191 	while(!pThrd-&gt;bShallStop) {
+192 		CHKiRet(klogLogKMsg(runModConf));
+193 	}
+194 finalize_it:
+195 ENDrunInput
+196 BEGINbeginCnfLoad
+197 CODESTARTbeginCnfLoad
+198 	loadModConf = pModConf;
+199 	pModConf-&gt;pConf = pConf;
+200 	pModConf-&gt;pszPath = NULL;
+201 	pModConf-&gt;bPermitNonKernel = 0;
+202 	pModConf-&gt;bParseKernelStamp = 0;
+203 	pModConf-&gt;bKeepKernelStamp = 0;
+204 	pModConf-&gt;console_log_level = -1;
+205 	pModConf-&gt;bKeepKernelStamp = 0;
+206 	pModConf-&gt;iFacilIntMsg = klogFacilIntMsg();
+207 	loadModConf-&gt;configSetViaV2Method = 0;
+208 	pModConf-&gt;ratelimiter = NULL;
+209 	pModConf-&gt;ratelimitBurst = 10000; 	pModConf-&gt;ratelimitInterval = 0; 	bLegacyCnfModGlobalsPermitted = 1;
+210 	initConfigSettings();
+211 ENDbeginCnfLoad
+212 BEGINsetModCnf
+213 	struct cnfparamvals *pvals = NULL;
+214 	int i;
+215 CODESTARTsetModCnf
+216 	pvals = nvlstGetParams(lst, &amp;modpblk, NULL);
+217 	if(pvals == NULL) {
+218 		LogError(0, RS_RET_MISSING_CNFPARAMS, "error processing module "
+219 				"config parameters [module(...)]");
+220 <a name="1"></a>		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+221 	}
+222 <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>	if(Debug) {
+223 		dbgprintf("module (global) param blk for imklog:\n");
+224 		cnfparamsPrint(&amp;modpblk, pvals);
+225 	}
+226 	for(i = 0 ; i &lt; modpblk.nParams ; ++i) {
+227 		if(!pvals[i].bUsed)
+228 			continue;
+229 		if(!strcmp(modpblk.descr[i].name, "logpath")) {
+230 			loadModConf-&gt;pszPath = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+231 		} else if(!strcmp(modpblk.descr[i].name, "permitnonkernelfacility")) {
+232 			loadModConf-&gt;bPermitNonKernel = (int) pvals[i].val.d.n;</b></font>
+233 		} else if(!strcmp(modpblk.descr[i].name, "parsekerneltimestamp")) {
+234 			loadModConf-&gt;bParseKernelStamp = (int) pvals[i].val.d.n;
+235 		} else if(!strcmp(modpblk.descr[i].name, "keepkerneltimestamp")) {
+236 			loadModConf-&gt;bKeepKernelStamp = (int) pvals[i].val.d.n;
+237 		} else if(!strcmp(modpblk.descr[i].name, "consoleloglevel")) {
+238 			loadModConf-&gt;console_log_level= (int) pvals[i].val.d.n;
+239 		} else if(!strcmp(modpblk.descr[i].name, "internalmsgfacility")) {
+240 			loadModConf-&gt;iFacilIntMsg = (int) pvals[i].val.d.n;
+241 <a name="2"></a>		} else if(!strcmp(modpblk.descr[i].name, "ratelimitburst")) {
+242 			loadModConf-&gt;ratelimitBurst = (unsigned int) pvals[i].val.d.n;
+243 		} else if(!strcmp(modpblk.descr[i].name, "ratelimitinterval")) {
+244 <font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>			loadModConf-&gt;ratelimitInterval = (unsigned int) pvals[i].val.d.n;
+245 		} else if(!strcmp(modpblk.descr[i].name, "ruleset")) {
+246 			loadModConf-&gt;pszBindRuleset = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+247 		} else {
+248 			LogMsg(0, RS_RET_INTERNAL_ERROR, LOG_WARNING,
+249 				"imklog: RSYSLOG BUG, non-handled param '%s' in "
+250 				"beginCnfLoad\n", modpblk.descr[i].name);
+251 		}
+252 	}</b></font>
+253 	bLegacyCnfModGlobalsPermitted = 0;
+254 	loadModConf-&gt;configSetViaV2Method = 1;
+255 finalize_it:
+256 	if(pvals != NULL)
+257 		cnfparamvalsDestruct(pvals, &amp;modpblk);
+258 ENDsetModCnf
+259 BEGINendCnfLoad
+260 CODESTARTendCnfLoad
+261 	if(!loadModConf-&gt;configSetViaV2Method) {
+262 		loadModConf-&gt;bPermitNonKernel = cs.bPermitNonKernel;
+263 		loadModConf-&gt;bParseKernelStamp = cs.bParseKernelStamp;
+264 		loadModConf-&gt;bKeepKernelStamp = cs.bKeepKernelStamp;
+265 		loadModConf-&gt;iFacilIntMsg = cs.iFacilIntMsg;
+266 		loadModConf-&gt;console_log_level = cs.console_log_level;
+267 		if((cs.pszPath == NULL) || (cs.pszPath[0] == '\0')) {
+268 			loadModConf-&gt;pszPath = NULL;
+269 			if(cs.pszPath != NULL)
+270 				free(cs.pszPath);
+271 		} else {
+272 			loadModConf-&gt;pszPath = cs.pszPath;
+273 		}
+274 		cs.pszPath = NULL;
+275 	}
+276 	loadModConf = NULL; ENDendCnfLoad
+277 BEGINcheckCnf
+278 CODESTARTcheckCnf
+279 	std_mod_checkRuleset(pModConf);
+280 ENDcheckCnf
+281 BEGINactivateCnfPrePrivDrop
+282 CODESTARTactivateCnfPrePrivDrop
+283 	runModConf = pModConf;
+284 	iRet = klogWillRunPrePrivDrop(runModConf);
+285 ENDactivateCnfPrePrivDrop
+286 BEGINactivateCnf
+287 CODESTARTactivateCnf
+288 	CHKiRet(ratelimitNew(&amp;runModConf-&gt;ratelimiter, "imklog", NULL));
+289 	ratelimitSetLinuxLike(runModConf-&gt;ratelimiter,
+290 			      runModConf-&gt;ratelimitInterval,
+291 			      runModConf-&gt;ratelimitBurst);
+292 finalize_it:
+293 ENDactivateCnf
+294 BEGINfreeCnf
+295 CODESTARTfreeCnf
+296 	free(pModConf-&gt;pszBindRuleset);
+297 ENDfreeCnf
+298 BEGINwillRun
+299 CODESTARTwillRun
+300 	pLocalHostIP = glbl.GetLocalHostIP();
+301 	iRet = klogWillRunPostPrivDrop(runModConf);
+302 ENDwillRun
+303 BEGINafterRun
+304 CODESTARTafterRun
+305 	ratelimitDestruct(runModConf-&gt;ratelimiter);
+306 	iRet = klogAfterRun(runModConf);
+307 ENDafterRun
+308 BEGINmodExit
+309 CODESTARTmodExit
+310 	if(pInputName != NULL)
+311 		prop.Destruct(&amp;pInputName);
+312 	objRelease(glbl, CORE_COMPONENT);
+313 	objRelease(net, CORE_COMPONENT);
+314 	objRelease(datetime, CORE_COMPONENT);
+315 	objRelease(ruleset, CORE_COMPONENT);
+316 	objRelease(prop, CORE_COMPONENT);
+317 ENDmodExit
+318 BEGINqueryEtryPt
+319 CODESTARTqueryEtryPt
+320 CODEqueryEtryPt_STD_IMOD_QUERIES
+321 CODEqueryEtryPt_STD_CONF2_QUERIES
+322 CODEqueryEtryPt_STD_CONF2_setModCnf_QUERIES
+323 CODEqueryEtryPt_STD_CONF2_PREPRIVDROP_QUERIES
+324 ENDqueryEtryPt
+325 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
+326 {
+327 	cs.bPermitNonKernel = 0;
+328 	cs.bParseKernelStamp = 0;
+329 	cs.bKeepKernelStamp = 0;
+330 	if(cs.pszPath != NULL) {
+331 		free(cs.pszPath);
+332 		cs.pszPath = NULL;
+333 	}
+334 	cs.iFacilIntMsg = klogFacilIntMsg();
+335 	return RS_RET_OK;
+336 }
+337 BEGINmodInit()
+338 CODESTARTmodInit
+339 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+340 	CHKiRet(objUse(datetime, CORE_COMPONENT));
+341 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+342 	CHKiRet(objUse(prop, CORE_COMPONENT));
+343 	CHKiRet(objUse(ruleset, CORE_COMPONENT));
+344 	CHKiRet(objUse(net, CORE_COMPONENT));
+345 	CHKiRet(prop.CreateStringProp(&amp;pInputName, UCHAR_CONSTANT("imklog"), sizeof("imklog") - 1));
+346 	initConfigSettings();
+347 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"klogLocalipif", 0, eCmdHdlrGoneAway,
+348 			NULL, NULL, STD_LOADABLE_MODULE_ID));
+349 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"debugprintkernelsymbols", 0, eCmdHdlrGoneAway,
+350 			NULL, NULL, STD_LOADABLE_MODULE_ID));
+351 	CHKiRet(regCfSysLineHdlr2((uchar *)"klogpath", 0, eCmdHdlrGetWord,
+352 			NULL, &amp;cs.pszPath, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+353 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"klogsymbollookup", 0, eCmdHdlrGoneAway,
+354 			NULL, NULL, STD_LOADABLE_MODULE_ID));
+355 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"klogsymbolstwice", 0, eCmdHdlrGoneAway,
+356 			NULL, NULL, STD_LOADABLE_MODULE_ID));
+357 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"klogusesyscallinterface", 0, eCmdHdlrGoneAway,
+358 			NULL, NULL, STD_LOADABLE_MODULE_ID));
+359 	CHKiRet(regCfSysLineHdlr2((uchar *)"klogpermitnonkernelfacility", 0, eCmdHdlrBinary,
+360 			NULL, &amp;cs.bPermitNonKernel, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+361 	CHKiRet(regCfSysLineHdlr2((uchar *)"klogconsoleloglevel", 0, eCmdHdlrInt,
+362 			NULL, &amp;cs.console_log_level, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+363 	CHKiRet(regCfSysLineHdlr2((uchar *)"kloginternalmsgfacility", 0, eCmdHdlrFacility,
+364 			NULL, &amp;cs.iFacilIntMsg, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+365 	CHKiRet(regCfSysLineHdlr2((uchar *)"klogparsekerneltimestamp", 0, eCmdHdlrBinary,
+366 			NULL, &amp;cs.bParseKernelStamp, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+367 	CHKiRet(regCfSysLineHdlr2((uchar *)"klogkeepkerneltimestamp", 0, eCmdHdlrBinary,
+368 			NULL, &amp;cs.bKeepKernelStamp, STD_LOADABLE_MODULE_ID, &amp;bLegacyCnfModGlobalsPermitted));
+369 	CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler,
+370 			resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+371 ENDmodInit
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -605,908 +425,610 @@ ENDmodInit
 </h3>
 <hr/>
 <pre>
-/* ommail.c
- *
- * This is an implementation of a mail sending output module. So far, we
- * only support direct SMTP, that is talking to a SMTP server. In the long
- * term, support for using sendmail should also be implemented. Please note
- * that the SMTP protocol implementation is a very bare one. We support
- * RFC821/822 messages, without any authentication and any other nice
- * features (no MIME, no nothing). It is assumed that proper firewalling
- * and/or STMP server configuration is used together with this module.
- *
- * NOTE: read comments in module-template.h to understand how this file
- *       works!
- *
- * File begun on 2008-04-04 by RGerhards
- *
- * Copyright 2008-2014 Adiscon GmbH.
- *
- * This file is part of rsyslog.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *       http://www.apache.org/licenses/LICENSE-2.0
- *       -or-
- *       see COPYING.ASL20 in the source distribution
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-#include "config.h"
-#include "rsyslog.h"
-#include &lt;stdio.h&gt;
-#include &lt;stdarg.h&gt;
-#include &lt;stdlib.h&gt;
-#include &lt;string.h&gt;
-#include &lt;assert.h&gt;
-#include &lt;unistd.h&gt;
-#include &lt;errno.h&gt;
-#include &lt;netdb.h&gt;
-#include &lt;time.h&gt;
-#include &lt;sys/socket.h&gt;
-#include "conf.h"
-#include "syslogd-types.h"
-#include "srUtils.h"
-#include "cfsysline.h"
-#include "module-template.h"
-#include "errmsg.h"
-#include "datetime.h"
-#include "glbl.h"
-#include "parserif.h"
-
-MODULE_TYPE_OUTPUT
-MODULE_TYPE_NOKEEP
-MODULE_CNFNAME("ommail")
-
-/* internal structures
- */
-DEF_OMOD_STATIC_DATA
-DEFobjCurrIf(glbl)
-DEFobjCurrIf(datetime)
-
-/* we add a little support for multiple recipients. We do this via a
- * singly-linked list, enqueued from the top. -- rgerhards, 2008-08-04
- */
-typedef struct toRcpt_s toRcpt_t;
-struct toRcpt_s {
-	uchar *pszTo;
-	toRcpt_t *pNext;
-};
-
-typedef struct _instanceData {
-	uchar *tplName;	/* format template to use */
-	uchar *constSubject; /* if non-NULL, constant string to be used as subject */
-	int8_t iMode;	/* 0 - smtp, 1 - sendmail */
-	sbool bHaveSubject; /* is a subject configured? (if so, it is the second string provided by rsyslog core) */
-	sbool bEnableBody; /* is a body configured? (if so, it is the second string provided by rsyslog core) */
-	union {
-		struct {
-			uchar *pszSrv;
-			uchar *pszSrvPort;
-			uchar *pszFrom;
-			toRcpt_t *lstRcpt;
-			} smtp;
-	} md;	/* mode-specific data */
-} instanceData;
-
-typedef struct wrkrInstanceData {
-	instanceData *pData;
-	union {
-		struct {
-			char RcvBuf[1024]; /* buffer for receiving server responses */
-			size_t lenRcvBuf;
-			size_t iRcvBuf;	/* current index into the rcvBuf (buf empty if iRcvBuf == lenRcvBuf) */
-			int sock;	/* socket to this server (most important when we do multiple msgs per mail) */
-			} smtp;
-	} md;	/* mode-specific data */
-} wrkrInstanceData_t;
-
-typedef struct configSettings_s {
-	toRcpt_t *lstRcpt;
-	uchar *pszSrv;
-	uchar *pszSrvPort;
-	uchar *pszFrom;
-	uchar *pszSubject;
-	int bEnableBody; /* should a mail body be generated? (set to 0 eg for SMS gateways) */
-} configSettings_t;
-static configSettings_t cs;
-
-<a name="0"></a>/* tables for interfacing with the v6 config system */
-/* action (instance) parameters */
-static struct cnfparamdescr actpdescr[] = {
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "server", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
-	{ "port", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
-	{ "mailfrom", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
-	{ "mailto", eCmdHdlrArray, CNFPARAM_REQUIRED },
-	{ "subject.template", eCmdHdlrGetWord, 0 },
-	{ "subject.text", eCmdHdlrString, 0 },
-	{ "body.enable", eCmdHdlrBinary, 0 },
-	{ "template", eCmdHdlrGetWord, 0 }
-};
-static struct cnfparamblk actpblk =
-	{ CNFPARAMBLK_VERSION,
-	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
-	  actpdescr
-	};</b></font>
-
-
-
-BEGINinitConfVars		/* (re)set config variables to default values */
-CODESTARTinitConfVars
-	cs.lstRcpt = NULL;
-	cs.pszSrv = NULL;
-	cs.pszSrvPort = NULL;
-	cs.pszFrom = NULL;
-	cs.pszSubject = NULL;
-	cs.bEnableBody = 1; /* should a mail body be generated? (set to 0 eg for SMS gateways) */
-ENDinitConfVars
-
-/* forward definitions (as few as possible) */
-static rsRetVal Send(int sock, const char *msg, size_t len);
-static rsRetVal readResponse(wrkrInstanceData_t *pWrkrData, int *piState, int iExpected);
-
-
-/* helpers for handling the recipient lists */
-
-/* destroy a complete recipient list */
-static void lstRcptDestruct(toRcpt_t *pRoot)
-{
-	toRcpt_t *pDel;
-
-	while(pRoot != NULL) {
-		pDel = pRoot;
-		pRoot = pRoot-&gt;pNext;
-		/* ready to disalloc */
-		free(pDel-&gt;pszTo);
-		free(pDel);
-	}
-}
-
-
-/* This function adds a recipient to the specified list.
- * The recipient address storage is handed over -- the caller must NOT delete it.
- */
-static rsRetVal
-addRcpt(toRcpt_t **ppLstRcpt, uchar *newRcpt)
-{
-	DEFiRet;
-	toRcpt_t *pNew = NULL;
-
-	CHKmalloc(pNew = calloc(1, sizeof(toRcpt_t)));
-
-	pNew-&gt;pszTo = newRcpt;
-	pNew-&gt;pNext = *ppLstRcpt;
-	*ppLstRcpt = pNew;
-
-	DBGPRINTF("ommail::addRcpt adds recipient %s\n", newRcpt);
-
-finalize_it:
-	if(iRet != RS_RET_OK) {
-		free(pNew);
-		free(newRcpt); /* in any case, this is no longer needed */
-	}
-
-	RETiRet;
-}
-
-/* This function is called when a new recipient email address is to be
- * added. rgerhards, 2008-08-04
- */
-static rsRetVal
-legacyConfAddRcpt(void __attribute__((unused)) *pVal, uchar *pNewVal)
-{
-	return addRcpt(&amp;cs.lstRcpt, pNewVal);
-}
-
-
-/* output the recipient list to the mail server
- * iStatusToCheck &lt; 0 means no checking should happen
- */
-static rsRetVal
-WriteRcpts(wrkrInstanceData_t *pWrkrData, uchar *pszOp, size_t lenOp, int iStatusToCheck)
-{
-	toRcpt_t *pRcpt;
-	int iState;
-	DEFiRet;
-
-	assert(lenOp != 0);
-
-	for(pRcpt = pWrkrData-&gt;pData-&gt;md.smtp.lstRcpt ; pRcpt != NULL ; pRcpt = pRcpt-&gt;pNext) {
-		DBGPRINTF("Sending '%s: &lt;%s&gt;'\n", pszOp, pRcpt-&gt;pszTo);
-		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pszOp, lenOp));
-		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, ":&lt;", sizeof(":&lt;") - 1));
-		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pRcpt-&gt;pszTo, strlen((char*)pRcpt-&gt;pszTo)));
-		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "&gt;\r\n", sizeof("&gt;\r\n") - 1));
-		if(iStatusToCheck &gt;= 0)
-			CHKiRet(readResponse(pWrkrData, &amp;iState, iStatusToCheck));
-	}
-
-finalize_it:
-	RETiRet;
-}
-
-
-/* output the recipient list in rfc2822 format
- */
-static rsRetVal
-WriteTos(wrkrInstanceData_t *pWrkrData, uchar *pszOp, size_t lenOp)
-{
-	toRcpt_t *pRcpt;
-	int iTos;
-	DEFiRet;
-
-	assert(lenOp != 0);
-
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pszOp, lenOp));
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, ": ", sizeof(": ") - 1));
-
-	for(pRcpt = pWrkrData-&gt;pData-&gt;md.smtp.lstRcpt, iTos = 0; pRcpt != NULL ; pRcpt = pRcpt-&gt;pNext, iTos++) {
-		DBGPRINTF("Sending '%s: &lt;%s&gt;'\n", pszOp, pRcpt-&gt;pszTo);
-		if(iTos)
-			CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, ", ", sizeof(", ") - 1));
-		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "&lt;", sizeof("&lt;") - 1));
-		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pRcpt-&gt;pszTo, strlen((char*)pRcpt-&gt;pszTo)));
-		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "&gt;", sizeof("&gt;") - 1));
-	}
-
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "\r\n", sizeof("\r\n") - 1));
-
-finalize_it:
-	RETiRet;
-}
-/* end helpers for handling the recipient lists */
-
-BEGINcreateInstance
-CODESTARTcreateInstance
-	pData-&gt;constSubject = NULL;
-	pData-&gt;bEnableBody = 1;
-ENDcreateInstance
-
-
-BEGINcreateWrkrInstance
-CODESTARTcreateWrkrInstance
-ENDcreateWrkrInstance
-
-
-BEGINisCompatibleWithFeature
-CODESTARTisCompatibleWithFeature
-	if(eFeat == sFEATURERepeatedMsgReduction)
-		iRet = RS_RET_OK;
-ENDisCompatibleWithFeature
-
-
-BEGINfreeInstance
-CODESTARTfreeInstance
-	free(pData-&gt;tplName);
-	if(pData-&gt;iMode == 0) {
-		free(pData-&gt;md.smtp.pszSrv);
-		free(pData-&gt;md.smtp.pszSrvPort);
-		free(pData-&gt;md.smtp.pszFrom);
-		lstRcptDestruct(pData-&gt;md.smtp.lstRcpt);
-	}
-ENDfreeInstance
-
-
-BEGINfreeWrkrInstance
-CODESTARTfreeWrkrInstance
-ENDfreeWrkrInstance
-
-
-BEGINdbgPrintInstInfo
-CODESTARTdbgPrintInstInfo
-	printf("mail"); /* TODO: extend! */
-ENDdbgPrintInstInfo
-
-
-/* TCP support code, should probably be moved to net.c or some place else... -- rgerhards, 2008-04-04 */
-
-/* "receive" a character from the remote server. A single character
- * is returned. Returns RS_RET_NO_MORE_DATA if the server has closed
- * the connection and RS_RET_IO_ERROR if something goes wrong. This
- * is a blocking read.
- * rgerhards, 2008-04-04
- */
-static rsRetVal
-getRcvChar(wrkrInstanceData_t *pWrkrData, char *pC)
-{
-	DEFiRet;
-	ssize_t lenBuf;
-
-	if(pWrkrData-&gt;md.smtp.iRcvBuf == pWrkrData-&gt;md.smtp.lenRcvBuf) { /* buffer empty? */
-		/* yes, we need to read the next server response */
-		do {
-			lenBuf = recv(pWrkrData-&gt;md.smtp.sock, pWrkrData-&gt;md.smtp.RcvBuf,
-			              sizeof(pWrkrData-&gt;md.smtp.RcvBuf), 0);
-			if(lenBuf == 0) {
-				ABORT_FINALIZE(RS_RET_NO_MORE_DATA);
-			} else if(lenBuf &lt; 0) {
-				if(errno != EAGAIN) {
-					ABORT_FINALIZE(RS_RET_IO_ERROR);
-				}
-			} else {
-				/* good read */
-				pWrkrData-&gt;md.smtp.iRcvBuf = 0;
-				pWrkrData-&gt;md.smtp.lenRcvBuf = lenBuf;
-			}
-
-		} while(lenBuf &lt; 1);
-	}
-
-	/* when we reach this point, we have a non-empty buffer */
-	*pC = pWrkrData-&gt;md.smtp.RcvBuf[pWrkrData-&gt;md.smtp.iRcvBuf++];
-
-finalize_it:
-	RETiRet;
-}
-
-
-/* close the mail server connection
- * rgerhards, 2008-04-08
- */
-static rsRetVal
-serverDisconnect(wrkrInstanceData_t *pWrkrData)
-{
-	DEFiRet;
-	assert(pWrkrData != NULL);
-
-	if(pWrkrData-&gt;md.smtp.sock != -1) {
-		close(pWrkrData-&gt;md.smtp.sock);
-		pWrkrData-&gt;md.smtp.sock = -1;
-	}
-
-	RETiRet;
-}
-
-
-/* open a connection to the mail server
- * rgerhards, 2008-04-04
- */
-static rsRetVal
-serverConnect(wrkrInstanceData_t *pWrkrData)
-{
-	struct addrinfo *res = NULL;
-	struct addrinfo hints;
-	const char *smtpPort;
-	const char *smtpSrv;
-	char errStr[1024];
-	instanceData *pData;
-	DEFiRet;
-
-	pData = pWrkrData-&gt;pData;
-
-	if(pData-&gt;md.smtp.pszSrv == NULL)
-		smtpSrv = "127.0.0.1";
-	else
-		smtpSrv = (char*)pData-&gt;md.smtp.pszSrv;
-
-	if(pData-&gt;md.smtp.pszSrvPort == NULL)
-		smtpPort = "25";
-	else
-		smtpPort = (char*)pData-&gt;md.smtp.pszSrvPort;
-
-	memset(&amp;hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC; /* TODO: make configurable! */
-	hints.ai_socktype = SOCK_STREAM;
-	if(getaddrinfo(smtpSrv, smtpPort, &amp;hints, &amp;res) != 0) {
-		DBGPRINTF("error %d in getaddrinfo\n", errno);
-		ABORT_FINALIZE(RS_RET_IO_ERROR);
-	}
-	
-	if((pWrkrData-&gt;md.smtp.sock = socket(res-&gt;ai_family, res-&gt;ai_socktype, res-&gt;ai_protocol)) == -1) {
-		DBGPRINTF("couldn't create send socket, reason %s", rs_strerror_r(errno, errStr, sizeof(errStr)));
-		ABORT_FINALIZE(RS_RET_IO_ERROR);
-	}
-
-	if(connect(pWrkrData-&gt;md.smtp.sock, res-&gt;ai_addr, res-&gt;ai_addrlen) != 0) {
-		DBGPRINTF("create tcp connection failed, reason %s", rs_strerror_r(errno, errStr, sizeof(errStr)));
-		ABORT_FINALIZE(RS_RET_IO_ERROR);
-	}
-
-finalize_it:
-	if(res != NULL)
-		freeaddrinfo(res);
-
-	if(iRet != RS_RET_OK) {
-		if(pWrkrData-&gt;md.smtp.sock != -1) {
-			close(pWrkrData-&gt;md.smtp.sock);
-			pWrkrData-&gt;md.smtp.sock = -1;
-		}
-	}
-
-	RETiRet;
-}
-
-
-/* send text to the server, blocking send */
-static rsRetVal
-Send(const int sock, const char *const __restrict__ msg, const size_t len)
-{
-	DEFiRet;
-	size_t offsBuf = 0;
-	ssize_t lenSend;
-
-	assert(msg != NULL);
-
-	if(len == 0) /* it's valid, but does not make much sense ;) */
-		FINALIZE;
-
-	do {
-		lenSend = send(sock, msg + offsBuf, len - offsBuf, 0);
-		if(lenSend == -1) {
-			if(errno != EAGAIN) {
-				DBGPRINTF("message not (smtp/tcp)send, errno %d", errno);
-				ABORT_FINALIZE(RS_RET_TCP_SEND_ERROR);
-			}
-		} else if(lenSend != (ssize_t) (len - offsBuf)) {
-			offsBuf += lenSend; /* on to next round... */
-		} else {
-			FINALIZE;
-		}
-	} while(1);
-
-finalize_it:
-	RETiRet;
-}
-
-
-/* send body text to the server, blocking send
- * The body is special in that we must escape a leading dot inside a line
- */
-static rsRetVal
-bodySend(wrkrInstanceData_t *pWrkrData, char *msg, size_t len)
-{
-	DEFiRet;
-	char szBuf[2048];
-	size_t iSrc;
-	size_t iBuf = 0;
-	int bHadCR = 0;
-	int bInStartOfLine = 1;
-
-	assert(pWrkrData != NULL);
-	assert(msg != NULL);
-
-	for(iSrc = 0 ; iSrc &lt; len ; ++iSrc) {
-		if(iBuf &gt;= sizeof(szBuf) - 1) { /* one is reserved for our extra dot */
-			CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, szBuf, iBuf));
-			iBuf = 0;
-		}
-		szBuf[iBuf++] = msg[iSrc];
-		switch(msg[iSrc]) {
-			case '\r':
-				bHadCR = 1;
-				break;
-			case '\n':
-				if(bHadCR)
-					bInStartOfLine = 1;
-				bHadCR = 0;
-				break;
-			case '.':
-				if(bInStartOfLine)
-					szBuf[iBuf++] = '.'; /* space is always reserved for this! */
-				/*FALLTHROUGH*/
-			default:
-				bInStartOfLine = 0;
-				bHadCR = 0;
-				break;
-		}
-	}
-
-	if(iBuf &gt; 0) { /* incomplete buffer to send (the *usual* case)? */
-		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, szBuf, iBuf));
-	}
-
-finalize_it:
-	RETiRet;
-}
-
-
-/* read response line from server
- */
-static rsRetVal
-readResponseLn(wrkrInstanceData_t *pWrkrData, char *pLn, size_t lenLn, size_t *const __restrict__ respLen)
-{
-	DEFiRet;
-	size_t i = 0;
-	char c;
-	
-	assert(pWrkrData != NULL);
-	assert(pLn != NULL);
-	
-	do {
-		CHKiRet(getRcvChar(pWrkrData, &amp;c));
-		if(c == '\n')
-			break;
-		if(i &lt; (lenLn - 1)) /* if line is too long, we simply discard the rest */
-			pLn[i++] = c;
-	} while(1);
-	DBGPRINTF("smtp server response: %s\n", pLn);
-	/* do not remove, this is helpful in troubleshooting SMTP probs! */
-
-finalize_it:
-	pLn[i] = '\0';
-	*respLen = i;
-	RETiRet;
-}
-
-
-/* read numerical response code from server and compare it to requried response code.
- * If they two don't match, return RS_RET_SMTP_ERROR.
- * rgerhards, 2008-04-07
- */
-static rsRetVal
-readResponse(wrkrInstanceData_t *pWrkrData, int *piState, int iExpected)
-{
-	DEFiRet;
-	int bCont;
-	char buf[128];
-	size_t respLen;
-	
-	assert(pWrkrData != NULL);
-	assert(piState != NULL);
-	
-	bCont = 1;
-	do {
-		CHKiRet(readResponseLn(pWrkrData, buf, sizeof(buf), &amp;respLen));
-		if(respLen &lt; 4) /* we treat too-short responses as error */
-			ABORT_FINALIZE(RS_RET_SMTP_ERROR);
-		if(buf[3] != '-') { /* last or only response line? */
-			bCont = 0;
-			*piState = buf[0] - '0';
-			*piState = *piState * 10 + buf[1] - '0';
-			*piState = *piState * 10 + buf[2] - '0';
-			if(*piState != iExpected)
-				ABORT_FINALIZE(RS_RET_SMTP_ERROR);
-		}
-	} while(bCont);
-	
-finalize_it:
-	RETiRet;
-}
-
-
-/* create a timestamp suitable for use with the Date: SMTP body header
- * rgerhards, 2008-04-08
- */
-static void
-mkSMTPTimestamp(uchar *pszBuf, size_t lenBuf)
-{
-	time_t tCurr;
-	struct tm tmCurr;
-	static const char szDay[][4] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-	static const char szMonth[][4] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
-	"Oct", "Nov", "Dec"};
-
-	datetime.GetTime(&amp;tCurr);
-	gmtime_r(&amp;tCurr, &amp;tmCurr);
-	snprintf((char*)pszBuf, lenBuf, "Date: %s, %2d %s %4d %02d:%02d:%02d +0000\r\n", szDay[tmCurr.tm_wday],
-	tmCurr.tm_mday,
-		 szMonth[tmCurr.tm_mon], 1900 + tmCurr.tm_year, tmCurr.tm_hour, tmCurr.tm_min, tmCurr.tm_sec);
-}
-
-
-/* send a message via SMTP
- * rgerhards, 2008-04-04
- */
-static rsRetVal
-sendSMTP(wrkrInstanceData_t *pWrkrData, uchar *body, uchar *subject)
-{
-	DEFiRet;
-	int iState; /* SMTP state */
-	instanceData *pData;
-	uchar szDateBuf[64];
-	
-	pData = pWrkrData-&gt;pData;
-
-	CHKiRet(serverConnect(pWrkrData));
-	CHKiRet(readResponse(pWrkrData, &amp;iState, 220));
-
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "HELO ", 5));
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)glbl.GetLocalHostName(),
-		strlen((char*)glbl.GetLocalHostName())));
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "\r\n", sizeof("\r\n") - 1));
-	CHKiRet(readResponse(pWrkrData, &amp;iState, 250));
-
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "MAIL FROM:&lt;", sizeof("MAIL FROM:&lt;") - 1));
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pData-&gt;md.smtp.pszFrom, strlen((char*)pData-&gt;md.smtp.pszFrom)));
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "&gt;\r\n", sizeof("&gt;\r\n") - 1));
-	CHKiRet(readResponse(pWrkrData, &amp;iState, 250));
-
-	CHKiRet(WriteRcpts(pWrkrData, (uchar*)"RCPT TO", sizeof("RCPT TO") - 1, 250));
-
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "DATA\r\n",   sizeof("DATA\r\n") - 1));
-	CHKiRet(readResponse(pWrkrData, &amp;iState, 354));
-
-	/* now come the data part */
-	/* header */
-	mkSMTPTimestamp(szDateBuf, sizeof(szDateBuf));
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)szDateBuf, strlen((char*)szDateBuf)));
-
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "From: &lt;", sizeof("From: &lt;") - 1));
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pData-&gt;md.smtp.pszFrom, strlen((char*)pData-&gt;md.smtp.pszFrom)));
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "&gt;\r\n", sizeof("&gt;\r\n") - 1));
-
-	CHKiRet(WriteTos(pWrkrData, (uchar*)"To", sizeof("To") - 1));
-
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "Subject: ",   sizeof("Subject: ") - 1));
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)subject, strlen((char*)subject)));
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "\r\n", sizeof("\r\n") - 1));
-
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "X-Mailer: rsyslog-ommail\r\n",
-		sizeof("x-mailer: rsyslog-ommail\r\n") - 1));
-
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "\r\n",   sizeof("\r\n") - 1)); /* indicate end of header */
-
-	/* body */
-	if(pData-&gt;bEnableBody)
-		CHKiRet(bodySend(pWrkrData, (char*)body, strlen((char*) body)));
-
-	/* end of data, back to envelope transaction */
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "\r\n.\r\n",   sizeof("\r\n.\r\n") - 1));
-	CHKiRet(readResponse(pWrkrData, &amp;iState, 250));
-
-	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "QUIT\r\n",   sizeof("QUIT\r\n") - 1));
-	CHKiRet(readResponse(pWrkrData, &amp;iState, 221));
-
-	/* we are finished, a new connection is created for each request, so let's close it now */
-	CHKiRet(serverDisconnect(pWrkrData));
-	
-finalize_it:
-	RETiRet;
-}
-
-
-/* in tryResume we check if we can connect to the server in question. If that is OK,
- * we close the connection without doing any actual SMTP transaction. It will be
- * reopened during the actual send process. This may not be the best way to do it if
- * there is a problem inside the SMTP transaction. However, we can't find that out without
- * actually initiating something, and that would be bad. The logic here helps us
- * correctly recover from an unreachable/down mail server, which is probably the majority
- * of problem cases. For SMTP transaction problems, we will do lots of retries, but if it
- * is a temporary problem, it will be fixed anyhow. So I consider this implementation to
- * be clean enough, especially as I think other approaches have other weaknesses.
- * rgerhards, 2008-04-08
- */
-BEGINtryResume
-CODESTARTtryResume
-	CHKiRet(serverConnect(pWrkrData));
-	CHKiRet(serverDisconnect(pWrkrData)); /* if we fail, we will never reach this line */
-finalize_it:
-	if(iRet == RS_RET_IO_ERROR)
-		iRet = RS_RET_SUSPENDED;
-ENDtryResume
-
-
-BEGINdoAction
-	uchar *subject;
-	const instanceData *const __restrict__ pData = pWrkrData-&gt;pData;
-CODESTARTdoAction
-	DBGPRINTF("ommail doAction()\n");
-
-	if(pData-&gt;constSubject != NULL)
-		subject = pData-&gt;constSubject;
-	else if(pData-&gt;bHaveSubject)
-		subject = ppString[1];
-	else
-		subject = (uchar*)"message from rsyslog";
-
-	iRet = sendSMTP(pWrkrData, ppString[0], subject);
-	if(iRet != RS_RET_OK) {
-		DBGPRINTF("error sending mail, suspending\n");
-		iRet = RS_RET_SUSPENDED;
-	}
-ENDdoAction
-
-
-
-static inline void
-setInstParamDefaults(instanceData *pData)
-{
-	pData-&gt;tplName = NULL;
-	pData-&gt;constSubject = NULL;
-}
-
-
-BEGINnewActInst
-	struct cnfparamvals *pvals;
-<a name="1"></a>	uchar *tplSubject = NULL;
-	int i, j;
-CODESTARTnewActInst
-<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
-		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
-	}
-
-	CHKiRet(createInstance(&amp;pData));
-	setInstParamDefaults(pData);
-
-	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
-		if(!pvals[i].bUsed)
-			continue;
-		if(!strcmp(actpblk.descr[i].name, "server")) {
-			pData-&gt;md.smtp.pszSrv = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "port")) {
-			pData-&gt;md.smtp.pszSrvPort =  (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
-		} else if(!strcmp(actpblk.descr[i].name, "mailfrom")) {
-			pData-&gt;md.smtp.pszFrom = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "mailto")) {
-			for(j = 0 ; j &lt; pvals[i].val.d.ar-&gt;nmemb ; ++j) {
-				addRcpt(&amp;(pData-&gt;md.smtp.lstRcpt),
-					(uchar*)es_str2cstr(pvals[i].val.d.ar-&gt;arr[j], NULL));
-			}
-		} else if(!strcmp(actpblk.descr[i].name, "subject.template")) {
-			if(pData-&gt;constSubject != NULL) {
-				parser_errmsg("ommail: only one of subject.template, subject.text "
-					      "can be set");
-				ABORT_FINALIZE(RS_RET_DUP_PARAM);
-			}
-			tplSubject = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "subject.text")) {
-			if(tplSubject != NULL) {
-				parser_errmsg("ommail: only one of subject.template, subject.text "
-					      "can be set");
-				ABORT_FINALIZE(RS_RET_DUP_PARAM);
-<a name="2"></a>			}
-			pData-&gt;constSubject = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else if(!strcmp(actpblk.descr[i].name, "body.enable")) {
-<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>			pData-&gt;bEnableBody =  (int) pvals[i].val.d.n;
-		} else if(!strcmp(actpblk.descr[i].name, "template")) {
-			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
-		} else {
-			DBGPRINTF("ommail: program error, non-handled "
-			  "param '%s'\n", actpblk.descr[i].name);
-		}
-	}</b></font>
-
-	if(tplSubject == NULL) {
-		/* if no subject is configured, we need just one template string */
-		CODE_STD_STRING_REQUESTparseSelectorAct(1)
-	} else {
-		CODE_STD_STRING_REQUESTparseSelectorAct(2)
-		pData-&gt;bHaveSubject = 1;
-		/* NOTE: tplSubject memory is *handed over* down here below - do NOT free() */
-		CHKiRet(OMSRsetEntry(*ppOMSR, 1, tplSubject, OMSR_NO_RQD_TPL_OPTS));
-	}
-
-	if(pData-&gt;tplName == NULL) {
-		CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*) strdup("RSYSLOG_FileFormat"),
-			OMSR_NO_RQD_TPL_OPTS));
-	} else {
-		CHKiRet(OMSRsetEntry(*ppOMSR, 0,
-			(uchar*) strdup((char*) pData-&gt;tplName),
-			OMSR_NO_RQD_TPL_OPTS));
-	}
-CODE_STD_FINALIZERnewActInst
-	cnfparamvalsDestruct(pvals, &amp;actpblk);
-ENDnewActInst
-
-
-BEGINparseSelectorAct
-CODESTARTparseSelectorAct
-	if(!strncmp((char*) p, ":ommail:", sizeof(":ommail:") - 1)) {
-		p += sizeof(":ommail:") - 1; /* eat indicator sequence (-1 because of '\0'!) */
-	} else {
-		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
-	}
-
-	/* ok, if we reach this point, we have something for us */
-	if((iRet = createInstance(&amp;pData)) != RS_RET_OK)
-		FINALIZE;
-
-	/* TODO: check strdup() result */
-
-	if(cs.pszFrom == NULL) {
-		LogError(0, RS_RET_MAIL_NO_FROM, "no sender address given - specify $ActionMailFrom");
-		ABORT_FINALIZE(RS_RET_MAIL_NO_FROM);
-	}
-	if(cs.lstRcpt == NULL) {
-		LogError(0, RS_RET_MAIL_NO_TO, "no recipient address given - specify $ActionMailTo");
-		ABORT_FINALIZE(RS_RET_MAIL_NO_TO);
-	}
-
-	pData-&gt;md.smtp.pszFrom = (uchar*) strdup((char*)cs.pszFrom);
-	pData-&gt;md.smtp.lstRcpt = cs.lstRcpt; /* we "hand over" this memory */
-	cs.lstRcpt = NULL; /* note: this is different from pre-3.21.2 versions! */
-
-	if(cs.pszSubject == NULL) {
-		/* if no subject is configured, we need just one template string */
-		CODE_STD_STRING_REQUESTparseSelectorAct(1)
-	} else {
-		CODE_STD_STRING_REQUESTparseSelectorAct(2)
-		pData-&gt;bHaveSubject = 1;
-		CHKiRet(OMSRsetEntry(*ppOMSR, 1, (uchar*)strdup((char*) cs.pszSubject), OMSR_NO_RQD_TPL_OPTS));
-	}
-	if(cs.pszSrv != NULL)
-		pData-&gt;md.smtp.pszSrv = (uchar*) strdup((char*)cs.pszSrv);
-	if(cs.pszSrvPort != NULL)
-		pData-&gt;md.smtp.pszSrvPort = (uchar*) strdup((char*)cs.pszSrvPort);
-	pData-&gt;bEnableBody = cs.bEnableBody;
-
-	/* process template */
-	iRet = cflineParseTemplateName(&amp;p, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS, (uchar*) "RSYSLOG_FileFormat");
-CODE_STD_FINALIZERparseSelectorAct
-ENDparseSelectorAct
-
-
-/* Free string config variables and reset them to NULL (not necessarily the default!) */
-static rsRetVal freeConfigVariables(void)
-{
-	DEFiRet;
-
-	free(cs.pszSrv);
-	cs.pszSrv = NULL;
-	free(cs.pszSrvPort);
-	cs.pszSrvPort = NULL;
-	free(cs.pszFrom);
-	cs.pszFrom = NULL;
-	lstRcptDestruct(cs.lstRcpt);
-	cs.lstRcpt = NULL;
-	
-	RETiRet;
-}
-
-
-BEGINmodExit
-CODESTARTmodExit
-	/* cleanup our allocations */
-	freeConfigVariables();
-
-	/* release what we no longer need */
-	objRelease(datetime, CORE_COMPONENT);
-	objRelease(glbl, CORE_COMPONENT);
-ENDmodExit
-
-
-BEGINqueryEtryPt
-CODESTARTqueryEtryPt
-CODEqueryEtryPt_STD_OMOD_QUERIES
-CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
-CODEqueryEtryPt_STD_OMOD8_QUERIES
-CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES
-ENDqueryEtryPt
-
-
-/* Reset config variables for this module to default values.
- */
-static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
-{
-	DEFiRet;
-	cs.bEnableBody = 1;
-	iRet = freeConfigVariables();
-	RETiRet;
-}
-
-
-BEGINmodInit()
-CODESTARTmodInit
-INITLegCnfVars
-	*ipIFVersProvided = CURR_MOD_IF_VERSION; /* we only support the current interface specification */
-CODEmodInit_QueryRegCFSLineHdlr
-	/* tell which objects we need */
-	CHKiRet(objUse(glbl, CORE_COMPONENT));
-	CHKiRet(objUse(datetime, CORE_COMPONENT));
-
-	DBGPRINTF("ommail version %s initializing\n", VERSION);
-
-	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailsmtpserver", 0, eCmdHdlrGetWord, NULL, &amp;cs.pszSrv,
-	STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailsmtpport", 0, eCmdHdlrGetWord, NULL, &amp;cs.pszSrvPort,
-	STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailfrom", 0, eCmdHdlrGetWord, NULL, &amp;cs.pszFrom,
-	STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailto", 0, eCmdHdlrGetWord, legacyConfAddRcpt, NULL,
-	STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailsubject", 0, eCmdHdlrGetWord, NULL, &amp;cs.pszSubject,
-	STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailenablebody", 0, eCmdHdlrBinary, NULL, &amp;cs.bEnableBody,
-	STD_LOADABLE_MODULE_ID));
-	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler,
-	resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
-ENDmodInit
+1 #include "config.h"
+2 #include "rsyslog.h"
+3 #include &lt;stdio.h&gt;
+4 #include &lt;stdarg.h&gt;
+5 #include &lt;stdlib.h&gt;
+6 #include &lt;string.h&gt;
+7 #include &lt;assert.h&gt;
+8 #include &lt;unistd.h&gt;
+9 #include &lt;errno.h&gt;
+10 #include &lt;netdb.h&gt;
+11 #include &lt;time.h&gt;
+12 #include &lt;sys/socket.h&gt;
+13 #include "conf.h"
+14 #include "syslogd-types.h"
+15 #include "srUtils.h"
+16 #include "cfsysline.h"
+17 #include "module-template.h"
+18 #include "errmsg.h"
+19 #include "datetime.h"
+20 #include "glbl.h"
+21 #include "parserif.h"
+22 MODULE_TYPE_OUTPUT
+23 MODULE_TYPE_NOKEEP
+24 MODULE_CNFNAME("ommail")
+25 DEF_OMOD_STATIC_DATA
+26 DEFobjCurrIf(glbl)
+27 DEFobjCurrIf(datetime)
+28 typedef struct toRcpt_s toRcpt_t;
+29 struct toRcpt_s {
+30 	uchar *pszTo;
+31 	toRcpt_t *pNext;
+32 };
+33 typedef struct _instanceData {
+34 	uchar *tplName;		uchar *constSubject; 	int8_t iMode;		sbool bHaveSubject; 	sbool bEnableBody; 	union {
+35 		struct {
+36 			uchar *pszSrv;
+37 			uchar *pszSrvPort;
+38 			uchar *pszFrom;
+39 			toRcpt_t *lstRcpt;
+40 			} smtp;
+41 	} md;	} instanceData;
+42 typedef struct wrkrInstanceData {
+43 	instanceData *pData;
+44 	union {
+45 		struct {
+46 			char RcvBuf[1024]; 			size_t lenRcvBuf;
+47 			size_t iRcvBuf;				int sock;				} smtp;
+48 	} md;	} wrkrInstanceData_t;
+49 typedef struct configSettings_s {
+50 	toRcpt_t *lstRcpt;
+51 	uchar *pszSrv;
+52 	uchar *pszSrvPort;
+53 	uchar *pszFrom;
+54 	uchar *pszSubject;
+55 	int bEnableBody; } configSettings_t;
+56 static configSettings_t cs;
+57 <a name="0"></a>static struct cnfparamdescr actpdescr[] = {
+58 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	{ "server", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
+59 	{ "port", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
+60 	{ "mailfrom", eCmdHdlrGetWord, CNFPARAM_REQUIRED },
+61 	{ "mailto", eCmdHdlrArray, CNFPARAM_REQUIRED },
+62 	{ "subject.template", eCmdHdlrGetWord, 0 },
+63 	{ "subject.text", eCmdHdlrString, 0 },
+64 	{ "body.enable", eCmdHdlrBinary, 0 },
+65 	{ "template", eCmdHdlrGetWord, 0 }
+66 };
+67 static struct cnfparamblk actpblk =
+68 	{ CNFPARAMBLK_VERSION,
+69 	  sizeof(actpdescr)/sizeof(struct cnfparamdescr),
+70 	  actpdescr
+71 	};</b></font>
+72 BEGINinitConfVars		CODESTARTinitConfVars
+73 	cs.lstRcpt = NULL;
+74 	cs.pszSrv = NULL;
+75 	cs.pszSrvPort = NULL;
+76 	cs.pszFrom = NULL;
+77 	cs.pszSubject = NULL;
+78 	cs.bEnableBody = 1; ENDinitConfVars
+79 static rsRetVal Send(int sock, const char *msg, size_t len);
+80 static rsRetVal readResponse(wrkrInstanceData_t *pWrkrData, int *piState, int iExpected);
+81 static void lstRcptDestruct(toRcpt_t *pRoot)
+82 {
+83 	toRcpt_t *pDel;
+84 	while(pRoot != NULL) {
+85 		pDel = pRoot;
+86 		pRoot = pRoot-&gt;pNext;
+87 		free(pDel-&gt;pszTo);
+88 		free(pDel);
+89 	}
+90 }
+91 static rsRetVal
+92 addRcpt(toRcpt_t **ppLstRcpt, uchar *newRcpt)
+93 {
+94 	DEFiRet;
+95 	toRcpt_t *pNew = NULL;
+96 	CHKmalloc(pNew = calloc(1, sizeof(toRcpt_t)));
+97 	pNew-&gt;pszTo = newRcpt;
+98 	pNew-&gt;pNext = *ppLstRcpt;
+99 	*ppLstRcpt = pNew;
+100 	DBGPRINTF("ommail::addRcpt adds recipient %s\n", newRcpt);
+101 finalize_it:
+102 	if(iRet != RS_RET_OK) {
+103 		free(pNew);
+104 		free(newRcpt); 	}
+105 	RETiRet;
+106 }
+107 static rsRetVal
+108 legacyConfAddRcpt(void __attribute__((unused)) *pVal, uchar *pNewVal)
+109 {
+110 	return addRcpt(&amp;cs.lstRcpt, pNewVal);
+111 }
+112 static rsRetVal
+113 WriteRcpts(wrkrInstanceData_t *pWrkrData, uchar *pszOp, size_t lenOp, int iStatusToCheck)
+114 {
+115 	toRcpt_t *pRcpt;
+116 	int iState;
+117 	DEFiRet;
+118 	assert(lenOp != 0);
+119 	for(pRcpt = pWrkrData-&gt;pData-&gt;md.smtp.lstRcpt ; pRcpt != NULL ; pRcpt = pRcpt-&gt;pNext) {
+120 		DBGPRINTF("Sending '%s: &lt;%s&gt;'\n", pszOp, pRcpt-&gt;pszTo);
+121 		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pszOp, lenOp));
+122 		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, ":&lt;", sizeof(":&lt;") - 1));
+123 		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pRcpt-&gt;pszTo, strlen((char*)pRcpt-&gt;pszTo)));
+124 		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "&gt;\r\n", sizeof("&gt;\r\n") - 1));
+125 		if(iStatusToCheck &gt;= 0)
+126 			CHKiRet(readResponse(pWrkrData, &amp;iState, iStatusToCheck));
+127 	}
+128 finalize_it:
+129 	RETiRet;
+130 }
+131 static rsRetVal
+132 WriteTos(wrkrInstanceData_t *pWrkrData, uchar *pszOp, size_t lenOp)
+133 {
+134 	toRcpt_t *pRcpt;
+135 	int iTos;
+136 	DEFiRet;
+137 	assert(lenOp != 0);
+138 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pszOp, lenOp));
+139 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, ": ", sizeof(": ") - 1));
+140 	for(pRcpt = pWrkrData-&gt;pData-&gt;md.smtp.lstRcpt, iTos = 0; pRcpt != NULL ; pRcpt = pRcpt-&gt;pNext, iTos++) {
+141 		DBGPRINTF("Sending '%s: &lt;%s&gt;'\n", pszOp, pRcpt-&gt;pszTo);
+142 		if(iTos)
+143 			CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, ", ", sizeof(", ") - 1));
+144 		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "&lt;", sizeof("&lt;") - 1));
+145 		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pRcpt-&gt;pszTo, strlen((char*)pRcpt-&gt;pszTo)));
+146 		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "&gt;", sizeof("&gt;") - 1));
+147 	}
+148 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "\r\n", sizeof("\r\n") - 1));
+149 finalize_it:
+150 	RETiRet;
+151 }
+152 BEGINcreateInstance
+153 CODESTARTcreateInstance
+154 	pData-&gt;constSubject = NULL;
+155 	pData-&gt;bEnableBody = 1;
+156 ENDcreateInstance
+157 BEGINcreateWrkrInstance
+158 CODESTARTcreateWrkrInstance
+159 ENDcreateWrkrInstance
+160 BEGINisCompatibleWithFeature
+161 CODESTARTisCompatibleWithFeature
+162 	if(eFeat == sFEATURERepeatedMsgReduction)
+163 		iRet = RS_RET_OK;
+164 ENDisCompatibleWithFeature
+165 BEGINfreeInstance
+166 CODESTARTfreeInstance
+167 	free(pData-&gt;tplName);
+168 	if(pData-&gt;iMode == 0) {
+169 		free(pData-&gt;md.smtp.pszSrv);
+170 		free(pData-&gt;md.smtp.pszSrvPort);
+171 		free(pData-&gt;md.smtp.pszFrom);
+172 		lstRcptDestruct(pData-&gt;md.smtp.lstRcpt);
+173 	}
+174 ENDfreeInstance
+175 BEGINfreeWrkrInstance
+176 CODESTARTfreeWrkrInstance
+177 ENDfreeWrkrInstance
+178 BEGINdbgPrintInstInfo
+179 CODESTARTdbgPrintInstInfo
+180 	printf("mail"); ENDdbgPrintInstInfo
+181 static rsRetVal
+182 getRcvChar(wrkrInstanceData_t *pWrkrData, char *pC)
+183 {
+184 	DEFiRet;
+185 	ssize_t lenBuf;
+186 	if(pWrkrData-&gt;md.smtp.iRcvBuf == pWrkrData-&gt;md.smtp.lenRcvBuf) { 		do {
+187 			lenBuf = recv(pWrkrData-&gt;md.smtp.sock, pWrkrData-&gt;md.smtp.RcvBuf,
+188 			              sizeof(pWrkrData-&gt;md.smtp.RcvBuf), 0);
+189 			if(lenBuf == 0) {
+190 				ABORT_FINALIZE(RS_RET_NO_MORE_DATA);
+191 			} else if(lenBuf &lt; 0) {
+192 				if(errno != EAGAIN) {
+193 					ABORT_FINALIZE(RS_RET_IO_ERROR);
+194 				}
+195 			} else {
+196 				pWrkrData-&gt;md.smtp.iRcvBuf = 0;
+197 				pWrkrData-&gt;md.smtp.lenRcvBuf = lenBuf;
+198 			}
+199 		} while(lenBuf &lt; 1);
+200 	}
+201 	*pC = pWrkrData-&gt;md.smtp.RcvBuf[pWrkrData-&gt;md.smtp.iRcvBuf++];
+202 finalize_it:
+203 	RETiRet;
+204 }
+205 static rsRetVal
+206 serverDisconnect(wrkrInstanceData_t *pWrkrData)
+207 {
+208 	DEFiRet;
+209 	assert(pWrkrData != NULL);
+210 	if(pWrkrData-&gt;md.smtp.sock != -1) {
+211 		close(pWrkrData-&gt;md.smtp.sock);
+212 		pWrkrData-&gt;md.smtp.sock = -1;
+213 	}
+214 	RETiRet;
+215 }
+216 static rsRetVal
+217 serverConnect(wrkrInstanceData_t *pWrkrData)
+218 {
+219 	struct addrinfo *res = NULL;
+220 	struct addrinfo hints;
+221 	const char *smtpPort;
+222 	const char *smtpSrv;
+223 	char errStr[1024];
+224 	instanceData *pData;
+225 	DEFiRet;
+226 	pData = pWrkrData-&gt;pData;
+227 	if(pData-&gt;md.smtp.pszSrv == NULL)
+228 		smtpSrv = "127.0.0.1";
+229 	else
+230 		smtpSrv = (char*)pData-&gt;md.smtp.pszSrv;
+231 	if(pData-&gt;md.smtp.pszSrvPort == NULL)
+232 		smtpPort = "25";
+233 	else
+234 		smtpPort = (char*)pData-&gt;md.smtp.pszSrvPort;
+235 	memset(&amp;hints, 0, sizeof(hints));
+236 	hints.ai_family = AF_UNSPEC; 	hints.ai_socktype = SOCK_STREAM;
+237 	if(getaddrinfo(smtpSrv, smtpPort, &amp;hints, &amp;res) != 0) {
+238 		DBGPRINTF("error %d in getaddrinfo\n", errno);
+239 		ABORT_FINALIZE(RS_RET_IO_ERROR);
+240 	}
+241 	if((pWrkrData-&gt;md.smtp.sock = socket(res-&gt;ai_family, res-&gt;ai_socktype, res-&gt;ai_protocol)) == -1) {
+242 		DBGPRINTF("couldn't create send socket, reason %s", rs_strerror_r(errno, errStr, sizeof(errStr)));
+243 		ABORT_FINALIZE(RS_RET_IO_ERROR);
+244 	}
+245 	if(connect(pWrkrData-&gt;md.smtp.sock, res-&gt;ai_addr, res-&gt;ai_addrlen) != 0) {
+246 		DBGPRINTF("create tcp connection failed, reason %s", rs_strerror_r(errno, errStr, sizeof(errStr)));
+247 		ABORT_FINALIZE(RS_RET_IO_ERROR);
+248 	}
+249 finalize_it:
+250 	if(res != NULL)
+251 		freeaddrinfo(res);
+252 	if(iRet != RS_RET_OK) {
+253 		if(pWrkrData-&gt;md.smtp.sock != -1) {
+254 			close(pWrkrData-&gt;md.smtp.sock);
+255 			pWrkrData-&gt;md.smtp.sock = -1;
+256 		}
+257 	}
+258 	RETiRet;
+259 }
+260 static rsRetVal
+261 Send(const int sock, const char *const __restrict__ msg, const size_t len)
+262 {
+263 	DEFiRet;
+264 	size_t offsBuf = 0;
+265 	ssize_t lenSend;
+266 	assert(msg != NULL);
+267 	if(len == 0) 		FINALIZE;
+268 	do {
+269 		lenSend = send(sock, msg + offsBuf, len - offsBuf, 0);
+270 		if(lenSend == -1) {
+271 			if(errno != EAGAIN) {
+272 				DBGPRINTF("message not (smtp/tcp)send, errno %d", errno);
+273 				ABORT_FINALIZE(RS_RET_TCP_SEND_ERROR);
+274 			}
+275 		} else if(lenSend != (ssize_t) (len - offsBuf)) {
+276 			offsBuf += lenSend; 		} else {
+277 			FINALIZE;
+278 		}
+279 	} while(1);
+280 finalize_it:
+281 	RETiRet;
+282 }
+283 static rsRetVal
+284 bodySend(wrkrInstanceData_t *pWrkrData, char *msg, size_t len)
+285 {
+286 	DEFiRet;
+287 	char szBuf[2048];
+288 	size_t iSrc;
+289 	size_t iBuf = 0;
+290 	int bHadCR = 0;
+291 	int bInStartOfLine = 1;
+292 	assert(pWrkrData != NULL);
+293 	assert(msg != NULL);
+294 	for(iSrc = 0 ; iSrc &lt; len ; ++iSrc) {
+295 		if(iBuf &gt;= sizeof(szBuf) - 1) { 			CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, szBuf, iBuf));
+296 			iBuf = 0;
+297 		}
+298 		szBuf[iBuf++] = msg[iSrc];
+299 		switch(msg[iSrc]) {
+300 			case '\r':
+301 				bHadCR = 1;
+302 				break;
+303 			case '\n':
+304 				if(bHadCR)
+305 					bInStartOfLine = 1;
+306 				bHadCR = 0;
+307 				break;
+308 			case '.':
+309 				if(bInStartOfLine)
+310 			default:
+311 				bInStartOfLine = 0;
+312 				bHadCR = 0;
+313 				break;
+314 		}
+315 	}
+316 	if(iBuf &gt; 0) { 		CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, szBuf, iBuf));
+317 	}
+318 finalize_it:
+319 	RETiRet;
+320 }
+321 static rsRetVal
+322 readResponseLn(wrkrInstanceData_t *pWrkrData, char *pLn, size_t lenLn, size_t *const __restrict__ respLen)
+323 {
+324 	DEFiRet;
+325 	size_t i = 0;
+326 	char c;
+327 	assert(pWrkrData != NULL);
+328 	assert(pLn != NULL);
+329 	do {
+330 		CHKiRet(getRcvChar(pWrkrData, &amp;c));
+331 		if(c == '\n')
+332 			break;
+333 		if(i &lt; (lenLn - 1)) 			pLn[i++] = c;
+334 	} while(1);
+335 	DBGPRINTF("smtp server response: %s\n", pLn);
+336 finalize_it:
+337 	pLn[i] = '\0';
+338 	*respLen = i;
+339 	RETiRet;
+340 }
+341 static rsRetVal
+342 readResponse(wrkrInstanceData_t *pWrkrData, int *piState, int iExpected)
+343 {
+344 	DEFiRet;
+345 	int bCont;
+346 	char buf[128];
+347 	size_t respLen;
+348 	assert(pWrkrData != NULL);
+349 	assert(piState != NULL);
+350 	bCont = 1;
+351 	do {
+352 		CHKiRet(readResponseLn(pWrkrData, buf, sizeof(buf), &amp;respLen));
+353 		if(respLen &lt; 4) 			ABORT_FINALIZE(RS_RET_SMTP_ERROR);
+354 		if(buf[3] != '-') { 			bCont = 0;
+355 			*piState = buf[0] - '0';
+356 			*piState = *piState * 10 + buf[1] - '0';
+357 			*piState = *piState * 10 + buf[2] - '0';
+358 			if(*piState != iExpected)
+359 				ABORT_FINALIZE(RS_RET_SMTP_ERROR);
+360 		}
+361 	} while(bCont);
+362 finalize_it:
+363 	RETiRet;
+364 }
+365 static void
+366 mkSMTPTimestamp(uchar *pszBuf, size_t lenBuf)
+367 {
+368 	time_t tCurr;
+369 	struct tm tmCurr;
+370 	static const char szDay[][4] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+371 	static const char szMonth[][4] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
+372 	"Oct", "Nov", "Dec"};
+373 	datetime.GetTime(&amp;tCurr);
+374 	gmtime_r(&amp;tCurr, &amp;tmCurr);
+375 	snprintf((char*)pszBuf, lenBuf, "Date: %s, %2d %s %4d %02d:%02d:%02d +0000\r\n", szDay[tmCurr.tm_wday],
+376 	tmCurr.tm_mday,
+377 		 szMonth[tmCurr.tm_mon], 1900 + tmCurr.tm_year, tmCurr.tm_hour, tmCurr.tm_min, tmCurr.tm_sec);
+378 }
+379 static rsRetVal
+380 sendSMTP(wrkrInstanceData_t *pWrkrData, uchar *body, uchar *subject)
+381 {
+382 	DEFiRet;
+383 	int iState; 	instanceData *pData;
+384 	uchar szDateBuf[64];
+385 	pData = pWrkrData-&gt;pData;
+386 	CHKiRet(serverConnect(pWrkrData));
+387 	CHKiRet(readResponse(pWrkrData, &amp;iState, 220));
+388 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "HELO ", 5));
+389 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)glbl.GetLocalHostName(),
+390 		strlen((char*)glbl.GetLocalHostName())));
+391 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "\r\n", sizeof("\r\n") - 1));
+392 	CHKiRet(readResponse(pWrkrData, &amp;iState, 250));
+393 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "MAIL FROM:&lt;", sizeof("MAIL FROM:&lt;") - 1));
+394 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pData-&gt;md.smtp.pszFrom, strlen((char*)pData-&gt;md.smtp.pszFrom)));
+395 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "&gt;\r\n", sizeof("&gt;\r\n") - 1));
+396 	CHKiRet(readResponse(pWrkrData, &amp;iState, 250));
+397 	CHKiRet(WriteRcpts(pWrkrData, (uchar*)"RCPT TO", sizeof("RCPT TO") - 1, 250));
+398 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "DATA\r\n",   sizeof("DATA\r\n") - 1));
+399 	CHKiRet(readResponse(pWrkrData, &amp;iState, 354));
+400 	mkSMTPTimestamp(szDateBuf, sizeof(szDateBuf));
+401 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)szDateBuf, strlen((char*)szDateBuf)));
+402 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "From: &lt;", sizeof("From: &lt;") - 1));
+403 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)pData-&gt;md.smtp.pszFrom, strlen((char*)pData-&gt;md.smtp.pszFrom)));
+404 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "&gt;\r\n", sizeof("&gt;\r\n") - 1));
+405 	CHKiRet(WriteTos(pWrkrData, (uchar*)"To", sizeof("To") - 1));
+406 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "Subject: ",   sizeof("Subject: ") - 1));
+407 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, (char*)subject, strlen((char*)subject)));
+408 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "\r\n", sizeof("\r\n") - 1));
+409 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "X-Mailer: rsyslog-ommail\r\n",
+410 		sizeof("x-mailer: rsyslog-ommail\r\n") - 1));
+411 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "\r\n",   sizeof("\r\n") - 1)); 
+412 	if(pData-&gt;bEnableBody)
+413 		CHKiRet(bodySend(pWrkrData, (char*)body, strlen((char*) body)));
+414 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "\r\n.\r\n",   sizeof("\r\n.\r\n") - 1));
+415 	CHKiRet(readResponse(pWrkrData, &amp;iState, 250));
+416 	CHKiRet(Send(pWrkrData-&gt;md.smtp.sock, "QUIT\r\n",   sizeof("QUIT\r\n") - 1));
+417 	CHKiRet(readResponse(pWrkrData, &amp;iState, 221));
+418 	CHKiRet(serverDisconnect(pWrkrData));
+419 finalize_it:
+420 	RETiRet;
+421 }
+422 BEGINtryResume
+423 CODESTARTtryResume
+424 	CHKiRet(serverConnect(pWrkrData));
+425 	CHKiRet(serverDisconnect(pWrkrData)); finalize_it:
+426 	if(iRet == RS_RET_IO_ERROR)
+427 		iRet = RS_RET_SUSPENDED;
+428 ENDtryResume
+429 BEGINdoAction
+430 	uchar *subject;
+431 	const instanceData *const __restrict__ pData = pWrkrData-&gt;pData;
+432 CODESTARTdoAction
+433 	DBGPRINTF("ommail doAction()\n");
+434 	if(pData-&gt;constSubject != NULL)
+435 		subject = pData-&gt;constSubject;
+436 	else if(pData-&gt;bHaveSubject)
+437 		subject = ppString[1];
+438 	else
+439 		subject = (uchar*)"message from rsyslog";
+440 	iRet = sendSMTP(pWrkrData, ppString[0], subject);
+441 	if(iRet != RS_RET_OK) {
+442 		DBGPRINTF("error sending mail, suspending\n");
+443 		iRet = RS_RET_SUSPENDED;
+444 	}
+445 ENDdoAction
+446 static inline void
+447 setInstParamDefaults(instanceData *pData)
+448 {
+449 	pData-&gt;tplName = NULL;
+450 	pData-&gt;constSubject = NULL;
+451 }
+452 BEGINnewActInst
+453 	struct cnfparamvals *pvals;
+454 <a name="1"></a>	uchar *tplSubject = NULL;
+455 	int i, j;
+456 CODESTARTnewActInst
+457 <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>	if((pvals = nvlstGetParams(lst, &amp;actpblk, NULL)) == NULL) {
+458 		ABORT_FINALIZE(RS_RET_MISSING_CNFPARAMS);
+459 	}
+460 	CHKiRet(createInstance(&amp;pData));
+461 	setInstParamDefaults(pData);
+462 	for(i = 0 ; i &lt; actpblk.nParams ; ++i) {
+463 		if(!pvals[i].bUsed)
+464 			continue;
+465 		if(!strcmp(actpblk.descr[i].name, "server")) {
+466 			pData-&gt;md.smtp.pszSrv = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+467 		} else if(!strcmp(actpblk.descr[i].name, "port")) {
+468 			pData-&gt;md.smtp.pszSrvPort =  (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);</b></font>
+469 		} else if(!strcmp(actpblk.descr[i].name, "mailfrom")) {
+470 			pData-&gt;md.smtp.pszFrom = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+471 		} else if(!strcmp(actpblk.descr[i].name, "mailto")) {
+472 			for(j = 0 ; j &lt; pvals[i].val.d.ar-&gt;nmemb ; ++j) {
+473 				addRcpt(&amp;(pData-&gt;md.smtp.lstRcpt),
+474 					(uchar*)es_str2cstr(pvals[i].val.d.ar-&gt;arr[j], NULL));
+475 			}
+476 		} else if(!strcmp(actpblk.descr[i].name, "subject.template")) {
+477 			if(pData-&gt;constSubject != NULL) {
+478 				parser_errmsg("ommail: only one of subject.template, subject.text "
+479 					      "can be set");
+480 				ABORT_FINALIZE(RS_RET_DUP_PARAM);
+481 			}
+482 			tplSubject = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+483 		} else if(!strcmp(actpblk.descr[i].name, "subject.text")) {
+484 			if(tplSubject != NULL) {
+485 				parser_errmsg("ommail: only one of subject.template, subject.text "
+486 					      "can be set");
+487 				ABORT_FINALIZE(RS_RET_DUP_PARAM);
+488 <a name="2"></a>			}
+489 			pData-&gt;constSubject = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+490 		} else if(!strcmp(actpblk.descr[i].name, "body.enable")) {
+491 <font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>			pData-&gt;bEnableBody =  (int) pvals[i].val.d.n;
+492 		} else if(!strcmp(actpblk.descr[i].name, "template")) {
+493 			pData-&gt;tplName = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
+494 		} else {
+495 			DBGPRINTF("ommail: program error, non-handled "
+496 			  "param '%s'\n", actpblk.descr[i].name);
+497 		}
+498 	}</b></font>
+499 	if(tplSubject == NULL) {
+500 		CODE_STD_STRING_REQUESTparseSelectorAct(1)
+501 	} else {
+502 		CODE_STD_STRING_REQUESTparseSelectorAct(2)
+503 		pData-&gt;bHaveSubject = 1;
+504 		CHKiRet(OMSRsetEntry(*ppOMSR, 1, tplSubject, OMSR_NO_RQD_TPL_OPTS));
+505 	}
+506 	if(pData-&gt;tplName == NULL) {
+507 		CHKiRet(OMSRsetEntry(*ppOMSR, 0, (uchar*) strdup("RSYSLOG_FileFormat"),
+508 			OMSR_NO_RQD_TPL_OPTS));
+509 	} else {
+510 		CHKiRet(OMSRsetEntry(*ppOMSR, 0,
+511 			(uchar*) strdup((char*) pData-&gt;tplName),
+512 			OMSR_NO_RQD_TPL_OPTS));
+513 	}
+514 CODE_STD_FINALIZERnewActInst
+515 	cnfparamvalsDestruct(pvals, &amp;actpblk);
+516 ENDnewActInst
+517 BEGINparseSelectorAct
+518 CODESTARTparseSelectorAct
+519 	if(!strncmp((char*) p, ":ommail:", sizeof(":ommail:") - 1)) {
+520 		p += sizeof(":ommail:") - 1; 	} else {
+521 		ABORT_FINALIZE(RS_RET_CONFLINE_UNPROCESSED);
+522 	}
+523 	if((iRet = createInstance(&amp;pData)) != RS_RET_OK)
+524 		FINALIZE;
+525 	if(cs.pszFrom == NULL) {
+526 		LogError(0, RS_RET_MAIL_NO_FROM, "no sender address given - specify $ActionMailFrom");
+527 		ABORT_FINALIZE(RS_RET_MAIL_NO_FROM);
+528 	}
+529 	if(cs.lstRcpt == NULL) {
+530 		LogError(0, RS_RET_MAIL_NO_TO, "no recipient address given - specify $ActionMailTo");
+531 		ABORT_FINALIZE(RS_RET_MAIL_NO_TO);
+532 	}
+533 	pData-&gt;md.smtp.pszFrom = (uchar*) strdup((char*)cs.pszFrom);
+534 	pData-&gt;md.smtp.lstRcpt = cs.lstRcpt; 	cs.lstRcpt = NULL; 
+535 	if(cs.pszSubject == NULL) {
+536 		CODE_STD_STRING_REQUESTparseSelectorAct(1)
+537 	} else {
+538 		CODE_STD_STRING_REQUESTparseSelectorAct(2)
+539 		pData-&gt;bHaveSubject = 1;
+540 		CHKiRet(OMSRsetEntry(*ppOMSR, 1, (uchar*)strdup((char*) cs.pszSubject), OMSR_NO_RQD_TPL_OPTS));
+541 	}
+542 	if(cs.pszSrv != NULL)
+543 		pData-&gt;md.smtp.pszSrv = (uchar*) strdup((char*)cs.pszSrv);
+544 	if(cs.pszSrvPort != NULL)
+545 		pData-&gt;md.smtp.pszSrvPort = (uchar*) strdup((char*)cs.pszSrvPort);
+546 	pData-&gt;bEnableBody = cs.bEnableBody;
+547 	iRet = cflineParseTemplateName(&amp;p, *ppOMSR, 0, OMSR_NO_RQD_TPL_OPTS, (uchar*) "RSYSLOG_FileFormat");
+548 CODE_STD_FINALIZERparseSelectorAct
+549 ENDparseSelectorAct
+550 static rsRetVal freeConfigVariables(void)
+551 {
+552 	DEFiRet;
+553 	free(cs.pszSrv);
+554 	cs.pszSrv = NULL;
+555 	free(cs.pszSrvPort);
+556 	cs.pszSrvPort = NULL;
+557 	free(cs.pszFrom);
+558 	cs.pszFrom = NULL;
+559 	lstRcptDestruct(cs.lstRcpt);
+560 	cs.lstRcpt = NULL;
+561 	RETiRet;
+562 }
+563 BEGINmodExit
+564 CODESTARTmodExit
+565 	freeConfigVariables();
+566 	objRelease(datetime, CORE_COMPONENT);
+567 	objRelease(glbl, CORE_COMPONENT);
+568 ENDmodExit
+569 BEGINqueryEtryPt
+570 CODESTARTqueryEtryPt
+571 CODEqueryEtryPt_STD_OMOD_QUERIES
+572 CODEqueryEtryPt_STD_CONF2_OMOD_QUERIES
+573 CODEqueryEtryPt_STD_OMOD8_QUERIES
+574 CODEqueryEtryPt_STD_CONF2_CNFNAME_QUERIES
+575 ENDqueryEtryPt
+576 static rsRetVal resetConfigVariables(uchar __attribute__((unused)) *pp, void __attribute__((unused)) *pVal)
+577 {
+578 	DEFiRet;
+579 	cs.bEnableBody = 1;
+580 	iRet = freeConfigVariables();
+581 	RETiRet;
+582 }
+583 BEGINmodInit()
+584 CODESTARTmodInit
+585 INITLegCnfVars
+586 	*ipIFVersProvided = CURR_MOD_IF_VERSION; CODEmodInit_QueryRegCFSLineHdlr
+587 	CHKiRet(objUse(glbl, CORE_COMPONENT));
+588 	CHKiRet(objUse(datetime, CORE_COMPONENT));
+589 	DBGPRINTF("ommail version %s initializing\n", VERSION);
+590 	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailsmtpserver", 0, eCmdHdlrGetWord, NULL, &amp;cs.pszSrv,
+591 	STD_LOADABLE_MODULE_ID));
+592 	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailsmtpport", 0, eCmdHdlrGetWord, NULL, &amp;cs.pszSrvPort,
+593 	STD_LOADABLE_MODULE_ID));
+594 	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailfrom", 0, eCmdHdlrGetWord, NULL, &amp;cs.pszFrom,
+595 	STD_LOADABLE_MODULE_ID));
+596 	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailto", 0, eCmdHdlrGetWord, legacyConfAddRcpt, NULL,
+597 	STD_LOADABLE_MODULE_ID));
+598 	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailsubject", 0, eCmdHdlrGetWord, NULL, &amp;cs.pszSubject,
+599 	STD_LOADABLE_MODULE_ID));
+600 	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"actionmailenablebody", 0, eCmdHdlrBinary, NULL, &amp;cs.bEnableBody,
+601 	STD_LOADABLE_MODULE_ID));
+602 	CHKiRet(omsdRegCFSLineHdlr(	(uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler,
+603 	resetConfigVariables, NULL, STD_LOADABLE_MODULE_ID));
+604 ENDmodInit
 </pre>
 </div>
 </div>

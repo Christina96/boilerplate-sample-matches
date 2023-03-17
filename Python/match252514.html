@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for zpool_1.py &amp; archive_1.py</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -41,1702 +40,639 @@ Matches for zpool_1.py &amp; archive_1.py
 </h3>
 <hr/>
 <pre>
-"""
-Module for running ZFS zpool command
-
-:codeauthor:    Nitin Madhok &lt;nmadhok@g.clemson.edu&gt;, Jorge Schrauwen &lt;sjorge@blackdot.be&gt;
-:maintainer:    Jorge Schrauwen &lt;sjorge@blackdot.be&gt;
-:maturity:      new
-:depends:       salt.utils.zfs
-:platform:      illumos,freebsd,linux
-
-.. versionchanged:: 2018.3.1
-  Big refactor to remove duplicate code, better type conversions and improved
-  consistency in output.
-
-"""
-
-import logging
-import os
-
-import salt.utils.decorators
-import salt.utils.decorators.path
-import salt.utils.path
-from salt.utils.odict import OrderedDict
-
-log = logging.getLogger(__name__)
-
-__virtualname__ = "zpool"
-__func_alias__ = {
-    "import_": "import",
-    "list_": "list",
-}
-
-
-def __virtual__():
-    """
-    Only load when the platform has zfs support
-    """
-    if __grains__.get("zfs_support"):
-        return __virtualname__
-    else:
-        return False, "The zpool module cannot be loaded: zfs not supported"
-
-
-def _clean_vdev_config(config):
-    """
-    Return a simple vdev tree from zpool.status' config section
-    """
-    cln_config = OrderedDict()
-    for label, sub_config in config.items():
-        if label not in ["state", "read", "write", "cksum"]:
-            sub_config = _clean_vdev_config(sub_config)
-
-            if sub_config and isinstance(cln_config, list):
-                cln_config.append(OrderedDict([(label, sub_config)]))
-            elif sub_config and isinstance(cln_config, OrderedDict):
-                cln_config[label] = sub_config
-            elif isinstance(cln_config, list):
-                cln_config.append(label)
-            elif isinstance(cln_config, OrderedDict):
-                new_config = []
-                for old_label, old_config in cln_config.items():
-                    new_config.append(OrderedDict([(old_label, old_config)]))
-                new_config.append(label)
-                cln_config = new_config
-            else:
-                cln_config = [label]
-
-    return cln_config
-
-
-def healthy():
-    """
-    Check if all zpools are healthy
-
-    .. versionadded:: 2016.3.0
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.healthy
-
-    """
-    ## collect status output
-    # NOTE: we pass the -x flag, by doing this
-    #       we will get 'all pools are healthy' on stdout
-    #       if all pools are healthy, otherwise we will get
-    #       the same output that we expect from zpool status
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"]("status", flags=["-x"]),
-        python_shell=False,
-    )
-    return res["stdout"] == "all pools are healthy"
-
-
-def status(zpool=None):
-    """
-    Return the status of the named zpool
-
-    zpool : string
-        optional name of storage pool
-
-    .. versionadded:: 2016.3.0
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.status myzpool
-
-    """
-    ret = OrderedDict()
-
-    ## collect status output
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"]("status", target=zpool),
-        python_shell=False,
-    )
-
-    if res["retcode"] != 0:
-        return __utils__["zfs.parse_command_result"](res)
-
-    # NOTE: command output for reference
-    # =====================================================================
-    #   pool: data
-    #  state: ONLINE
-    #   scan: scrub repaired 0 in 2h27m with 0 errors on Mon Jan  8 03:27:25 2018
-    # config:
-    #
-    #     NAME                       STATE     READ WRITE CKSUM
-    #     data                       ONLINE       0     0     0
-    #       mirror-0                 ONLINE       0     0     0
-    #         c0tXXXXCXXXXXXXXXXXd0  ONLINE       0     0     0
-    #         c0tXXXXCXXXXXXXXXXXd0  ONLINE       0     0     0
-    #         c0tXXXXCXXXXXXXXXXXd0  ONLINE       0     0     0
-    #
-    # errors: No known data errors
-    # =====================================================================
-
-    ## parse status output
-    # NOTE: output is 'key: value' except for the 'config' key.
-    #       multiple pools will repeat the output, so if switch pools if
-    #       we see 'pool:'
-    current_pool = None
-    current_prop = None
-    for zpd in res["stdout"].splitlines():
-        if zpd.strip() == "":
-            continue
-        if ":" in zpd and zpd[0] != "\t":
-            # NOTE: line is 'key: value' format, we just update a dict
-            prop = zpd.split(":")[0].strip()
-            value = ":".join(zpd.split(":")[1:]).strip()
-            if prop == "pool" and current_pool != value:
-                current_pool = value
-                ret[current_pool] = OrderedDict()
-            if prop != "pool":
-                ret[current_pool][prop] = value
-
-            current_prop = prop
-        else:
-            # NOTE: we append the line output to the last property
-            #       this should only happens once we hit the config
-            #       section
-            ret[current_pool][current_prop] = "{}\n{}".format(
-                ret[current_pool][current_prop], zpd
-            )
-
-    ## parse config property for each pool
-    # NOTE: the config property has some structured data
-    #       sadly this data is in a different format than
-    #       the rest and it needs further processing
-    for pool in ret:
-        if "config" not in ret[pool]:
-            continue
-        header = None
-        root_vdev = None
-        vdev = None
-        dev = None
-        rdev = None
-        config = ret[pool]["config"]
-        config_data = OrderedDict()
-        for line in config.splitlines():
-            # NOTE: the first line is the header
-            #       we grab all the none whitespace values
-            if not header:
-                header = line.strip().lower()
-                header = [x for x in header.split(" ") if x not in [""]]
-                continue
-
-            # NOTE: data is indented by 1 tab, then multiples of 2 spaces
-            #       to differential root vdev, vdev, and dev
-            #
-            #       we just strip the initial tab (can't use .strip() here)
-            if line[0] == "\t":
-                line = line[1:]
-
-            # NOTE: transform data into dict
-            stat_data = OrderedDict(
-                list(
-                    zip(
-                        header,
-                        [x for x in line.strip().split(" ") if x not in [""]],
-                    )
-                )
-            )
-
-            # NOTE: decode the zfs values properly
-            stat_data = __utils__["zfs.from_auto_dict"](stat_data)
-
-            # NOTE: store stat_data in the proper location
-            if line.startswith(" " * 6):
-                rdev = stat_data["name"]
-                config_data[root_vdev][vdev][dev][rdev] = stat_data
-            elif line.startswith(" " * 4):
-                rdev = None
-                dev = stat_data["name"]
-                config_data[root_vdev][vdev][dev] = stat_data
-            elif line.startswith(" " * 2):
-                rdev = dev = None
-                vdev = stat_data["name"]
-                config_data[root_vdev][vdev] = stat_data
-            else:
-                rdev = dev = vdev = None
-                root_vdev = stat_data["name"]
-                config_data[root_vdev] = stat_data
-
-            # NOTE: name already used as identifier, drop duplicate data
-            del stat_data["name"]
-
-        ret[pool]["config"] = config_data
-
-    return ret
-
-
-def iostat(zpool=None, sample_time=5, parsable=True):
-    """
-    Display I/O statistics for the given pools
-
-    zpool : string
-        optional name of storage pool
-
-    sample_time : int
-        seconds to capture data before output
-        default a sample of 5 seconds is used
-    parsable : boolean
-        display data in pythonc values (True, False, Bytes,...)
-
-    .. versionadded:: 2016.3.0
-    .. versionchanged:: 2018.3.1
-
-        Added ```parsable``` parameter that defaults to True
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.iostat myzpool
-
-    """
-    ret = OrderedDict()
-
-    ## get iostat output
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="iostat", flags=["-v"], target=[zpool, sample_time, 2]
-        ),
-        python_shell=False,
-    )
-
-    if res["retcode"] != 0:
-        return __utils__["zfs.parse_command_result"](res)
-
-    # NOTE: command output for reference
-    # =====================================================================
-    #                               capacity     operations    bandwidth
-    # pool                       alloc   free   read  write   read  write
-    # -------------------------  -----  -----  -----  -----  -----  -----
-    # mypool                      648G  1.18T     10      6  1.30M   817K
-    #   mirror                    648G  1.18T     10      6  1.30M   817K
-    #     c0tXXXXCXXXXXXXXXXXd0      -      -      9      5  1.29M   817K
-    #     c0tXXXXCXXXXXXXXXXXd0      -      -      9      5  1.29M   817K
-    #     c0tXXXXCXXXXXXXXXXXd0      -      -      9      5  1.29M   817K
-    # -------------------------  -----  -----  -----  -----  -----  -----
-    # =====================================================================
-
-    ## parse iostat output
-    # NOTE: hardcode the header
-    #       the double header line is hard to parse, we opt to
-    #       hardcode the header fields
-    header = [
-        "name",
-        "capacity-alloc",
-        "capacity-free",
-        "operations-read",
-        "operations-write",
-        "bandwidth-read",
-        "bandwidth-write",
-    ]
-    root_vdev = None
-    vdev = None
-    dev = None
-    current_data = OrderedDict()
-    for line in res["stdout"].splitlines():
-        # NOTE: skip header
-        if line.strip() == "" or line.strip().split()[-1] in ["write", "bandwidth"]:
-            continue
-
-        # NOTE: reset pool on line separator
-        if line.startswith("-") and line.endswith("-"):
-            ret.update(current_data)
-            current_data = OrderedDict()
-            continue
-
-        # NOTE: transform data into dict
-        io_data = OrderedDict(
-            list(
-                zip(
-                    header,
-                    [x for x in line.strip().split(" ") if x not in [""]],
-                )
-            )
-        )
-
-        # NOTE: normalize values
-        if parsable:
-            # NOTE: raw numbers and pythonic types
-            io_data = __utils__["zfs.from_auto_dict"](io_data)
-        else:
-            # NOTE: human readable zfs types
-            io_data = __utils__["zfs.to_auto_dict"](io_data)
-
-        # NOTE: store io_data in the proper location
-        if line.startswith(" " * 4):
-            dev = io_data["name"]
-            current_data[root_vdev][vdev][dev] = io_data
-        elif line.startswith(" " * 2):
-            dev = None
-            vdev = io_data["name"]
-            current_data[root_vdev][vdev] = io_data
-        else:
-            dev = vdev = None
-            root_vdev = io_data["name"]
-            current_data[root_vdev] = io_data
-
-        # NOTE: name already used as identifier, drop duplicate data
-        del io_data["name"]
-
-    return ret
-
-
-def list_(properties="size,alloc,free,cap,frag,health", zpool=None, parsable=True):
-    """
-    .. versionadded:: 2015.5.0
-
-    Return information about (all) storage pools
-
-    zpool : string
-        optional name of storage pool
-
-    properties : string
-        comma-separated list of properties to list
-
-    parsable : boolean
-        display numbers in parsable (exact) values
-
-        .. versionadded:: 2018.3.0
-
-    .. note::
-
-        The ``name`` property will always be included, while the ``frag``
-        property will get removed if not available
-
-    zpool : string
-        optional zpool
-
-    .. note::
-
-        Multiple storage pool can be provided as a space separated list
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.list
-        salt '*' zpool.list zpool=tank
-        salt '*' zpool.list 'size,free'
-        salt '*' zpool.list 'size,free' tank
-
-    """
-    ret = OrderedDict()
-
-    ## update properties
-    # NOTE: properties should be a list
-    if not isinstance(properties, list):
-        properties = properties.split(",")
-
-    # NOTE: name should be first property
-    while "name" in properties:
-        properties.remove("name")
-    properties.insert(0, "name")
-
-    # NOTE: remove 'frags' if we don't have feature flags
-    if not __utils__["zfs.has_feature_flags"]():
-        while "frag" in properties:
-            properties.remove("frag")
-
-    ## collect list output
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="list",
-            flags=["-H"],
-            opts={"-o": ",".join(properties)},
-            target=zpool,
-        ),
-        python_shell=False,
-    )
-
-    if res["retcode"] != 0:
-        return __utils__["zfs.parse_command_result"](res)
-
-    # NOTE: command output for reference
-    # ========================================================================
-    # data  1992864825344   695955501056    1296909324288   34  11%     ONLINE
-    # =========================================================================
-
-    ## parse list output
-    for line in res["stdout"].splitlines():
-        # NOTE: transform data into dict
-        zpool_data = OrderedDict(
-            list(
-                zip(
-                    properties,
-                    line.strip().split("\t"),
-                )
-            )
-        )
-
-        # NOTE: normalize values
-        if parsable:
-            # NOTE: raw numbers and pythonic types
-            zpool_data = __utils__["zfs.from_auto_dict"](zpool_data)
-        else:
-            # NOTE: human readable zfs types
-            zpool_data = __utils__["zfs.to_auto_dict"](zpool_data)
-
-        ret[zpool_data["name"]] = zpool_data
-        del ret[zpool_data["name"]]["name"]
-
-    return ret
-
-
-def get(zpool, prop=None, show_source=False, parsable=True):
-    """
-    .. versionadded:: 2016.3.0
-
-    Retrieves the given list of properties
-
-    zpool : string
-        Name of storage pool
-
-    prop : string
-        Optional name of property to retrieve
-
-    show_source : boolean
-        Show source of property
-
-    parsable : boolean
-        Display numbers in parsable (exact) values
-
-        .. versionadded:: 2018.3.0
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.get myzpool
-
-    """
-    ret = OrderedDict()
-    value_properties = ["name", "property", "value", "source"]
-
-    ## collect get output
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="get",
-            flags=["-H"],
-            property_name=prop if prop else "all",
-            target=zpool,
-        ),
-        python_shell=False,
-    )
-
-    if res["retcode"] != 0:
-        return __utils__["zfs.parse_command_result"](res)
-
-    # NOTE: command output for reference
-    # ========================================================================
-    # ...
-    # data  mountpoint  /data   local
-    # data  compression off     default
-    # ...
-    # =========================================================================
-
-    # parse get output
-    for line in res["stdout"].splitlines():
-        # NOTE: transform data into dict
-        prop_data = OrderedDict(
-            list(
-                zip(
-                    value_properties,
-                    [x for x in line.strip().split("\t") if x not in [""]],
-                )
-            )
-        )
-
-        # NOTE: older zfs does not have -o, fall back to manually stipping the name field
-        del prop_data["name"]
-
-        # NOTE: normalize values
-        if parsable:
-            # NOTE: raw numbers and pythonic types
-            prop_data["value"] = __utils__["zfs.from_auto"](
-                prop_data["property"], prop_data["value"]
-            )
-        else:
-            # NOTE: human readable zfs types
-            prop_data["value"] = __utils__["zfs.to_auto"](
-                prop_data["property"], prop_data["value"]
-            )
-
-        # NOTE: show source if requested
-        if show_source:
-            ret[prop_data["property"]] = prop_data
-            del ret[prop_data["property"]]["property"]
-        else:
-            ret[prop_data["property"]] = prop_data["value"]
-
-    return ret
-
-
-def set(zpool, prop, value):
-    """
-    Sets the given property on the specified pool
-
-    zpool : string
-        Name of storage pool
-
-    prop : string
-        Name of property to set
-
-    value : string
-        Value to set for the specified property
-
-    .. versionadded:: 2016.3.0
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.set myzpool readonly yes
-
-    """
-    ret = OrderedDict()
-
-    # set property
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="set",
-            property_name=prop,
-            property_value=value,
-            target=zpool,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "set")
-
-
-def exists(zpool):
-    """
-    Check if a ZFS storage pool is active
-
-    zpool : string
-        Name of storage pool
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.exists myzpool
-
-    """
-    # list for zpool
-    # NOTE: retcode &gt; 0 if zpool does not exists
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="list",
-            target=zpool,
-        ),
-        python_shell=False,
-        ignore_retcode=True,
-    )
-
-    return res["retcode"] == 0
-
-
-def destroy(zpool, force=False):
-    """
-    Destroys a storage pool
-
-    zpool : string
-        Name of storage pool
-
-    force : boolean
-        Force destroy of pool
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.destroy myzpool
-
-    """
-    # destroy zpool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="destroy",
-            flags=["-f"] if force else None,
-            target=zpool,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "destroyed")
-
-
-def scrub(zpool, stop=False, pause=False):
-    """
-    Scrub a storage pool
-
-    zpool : string
-        Name of storage pool
-
-    stop : boolean
-        If ``True``, cancel ongoing scrub
-
-    pause : boolean
-        If ``True``, pause ongoing scrub
-
-        .. versionadded:: 2018.3.0
-
-        .. note::
-
-            Pause is only available on recent versions of ZFS.
-
-            If both ``pause`` and ``stop`` are ``True``, then ``stop`` will
-            win.
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.scrub myzpool
-
-    """
-    ## select correct action
-    if stop:
-        action = ["-s"]
-    elif pause:
-        action = ["-p"]
-    else:
-        action = None
-
-    ## Scrub storage pool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="scrub",
-            flags=action,
-            target=zpool,
-        ),
-        python_shell=False,
-    )
-
-    if res["retcode"] != 0:
-        return __utils__["zfs.parse_command_result"](res, "scrubbing")
-
-    ret = OrderedDict()
-    if stop or pause:
-        ret["scrubbing"] = False
-    else:
-        ret["scrubbing"] = True
-    return ret
-
-
-def create(zpool, *vdevs, **kwargs):
-    """
-    .. versionadded:: 2015.5.0
-
-    Create a simple zpool, a mirrored zpool, a zpool having nested VDEVs, a hybrid zpool with cache, spare and log drives or a zpool with RAIDZ-1, RAIDZ-2 or RAIDZ-3
-
-    zpool : string
-        Name of storage pool
-
-    vdevs : string
-        One or move devices
-
-    force : boolean
-        Forces use of vdevs, even if they appear in use or specify a
-        conflicting replication level.
-
-    mountpoint : string
-        Sets the mount point for the root dataset
-
-    altroot : string
-        Equivalent to "-o cachefile=none,altroot=root"
-
-    properties : dict
-        Additional pool properties
-
-    filesystem_properties : dict
-        Additional filesystem properties
-
-    createboot : boolean
-        create a boot partition
-
-        .. versionadded:: 2018.3.0
-
-        .. warning:
-          This is only available on illumos and Solaris
-
-    CLI Examples:
-
-    .. code-block:: bash
-
-        salt '*' zpool.create myzpool /path/to/vdev1 [...] [force=True|False]
-        salt '*' zpool.create myzpool mirror /path/to/vdev1 /path/to/vdev2 [...] [force=True|False]
-        salt '*' zpool.create myzpool raidz1 /path/to/vdev1 /path/to/vdev2 raidz2 /path/to/vdev3 /path/to/vdev4 /path/to/vdev5 [...] [force=True|False]
-        salt '*' zpool.create myzpool mirror /path/to/vdev1 [...] mirror /path/to/vdev2 /path/to/vdev3 [...] [force=True|False]
-        salt '*' zpool.create myhybridzpool mirror /tmp/file1 [...] log mirror /path/to/vdev1 [...] cache /path/to/vdev2 [...] spare /path/to/vdev3 [...] [force=True|False]
-
-    .. note::
-
-        Zpool properties can be specified at the time of creation of the pool
-        by passing an additional argument called "properties" and specifying
-        the properties with their respective values in the form of a python
-        dictionary:
-
-        .. code-block:: text
-
-            properties="{'property1': 'value1', 'property2': 'value2'}"
-
-        Filesystem properties can be specified at the time of creation of the
-        pool by passing an additional argument called "filesystem_properties"
-        and specifying the properties with their respective values in the form
-        of a python dictionary:
-
-        .. code-block:: text
-
-            filesystem_properties="{'property1': 'value1', 'property2': 'value2'}"
-
-        Example:
-
-        .. code-block:: bash
-
-            salt '*' zpool.create myzpool /path/to/vdev1 [...] properties="{'property1': 'value1', 'property2': 'value2'}"
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.create myzpool /path/to/vdev1 [...] [force=True|False]
-        salt '*' zpool.create myzpool mirror /path/to/vdev1 /path/to/vdev2 [...] [force=True|False]
-        salt '*' zpool.create myzpool raidz1 /path/to/vdev1 /path/to/vdev2 raidz2 /path/to/vdev3 /path/to/vdev4 /path/to/vdev5 [...] [force=True|False]
-        salt '*' zpool.create myzpool mirror /path/to/vdev1 [...] mirror /path/to/vdev2 /path/to/vdev3 [...] [force=True|False]
-        salt '*' zpool.create myhybridzpool mirror /tmp/file1 [...] log mirror /path/to/vdev1 [...] cache /path/to/vdev2 [...] spare /path/to/vdev3 [...] [force=True|False]
-
-    """
-    ## Configure pool
-    # NOTE: initialize the defaults
-    flags = []
-    opts = {}
-    target = []
-
-    # NOTE: push pool and filesystem properties
-    pool_properties = kwargs.get("properties", {})
-    filesystem_properties = kwargs.get("filesystem_properties", {})
-
-    # NOTE: set extra config based on kwargs
-    if kwargs.get("force", False):
-        flags.append("-f")
-    if kwargs.get("createboot", False) or "bootsize" in pool_properties:
-        flags.append("-B")
-    if kwargs.get("altroot", False):
-        opts["-R"] = kwargs.get("altroot")
-    if kwargs.get("mountpoint", False):
-        opts["-m"] = kwargs.get("mountpoint")
-
-    # NOTE: append the pool name and specifications
-    target.append(zpool)
-    target.extend(vdevs)
-
-    ## Create storage pool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="create",
-            flags=flags,
-            opts=opts,
-            pool_properties=pool_properties,
-            filesystem_properties=filesystem_properties,
-            target=target,
-        ),
-        python_shell=False,
-    )
-
-    ret = __utils__["zfs.parse_command_result"](res, "created")
-    if ret["created"]:
-        ## NOTE: lookup zpool status for vdev config
-        ret["vdevs"] = _clean_vdev_config(
-            __salt__["zpool.status"](zpool=zpool)[zpool]["config"][zpool],
-        )
-
-    return ret
-
-
-def add(zpool, *vdevs, **kwargs):
-    """
-    Add the specified vdev\'s to the given storage pool
-
-    zpool : string
-        Name of storage pool
-
-    vdevs : string
-        One or more devices
-
-    force : boolean
-        Forces use of device
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.add myzpool /path/to/vdev1 /path/to/vdev2 [...]
-
-    """
-    ## Configure pool
-    # NOTE: initialize the defaults
-    flags = []
-    target = []
-
-    # NOTE: set extra config based on kwargs
-    if kwargs.get("force", False):
-        flags.append("-f")
-
-    # NOTE: append the pool name and specifications
-    target.append(zpool)
-    target.extend(vdevs)
-
-    ## Update storage pool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="add",
-            flags=flags,
-            target=target,
-        ),
-        python_shell=False,
-    )
-
-    ret = __utils__["zfs.parse_command_result"](res, "added")
-    if ret["added"]:
-        ## NOTE: lookup zpool status for vdev config
-        ret["vdevs"] = _clean_vdev_config(
-            __salt__["zpool.status"](zpool=zpool)[zpool]["config"][zpool],
-        )
-
-    return ret
-
-
-def attach(zpool, device, new_device, force=False):
-    """
-    Attach specified device to zpool
-
-    zpool : string
-        Name of storage pool
-
-    device : string
-        Existing device name too
-
-    new_device : string
-        New device name (to be attached to ``device``)
-
-    force : boolean
-        Forces use of device
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.attach myzpool /path/to/vdev1 /path/to/vdev2 [...]
-
-    """
-    ## Configure pool
-    # NOTE: initialize the defaults
-    flags = []
-    target = []
-
-    # NOTE: set extra config
-    if force:
-        flags.append("-f")
-
-    # NOTE: append the pool name and specifications
-    target.append(zpool)
-    target.append(device)
-    target.append(new_device)
-
-    ## Update storage pool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="attach",
-            flags=flags,
-            target=target,
-        ),
-        python_shell=False,
-    )
-
-    ret = __utils__["zfs.parse_command_result"](res, "attached")
-    if ret["attached"]:
-        ## NOTE: lookup zpool status for vdev config
-        ret["vdevs"] = _clean_vdev_config(
-            __salt__["zpool.status"](zpool=zpool)[zpool]["config"][zpool],
-        )
-
-    return ret
-
-
-def detach(zpool, device):
-    """
-    Detach specified device to zpool
-
-    zpool : string
-        Name of storage pool
-
-    device : string
-        Device to detach
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.detach myzpool /path/to/vdev1
-
-    """
-    ## Update storage pool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="detach",
-            target=[zpool, device],
-        ),
-        python_shell=False,
-    )
-
-    ret = __utils__["zfs.parse_command_result"](res, "detatched")
-    if ret["detatched"]:
-        ## NOTE: lookup zpool status for vdev config
-        ret["vdevs"] = _clean_vdev_config(
-            __salt__["zpool.status"](zpool=zpool)[zpool]["config"][zpool],
-        )
-
-    return ret
-
-
-def split(zpool, newzpool, **kwargs):
-    """
-    .. versionadded:: 2018.3.0
-
-    Splits devices off pool creating newpool.
-
-    .. note::
-
-        All vdevs in pool must be mirrors.  At the time of the split,
-        ``newzpool`` will be a replica of ``zpool``.
-
-        After splitting, do not forget to import the new pool!
-
-    zpool : string
-        Name of storage pool
-
-    newzpool : string
-        Name of new storage pool
-
-    mountpoint : string
-        Sets the mount point for the root dataset
-
-    altroot : string
-        Sets altroot for newzpool
-
-    properties : dict
-        Additional pool properties for newzpool
-
-    CLI Examples:
-
-    .. code-block:: bash
-
-        salt '*' zpool.split datamirror databackup
-        salt '*' zpool.split datamirror databackup altroot=/backup
-
-    .. note::
-
-        Zpool properties can be specified at the time of creation of the pool
-        by passing an additional argument called "properties" and specifying
-        the properties with their respective values in the form of a python
-        dictionary:
-
-        .. code-block:: text
-
-            properties="{'property1': 'value1', 'property2': 'value2'}"
-
-        Example:
-
-        .. code-block:: bash
-
-            salt '*' zpool.split datamirror databackup properties="{'readonly': 'on'}"
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.split datamirror databackup
-        salt '*' zpool.split datamirror databackup altroot=/backup
-
-    """
-    ## Configure pool
-    # NOTE: initialize the defaults
-    opts = {}
-
-    # NOTE: push pool and filesystem properties
-    pool_properties = kwargs.get("properties", {})
-
-    # NOTE: set extra config based on kwargs
-    if kwargs.get("altroot", False):
-        opts["-R"] = kwargs.get("altroot")
-
-    ## Split storage pool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="split",
-            opts=opts,
-            pool_properties=pool_properties,
-            target=[zpool, newzpool],
-        ),
-        python_shell=False,
-    )
-
-<a name="0"></a>    return __utils__["zfs.parse_command_result"](res, "split")
-
-
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>def replace(zpool, old_device, new_device=None, force=False):
-    """
-    Replaces ``old_device`` with ``new_device``
-
-    .. note::
-
-        This is equivalent to attaching ``new_device``,
-        waiting for it to resilver, and then detaching ``old_device``.
-
-        The size of ``new_device`` must be greater than or equal to the minimum
-        size of all the devices in a mirror or raidz configuration.
-
-    zpool : string
-        Name of storage pool
-
-    old_device : string
-        Old device to replace
-
-    new_device : string
-        Optional new device
-
-    force : boolean
-        Forces use of new_device, even if its appears to be in use.
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.replace myzpool /path/to/vdev1 /path/to/vdev2
-
-    """
-    ## Configure pool
-    # NOTE: initialize the defaults
-    flags = []
-    target = []
-
-    # NOTE: set extra config
-    if force:
-        flags.append("-f")
-
-    # NOTE: append the pool name and specifications
-    target.append(zpool)
-    target.append(</b></font>old_device)
-    if new_device:
-        target.append(new_device)
-
-    ## Replace device
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="replace",
-            flags=flags,
-            target=target,
-        ),
-        python_shell=False,
-    )
-
-    ret = __utils__["zfs.parse_command_result"](res, "replaced")
-    if ret["replaced"]:
-        ## NOTE: lookup zpool status for vdev config
-        ret["vdevs"] = _clean_vdev_config(
-            __salt__["zpool.status"](zpool=zpool)[zpool]["config"][zpool],
-        )
-
-    return ret
-
-
-@salt.utils.decorators.path.which("mkfile")
-def create_file_vdev(size, *vdevs):
-    """
-    Creates file based virtual devices for a zpool
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.create_file_vdev 7G /path/to/vdev1 [/path/to/vdev2] [...]
-
-    .. note::
-
-        Depending on file size, the above command may take a while to return.
-
-    """
-    ret = OrderedDict()
-    err = OrderedDict()
-
-    _mkfile_cmd = salt.utils.path.which("mkfile")
-    for vdev in vdevs:
-        if os.path.isfile(vdev):
-            ret[vdev] = "existed"
-        else:
-            res = __salt__["cmd.run_all"](
-                "{mkfile} {size} {vdev}".format(
-                    mkfile=_mkfile_cmd,
-                    size=size,
-                    vdev=vdev,
-                ),
-                python_shell=False,
-            )
-            if res["retcode"] != 0:
-                if "stderr" in res and ":" in res["stderr"]:
-                    ret[vdev] = "failed"
-                    err[vdev] = ":".join(res["stderr"].strip().split(":")[1:])
-            else:
-                ret[vdev] = "created"
-    if err:
-        ret["error"] = err
-
-    return ret
-
-
-def export(*pools, **kwargs):
-    """
-    .. versionadded:: 2015.5.0
-
-    Export storage pools
-
-    pools : string
-        One or more storage pools to export
-
-    force : boolean
-        Force export of storage pools
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.export myzpool ... [force=True|False]
-        salt '*' zpool.export myzpool2 myzpool2 ... [force=True|False]
-
-    """
-    ## Configure pool
-    # NOTE: initialize the defaults
-    flags = []
-    targets = []
-
-    # NOTE: set extra config based on kwargs
-    if kwargs.get("force", False):
-        flags.append("-f")
-
-    # NOTE: append the pool name and specifications
-    targets = list(pools)
-
-    ## Export pools
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="export",
-            flags=flags,
-            target=targets,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "exported")
-
-
-def import_(zpool=None, new_name=None, **kwargs):
-    """
-    .. versionadded:: 2015.5.0
-
-    Import storage pools or list pools available for import
-
-    zpool : string
-        Optional name of storage pool
-
-    new_name : string
-        Optional new name for the storage pool
-
-    mntopts : string
-        Comma-separated list of mount options to use when mounting datasets
-        within the pool.
-
-    force : boolean
-        Forces import, even if the pool appears to be potentially active.
-
-    altroot : string
-        Equivalent to "-o cachefile=none,altroot=root"
-
-    dir : string
-        Searches for devices or files in dir, multiple dirs can be specified as
-        follows: ``dir="dir1,dir2"``
-
-    no_mount : boolean
-        Import the pool without mounting any file systems.
-
-    only_destroyed : boolean
-        Imports destroyed pools only. This also sets ``force=True``.
-
-    recovery : bool|str
-        false: do not try to recovery broken pools
-        true: try to recovery the pool by rolling back the latest transactions
-        test: check if a pool can be recovered, but don't import it
-        nolog: allow import without log device, recent transactions might be lost
-
-        .. note::
-            If feature flags are not support this forced to the default of 'false'
-
-        .. warning::
-            When recovery is set to 'test' the result will be have imported set to True if the pool
-            can be imported. The pool might also be imported if the pool was not broken to begin with.
-
-    properties : dict
-        Additional pool properties
-
-    .. note::
-
-        Zpool properties can be specified at the time of creation of the pool
-        by passing an additional argument called "properties" and specifying
-        the properties with their respective values in the form of a python
-        dictionary:
-
-        .. code-block:: text
-
-            properties="{'property1': 'value1', 'property2': 'value2'}"
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.import [force=True|False]
-        salt '*' zpool.import myzpool [mynewzpool] [force=True|False]
-        salt '*' zpool.import myzpool dir='/tmp'
-
-    """
-    ## Configure pool
-    # NOTE: initialize the defaults
-    flags = []
-    opts = {}
-    target = []
-
-    # NOTE: push pool and filesystem properties
-    pool_properties = kwargs.get("properties", {})
-
-    # NOTE: set extra config based on kwargs
-    if kwargs.get("force", False) or kwargs.get("only_destroyed", False):
-        flags.append("-f")
-    if kwargs.get("only_destroyed", False):
-        flags.append("-D")
-    if kwargs.get("no_mount", False):
-        flags.append("-N")
-    if kwargs.get("altroot", False):
-        opts["-R"] = kwargs.get("altroot")
-    if kwargs.get("mntopts", False):
-        # NOTE: -o is used for both mount options and pool properties!
-        #       ```-o nodevices,noexec,nosetuid,ro``` vs ```-o prop=val```
-        opts["-o"] = kwargs.get("mntopts")
-    if kwargs.get("dir", False):
-        opts["-d"] = kwargs.get("dir").split(",")
-    if kwargs.get("recovery", False) and __utils__["zfs.has_feature_flags"]():
-        recovery = kwargs.get("recovery")
-        if recovery in [True, "test"]:
-            flags.append("-F")
-        if recovery == "test":
-            flags.append("-n")
-        if recovery == "nolog":
-            flags.append("-m")
-
-    # NOTE: append the pool name and specifications
-    if zpool:
-        target.append(zpool)
-        target.append(new_name)
-    else:
-        flags.append("-a")
-
-    ## Import storage pool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="import",
-            flags=flags,
-            opts=opts,
-            pool_properties=pool_properties,
-            target=target,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "imported")
-
-
-def online(zpool, *vdevs, **kwargs):
-    """
-    .. versionadded:: 2015.5.0
-
-    Ensure that the specified devices are online
-
-    zpool : string
-        name of storage pool
-
-    vdevs : string
-        one or more devices
-
-    expand : boolean
-        Expand the device to use all available space.
-
-        .. note::
-
-            If the device is part of a mirror or raidz then all devices must be
-            expanded before the new space will become available to the pool.
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.online myzpool /path/to/vdev1 [...]
-
-    """
-    ## Configure pool
-    # default options
-    flags = []
-    target = []
-
-    # set flags and options
-    if kwargs.get("expand", False):
-        flags.append("-e")
-    target.append(zpool)
-    if vdevs:
-        target.extend(vdevs)
-
-    ## Configure pool
-    # NOTE: initialize the defaults
-    flags = []
-    target = []
-
-    # NOTE: set extra config based on kwargs
-    if kwargs.get("expand", False):
-        flags.append("-e")
-
-    # NOTE: append the pool name and specifications
-    target.append(zpool)
-    target.extend(vdevs)
-
-    ## Bring online device
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="online",
-            flags=flags,
-            target=target,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "onlined")
-
-
-def offline(zpool, *vdevs, **kwargs):
-    """
-    .. versionadded:: 2015.5.0
-
-    Ensure that the specified devices are offline
-
-    .. warning::
-
-        By default, the ``OFFLINE`` state is persistent. The device remains
-        offline when the system is rebooted. To temporarily take a device
-        offline, use ``temporary=True``.
-
-    zpool : string
-        name of storage pool
-
-    vdevs : string
-        One or more devices
-
-    temporary : boolean
-        Enable temporarily offline
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.offline myzpool /path/to/vdev1 [...] [temporary=True|False]
-
-    """
-    ## Configure pool
-    # NOTE: initialize the defaults
-    flags = []
-    target = []
-
-    # NOTE: set extra config based on kwargs
-    if kwargs.get("temporary", False):
-        flags.append("-t")
-
-    # NOTE: append the pool name and specifications
-    target.append(zpool)
-    target.extend(vdevs)
-
-    ## Take a device offline
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="offline",
-            flags=flags,
-            target=target,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "offlined")
-
-
-def labelclear(device, force=False):
-    """
-    .. versionadded:: 2018.3.0
-
-    Removes ZFS label information from the specified device
-
-    device : string
-        Device name; must not be part of an active pool configuration.
-
-    force : boolean
-        Treat exported or foreign devices as inactive
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.labelclear /path/to/dev
-
-    """
-    ## clear label for all specified device
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="labelclear",
-            flags=["-f"] if force else None,
-            target=device,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "labelcleared")
-
-
-def clear(zpool, device=None):
-    """
-    Clears device errors in a pool.
-
-    .. warning::
-
-        The device must not be part of an active pool configuration.
-
-    zpool : string
-        name of storage pool
-    device : string
-        (optional) specific device to clear
-
-    .. versionadded:: 2018.3.1
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.clear mypool
-        salt '*' zpool.clear mypool /path/to/dev
-
-    """
-    ## Configure pool
-    # NOTE: initialize the defaults
-    target = []
-
-    # NOTE: append the pool name and specifications
-    target.append(zpool)
-    target.append(device)
-
-    ## clear storage pool errors
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="clear",
-            target=target,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "cleared")
-
-
-def reguid(zpool):
-    """
-    Generates a new unique identifier for the pool
-
-    .. warning::
-        You must ensure that all devices in this pool are online and healthy
-        before performing this action.
-
-    zpool : string
-        name of storage pool
-
-    .. versionadded:: 2016.3.0
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.reguid myzpool
-    """
-    ## generate new GUID for pool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="reguid",
-            target=zpool,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "reguided")
-
-
-def reopen(zpool):
-    """
-    Reopen all the vdevs associated with the pool
-
-    zpool : string
-        name of storage pool
-
-    .. versionadded:: 2016.3.0
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.reopen myzpool
-
-    """
-    ## reopen all devices fro pool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="reopen",
-            target=zpool,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "reopened")
-
-
-def upgrade(zpool=None, version=None):
-    """
-    .. versionadded:: 2016.3.0
-
-    Enables all supported features on the given pool
-
-    zpool : string
-        Optional storage pool, applies to all otherwize
-
-    version : int
-        Version to upgrade to, if unspecified upgrade to the highest possible
-
-    .. warning::
-        Once this is done, the pool will no longer be accessible on systems that do not
-        support feature flags. See zpool-features(5) for details on compatibility with
-        systems that support feature flags, but do not support all features enabled on the pool.
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.upgrade myzpool
-
-    """
-    ## Configure pool
-    # NOTE: initialize the defaults
-    flags = []
-    opts = {}
-
-    # NOTE: set extra config
-    if version:
-        opts["-V"] = version
-    if not zpool:
-        flags.append("-a")
-
-    ## Upgrade pool
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="upgrade",
-            flags=flags,
-            opts=opts,
-            target=zpool,
-        ),
-        python_shell=False,
-    )
-
-    return __utils__["zfs.parse_command_result"](res, "upgraded")
-
-
-def history(zpool=None, internal=False, verbose=False):
-    """
-    .. versionadded:: 2016.3.0
-
-    Displays the command history of the specified pools, or all pools if no
-    pool is specified
-
-    zpool : string
-        Optional storage pool
-
-    internal : boolean
-        Toggle display of internally logged ZFS events
-
-    verbose : boolean
-        Toggle display of the user name, the hostname, and the zone in which
-        the operation was performed
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' zpool.upgrade myzpool
-
-    """
-    ret = OrderedDict()
-
-    ## Configure pool
-    # NOTE: initialize the defaults
-    flags = []
-
-    # NOTE: set extra config
-    if verbose:
-        flags.append("-l")
-    if internal:
-        flags.append("-i")
-
-    ## Lookup history
-    res = __salt__["cmd.run_all"](
-        __utils__["zfs.zpool_command"](
-            command="history",
-            flags=flags,
-            target=zpool,
-        ),
-        python_shell=False,
-    )
-
-    if res["retcode"] != 0:
-        return __utils__["zfs.parse_command_result"](res)
-    else:
-        pool = "unknown"
-        for line in res["stdout"].splitlines():
-            if line.startswith("History for"):
-                pool = line[13:-2]
-                ret[pool] = OrderedDict()
-            else:
-                if line == "":
-                    continue
-                log_timestamp = line[0:19]
-                log_command = line[20:]
-                ret[pool][log_timestamp] = log_command
-
-    return ret
+1 import logging
+2 import os
+3 import salt.utils.decorators
+4 import salt.utils.decorators.path
+5 import salt.utils.path
+6 from salt.utils.odict import OrderedDict
+7 log = logging.getLogger(__name__)
+8 __virtualname__ = "zpool"
+9 __func_alias__ = {
+10     "import_": "import",
+11     "list_": "list",
+12 }
+13 def __virtual__():
+14     if __grains__.get("zfs_support"):
+15         return __virtualname__
+16     else:
+17         return False, "The zpool module cannot be loaded: zfs not supported"
+18 def _clean_vdev_config(config):
+19     cln_config = OrderedDict()
+20     for label, sub_config in config.items():
+21         if label not in ["state", "read", "write", "cksum"]:
+22             sub_config = _clean_vdev_config(sub_config)
+23             if sub_config and isinstance(cln_config, list):
+24                 cln_config.append(OrderedDict([(label, sub_config)]))
+25             elif sub_config and isinstance(cln_config, OrderedDict):
+26                 cln_config[label] = sub_config
+27             elif isinstance(cln_config, list):
+28                 cln_config.append(label)
+29             elif isinstance(cln_config, OrderedDict):
+30                 new_config = []
+31                 for old_label, old_config in cln_config.items():
+32                     new_config.append(OrderedDict([(old_label, old_config)]))
+33                 new_config.append(label)
+34                 cln_config = new_config
+35             else:
+36                 cln_config = [label]
+37     return cln_config
+38 def healthy():
+39     res = __salt__["cmd.run_all"](
+40         __utils__["zfs.zpool_command"]("status", flags=["-x"]),
+41         python_shell=False,
+42     )
+43     return res["stdout"] == "all pools are healthy"
+44 def status(zpool=None):
+45     ret = OrderedDict()
+46     res = __salt__["cmd.run_all"](
+47         __utils__["zfs.zpool_command"]("status", target=zpool),
+48         python_shell=False,
+49     )
+50     if res["retcode"] != 0:
+51         return __utils__["zfs.parse_command_result"](res)
+52     current_pool = None
+53     current_prop = None
+54     for zpd in res["stdout"].splitlines():
+55         if zpd.strip() == "":
+56             continue
+57         if ":" in zpd and zpd[0] != "\t":
+58             prop = zpd.split(":")[0].strip()
+59             value = ":".join(zpd.split(":")[1:]).strip()
+60             if prop == "pool" and current_pool != value:
+61                 current_pool = value
+62                 ret[current_pool] = OrderedDict()
+63             if prop != "pool":
+64                 ret[current_pool][prop] = value
+65             current_prop = prop
+66         else:
+67             ret[current_pool][current_prop] = "{}\n{}".format(
+68                 ret[current_pool][current_prop], zpd
+69             )
+70     for pool in ret:
+71         if "config" not in ret[pool]:
+72             continue
+73         header = None
+74         root_vdev = None
+75         vdev = None
+76         dev = None
+77         rdev = None
+78         config = ret[pool]["config"]
+79         config_data = OrderedDict()
+80         for line in config.splitlines():
+81             if not header:
+82                 header = line.strip().lower()
+83                 header = [x for x in header.split(" ") if x not in [""]]
+84                 continue
+85             if line[0] == "\t":
+86                 line = line[1:]
+87             stat_data = OrderedDict(
+88                 list(
+89                     zip(
+90                         header,
+91                         [x for x in line.strip().split(" ") if x not in [""]],
+92                     )
+93                 )
+94             )
+95             stat_data = __utils__["zfs.from_auto_dict"](stat_data)
+96             if line.startswith(" " * 6):
+97                 rdev = stat_data["name"]
+98                 config_data[root_vdev][vdev][dev][rdev] = stat_data
+99             elif line.startswith(" " * 4):
+100                 rdev = None
+101                 dev = stat_data["name"]
+102                 config_data[root_vdev][vdev][dev] = stat_data
+103             elif line.startswith(" " * 2):
+104                 rdev = dev = None
+105                 vdev = stat_data["name"]
+106                 config_data[root_vdev][vdev] = stat_data
+107             else:
+108                 rdev = dev = vdev = None
+109                 root_vdev = stat_data["name"]
+110                 config_data[root_vdev] = stat_data
+111             del stat_data["name"]
+112         ret[pool]["config"] = config_data
+113     return ret
+114 def iostat(zpool=None, sample_time=5, parsable=True):
+115     ret = OrderedDict()
+116     res = __salt__["cmd.run_all"](
+117         __utils__["zfs.zpool_command"](
+118             command="iostat", flags=["-v"], target=[zpool, sample_time, 2]
+119         ),
+120         python_shell=False,
+121     )
+122     if res["retcode"] != 0:
+123         return __utils__["zfs.parse_command_result"](res)
+124     header = [
+125         "name",
+126         "capacity-alloc",
+127         "capacity-free",
+128         "operations-read",
+129         "operations-write",
+130         "bandwidth-read",
+131         "bandwidth-write",
+132     ]
+133     root_vdev = None
+134     vdev = None
+135     dev = None
+136     current_data = OrderedDict()
+137     for line in res["stdout"].splitlines():
+138         if line.strip() == "" or line.strip().split()[-1] in ["write", "bandwidth"]:
+139             continue
+140         if line.startswith("-") and line.endswith("-"):
+141             ret.update(current_data)
+142             current_data = OrderedDict()
+143             continue
+144         io_data = OrderedDict(
+145             list(
+146                 zip(
+147                     header,
+148                     [x for x in line.strip().split(" ") if x not in [""]],
+149                 )
+150             )
+151         )
+152         if parsable:
+153             io_data = __utils__["zfs.from_auto_dict"](io_data)
+154         else:
+155             io_data = __utils__["zfs.to_auto_dict"](io_data)
+156         if line.startswith(" " * 4):
+157             dev = io_data["name"]
+158             current_data[root_vdev][vdev][dev] = io_data
+159         elif line.startswith(" " * 2):
+160             dev = None
+161             vdev = io_data["name"]
+162             current_data[root_vdev][vdev] = io_data
+163         else:
+164             dev = vdev = None
+165             root_vdev = io_data["name"]
+166             current_data[root_vdev] = io_data
+167         del io_data["name"]
+168     return ret
+169 def list_(properties="size,alloc,free,cap,frag,health", zpool=None, parsable=True):
+170     ret = OrderedDict()
+171     if not isinstance(properties, list):
+172         properties = properties.split(",")
+173     while "name" in properties:
+174         properties.remove("name")
+175     properties.insert(0, "name")
+176     if not __utils__["zfs.has_feature_flags"]():
+177         while "frag" in properties:
+178             properties.remove("frag")
+179     res = __salt__["cmd.run_all"](
+180         __utils__["zfs.zpool_command"](
+181             command="list",
+182             flags=["-H"],
+183             opts={"-o": ",".join(properties)},
+184             target=zpool,
+185         ),
+186         python_shell=False,
+187     )
+188     if res["retcode"] != 0:
+189         return __utils__["zfs.parse_command_result"](res)
+190     for line in res["stdout"].splitlines():
+191         zpool_data = OrderedDict(
+192             list(
+193                 zip(
+194                     properties,
+195                     line.strip().split("\t"),
+196                 )
+197             )
+198         )
+199         if parsable:
+200             zpool_data = __utils__["zfs.from_auto_dict"](zpool_data)
+201         else:
+202             zpool_data = __utils__["zfs.to_auto_dict"](zpool_data)
+203         ret[zpool_data["name"]] = zpool_data
+204         del ret[zpool_data["name"]]["name"]
+205     return ret
+206 def get(zpool, prop=None, show_source=False, parsable=True):
+207     ret = OrderedDict()
+208     value_properties = ["name", "property", "value", "source"]
+209     res = __salt__["cmd.run_all"](
+210         __utils__["zfs.zpool_command"](
+211             command="get",
+212             flags=["-H"],
+213             property_name=prop if prop else "all",
+214             target=zpool,
+215         ),
+216         python_shell=False,
+217     )
+218     if res["retcode"] != 0:
+219         return __utils__["zfs.parse_command_result"](res)
+220     for line in res["stdout"].splitlines():
+221         prop_data = OrderedDict(
+222             list(
+223                 zip(
+224                     value_properties,
+225                     [x for x in line.strip().split("\t") if x not in [""]],
+226                 )
+227             )
+228         )
+229         del prop_data["name"]
+230         if parsable:
+231             prop_data["value"] = __utils__["zfs.from_auto"](
+232                 prop_data["property"], prop_data["value"]
+233             )
+234         else:
+235             prop_data["value"] = __utils__["zfs.to_auto"](
+236                 prop_data["property"], prop_data["value"]
+237             )
+238         if show_source:
+239             ret[prop_data["property"]] = prop_data
+240             del ret[prop_data["property"]]["property"]
+241         else:
+242             ret[prop_data["property"]] = prop_data["value"]
+243     return ret
+244 def set(zpool, prop, value):
+245     ret = OrderedDict()
+246     res = __salt__["cmd.run_all"](
+247         __utils__["zfs.zpool_command"](
+248             command="set",
+249             property_name=prop,
+250             property_value=value,
+251             target=zpool,
+252         ),
+253         python_shell=False,
+254     )
+255     return __utils__["zfs.parse_command_result"](res, "set")
+256 def exists(zpool):
+257     res = __salt__["cmd.run_all"](
+258         __utils__["zfs.zpool_command"](
+259             command="list",
+260             target=zpool,
+261         ),
+262         python_shell=False,
+263         ignore_retcode=True,
+264     )
+265     return res["retcode"] == 0
+266 def destroy(zpool, force=False):
+267     res = __salt__["cmd.run_all"](
+268         __utils__["zfs.zpool_command"](
+269             command="destroy",
+270             flags=["-f"] if force else None,
+271             target=zpool,
+272         ),
+273         python_shell=False,
+274     )
+275     return __utils__["zfs.parse_command_result"](res, "destroyed")
+276 def scrub(zpool, stop=False, pause=False):
+277     if stop:
+278         action = ["-s"]
+279     elif pause:
+280         action = ["-p"]
+281     else:
+282         action = None
+283     res = __salt__["cmd.run_all"](
+284         __utils__["zfs.zpool_command"](
+285             command="scrub",
+286             flags=action,
+287             target=zpool,
+288         ),
+289         python_shell=False,
+290     )
+291     if res["retcode"] != 0:
+292         return __utils__["zfs.parse_command_result"](res, "scrubbing")
+293     ret = OrderedDict()
+294     if stop or pause:
+295         ret["scrubbing"] = False
+296     else:
+297         ret["scrubbing"] = True
+298     return ret
+299 def create(zpool, *vdevs, **kwargs):
+300     flags = []
+301     opts = {}
+302     target = []
+303     pool_properties = kwargs.get("properties", {})
+304     filesystem_properties = kwargs.get("filesystem_properties", {})
+305     if kwargs.get("force", False):
+306         flags.append("-f")
+307     if kwargs.get("createboot", False) or "bootsize" in pool_properties:
+308         flags.append("-B")
+309     if kwargs.get("altroot", False):
+310         opts["-R"] = kwargs.get("altroot")
+311     if kwargs.get("mountpoint", False):
+312         opts["-m"] = kwargs.get("mountpoint")
+313     target.append(zpool)
+314     target.extend(vdevs)
+315     res = __salt__["cmd.run_all"](
+316         __utils__["zfs.zpool_command"](
+317             command="create",
+318             flags=flags,
+319             opts=opts,
+320             pool_properties=pool_properties,
+321             filesystem_properties=filesystem_properties,
+322             target=target,
+323         ),
+324         python_shell=False,
+325     )
+326     ret = __utils__["zfs.parse_command_result"](res, "created")
+327     if ret["created"]:
+328         ret["vdevs"] = _clean_vdev_config(
+329             __salt__["zpool.status"](zpool=zpool)[zpool]["config"][zpool],
+330         )
+331     return ret
+332 def add(zpool, *vdevs, **kwargs):
+333     flags = []
+334     target = []
+335     if kwargs.get("force", False):
+336         flags.append("-f")
+337     target.append(zpool)
+338     target.extend(vdevs)
+339     res = __salt__["cmd.run_all"](
+340         __utils__["zfs.zpool_command"](
+341             command="add",
+342             flags=flags,
+343             target=target,
+344         ),
+345         python_shell=False,
+346     )
+347     ret = __utils__["zfs.parse_command_result"](res, "added")
+348     if ret["added"]:
+349         ret["vdevs"] = _clean_vdev_config(
+350             __salt__["zpool.status"](zpool=zpool)[zpool]["config"][zpool],
+351         )
+352     return ret
+353 def attach(zpool, device, new_device, force=False):
+354     flags = []
+355     target = []
+356     if force:
+357         flags.append("-f")
+358     target.append(zpool)
+359     target.append(device)
+360     target.append(new_device)
+361     res = __salt__["cmd.run_all"](
+362         __utils__["zfs.zpool_command"](
+363             command="attach",
+364             flags=flags,
+365             target=target,
+366         ),
+367         python_shell=False,
+368     )
+369     ret = __utils__["zfs.parse_command_result"](res, "attached")
+370     if ret["attached"]:
+371         ret["vdevs"] = _clean_vdev_config(
+372             __salt__["zpool.status"](zpool=zpool)[zpool]["config"][zpool],
+373         )
+374     return ret
+375 def detach(zpool, device):
+376     res = __salt__["cmd.run_all"](
+377         __utils__["zfs.zpool_command"](
+378             command="detach",
+379             target=[zpool, device],
+380         ),
+381         python_shell=False,
+382     )
+383     ret = __utils__["zfs.parse_command_result"](res, "detatched")
+384     if ret["detatched"]:
+385         ret["vdevs"] = _clean_vdev_config(
+386             __salt__["zpool.status"](zpool=zpool)[zpool]["config"][zpool],
+387         )
+388     return ret
+389 def split(zpool, newzpool, **kwargs):
+390     opts = {}
+391     pool_properties = kwargs.get("properties", {})
+392     if kwargs.get("altroot", False):
+393         opts["-R"] = kwargs.get("altroot")
+394     res = __salt__["cmd.run_all"](
+395         __utils__["zfs.zpool_command"](
+396             command="split",
+397             opts=opts,
+398             pool_properties=pool_properties,
+399             target=[zpool, newzpool],
+400         ),
+401         python_shell=False,
+402     )
+403 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>def replace(zpool, old_device, new_device=None, force=False):
+404     flags = []
+405     target = []
+406     if force:
+407         flags.append("-f")
+408     target.append(zpool)
+409     target.append(</b></font>old_device)
+410     if new_device:
+411         target.append(new_device)
+412     res = __salt__["cmd.run_all"](
+413         __utils__["zfs.zpool_command"](
+414             command="replace",
+415             flags=flags,
+416             target=target,
+417         ),
+418         python_shell=False,
+419     )
+420     ret = __utils__["zfs.parse_command_result"](res, "replaced")
+421     if ret["replaced"]:
+422         ret["vdevs"] = _clean_vdev_config(
+423             __salt__["zpool.status"](zpool=zpool)[zpool]["config"][zpool],
+424         )
+425     return ret
+426 @salt.utils.decorators.path.which("mkfile")
+427 def create_file_vdev(size, *vdevs):
+428     ret = OrderedDict()
+429     err = OrderedDict()
+430     _mkfile_cmd = salt.utils.path.which("mkfile")
+431     for vdev in vdevs:
+432         if os.path.isfile(vdev):
+433             ret[vdev] = "existed"
+434         else:
+435             res = __salt__["cmd.run_all"](
+436                 "{mkfile} {size} {vdev}".format(
+437                     mkfile=_mkfile_cmd,
+438                     size=size,
+439                     vdev=vdev,
+440                 ),
+441                 python_shell=False,
+442             )
+443             if res["retcode"] != 0:
+444                 if "stderr" in res and ":" in res["stderr"]:
+445                     ret[vdev] = "failed"
+446                     err[vdev] = ":".join(res["stderr"].strip().split(":")[1:])
+447             else:
+448                 ret[vdev] = "created"
+449     if err:
+450         ret["error"] = err
+451     return ret
+452 def export(*pools, **kwargs):
+453     flags = []
+454     targets = []
+455     if kwargs.get("force", False):
+456         flags.append("-f")
+457     targets = list(pools)
+458     res = __salt__["cmd.run_all"](
+459         __utils__["zfs.zpool_command"](
+460             command="export",
+461             flags=flags,
+462             target=targets,
+463         ),
+464         python_shell=False,
+465     )
+466     return __utils__["zfs.parse_command_result"](res, "exported")
+467 def import_(zpool=None, new_name=None, **kwargs):
+468     flags = []
+469     opts = {}
+470     target = []
+471     pool_properties = kwargs.get("properties", {})
+472     if kwargs.get("force", False) or kwargs.get("only_destroyed", False):
+473         flags.append("-f")
+474     if kwargs.get("only_destroyed", False):
+475         flags.append("-D")
+476     if kwargs.get("no_mount", False):
+477         flags.append("-N")
+478     if kwargs.get("altroot", False):
+479         opts["-R"] = kwargs.get("altroot")
+480     if kwargs.get("mntopts", False):
+481         opts["-o"] = kwargs.get("mntopts")
+482     if kwargs.get("dir", False):
+483         opts["-d"] = kwargs.get("dir").split(",")
+484     if kwargs.get("recovery", False) and __utils__["zfs.has_feature_flags"]():
+485         recovery = kwargs.get("recovery")
+486         if recovery in [True, "test"]:
+487             flags.append("-F")
+488         if recovery == "test":
+489             flags.append("-n")
+490         if recovery == "nolog":
+491             flags.append("-m")
+492     if zpool:
+493         target.append(zpool)
+494         target.append(new_name)
+495     else:
+496         flags.append("-a")
+497     res = __salt__["cmd.run_all"](
+498         __utils__["zfs.zpool_command"](
+499             command="import",
+500             flags=flags,
+501             opts=opts,
+502             pool_properties=pool_properties,
+503             target=target,
+504         ),
+505         python_shell=False,
+506     )
+507     return __utils__["zfs.parse_command_result"](res, "imported")
+508 def online(zpool, *vdevs, **kwargs):
+509     flags = []
+510     target = []
+511     if kwargs.get("expand", False):
+512         flags.append("-e")
+513     target.append(zpool)
+514     if vdevs:
+515         target.extend(vdevs)
+516     flags = []
+517     target = []
+518     if kwargs.get("expand", False):
+519         flags.append("-e")
+520     target.append(zpool)
+521     target.extend(vdevs)
+522     res = __salt__["cmd.run_all"](
+523         __utils__["zfs.zpool_command"](
+524             command="online",
+525             flags=flags,
+526             target=target,
+527         ),
+528         python_shell=False,
+529     )
+530     return __utils__["zfs.parse_command_result"](res, "onlined")
+531 def offline(zpool, *vdevs, **kwargs):
+532     flags = []
+533     target = []
+534     if kwargs.get("temporary", False):
+535         flags.append("-t")
+536     target.append(zpool)
+537     target.extend(vdevs)
+538     res = __salt__["cmd.run_all"](
+539         __utils__["zfs.zpool_command"](
+540             command="offline",
+541             flags=flags,
+542             target=target,
+543         ),
+544         python_shell=False,
+545     )
+546     return __utils__["zfs.parse_command_result"](res, "offlined")
+547 def labelclear(device, force=False):
+548     res = __salt__["cmd.run_all"](
+549         __utils__["zfs.zpool_command"](
+550             command="labelclear",
+551             flags=["-f"] if force else None,
+552             target=device,
+553         ),
+554         python_shell=False,
+555     )
+556     return __utils__["zfs.parse_command_result"](res, "labelcleared")
+557 def clear(zpool, device=None):
+558     target = []
+559     target.append(zpool)
+560     target.append(device)
+561     res = __salt__["cmd.run_all"](
+562         __utils__["zfs.zpool_command"](
+563             command="clear",
+564             target=target,
+565         ),
+566         python_shell=False,
+567     )
+568     return __utils__["zfs.parse_command_result"](res, "cleared")
+569 def reguid(zpool):
+570     res = __salt__["cmd.run_all"](
+571         __utils__["zfs.zpool_command"](
+572             command="reguid",
+573             target=zpool,
+574         ),
+575         python_shell=False,
+576     )
+577     return __utils__["zfs.parse_command_result"](res, "reguided")
+578 def reopen(zpool):
+579     res = __salt__["cmd.run_all"](
+580         __utils__["zfs.zpool_command"](
+581             command="reopen",
+582             target=zpool,
+583         ),
+584         python_shell=False,
+585     )
+586     return __utils__["zfs.parse_command_result"](res, "reopened")
+587 def upgrade(zpool=None, version=None):
+588     flags = []
+589     opts = {}
+590     if version:
+591         opts["-V"] = version
+592     if not zpool:
+593         flags.append("-a")
+594     res = __salt__["cmd.run_all"](
+595         __utils__["zfs.zpool_command"](
+596             command="upgrade",
+597             flags=flags,
+598             opts=opts,
+599             target=zpool,
+600         ),
+601         python_shell=False,
+602     )
+603     return __utils__["zfs.parse_command_result"](res, "upgraded")
+604 def history(zpool=None, internal=False, verbose=False):
+605     ret = OrderedDict()
+606     flags = []
+607     if verbose:
+608         flags.append("-l")
+609     if internal:
+610         flags.append("-i")
+611     res = __salt__["cmd.run_all"](
+612         __utils__["zfs.zpool_command"](
+613             command="history",
+614             flags=flags,
+615             target=zpool,
+616         ),
+617         python_shell=False,
+618     )
+619     if res["retcode"] != 0:
+620         return __utils__["zfs.parse_command_result"](res)
+621     else:
+622         pool = "unknown"
+623         for line in res["stdout"].splitlines():
+624             if line.startswith("History for"):
+625                 pool = line[13:-2]
+626                 ret[pool] = OrderedDict()
+627             else:
+628                 if line == "":
+629                     continue
+630                 log_timestamp = line[0:19]
+631                 log_command = line[20:]
+632                 ret[pool][log_timestamp] = log_command
+633     return ret
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -1749,1378 +685,589 @@ def history(zpool=None, internal=False, verbose=False):
 </h3>
 <hr/>
 <pre>
-"""
-A module to wrap (non-Windows) archive calls
-
-.. versionadded:: 2014.1.0
-"""
-
-import contextlib
-import copy
-import errno
-import glob
-import logging
-import os
-import re
-import shlex
-import stat
-import subprocess
-import tarfile
-import urllib.parse
-import zipfile
-
-import salt.utils.decorators
-import salt.utils.decorators.path
-import salt.utils.files
-import salt.utils.path
-import salt.utils.platform
-import salt.utils.stringutils
-import salt.utils.templates
-from salt.exceptions import CommandExecutionError, SaltInvocationError
-
-try:
-    import rarfile
-
-    HAS_RARFILE = True
-except ImportError:
-    HAS_RARFILE = False
-
-
-if salt.utils.platform.is_windows():
-    import win32file
-
-# TODO: Check that the passed arguments are correct
-
-# Don't shadow built-in's.
-__func_alias__ = {"zip_": "zip", "list_": "list"}
-
-log = logging.getLogger(__name__)
-
-
-def list_(
-    name,
-    archive_format=None,
-    options=None,
-    strip_components=None,
-    clean=False,
-    verbose=False,
-    saltenv="base",
-    source_hash=None,
-    use_etag=False,
-):
-    """
-    .. versionadded:: 2016.11.0
-    .. versionchanged:: 2016.11.2,3005
-        The rarfile_ Python module is now supported for listing the contents of
-        rar archives. This is necessary on minions with older releases of the
-        ``rar`` CLI tool, which do not support listing the contents in a
-        parsable format.
-
-    .. _rarfile: https://pypi.python.org/pypi/rarfile
-
-    List the files and directories in an tar, zip, or rar archive.
-
-    .. note::
-        This function will only provide results for XZ-compressed archives if
-        the xz_ CLI command is available, as Python does not at this time
-        natively support XZ compression in its tarfile_ module. Keep in mind
-        however that most Linux distros ship with xz_ already installed.
-
-        To check if a given minion has xz_, the following Salt command can be
-        run:
-
-        .. code-block:: bash
-
-            salt minion_id cmd.which xz
-
-        If ``None`` is returned, then xz_ is not present and must be installed.
-        It is widely available and should be packaged as either ``xz`` or
-        ``xz-utils``.
-
-    name
-        Path/URL of archive
-
-    archive_format
-        Specify the format of the archive (``tar``, ``zip``, or ``rar``). If
-        this argument is omitted, the archive format will be guessed based on
-        the value of the ``name`` parameter.
-
-    options
-        **For tar archives only.** This function will, by default, try to use
-        the tarfile_ module from the Python standard library to get a list of
-        files/directories. If this method fails, then it will fall back to
-        using the shell to decompress the archive to stdout and pipe the
-        results to ``tar -tf -`` to produce a list of filenames. XZ-compressed
-        archives are already supported automatically, but in the event that the
-        tar archive uses a different sort of compression not supported natively
-        by tarfile_, this option can be used to specify a command that will
-        decompress the archive to stdout. For example:
-
-        .. code-block:: bash
-
-            salt minion_id archive.list /path/to/foo.tar.gz options='gzip --decompress --stdout'
-
-        .. note::
-            It is not necessary to manually specify options for gzip'ed
-            archives, as gzip compression is natively supported by tarfile_.
-
-    strip_components
-        This argument specifies a number of top-level directories to strip from
-        the results. This is similar to the paths that would be extracted if
-        ``--strip-components`` (or ``--strip``) were used when extracting tar
-        archives.
-
-        .. versionadded:: 2016.11.2
-
-    clean : False
-        Set this value to ``True`` to delete the path referred to by ``name``
-        once the contents have been listed. This option should be used with
-        care.
-
-        .. note::
-            If there is an error listing the archive's contents, the cached
-            file will not be removed, to allow for troubleshooting.
-
-    verbose : False
-        If ``False``, this function will return a list of files/dirs in the
-        archive. If ``True``, it will return a dictionary categorizing the
-        paths into separate keys containing the directory names, file names,
-        and also directories/files present in the top level of the archive.
-
-        .. versionchanged:: 2016.11.2
-            This option now includes symlinks in their own list. Before, they
-            were included with files.
-
-    saltenv : base
-        Specifies the fileserver environment from which to retrieve
-        ``archive``. This is only applicable when ``archive`` is a file from
-        the ``salt://`` fileserver.
-
-    source_hash
-        If ``name`` is an http(s)/ftp URL and the file exists in the minion's
-        file cache, this option can be passed to keep the minion from
-        re-downloading the archive if the cached copy matches the specified
-        hash.
-
-        .. versionadded:: 2018.3.0
-
-    use_etag
-        If ``True``, remote http/https file sources will attempt to use the
-        ETag header to determine if the remote file needs to be downloaded.
-        This provides a lightweight mechanism for promptly refreshing files
-        changed on a web server without requiring a full hash comparison via
-        the ``source_hash`` parameter.
-
-        .. versionadded:: 3005
-
-    .. _tarfile: https://docs.python.org/2/library/tarfile.html
-    .. _xz: http://tukaani.org/xz/
-
-    CLI Examples:
-
-    .. code-block:: bash
-
-            salt '*' archive.list /path/to/myfile.tar.gz
-            salt '*' archive.list /path/to/myfile.tar.gz strip_components=1
-            salt '*' archive.list salt://foo.tar.gz
-            salt '*' archive.list https://domain.tld/myfile.zip
-            salt '*' archive.list https://domain.tld/myfile.zip source_hash=f1d2d2f924e986ac86fdf7b36c94bcdf32beec15
-            salt '*' archive.list ftp://10.1.2.3/foo.rar
-    """
-
-    def _list_tar(name, cached, decompress_cmd, failhard=False):
-        """
-        List the contents of a tar archive.
-        """
-        dirs = []
-        files = []
-        links = []
-        try:
-            open_kwargs = (
-                {"name": cached}
-                if not isinstance(cached, subprocess.Popen)
-                else {"fileobj": cached.stdout, "mode": "r|"}
-            )
-            with contextlib.closing(tarfile.open(**open_kwargs)) as tar_archive:
-                for member in tar_archive.getmembers():
-                    _member = salt.utils.data.decode(member.name)
-                    if member.issym():
-                        links.append(_member)
-                    elif member.isdir():
-                        dirs.append(_member + "/")
-                    else:
-                        files.append(_member)
-            return dirs, files, links
-
-        except tarfile.ReadError:
-            if failhard:
-                if isinstance(cached, subprocess.Popen):
-                    stderr = cached.communicate()[1]
-                    if cached.returncode != 0:
-                        raise CommandExecutionError(
-                            "Failed to decompress {}".format(name),
-                            info={"error": stderr},
-                        )
-            else:
-                if not salt.utils.path.which("tar"):
-                    raise CommandExecutionError("'tar' command not available")
-                if decompress_cmd is not None and isinstance(decompress_cmd, str):
-                    # Guard against shell injection
-                    try:
-                        decompress_cmd = [
-                            shlex.quote(x) for x in shlex.split(decompress_cmd)
-                        ]
-                    except AttributeError:
-                        raise CommandExecutionError("Invalid CLI options")
-                else:
-                    if (
-                        salt.utils.path.which("xz")
-                        and __salt__["cmd.retcode"](
-                            ["xz", "-t", cached],
-                            python_shell=False,
-                            ignore_retcode=True,
-                        )
-                        == 0
-                    ):
-                        decompress_cmd = ["xz", "--decompress", "--stdout"]
-
-                if decompress_cmd:
-                    decompressed = subprocess.Popen(
-                        decompress_cmd + [shlex.quote(cached)],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                    return _list_tar(name, decompressed, None, True)
-
-        raise CommandExecutionError(
-            "Unable to list contents of {}. If this is an XZ-compressed tar "
-            "archive, install XZ Utils to enable listing its contents. If it "
-            "is compressed using something other than XZ, it may be necessary "
-            "to specify CLI options to decompress the archive. See the "
-            "documentation for details.".format(name)
-        )
-
-    def _list_zip(name, cached):
-        """
-        List the contents of a zip archive.
-        Password-protected ZIP archives can still be listed by zipfile, so
-        there is no reason to invoke the unzip command.
-        """
-        dirs = set()
-        files = []
-        links = []
-        try:
-            with contextlib.closing(zipfile.ZipFile(cached)) as zip_archive:
-                for member in zip_archive.infolist():
-                    path = member.filename
-                    if salt.utils.platform.is_windows():
-                        if path.endswith("/"):
-                            # zipfile.ZipInfo objects on windows use forward
-                            # slash at end of the directory name.
-                            dirs.add(path)
-                        else:
-                            files.append(path)
-                    else:
-                        mode = member.external_attr &gt;&gt; 16
-                        if stat.S_ISLNK(mode):
-                            links.append(path)
-                        elif stat.S_ISDIR(mode):
-                            dirs.add(path)
-                        else:
-                            files.append(path)
-
-                _files = copy.deepcopy(files)
-                for path in _files:
-                    # ZIP files created on Windows do not add entries
-                    # to the archive for directories. So, we'll need to
-                    # manually add them.
-                    dirname = "".join(path.rpartition("/")[:2])
-                    if dirname:
-                        dirs.add(dirname)
-                        if dirname in files:
-                            files.remove(dirname)
-            return list(dirs), files, links
-        except zipfile.BadZipfile:
-            raise CommandExecutionError("{} is not a ZIP file".format(name))
-
-    def _list_rar(name, cached):
-        """
-        List the contents of a rar archive.
-        """
-        dirs = []
-        files = []
-        if HAS_RARFILE:
-            with rarfile.RarFile(cached) as rf:
-                for member in rf.infolist():
-                    path = member.filename.replace("\\", "/")
-                    if member.isdir():
-                        dirs.append(path + "/")
-                    else:
-                        files.append(path)
-        else:
-            if not salt.utils.path.which("rar"):
-                raise CommandExecutionError(
-                    "rar command not available, is it installed?"
-                )
-            output = __salt__["cmd.run"](
-                ["rar", "lt", name], python_shell=False, ignore_retcode=False
-            )
-            matches = re.findall(r"Name:\s*([^\n]+)\s*Type:\s*([^\n]+)", output)
-            for path, type_ in matches:
-                if type_ == "Directory":
-                    dirs.append(path + "/")
-                else:
-                    files.append(path)
-            if not dirs and not files:
-                raise CommandExecutionError(
-                    "Failed to list {}, is it a rar file? If so, the "
-                    "installed version of rar may be too old to list data in "
-                    "a parsable format. Installing the rarfile Python module "
-                    "may be an easier workaround if newer rar is not readily "
-                    "available.".format(name),
-                    info={"error": output},
-                )
-        return dirs, files, []
-
-    cached = __salt__["cp.cache_file"](
-        name, saltenv, source_hash=source_hash, use_etag=use_etag
-    )
-    if not cached:
-        raise CommandExecutionError("Failed to cache {}".format(name))
-
-    try:
-        if strip_components:
-            try:
-                int(strip_components)
-            except ValueError:
-                strip_components = -1
-
-            if strip_components &lt;= 0:
-                raise CommandExecutionError(
-                    "'strip_components' must be a positive integer"
-                )
-
-        parsed = urllib.parse.urlparse(name)
-        path = parsed.path or parsed.netloc
-
-        def _unsupported_format(archive_format):
-            """
-            Raise the proper exception message for the given archive format.
-            """
-            if archive_format is None:
-                raise CommandExecutionError(
-                    "Unable to guess archive format, please pass an "
-                    "'archive_format' argument."
-                )
-            raise CommandExecutionError(
-                "Unsupported archive format '{}'".format(archive_format)
-            )
-
-        if not archive_format:
-            guessed_format = salt.utils.files.guess_archive_type(path)
-            if guessed_format is None:
-                _unsupported_format(archive_format)
-            archive_format = guessed_format
-
-        func = locals().get("_list_" + archive_format)
-        if not hasattr(func, "__call__"):
-            _unsupported_format(archive_format)
-
-        args = (options,) if archive_format == "tar" else ()
-        try:
-            dirs, files, links = func(name, cached, *args)
-        except OSError as exc:
-            raise CommandExecutionError(
-                "Failed to list contents of {}: {}".format(name, exc.__str__())
-            )
-        except CommandExecutionError as exc:
-            raise
-        except Exception as exc:  # pylint: disable=broad-except
-            raise CommandExecutionError(
-                "Uncaught exception '{}' when listing contents of {}".format(exc, name)
-            )
-
-        if clean:
-            try:
-                os.remove(cached)
-                log.debug("Cleaned cached archive %s", cached)
-            except OSError as exc:
-                if exc.errno != errno.ENOENT:
-                    log.warning(
-                        "Failed to clean cached archive %s: %s", cached, exc.__str__()
-                    )
-
-        if strip_components:
-            for item in (dirs, files, links):
-                for index, path in enumerate(item):
-                    try:
-                        # Strip off the specified number of directory
-                        # boundaries, and grab what comes after the last
-                        # stripped path separator.
-                        item[index] = item[index].split(os.sep, strip_components)[
-                            strip_components
-                        ]
-                    except IndexError:
-                        # Path is excluded by strip_components because it is not
-                        # deep enough. Set this to an empty string so it can
-                        # be removed in the generator expression below.
-                        item[index] = ""
-
-                # Remove all paths which were excluded
-                item[:] = (x for x in item if x)
-                item.sort()
-
-        if verbose:
-            ret = {
-                "dirs": sorted(salt.utils.data.decode_list(dirs)),
-                "files": sorted(salt.utils.data.decode_list(files)),
-                "links": sorted(salt.utils.data.decode_list(links)),
-            }
-            ret["top_level_dirs"] = [x for x in ret["dirs"] if x.count("/") == 1]
-            ret["top_level_files"] = [x for x in ret["files"] if x.count("/") == 0]
-            ret["top_level_links"] = [x for x in ret["links"] if x.count("/") == 0]
-        else:
-            ret = sorted(dirs + files + links)
-        return ret
-
-    except CommandExecutionError as exc:
-        # Reraise with cache path in the error so that the user can examine the
-        # cached archive for troubleshooting purposes.
-        info = exc.info or {}
-        info["archive location"] = cached
-        raise CommandExecutionError(exc.error, info=info)
-
-
-_glob_wildcards = re.compile("[*?[]")
-
-
-def _glob(pathname):
-    """
-    In case ``pathname`` contains glob wildcards, performs expansion and returns
-    the possibly empty list of matching pathnames. Otherwise returns a list that
-    contains only ``pathname`` itself.
-    """
-    if _glob_wildcards.search(pathname) is None:
-        return [pathname]
-    else:
-        return glob.glob(pathname)
-
-
-def _expand_sources(sources):
-    """
-    Expands a user-provided specification of source files into a list of paths.
-    """
-    if sources is None:
-        return []
-    if isinstance(sources, str):
-        sources = [x.strip() for x in sources.split(",")]
-    elif isinstance(sources, (float, int)):
-        sources = [str(sources)]
-    return [path for source in sources for path in _glob(source)]
-
-
-@salt.utils.decorators.path.which("tar")
-def tar(options, tarfile, sources=None, dest=None, cwd=None, template=None, runas=None):
-    """
-    .. note::
-
-        This function has changed for version 0.17.0. In prior versions, the
-        ``cwd`` and ``template`` arguments must be specified, with the source
-        directories/files coming as a space-separated list at the end of the
-        command. Beginning with 0.17.0, ``sources`` must be a comma-separated
-        list, and the ``cwd`` and ``template`` arguments are optional.
-
-    Uses the tar command to pack, unpack, etc. tar files
-
-
-    options
-        Options to pass to the tar command
-
-        .. versionchanged:: 2015.8.0
-
-            The mandatory `-` prefixing has been removed.  An options string
-            beginning with a `--long-option`, would have uncharacteristically
-            needed its first `-` removed under the former scheme.
-
-            Also, tar will parse its options differently if short options are
-            used with or without a preceding `-`, so it is better to not
-            confuse the user into thinking they're using the non-`-` format,
-            when really they are using the with-`-` format.
-
-    tarfile
-        The filename of the tar archive to pack/unpack
-
-    sources
-        Comma delimited list of files to **pack** into the tarfile. Can also be
-        passed as a Python list.
-
-        .. versionchanged:: 2017.7.0
-            Globbing is now supported for this argument
-
-    dest
-        The destination directory into which to **unpack** the tarfile
-
-    cwd : None
-        The directory in which the tar command should be executed. If not
-        specified, will default to the home directory of the user under which
-        the salt minion process is running.
-
-    template : None
-        Can be set to 'jinja' or another supported template engine to render
-        the command arguments before execution:
-
-        .. code-block:: bash
-
-            salt '*' archive.tar cjvf /tmp/salt.tar.bz2 {{grains.saltpath}} template=jinja
-
-    CLI Examples:
-
-    .. code-block:: bash
-
-        # Create a tarfile
-        salt '*' archive.tar cjvf /tmp/tarfile.tar.bz2 /tmp/file_1,/tmp/file_2
-        # Create a tarfile using globbing (2017.7.0 and later)
-        salt '*' archive.tar cjvf /tmp/tarfile.tar.bz2 '/tmp/file_*'
-        # Unpack a tarfile
-        salt '*' archive.tar xf foo.tar dest=/target/directory
-    """
-    if not options:
-        # Catch instances were people pass an empty string for the "options"
-        # argument. Someone would have to be really silly to do this, but we
-        # should at least let them know of their silliness.
-        raise SaltInvocationError("Tar options can not be empty")
-
-    cmd = ["tar"]
-    if options:
-        cmd.extend(options.split())
-
-    cmd.extend(["{}".format(tarfile)])
-    cmd.extend(_expand_sources(sources))
-    if dest:
-        cmd.extend(["-C", "{}".format(dest)])
-
-    return __salt__["cmd.run"](
-        cmd, cwd=cwd, template=template, runas=runas, python_shell=False
-    ).splitlines()
-<a name="0"></a>
-
-@salt.utils.decorators.path.which("gzip")
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>def gzip(sourcefile, template=None, runas=None, options=None):
-    """
-    Uses the gzip command to create gzip files
-
-    template : None
-        Can be set to 'jinja' or another supported template engine to render
-        the command arguments before execution:
-
-        .. code-block:: bash
-
-            salt '*' archive.gzip template=jinja /tmp/{{grains.id}}.txt
-
-    runas : None
-        The user with which to run the gzip command line
-
-    options : None
-        Pass any additional arguments to gzip
-
-        .. versionadded:: 2016.3.4
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        # Create /tmp/sourcefile.txt.gz
-        salt '*' archive.gzip /tmp/sourcefile.txt
-        salt '*' archive.gzip /tmp/sourcefile.txt options='-9 --verbose'
-    """
-    cmd = ["gzip"]
-    if options:
-        cmd.append(options)
-    cmd.append("{}".format(</b></font>sourcefile))
-
-    return __salt__["cmd.run"](
-        cmd, template=template, runas=runas, python_shell=False
-    ).splitlines()
-
-
-@salt.utils.decorators.path.which("gunzip")
-def gunzip(gzipfile, template=None, runas=None, options=None):
-    """
-    Uses the gunzip command to unpack gzip files
-
-    template : None
-        Can be set to 'jinja' or another supported template engine to render
-        the command arguments before execution:
-
-        .. code-block:: bash
-
-            salt '*' archive.gunzip template=jinja /tmp/{{grains.id}}.txt.gz
-
-    runas : None
-        The user with which to run the gzip command line
-
-    options : None
-        Pass any additional arguments to gzip
-
-        .. versionadded:: 2016.3.4
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        # Create /tmp/sourcefile.txt
-        salt '*' archive.gunzip /tmp/sourcefile.txt.gz
-        salt '*' archive.gunzip /tmp/sourcefile.txt options='--verbose'
-    """
-    cmd = ["gunzip"]
-    if options:
-        cmd.append(options)
-    cmd.append("{}".format(gzipfile))
-
-    return __salt__["cmd.run"](
-        cmd, template=template, runas=runas, python_shell=False
-    ).splitlines()
-
-
-@salt.utils.decorators.path.which("zip")
-def cmd_zip(zip_file, sources, template=None, cwd=None, runas=None):
-    """
-    .. versionadded:: 2015.5.0
-        In versions 2014.7.x and earlier, this function was known as
-        ``archive.zip``.
-
-    Uses the ``zip`` command to create zip files. This command is part of the
-    `Info-ZIP`_ suite of tools, and is typically packaged as simply ``zip``.
-
-    .. _`Info-ZIP`: http://www.info-zip.org/
-
-    zip_file
-        Path of zip file to be created
-
-    sources
-        Comma-separated list of sources to include in the zip file. Sources can
-        also be passed in a Python list.
-
-        .. versionchanged:: 2017.7.0
-            Globbing is now supported for this argument
-
-    template : None
-        Can be set to 'jinja' or another supported template engine to render
-        the command arguments before execution:
-
-        .. code-block:: bash
-
-            salt '*' archive.cmd_zip template=jinja /tmp/zipfile.zip /tmp/sourcefile1,/tmp/{{grains.id}}.txt
-
-    cwd : None
-        Use this argument along with relative paths in ``sources`` to create
-        zip files which do not contain the leading directories. If not
-        specified, the zip file will be created as if the cwd was ``/``, and
-        creating a zip file of ``/foo/bar/baz.txt`` will contain the parent
-        directories ``foo`` and ``bar``. To create a zip file containing just
-        ``baz.txt``, the following command would be used:
-
-        .. code-block:: bash
-
-            salt '*' archive.cmd_zip /tmp/baz.zip baz.txt cwd=/foo/bar
-
-        .. versionadded:: 2014.7.1
-
-    runas : None
-        Create the zip file as the specified user. Defaults to the user under
-        which the minion is running.
-
-        .. versionadded:: 2015.5.0
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' archive.cmd_zip /tmp/zipfile.zip /tmp/sourcefile1,/tmp/sourcefile2
-        # Globbing for sources (2017.7.0 and later)
-        salt '*' archive.cmd_zip /tmp/zipfile.zip '/tmp/sourcefile*'
-    """
-    cmd = ["zip", "-r"]
-    cmd.append("{}".format(zip_file))
-    cmd.extend(_expand_sources(sources))
-    return __salt__["cmd.run"](
-        cmd, cwd=cwd, template=template, runas=runas, python_shell=False
-    ).splitlines()
-
-
-@salt.utils.decorators.depends("zipfile", fallback_function=cmd_zip)
-def zip_(zip_file, sources, template=None, cwd=None, runas=None, zip64=False):
-    """
-    Uses the ``zipfile`` Python module to create zip files
-
-    .. versionchanged:: 2015.5.0
-        This function was rewritten to use Python's native zip file support.
-        The old functionality has been preserved in the new function
-        :mod:`archive.cmd_zip &lt;salt.modules.archive.cmd_zip&gt;`. For versions
-        2014.7.x and earlier, see the :mod:`archive.cmd_zip
-        &lt;salt.modules.archive.cmd_zip&gt;` documentation.
-
-    zip_file
-        Path of zip file to be created
-
-    sources
-        Comma-separated list of sources to include in the zip file. Sources can
-        also be passed in a Python list.
-
-        .. versionchanged:: 2017.7.0
-            Globbing is now supported for this argument
-
-    template : None
-        Can be set to 'jinja' or another supported template engine to render
-        the command arguments before execution:
-
-        .. code-block:: bash
-
-            salt '*' archive.zip template=jinja /tmp/zipfile.zip /tmp/sourcefile1,/tmp/{{grains.id}}.txt
-
-    cwd : None
-        Use this argument along with relative paths in ``sources`` to create
-        zip files which do not contain the leading directories. If not
-        specified, the zip file will be created as if the cwd was ``/``, and
-        creating a zip file of ``/foo/bar/baz.txt`` will contain the parent
-        directories ``foo`` and ``bar``. To create a zip file containing just
-        ``baz.txt``, the following command would be used:
-
-        .. code-block:: bash
-
-            salt '*' archive.zip /tmp/baz.zip baz.txt cwd=/foo/bar
-
-    runas : None
-        Create the zip file as the specified user. Defaults to the user under
-        which the minion is running.
-
-    zip64 : False
-        Used to enable ZIP64 support, necessary to create archives larger than
-        4 GByte in size.
-        If true, will create ZIP file with the ZIPp64 extension when the zipfile
-        is larger than 2 GB.
-        ZIP64 extension is disabled by default in the Python native zip support
-        because the default zip and unzip commands on Unix (the InfoZIP utilities)
-        don't support these extensions.
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' archive.zip /tmp/zipfile.zip /tmp/sourcefile1,/tmp/sourcefile2
-        # Globbing for sources (2017.7.0 and later)
-        salt '*' archive.zip /tmp/zipfile.zip '/tmp/sourcefile*'
-    """
-    if runas:
-        euid = os.geteuid()
-        egid = os.getegid()
-        uinfo = __salt__["user.info"](runas)
-        if not uinfo:
-            raise SaltInvocationError("User '{}' does not exist".format(runas))
-
-    zip_file, sources = _render_filenames(zip_file, sources, None, template)
-    sources = _expand_sources(sources)
-
-    if not cwd:
-        for src in sources:
-            if not os.path.isabs(src):
-                raise SaltInvocationError("Relative paths require the 'cwd' parameter")
-    else:
-        err_msg = "cwd must be absolute"
-        try:
-            if not os.path.isabs(cwd):
-                raise SaltInvocationError(err_msg)
-        except AttributeError:
-            raise SaltInvocationError(err_msg)
-
-    if runas and (euid != uinfo["uid"] or egid != uinfo["gid"]):
-        # Change the egid first, as changing it after the euid will fail
-        # if the runas user is non-privileged.
-        os.setegid(uinfo["gid"])
-        os.seteuid(uinfo["uid"])
-
-    try:
-        exc = None
-        archived_files = []
-        with contextlib.closing(
-            zipfile.ZipFile(zip_file, "w", zipfile.ZIP_DEFLATED, zip64)
-        ) as zfile:
-            for src in sources:
-                if cwd:
-                    src = os.path.join(cwd, src)
-                if os.path.exists(src):
-                    if os.path.isabs(src):
-                        rel_root = "/"
-                    else:
-                        rel_root = cwd if cwd is not None else "/"
-                    if os.path.isdir(src):
-                        for dir_name, sub_dirs, files in salt.utils.path.os_walk(src):
-                            if cwd and dir_name.startswith(cwd):
-                                arc_dir = os.path.relpath(dir_name, cwd)
-                            else:
-                                arc_dir = os.path.relpath(dir_name, rel_root)
-                            if arc_dir:
-                                archived_files.append(arc_dir + "/")
-                                zfile.write(dir_name, arc_dir)
-                            for filename in files:
-                                abs_name = os.path.join(dir_name, filename)
-                                arc_name = os.path.join(arc_dir, filename)
-                                archived_files.append(arc_name)
-                                zfile.write(abs_name, arc_name)
-                    else:
-                        if cwd and src.startswith(cwd):
-                            arc_name = os.path.relpath(src, cwd)
-                        else:
-                            arc_name = os.path.relpath(src, rel_root)
-                        archived_files.append(arc_name)
-                        zfile.write(src, arc_name)
-    except Exception as exc:  # pylint: disable=broad-except
-        pass
-    finally:
-        # Restore the euid/egid
-        if runas:
-            os.seteuid(euid)
-            os.setegid(egid)
-        if exc is not None:
-            # Wait to raise the exception until euid/egid are restored to avoid
-            # permission errors in writing to minion log.
-            if exc == zipfile.LargeZipFile:
-                raise CommandExecutionError(
-                    "Resulting zip file too large, would require ZIP64 support"
-                    "which has not been enabled. Rerun command with zip64=True"
-                )
-            else:
-                raise CommandExecutionError(
-                    "Exception encountered creating zipfile: {}".format(exc)
-                )
-
-    return archived_files
-
-
-@salt.utils.decorators.path.which("unzip")
-def cmd_unzip(
-    zip_file,
-    dest,
-    excludes=None,
-    options=None,
-    template=None,
-    runas=None,
-    trim_output=False,
-    password=None,
-):
-    """
-    .. versionadded:: 2015.5.0
-        In versions 2014.7.x and earlier, this function was known as
-        ``archive.unzip``.
-
-    Uses the ``unzip`` command to unpack zip files. This command is part of the
-    `Info-ZIP`_ suite of tools, and is typically packaged as simply ``unzip``.
-
-    .. _`Info-ZIP`: http://www.info-zip.org/
-
-    zip_file
-        Path of zip file to be unpacked
-
-    dest
-        The destination directory into which the file should be unpacked
-
-    excludes : None
-        Comma-separated list of files not to unpack. Can also be passed in a
-        Python list.
-
-    template : None
-        Can be set to 'jinja' or another supported template engine to render
-        the command arguments before execution:
-
-        .. code-block:: bash
-
-            salt '*' archive.cmd_unzip template=jinja /tmp/zipfile.zip '/tmp/{{grains.id}}' excludes=file_1,file_2
-
-    options
-        Optional when using ``zip`` archives, ignored when usign other archives
-        files. This is mostly used to overwrite existing files with ``o``.
-        This options are only used when ``unzip`` binary is used.
-
-        .. versionadded:: 2016.3.1
-
-    runas : None
-        Unpack the zip file as the specified user. Defaults to the user under
-        which the minion is running.
-
-        .. versionadded:: 2015.5.0
-
-    trim_output : False
-        The number of files we should output on success before the rest are trimmed, if this is
-        set to True then it will default to 100
-
-    password
-        Password to use with password protected zip files
-
-        .. note::
-            This is not considered secure. It is recommended to instead use
-            :py:func:`archive.unzip &lt;salt.modules.archive.unzip&gt;` for
-            password-protected ZIP files. If a password is used here, then the
-            unzip command run to extract the ZIP file will not show up in the
-            minion log like most shell commands Salt runs do. However, the
-            password will still be present in the events logged to the minion
-            log at the ``debug`` log level. If the minion is logging at
-            ``debug`` (or more verbose), then be advised that the password will
-            appear in the log.
-
-        .. versionadded:: 2016.11.0
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' archive.cmd_unzip /tmp/zipfile.zip /home/strongbad/ excludes=file_1,file_2
-    """
-    if isinstance(excludes, str):
-        excludes = [x.strip() for x in excludes.split(",")]
-    elif isinstance(excludes, (float, int)):
-        excludes = [str(excludes)]
-
-    cmd = ["unzip"]
-    if password:
-        cmd.extend(["-P", password])
-    if options:
-        cmd.extend(shlex.split(options))
-    cmd.extend(["{}".format(zip_file), "-d", "{}".format(dest)])
-
-    if excludes is not None:
-        cmd.append("-x")
-        cmd.extend(excludes)
-
-    result = __salt__["cmd.run_all"](
-        cmd,
-        template=template,
-        runas=runas,
-        python_shell=False,
-        redirect_stderr=True,
-        output_loglevel="quiet" if password else "debug",
-    )
-
-    if result["retcode"] != 0:
-        raise CommandExecutionError(result["stdout"])
-
-    return _trim_files(result["stdout"].splitlines(), trim_output)
-
-
-def unzip(
-    zip_file,
-    dest,
-    excludes=None,
-    options=None,
-    template=None,
-    runas=None,
-    trim_output=False,
-    password=None,
-    extract_perms=True,
-):
-    """
-    Uses the ``zipfile`` Python module to unpack zip files
-
-    .. versionchanged:: 2015.5.0
-        This function was rewritten to use Python's native zip file support.
-        The old functionality has been preserved in the new function
-        :mod:`archive.cmd_unzip &lt;salt.modules.archive.cmd_unzip&gt;`. For versions
-        2014.7.x and earlier, see the :mod:`archive.cmd_zip
-        &lt;salt.modules.archive.cmd_zip&gt;` documentation.
-
-    zip_file
-        Path of zip file to be unpacked
-
-    dest
-        The destination directory into which the file should be unpacked
-
-    excludes : None
-        Comma-separated list of files not to unpack. Can also be passed in a
-        Python list.
-
-    options
-        This options are only used when ``unzip`` binary is used. In this
-        function is ignored.
-
-        .. versionadded:: 2016.3.1
-
-    template : None
-        Can be set to 'jinja' or another supported template engine to render
-        the command arguments before execution:
-
-        .. code-block:: bash
-
-            salt '*' archive.unzip template=jinja /tmp/zipfile.zip /tmp/{{grains.id}}/ excludes=file_1,file_2
-
-    runas : None
-        Unpack the zip file as the specified user. Defaults to the user under
-        which the minion is running.
-
-    trim_output : False
-        The number of files we should output on success before the rest are trimmed, if this is
-        set to True then it will default to 100
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' archive.unzip /tmp/zipfile.zip /home/strongbad/ excludes=file_1,file_2
-
-    password
-        Password to use with password protected zip files
-
-        .. note::
-            The password will be present in the events logged to the minion log
-            file at the ``debug`` log level. If the minion is logging at
-            ``debug`` (or more verbose), then be advised that the password will
-            appear in the log.
-
-        .. versionadded:: 2016.3.0
-
-    extract_perms : True
-        The Python zipfile_ module does not extract file/directory attributes
-        by default. When this argument is set to ``True``, Salt will attempt to
-        apply the file permission attributes to the extracted files/folders.
-
-        On Windows, only the read-only flag will be extracted as set within the
-        zip file, other attributes (i.e. user/group permissions) are ignored.
-
-        Set this argument to ``False`` to disable this behavior.
-
-        .. versionadded:: 2016.11.0
-
-    .. _zipfile: https://docs.python.org/2/library/zipfile.html
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' archive.unzip /tmp/zipfile.zip /home/strongbad/ password='BadPassword'
-    """
-    if not excludes:
-        excludes = []
-    if runas:
-        euid = os.geteuid()
-        egid = os.getegid()
-        uinfo = __salt__["user.info"](runas)
-        if not uinfo:
-            raise SaltInvocationError("User '{}' does not exist".format(runas))
-
-    zip_file, dest = _render_filenames(zip_file, dest, None, template)
-
-    if runas and (euid != uinfo["uid"] or egid != uinfo["gid"]):
-        # Change the egid first, as changing it after the euid will fail
-        # if the runas user is non-privileged.
-        os.setegid(uinfo["gid"])
-        os.seteuid(uinfo["uid"])
-
-    try:
-        # Define cleaned_files here so that an exception will not prevent this
-        # variable from being defined and cause a NameError in the return
-        # statement at the end of the function.
-        cleaned_files = []
-        with contextlib.closing(zipfile.ZipFile(zip_file, "r")) as zfile:
-            files = zfile.namelist()
-
-            if isinstance(excludes, str):
-                excludes = [x.strip() for x in excludes.split(",")]
-            elif isinstance(excludes, (float, int)):
-                excludes = [str(excludes)]
-
-            cleaned_files.extend([x for x in files if x not in excludes])
-            for target in cleaned_files:
-                if target not in excludes:
-                    if salt.utils.platform.is_windows() is False:
-                        info = zfile.getinfo(target)
-                        # Check if zipped file is a symbolic link
-                        if stat.S_ISLNK(info.external_attr &gt;&gt; 16):
-                            source = zfile.read(target)
-                            os.symlink(source, os.path.join(dest, target))
-                            continue
-                    zfile.extract(target, dest, password)
-                    if extract_perms:
-                        if not salt.utils.platform.is_windows():
-                            perm = zfile.getinfo(target).external_attr &gt;&gt; 16
-                            if perm == 0:
-                                umask_ = salt.utils.files.get_umask()
-                                if target.endswith("/"):
-                                    perm = 0o777 &amp; ~umask_
-                                else:
-                                    perm = 0o666 &amp; ~umask_
-                            os.chmod(os.path.join(dest, target), perm)
-                        else:
-                            win32_attr = zfile.getinfo(target).external_attr &amp; 0xFF
-                            win32file.SetFileAttributes(
-                                os.path.join(dest, target), win32_attr
-                            )
-    except Exception as exc:  # pylint: disable=broad-except
-        if runas:
-            os.seteuid(euid)
-            os.setegid(egid)
-        # Wait to raise the exception until euid/egid are restored to avoid
-        # permission errors in writing to minion log.
-        raise CommandExecutionError(
-            "Exception encountered unpacking zipfile: {}".format(exc)
-        )
-    finally:
-        # Restore the euid/egid
-        if runas:
-            os.seteuid(euid)
-            os.setegid(egid)
-
-    return _trim_files(cleaned_files, trim_output)
-
-
-def is_encrypted(name, clean=False, saltenv="base", source_hash=None, use_etag=False):
-    """
-    .. versionadded:: 2016.11.0
-    .. versionchanged:: 3005
-
-    Returns ``True`` if the zip archive is password-protected, ``False`` if
-    not. If the specified file is not a ZIP archive, an error will be raised.
-
-    name
-        The path / URL of the archive to check.
-
-    clean : False
-        Set this value to ``True`` to delete the path referred to by ``name``
-        once the contents have been listed. This option should be used with
-        care.
-
-        .. note::
-            If there is an error listing the archive's contents, the cached
-            file will not be removed, to allow for troubleshooting.
-
-    saltenv : base
-        Specifies the fileserver environment from which to retrieve
-        ``archive``. This is only applicable when ``archive`` is a file from
-        the ``salt://`` fileserver.
-
-    source_hash
-        If ``name`` is an http(s)/ftp URL and the file exists in the minion's
-        file cache, this option can be passed to keep the minion from
-        re-downloading the archive if the cached copy matches the specified
-        hash.
-
-        .. versionadded:: 2018.3.0
-
-    use_etag
-        If ``True``, remote http/https file sources will attempt to use the
-        ETag header to determine if the remote file needs to be downloaded.
-        This provides a lightweight mechanism for promptly refreshing files
-        changed on a web server without requiring a full hash comparison via
-        the ``source_hash`` parameter.
-
-        .. versionadded:: 3005
-
-    CLI Examples:
-
-    .. code-block:: bash
-
-            salt '*' archive.is_encrypted /path/to/myfile.zip
-            salt '*' archive.is_encrypted salt://foo.zip
-            salt '*' archive.is_encrypted salt://foo.zip saltenv=dev
-            salt '*' archive.is_encrypted https://domain.tld/myfile.zip clean=True
-            salt '*' archive.is_encrypted https://domain.tld/myfile.zip source_hash=f1d2d2f924e986ac86fdf7b36c94bcdf32beec15
-            salt '*' archive.is_encrypted ftp://10.1.2.3/foo.zip
-    """
-    cached = __salt__["cp.cache_file"](
-        name, saltenv, source_hash=source_hash, use_etag=use_etag
-    )
-    if not cached:
-        raise CommandExecutionError("Failed to cache {}".format(name))
-
-    archive_info = {"archive location": cached}
-    try:
-        with contextlib.closing(zipfile.ZipFile(cached)) as zip_archive:
-            zip_archive.testzip()
-    except RuntimeError:
-        ret = True
-    except zipfile.BadZipfile:
-        raise CommandExecutionError(
-            "{} is not a ZIP file".format(name), info=archive_info
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        raise CommandExecutionError(exc.__str__(), info=archive_info)
-    else:
-        ret = False
-
-    if clean:
-        try:
-            os.remove(cached)
-            log.debug("Cleaned cached archive %s", cached)
-        except OSError as exc:
-            if exc.errno != errno.ENOENT:
-                log.warning(
-                    "Failed to clean cached archive %s: %s", cached, exc.__str__()
-                )
-    return ret
-
-
-@salt.utils.decorators.path.which("rar")
-def rar(rarfile, sources, template=None, cwd=None, runas=None):
-    """
-    Uses `rar for Linux`_ to create rar files
-
-    .. _`rar for Linux`: http://www.rarlab.com/
-
-    rarfile
-        Path of rar file to be created
-
-    sources
-        Comma-separated list of sources to include in the rar file. Sources can
-        also be passed in a Python list.
-
-        .. versionchanged:: 2017.7.0
-            Globbing is now supported for this argument
-
-    cwd : None
-        Run the rar command from the specified directory. Use this argument
-        along with relative file paths to create rar files which do not
-        contain the leading directories. If not specified, this will default
-        to the home directory of the user under which the salt minion process
-        is running.
-
-        .. versionadded:: 2014.7.1
-
-    template : None
-        Can be set to 'jinja' or another supported template engine to render
-        the command arguments before execution:
-
-        .. code-block:: bash
-
-            salt '*' archive.rar template=jinja /tmp/rarfile.rar '/tmp/sourcefile1,/tmp/{{grains.id}}.txt'
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' archive.rar /tmp/rarfile.rar /tmp/sourcefile1,/tmp/sourcefile2
-        # Globbing for sources (2017.7.0 and later)
-        salt '*' archive.rar /tmp/rarfile.rar '/tmp/sourcefile*'
-    """
-    cmd = ["rar", "a", "-idp", "{}".format(rarfile)]
-    cmd.extend(_expand_sources(sources))
-    return __salt__["cmd.run"](
-        cmd, cwd=cwd, template=template, runas=runas, python_shell=False
-    ).splitlines()
-
-
-@salt.utils.decorators.path.which_bin(("unrar", "rar"))
-def unrar(rarfile, dest, excludes=None, template=None, runas=None, trim_output=False):
-    """
-    Uses `rar for Linux`_ to unpack rar files
-
-    .. _`rar for Linux`: http://www.rarlab.com/
-
-    rarfile
-        Name of rar file to be unpacked
-
-    dest
-        The destination directory into which to **unpack** the rar file
-
-    template : None
-        Can be set to 'jinja' or another supported template engine to render
-        the command arguments before execution:
-
-        .. code-block:: bash
-
-            salt '*' archive.unrar template=jinja /tmp/rarfile.rar /tmp/{{grains.id}}/ excludes=file_1,file_2
-
-    trim_output : False
-        The number of files we should output on success before the rest are trimmed, if this is
-        set to True then it will default to 100
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' archive.unrar /tmp/rarfile.rar /home/strongbad/ excludes=file_1,file_2
-
-    """
-    if isinstance(excludes, str):
-        excludes = [entry.strip() for entry in excludes.split(",")]
-
-    cmd = [
-        salt.utils.path.which_bin(("unrar", "rar")),
-        "x",
-        "-idp",
-        "{}".format(rarfile),
-    ]
-    if excludes is not None:
-        for exclude in excludes:
-            cmd.extend(["-x", "{}".format(exclude)])
-    cmd.append("{}".format(dest))
-    files = __salt__["cmd.run"](
-        cmd, template=template, runas=runas, python_shell=False
-    ).splitlines()
-
-    return _trim_files(files, trim_output)
-
-
-def _render_filenames(filenames, zip_file, saltenv, template):
-    """
-    Process markup in the :param:`filenames` and :param:`zipfile` variables (NOT the
-    files under the paths they ultimately point to) according to the markup
-    format provided by :param:`template`.
-    """
-    if not template:
-        return (filenames, zip_file)
-
-    # render the path as a template using path_template_engine as the engine
-    if template not in salt.utils.templates.TEMPLATE_REGISTRY:
-        raise CommandExecutionError(
-            "Attempted to render file paths with unavailable engine {}".format(template)
-        )
-
-    kwargs = {}
-    kwargs["salt"] = __salt__
-    kwargs["pillar"] = __pillar__
-    kwargs["grains"] = __grains__
-    kwargs["opts"] = __opts__
-    kwargs["saltenv"] = saltenv
-
-    def _render(contents):
-        """
-        Render :param:`contents` into a literal pathname by writing it to a
-        temp file, rendering that file, and returning the result.
-        """
-        # write out path to temp file
-        tmp_path_fn = salt.utils.files.mkstemp()
-        with salt.utils.files.fopen(tmp_path_fn, "w+") as fp_:
-            fp_.write(salt.utils.stringutils.to_str(contents))
-        data = salt.utils.templates.TEMPLATE_REGISTRY[template](
-            tmp_path_fn, to_str=True, **kwargs
-        )
-        salt.utils.files.safe_rm(tmp_path_fn)
-        if not data["result"]:
-            # Failed to render the template
-            raise CommandExecutionError(
-                "Failed to render file path with error: {}".format(data["data"])
-            )
-        else:
-            return data["data"]
-
-    filenames = _render(filenames)
-    zip_file = _render(zip_file)
-    return (filenames, zip_file)
-
-
-def _trim_files(files, trim_output):
-    """
-    Trim the file list for output.
-    """
-    count = 100
-    if not isinstance(trim_output, bool):
-        count = trim_output
-
-    if (
-        not (isinstance(trim_output, bool) and trim_output is False)
-        and len(files) &gt; count
-    ):
-        files = files[:count]
-        files.append("List trimmed after {} files.".format(count))
-
-    return files
+1 import contextlib
+2 import copy
+3 import errno
+4 import glob
+5 import logging
+6 import os
+7 import re
+8 import shlex
+9 import stat
+10 import subprocess
+11 import tarfile
+12 import urllib.parse
+13 import zipfile
+14 import salt.utils.decorators
+15 import salt.utils.decorators.path
+16 import salt.utils.files
+17 import salt.utils.path
+18 import salt.utils.platform
+19 import salt.utils.stringutils
+20 import salt.utils.templates
+21 from salt.exceptions import CommandExecutionError, SaltInvocationError
+22 try:
+23     import rarfile
+24     HAS_RARFILE = True
+25 except ImportError:
+26     HAS_RARFILE = False
+27 if salt.utils.platform.is_windows():
+28     import win32file
+29 __func_alias__ = {"zip_": "zip", "list_": "list"}
+30 log = logging.getLogger(__name__)
+31 def list_(
+32     name,
+33     archive_format=None,
+34     options=None,
+35     strip_components=None,
+36     clean=False,
+37     verbose=False,
+38     saltenv="base",
+39     source_hash=None,
+40     use_etag=False,
+41 ):
+42     def _list_tar(name, cached, decompress_cmd, failhard=False):
+43         dirs = []
+44         files = []
+45         links = []
+46         try:
+47             open_kwargs = (
+48                 {"name": cached}
+49                 if not isinstance(cached, subprocess.Popen)
+50                 else {"fileobj": cached.stdout, "mode": "r|"}
+51             )
+52             with contextlib.closing(tarfile.open(**open_kwargs)) as tar_archive:
+53                 for member in tar_archive.getmembers():
+54                     _member = salt.utils.data.decode(member.name)
+55                     if member.issym():
+56                         links.append(_member)
+57                     elif member.isdir():
+58                         dirs.append(_member + "/")
+59                     else:
+60                         files.append(_member)
+61             return dirs, files, links
+62         except tarfile.ReadError:
+63             if failhard:
+64                 if isinstance(cached, subprocess.Popen):
+65                     stderr = cached.communicate()[1]
+66                     if cached.returncode != 0:
+67                         raise CommandExecutionError(
+68                             "Failed to decompress {}".format(name),
+69                             info={"error": stderr},
+70                         )
+71             else:
+72                 if not salt.utils.path.which("tar"):
+73                     raise CommandExecutionError("'tar' command not available")
+74                 if decompress_cmd is not None and isinstance(decompress_cmd, str):
+75                     try:
+76                         decompress_cmd = [
+77                             shlex.quote(x) for x in shlex.split(decompress_cmd)
+78                         ]
+79                     except AttributeError:
+80                         raise CommandExecutionError("Invalid CLI options")
+81                 else:
+82                     if (
+83                         salt.utils.path.which("xz")
+84                         and __salt__["cmd.retcode"](
+85                             ["xz", "-t", cached],
+86                             python_shell=False,
+87                             ignore_retcode=True,
+88                         )
+89                         == 0
+90                     ):
+91                         decompress_cmd = ["xz", "--decompress", "--stdout"]
+92                 if decompress_cmd:
+93                     decompressed = subprocess.Popen(
+94                         decompress_cmd + [shlex.quote(cached)],
+95                         stdout=subprocess.PIPE,
+96                         stderr=subprocess.PIPE,
+97                     )
+98                     return _list_tar(name, decompressed, None, True)
+99         raise CommandExecutionError(
+100             "Unable to list contents of {}. If this is an XZ-compressed tar "
+101             "archive, install XZ Utils to enable listing its contents. If it "
+102             "is compressed using something other than XZ, it may be necessary "
+103             "to specify CLI options to decompress the archive. See the "
+104             "documentation for details.".format(name)
+105         )
+106     def _list_zip(name, cached):
+107         dirs = set()
+108         files = []
+109         links = []
+110         try:
+111             with contextlib.closing(zipfile.ZipFile(cached)) as zip_archive:
+112                 for member in zip_archive.infolist():
+113                     path = member.filename
+114                     if salt.utils.platform.is_windows():
+115                         if path.endswith("/"):
+116                             dirs.add(path)
+117                         else:
+118                             files.append(path)
+119                     else:
+120                         mode = member.external_attr &gt;&gt; 16
+121                         if stat.S_ISLNK(mode):
+122                             links.append(path)
+123                         elif stat.S_ISDIR(mode):
+124                             dirs.add(path)
+125                         else:
+126                             files.append(path)
+127                 _files = copy.deepcopy(files)
+128                 for path in _files:
+129                     dirname = "".join(path.rpartition("/")[:2])
+130                     if dirname:
+131                         dirs.add(dirname)
+132                         if dirname in files:
+133                             files.remove(dirname)
+134             return list(dirs), files, links
+135         except zipfile.BadZipfile:
+136             raise CommandExecutionError("{} is not a ZIP file".format(name))
+137     def _list_rar(name, cached):
+138         dirs = []
+139         files = []
+140         if HAS_RARFILE:
+141             with rarfile.RarFile(cached) as rf:
+142                 for member in rf.infolist():
+143                     path = member.filename.replace("\\", "/")
+144                     if member.isdir():
+145                         dirs.append(path + "/")
+146                     else:
+147                         files.append(path)
+148         else:
+149             if not salt.utils.path.which("rar"):
+150                 raise CommandExecutionError(
+151                     "rar command not available, is it installed?"
+152                 )
+153             output = __salt__["cmd.run"](
+154                 ["rar", "lt", name], python_shell=False, ignore_retcode=False
+155             )
+156             matches = re.findall(r"Name:\s*([^\n]+)\s*Type:\s*([^\n]+)", output)
+157             for path, type_ in matches:
+158                 if type_ == "Directory":
+159                     dirs.append(path + "/")
+160                 else:
+161                     files.append(path)
+162             if not dirs and not files:
+163                 raise CommandExecutionError(
+164                     "Failed to list {}, is it a rar file? If so, the "
+165                     "installed version of rar may be too old to list data in "
+166                     "a parsable format. Installing the rarfile Python module "
+167                     "may be an easier workaround if newer rar is not readily "
+168                     "available.".format(name),
+169                     info={"error": output},
+170                 )
+171         return dirs, files, []
+172     cached = __salt__["cp.cache_file"](
+173         name, saltenv, source_hash=source_hash, use_etag=use_etag
+174     )
+175     if not cached:
+176         raise CommandExecutionError("Failed to cache {}".format(name))
+177     try:
+178         if strip_components:
+179             try:
+180                 int(strip_components)
+181             except ValueError:
+182                 strip_components = -1
+183             if strip_components &lt;= 0:
+184                 raise CommandExecutionError(
+185                     "'strip_components' must be a positive integer"
+186                 )
+187         parsed = urllib.parse.urlparse(name)
+188         path = parsed.path or parsed.netloc
+189         def _unsupported_format(archive_format):
+190             if archive_format is None:
+191                 raise CommandExecutionError(
+192                     "Unable to guess archive format, please pass an "
+193                     "'archive_format' argument."
+194                 )
+195             raise CommandExecutionError(
+196                 "Unsupported archive format '{}'".format(archive_format)
+197             )
+198         if not archive_format:
+199             guessed_format = salt.utils.files.guess_archive_type(path)
+200             if guessed_format is None:
+201                 _unsupported_format(archive_format)
+202             archive_format = guessed_format
+203         func = locals().get("_list_" + archive_format)
+204         if not hasattr(func, "__call__"):
+205             _unsupported_format(archive_format)
+206         args = (options,) if archive_format == "tar" else ()
+207         try:
+208             dirs, files, links = func(name, cached, *args)
+209         except OSError as exc:
+210             raise CommandExecutionError(
+211                 "Failed to list contents of {}: {}".format(name, exc.__str__())
+212             )
+213         except CommandExecutionError as exc:
+214             raise
+215         except Exception as exc:  # pylint: disable=broad-except
+216             raise CommandExecutionError(
+217                 "Uncaught exception '{}' when listing contents of {}".format(exc, name)
+218             )
+219         if clean:
+220             try:
+221                 os.remove(cached)
+222                 log.debug("Cleaned cached archive %s", cached)
+223             except OSError as exc:
+224                 if exc.errno != errno.ENOENT:
+225                     log.warning(
+226                         "Failed to clean cached archive %s: %s", cached, exc.__str__()
+227                     )
+228         if strip_components:
+229             for item in (dirs, files, links):
+230                 for index, path in enumerate(item):
+231                     try:
+232                         item[index] = item[index].split(os.sep, strip_components)[
+233                             strip_components
+234                         ]
+235                     except IndexError:
+236                         item[index] = ""
+237                 item[:] = (x for x in item if x)
+238                 item.sort()
+239         if verbose:
+240             ret = {
+241                 "dirs": sorted(salt.utils.data.decode_list(dirs)),
+242                 "files": sorted(salt.utils.data.decode_list(files)),
+243                 "links": sorted(salt.utils.data.decode_list(links)),
+244             }
+245             ret["top_level_dirs"] = [x for x in ret["dirs"] if x.count("/") == 1]
+246             ret["top_level_files"] = [x for x in ret["files"] if x.count("/") == 0]
+247             ret["top_level_links"] = [x for x in ret["links"] if x.count("/") == 0]
+248         else:
+249             ret = sorted(dirs + files + links)
+250         return ret
+251     except CommandExecutionError as exc:
+252         info = exc.info or {}
+253         info["archive location"] = cached
+254         raise CommandExecutionError(exc.error, info=info)
+255 _glob_wildcards = re.compile("[*?[]")
+256 def _glob(pathname):
+257     if _glob_wildcards.search(pathname) is None:
+258         return [pathname]
+259     else:
+260         return glob.glob(pathname)
+261 def _expand_sources(sources):
+262     if sources is None:
+263         return []
+264     if isinstance(sources, str):
+265         sources = [x.strip() for x in sources.split(",")]
+266     elif isinstance(sources, (float, int)):
+267         sources = [str(sources)]
+268     return [path for source in sources for path in _glob(source)]
+269 @salt.utils.decorators.path.which("tar")
+270 def tar(options, tarfile, sources=None, dest=None, cwd=None, template=None, runas=None):
+271     if not options:
+272         raise SaltInvocationError("Tar options can not be empty")
+273     cmd = ["tar"]
+274     if options:
+275         cmd.extend(options.split())
+276     cmd.extend(["{}".format(tarfile)])
+277     cmd.extend(_expand_sources(sources))
+278     if dest:
+279         cmd.extend(["-C", "{}".format(dest)])
+280     return __salt__["cmd.run"](
+281         cmd, cwd=cwd, template=template, runas=runas, python_shell=False
+282     ).splitlines()
+283 @salt.utils.decorators.path.which("gzip")
+284 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>def gzip(sourcefile, template=None, runas=None, options=None):
+285     cmd = ["gzip"]
+286     if options:
+287         cmd.append(options)
+288     cmd.append("{}".format(</b></font>sourcefile))
+289     return __salt__["cmd.run"](
+290         cmd, template=template, runas=runas, python_shell=False
+291     ).splitlines()
+292 @salt.utils.decorators.path.which("gunzip")
+293 def gunzip(gzipfile, template=None, runas=None, options=None):
+294     cmd = ["gunzip"]
+295     if options:
+296         cmd.append(options)
+297     cmd.append("{}".format(gzipfile))
+298     return __salt__["cmd.run"](
+299         cmd, template=template, runas=runas, python_shell=False
+300     ).splitlines()
+301 @salt.utils.decorators.path.which("zip")
+302 def cmd_zip(zip_file, sources, template=None, cwd=None, runas=None):
+303     cmd = ["zip", "-r"]
+304     cmd.append("{}".format(zip_file))
+305     cmd.extend(_expand_sources(sources))
+306     return __salt__["cmd.run"](
+307         cmd, cwd=cwd, template=template, runas=runas, python_shell=False
+308     ).splitlines()
+309 @salt.utils.decorators.depends("zipfile", fallback_function=cmd_zip)
+310 def zip_(zip_file, sources, template=None, cwd=None, runas=None, zip64=False):
+311     if runas:
+312         euid = os.geteuid()
+313         egid = os.getegid()
+314         uinfo = __salt__["user.info"](runas)
+315         if not uinfo:
+316             raise SaltInvocationError("User '{}' does not exist".format(runas))
+317     zip_file, sources = _render_filenames(zip_file, sources, None, template)
+318     sources = _expand_sources(sources)
+319     if not cwd:
+320         for src in sources:
+321             if not os.path.isabs(src):
+322                 raise SaltInvocationError("Relative paths require the 'cwd' parameter")
+323     else:
+324         err_msg = "cwd must be absolute"
+325         try:
+326             if not os.path.isabs(cwd):
+327                 raise SaltInvocationError(err_msg)
+328         except AttributeError:
+329             raise SaltInvocationError(err_msg)
+330     if runas and (euid != uinfo["uid"] or egid != uinfo["gid"]):
+331         os.setegid(uinfo["gid"])
+332         os.seteuid(uinfo["uid"])
+333     try:
+334         exc = None
+335         archived_files = []
+336         with contextlib.closing(
+337             zipfile.ZipFile(zip_file, "w", zipfile.ZIP_DEFLATED, zip64)
+338         ) as zfile:
+339             for src in sources:
+340                 if cwd:
+341                     src = os.path.join(cwd, src)
+342                 if os.path.exists(src):
+343                     if os.path.isabs(src):
+344                         rel_root = "/"
+345                     else:
+346                         rel_root = cwd if cwd is not None else "/"
+347                     if os.path.isdir(src):
+348                         for dir_name, sub_dirs, files in salt.utils.path.os_walk(src):
+349                             if cwd and dir_name.startswith(cwd):
+350                                 arc_dir = os.path.relpath(dir_name, cwd)
+351                             else:
+352                                 arc_dir = os.path.relpath(dir_name, rel_root)
+353                             if arc_dir:
+354                                 archived_files.append(arc_dir + "/")
+355                                 zfile.write(dir_name, arc_dir)
+356                             for filename in files:
+357                                 abs_name = os.path.join(dir_name, filename)
+358                                 arc_name = os.path.join(arc_dir, filename)
+359                                 archived_files.append(arc_name)
+360                                 zfile.write(abs_name, arc_name)
+361                     else:
+362                         if cwd and src.startswith(cwd):
+363                             arc_name = os.path.relpath(src, cwd)
+364                         else:
+365                             arc_name = os.path.relpath(src, rel_root)
+366                         archived_files.append(arc_name)
+367                         zfile.write(src, arc_name)
+368     except Exception as exc:  # pylint: disable=broad-except
+369         pass
+370     finally:
+371         if runas:
+372             os.seteuid(euid)
+373             os.setegid(egid)
+374         if exc is not None:
+375             if exc == zipfile.LargeZipFile:
+376                 raise CommandExecutionError(
+377                     "Resulting zip file too large, would require ZIP64 support"
+378                     "which has not been enabled. Rerun command with zip64=True"
+379                 )
+380             else:
+381                 raise CommandExecutionError(
+382                     "Exception encountered creating zipfile: {}".format(exc)
+383                 )
+384     return archived_files
+385 @salt.utils.decorators.path.which("unzip")
+386 def cmd_unzip(
+387     zip_file,
+388     dest,
+389     excludes=None,
+390     options=None,
+391     template=None,
+392     runas=None,
+393     trim_output=False,
+394     password=None,
+395 ):
+396     if isinstance(excludes, str):
+397         excludes = [x.strip() for x in excludes.split(",")]
+398     elif isinstance(excludes, (float, int)):
+399         excludes = [str(excludes)]
+400     cmd = ["unzip"]
+401     if password:
+402         cmd.extend(["-P", password])
+403     if options:
+404         cmd.extend(shlex.split(options))
+405     cmd.extend(["{}".format(zip_file), "-d", "{}".format(dest)])
+406     if excludes is not None:
+407         cmd.append("-x")
+408         cmd.extend(excludes)
+409     result = __salt__["cmd.run_all"](
+410         cmd,
+411         template=template,
+412         runas=runas,
+413         python_shell=False,
+414         redirect_stderr=True,
+415         output_loglevel="quiet" if password else "debug",
+416     )
+417     if result["retcode"] != 0:
+418         raise CommandExecutionError(result["stdout"])
+419     return _trim_files(result["stdout"].splitlines(), trim_output)
+420 def unzip(
+421     zip_file,
+422     dest,
+423     excludes=None,
+424     options=None,
+425     template=None,
+426     runas=None,
+427     trim_output=False,
+428     password=None,
+429     extract_perms=True,
+430 ):
+431     if not excludes:
+432         excludes = []
+433     if runas:
+434         euid = os.geteuid()
+435         egid = os.getegid()
+436         uinfo = __salt__["user.info"](runas)
+437         if not uinfo:
+438             raise SaltInvocationError("User '{}' does not exist".format(runas))
+439     zip_file, dest = _render_filenames(zip_file, dest, None, template)
+440     if runas and (euid != uinfo["uid"] or egid != uinfo["gid"]):
+441         os.setegid(uinfo["gid"])
+442         os.seteuid(uinfo["uid"])
+443     try:
+444         cleaned_files = []
+445         with contextlib.closing(zipfile.ZipFile(zip_file, "r")) as zfile:
+446             files = zfile.namelist()
+447             if isinstance(excludes, str):
+448                 excludes = [x.strip() for x in excludes.split(",")]
+449             elif isinstance(excludes, (float, int)):
+450                 excludes = [str(excludes)]
+451             cleaned_files.extend([x for x in files if x not in excludes])
+452             for target in cleaned_files:
+453                 if target not in excludes:
+454                     if salt.utils.platform.is_windows() is False:
+455                         info = zfile.getinfo(target)
+456                         if stat.S_ISLNK(info.external_attr &gt;&gt; 16):
+457                             source = zfile.read(target)
+458                             os.symlink(source, os.path.join(dest, target))
+459                             continue
+460                     zfile.extract(target, dest, password)
+461                     if extract_perms:
+462                         if not salt.utils.platform.is_windows():
+463                             perm = zfile.getinfo(target).external_attr &gt;&gt; 16
+464                             if perm == 0:
+465                                 umask_ = salt.utils.files.get_umask()
+466                                 if target.endswith("/"):
+467                                     perm = 0o777 &amp; ~umask_
+468                                 else:
+469                                     perm = 0o666 &amp; ~umask_
+470                             os.chmod(os.path.join(dest, target), perm)
+471                         else:
+472                             win32_attr = zfile.getinfo(target).external_attr &amp; 0xFF
+473                             win32file.SetFileAttributes(
+474                                 os.path.join(dest, target), win32_attr
+475                             )
+476     except Exception as exc:  # pylint: disable=broad-except
+477         if runas:
+478             os.seteuid(euid)
+479             os.setegid(egid)
+480         raise CommandExecutionError(
+481             "Exception encountered unpacking zipfile: {}".format(exc)
+482         )
+483     finally:
+484         if runas:
+485             os.seteuid(euid)
+486             os.setegid(egid)
+487     return _trim_files(cleaned_files, trim_output)
+488 def is_encrypted(name, clean=False, saltenv="base", source_hash=None, use_etag=False):
+489     cached = __salt__["cp.cache_file"](
+490         name, saltenv, source_hash=source_hash, use_etag=use_etag
+491     )
+492     if not cached:
+493         raise CommandExecutionError("Failed to cache {}".format(name))
+494     archive_info = {"archive location": cached}
+495     try:
+496         with contextlib.closing(zipfile.ZipFile(cached)) as zip_archive:
+497             zip_archive.testzip()
+498     except RuntimeError:
+499         ret = True
+500     except zipfile.BadZipfile:
+501         raise CommandExecutionError(
+502             "{} is not a ZIP file".format(name), info=archive_info
+503         )
+504     except Exception as exc:  # pylint: disable=broad-except
+505         raise CommandExecutionError(exc.__str__(), info=archive_info)
+506     else:
+507         ret = False
+508     if clean:
+509         try:
+510             os.remove(cached)
+511             log.debug("Cleaned cached archive %s", cached)
+512         except OSError as exc:
+513             if exc.errno != errno.ENOENT:
+514                 log.warning(
+515                     "Failed to clean cached archive %s: %s", cached, exc.__str__()
+516                 )
+517     return ret
+518 @salt.utils.decorators.path.which("rar")
+519 def rar(rarfile, sources, template=None, cwd=None, runas=None):
+520     cmd = ["rar", "a", "-idp", "{}".format(rarfile)]
+521     cmd.extend(_expand_sources(sources))
+522     return __salt__["cmd.run"](
+523         cmd, cwd=cwd, template=template, runas=runas, python_shell=False
+524     ).splitlines()
+525 @salt.utils.decorators.path.which_bin(("unrar", "rar"))
+526 def unrar(rarfile, dest, excludes=None, template=None, runas=None, trim_output=False):
+527     if isinstance(excludes, str):
+528         excludes = [entry.strip() for entry in excludes.split(",")]
+529     cmd = [
+530         salt.utils.path.which_bin(("unrar", "rar")),
+531         "x",
+532         "-idp",
+533         "{}".format(rarfile),
+534     ]
+535     if excludes is not None:
+536         for exclude in excludes:
+537             cmd.extend(["-x", "{}".format(exclude)])
+538     cmd.append("{}".format(dest))
+539     files = __salt__["cmd.run"](
+540         cmd, template=template, runas=runas, python_shell=False
+541     ).splitlines()
+542     return _trim_files(files, trim_output)
+543 def _render_filenames(filenames, zip_file, saltenv, template):
+544     if not template:
+545         return (filenames, zip_file)
+546     if template not in salt.utils.templates.TEMPLATE_REGISTRY:
+547         raise CommandExecutionError(
+548             "Attempted to render file paths with unavailable engine {}".format(template)
+549         )
+550     kwargs = {}
+551     kwargs["salt"] = __salt__
+552     kwargs["pillar"] = __pillar__
+553     kwargs["grains"] = __grains__
+554     kwargs["opts"] = __opts__
+555     kwargs["saltenv"] = saltenv
+556     def _render(contents):
+557         tmp_path_fn = salt.utils.files.mkstemp()
+558         with salt.utils.files.fopen(tmp_path_fn, "w+") as fp_:
+559             fp_.write(salt.utils.stringutils.to_str(contents))
+560         data = salt.utils.templates.TEMPLATE_REGISTRY[template](
+561             tmp_path_fn, to_str=True, **kwargs
+562         )
+563         salt.utils.files.safe_rm(tmp_path_fn)
+564         if not data["result"]:
+565             raise CommandExecutionError(
+566                 "Failed to render file path with error: {}".format(data["data"])
+567             )
+568         else:
+569             return data["data"]
+570     filenames = _render(filenames)
+571     zip_file = _render(zip_file)
+572     return (filenames, zip_file)
+573 def _trim_files(files, trim_output):
+574     count = 100
+575     if not isinstance(trim_output, bool):
+576         count = trim_output
+577     if (
+578         not (isinstance(trim_output, bool) and trim_output is False)
+579         and len(files) &gt; count
+580     ):
+581         files = files[:count]
+582         files.append("List trimmed after {} files.".format(count))
+583     return files
 </pre>
 </div>
 </div>
