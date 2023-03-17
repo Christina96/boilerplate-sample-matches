@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for zpool.py &amp; nfs3.py</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -41,446 +40,171 @@ Matches for zpool.py &amp; nfs3.py
 </h3>
 <hr/>
 <pre>
-"""
-States for managing zpools
-
-:maintainer:    Jorge Schrauwen &lt;sjorge@blackdot.be&gt;
-:maturity:      new
-:depends:       salt.utils.zfs, salt.modules.zpool
-:platform:      smartos, illumos, solaris, freebsd, linux
-
-.. versionadded:: 2016.3.0
-.. versionchanged:: 2018.3.1
-  Big refactor to remove duplicate code, better type conversions and improved
-  consistency in output.
-
-.. code-block:: yaml
-
-    oldpool:
-      zpool.absent:
-        - export: true
-
-    newpool:
-      zpool.present:
-        - config:
-            import: false
-            force: true
-        - properties:
-            comment: salty storage pool
-        - layout:
-            - mirror:
-              - /dev/disk0
-              - /dev/disk1
-            - mirror:
-              - /dev/disk2
-              - /dev/disk3
-
-    partitionpool:
-      zpool.present:
-        - config:
-            import: false
-            force: true
-        - properties:
-            comment: disk partition salty storage pool
-            ashift: '12'
-            feature@lz4_compress: enabled
-        - filesystem_properties:
-            compression: lz4
-            atime: on
-            relatime: on
-        - layout:
-            - /dev/disk/by-uuid/3e43ce94-77af-4f52-a91b-6cdbb0b0f41b
-
-    simplepool:
-      zpool.present:
-        - config:
-            import: false
-            force: true
-        - properties:
-            comment: another salty storage pool
-        - layout:
-            - /dev/disk0
-            - /dev/disk1
-
-.. warning::
-
-    The layout will never be updated, it will only be used at time of creation.
-    It's a whole lot of work to figure out if a devices needs to be detached, removed,
-    etc. This is best done by the sysadmin on a case per case basis.
-
-    Filesystem properties are also not updated, this should be managed by the zfs state module.
-
-"""
-
-import logging
-import os
-
-from salt.utils.odict import OrderedDict
-
-log = logging.getLogger(__name__)
-
-# Define the state's virtual name
-__virtualname__ = "zpool"
-
-
-def __virtual__():
-    """
-    Provides zpool state
-    """
-    if not __grains__.get("zfs_support"):
-        return False, "The zpool state cannot be loaded: zfs not supported"
-    return __virtualname__
-
-
-def _layout_to_vdev(layout, device_dir=None):
-    """
-    Turn the layout data into usable vdevs spedcification
-
-    We need to support 2 ways of passing the layout:
-
-    .. code::
-        layout_new:
-          - mirror:
-            - disk0
-            - disk1
-          - mirror:
-            - disk2
-            - disk3
-
-    .. code:
-        layout_legacy:
-          mirror-0:
-            disk0
-            disk1
-          mirror-1:
-            disk2
-            disk3
-
-    """
-    vdevs = []
-
-    # NOTE: check device_dir exists
-    if device_dir and not os.path.exists(device_dir):
-        device_dir = None
-
-    # NOTE: handle list of OrderedDicts (new layout)
-    if isinstance(layout, list):
-        # NOTE: parse each vdev as a tiny layout and just append
-        for vdev in layout:
-            if isinstance(vdev, OrderedDict):
-                vdevs.extend(_layout_to_vdev(vdev, device_dir))
-            else:
-                if device_dir and vdev[0] != "/":
-                    vdev = os.path.join(device_dir, vdev)
-                vdevs.append(vdev)
-
-    # NOTE: handle nested OrderedDict (legacy layout)
-    #       this is also used to parse the nested OrderedDicts
-    #       from the new layout
-    elif isinstance(layout, OrderedDict):
-        for vdev in layout:
-            # NOTE: extract the vdev type and disks in the vdev
-            vdev_type = vdev.split("-")[0]
-            vdev_disk = layout[vdev]
-
-            # NOTE: skip appending the dummy type 'disk'
-            if vdev_type != "disk":
-                vdevs.append(vdev_type)
-
-            # NOTE: ensure the disks are a list (legacy layout are not)
-            if not isinstance(vdev_disk, list):
-                vdev_disk = vdev_disk.split(" ")
-
-            # NOTE: also append the actualy disks behind the type
-            #       also prepend device_dir to disks if required
-            for disk in vdev_disk:
-                if device_dir and disk[0] != "/":
-                    disk = os.path.join(device_dir, disk)
-                vdevs.append(disk)
-
-    # NOTE: we got invalid data for layout
-    else:
-        vdevs = None
-
-    return vdevs
-
-
-def present(
-    name, properties=None, filesystem_properties=None, layout=None, config=None
-):
-    """
-    ensure storage pool is present on the system
-
-    name : string
-        name of storage pool
-    properties : dict
-        optional set of properties to set for the storage pool
-    filesystem_properties : dict
-        optional set of filesystem properties to set for the storage pool (creation only)
-    layout: dict
-        disk layout to use if the pool does not exist (creation only)
-    config : dict
-        fine grain control over this state
-
-    .. note::
-
-        The following configuration properties can be toggled in the config parameter.
-          - import (true) - try to import the pool before creating it if absent
-          - import_dirs (None) - specify additional locations to scan for devices on import (comma-separated)
-          - device_dir (None, SunOS=/dev/dsk, Linux=/dev) - specify device directory to prepend for none
-            absolute device paths
-          - force (false) - try to force the import or creation
-
-    .. note::
-
-        It is no longer needed to give a unique name to each top-level vdev, the old
-        layout format is still supported but no longer recommended.
-
-        .. code-block:: yaml
-
-            - mirror:
-              - /tmp/vdisk3
-              - /tmp/vdisk2
-            - mirror:
-              - /tmp/vdisk0
-              - /tmp/vdisk1
-
-        The above yaml will always result in the following zpool create:
-
-        .. code-block:: bash
-
-            zpool create mypool mirror /tmp/vdisk3 /tmp/vdisk2 mirror /tmp/vdisk0 /tmp/vdisk1
-
-    .. warning::
-
-        The legacy format is also still supported but not recommended,
-        because ID's inside the layout dict must be unique they need to have a suffix.
-
-        .. code-block:: yaml
-
-            mirror-0:
-              /tmp/vdisk3
-              /tmp/vdisk2
-            mirror-1:
-              /tmp/vdisk0
-              /tmp/vdisk1
-
-    .. warning::
-
-        Pay attention to the order of your dict!
-
-        .. code-block:: yaml
-
-            - mirror:
-              - /tmp/vdisk0
-              - /tmp/vdisk1
-            - /tmp/vdisk2
-
-        The above will result in the following zpool create:
-
-        .. code-block:: bash
-
-            zpool create mypool mirror /tmp/vdisk0 /tmp/vdisk1 /tmp/vdisk2
-
-        Creating a 3-way mirror! While you probably expect it to be mirror
-        root vdev with 2 devices + a root vdev of 1 device!
-
-    """
-    ret = {"name": name, "changes": {}, "result": None, "comment": ""}
-
-    # config defaults
-    default_config = {
-        "import": True,
-        "import_dirs": None,
-        "device_dir": None,
-        "force": False,
-    }
-    if __grains__["kernel"] == "SunOS":
-        default_config["device_dir"] = "/dev/dsk"
-    elif __grains__["kernel"] == "Linux":
-        default_config["device_dir"] = "/dev"
-
-    # merge state config
-    if config:
-        default_config.update(config)
-    config = default_config
-
-    # ensure properties are zfs values
-    if properties:
-        properties = __utils__["zfs.from_auto_dict"](properties)
-    elif properties is None:
-        properties = {}
-    if filesystem_properties:
-        filesystem_properties = __utils__["zfs.from_auto_dict"](filesystem_properties)
-    elif filesystem_properties is None:
-        filesystem_properties = {}
-
-    # parse layout
-    vdevs = _layout_to_vdev(layout, config["device_dir"])
-    if vdevs:
-        vdevs.insert(0, name)
-
-    # log configuration
-    log.debug("zpool.present::%s::config - %s", name, config)
-    log.debug("zpool.present::%s::vdevs - %s", name, vdevs)
-    log.debug("zpool.present::%s::properties -  %s", name, properties)
-    log.debug(
-        "zpool.present::%s::filesystem_properties -  %s", name, filesystem_properties
-    )
-
-    # ensure the pool is present
-    ret["result"] = False
-
-    # don't do anything because this is a test
-<a name="0"></a>    if __opts__["test"]:
-        if __salt__["zpool.exists"](name):
-            ret["result"] = True
-            ret["comment"] <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>= "storage pool {} is {}".format(name, "uptodate")
-        else:
-            ret["result"] = None
-            ret["changes"][name] = "imported" if config["import"] else "created"
-            ret["comment"] = "storage pool {} would have been {}".</b></font>format(
-                name, ret["changes"][name]
-            )
-
-    # update pool
-    elif __salt__["zpool.exists"](name):
-        ret["result"] = True
-
-        # fetch current pool properties
-        properties_current = __salt__["zpool.get"](name, parsable=True)
-
-        # build list of properties to update
-        properties_update = []
-        if properties:
-            for prop in properties:
-                # skip unexisting properties
-                if prop not in properties_current:
-                    log.warning(
-                        "zpool.present::%s::update - unknown property: %s", name, prop
-                    )
-                    continue
-
-                # compare current and wanted value
-                if properties_current[prop] != properties[prop]:
-                    properties_update.append(prop)
-
-        # update pool properties
-        for prop in properties_update:
-            res = __salt__["zpool.set"](name, prop, properties[prop])
-
-            if res["set"]:
-                if name not in ret["changes"]:
-                    ret["changes"][name] = {}
-                ret["changes"][name][prop] = properties[prop]
-            else:
-                ret["result"] = False
-                if ret["comment"] == "":
-                    ret["comment"] = "The following properties were not updated:"
-                ret["comment"] = "{} {}".format(ret["comment"], prop)
-
-        if ret["result"]:
-            ret["comment"] = (
-                "properties updated" if ret["changes"] else "no update needed"
-            )
-
-    # import or create the pool (at least try to anyway)
-    else:
-        # import pool
-        if config["import"]:
-            mod_res = __salt__["zpool.import"](
-                name,
-                force=config["force"],
-                dir=config["import_dirs"],
-            )
-
-            ret["result"] = mod_res["imported"]
-            if ret["result"]:
-                ret["changes"][name] = "imported"
-                ret["comment"] = "storage pool {} was imported".format(name)
-
-        # create pool
-        if not ret["result"] and vdevs:
-            log.debug("zpool.present::%s::creating", name)
-
-            # execute zpool.create
-            mod_res = __salt__["zpool.create"](
-                *vdevs,
-                force=config["force"],
-                properties=properties,
-                filesystem_properties=filesystem_properties
-            )
-
-            ret["result"] = mod_res["created"]
-            if ret["result"]:
-                ret["changes"][name] = "created"
-                ret["comment"] = "storage pool {} was created".format(name)
-            elif "error" in mod_res:
-                ret["comment"] = mod_res["error"]
-            else:
-                ret["comment"] = "could not create storage pool {}".format(name)
-
-        # give up, we cannot import the pool and we do not have a layout to create it
-        if not ret["result"] and not vdevs:
-            ret["comment"] = (
-                "storage pool {} was not imported, no (valid) layout specified for"
-                " creation".format(name)
-            )
-
-    return ret
-
-
-def absent(name, export=False, force=False):
-    """
-    ensure storage pool is absent on the system
-
-    name : string
-        name of storage pool
-    export : boolean
-        export instead of destroy the zpool if present
-    force : boolean
-        force destroy or export
-
-    """
-    ret = {"name": name, "changes": {}, "result": None, "comment": ""}
-
-    # log configuration
-    log.debug("zpool.absent::%s::config::force = %s", name, force)
-    log.debug("zpool.absent::%s::config::export = %s", name, export)
-
-    # ensure the pool is absent
-    if __salt__["zpool.exists"](name):  # looks like we need to do some work
-        mod_res = {}
-        ret["result"] = False
-
-        # NOTE: handle test
-        if __opts__["test"]:
-            ret["result"] = True
-
-        # NOTE: try to export the pool
-        elif export:
-            mod_res = __salt__["zpool.export"](name, force=force)
-            ret["result"] = mod_res["exported"]
-
-        # NOTE: try to destroy the pool
-        else:
-            mod_res = __salt__["zpool.destroy"](name, force=force)
-            ret["result"] = mod_res["destroyed"]
-
-        if ret["result"]:  # update the changes and comment
-            ret["changes"][name] = "exported" if export else "destroyed"
-            ret["comment"] = "storage pool {} was {}".format(name, ret["changes"][name])
-        elif "error" in mod_res:
-            ret["comment"] = mod_res["error"]
-
-    else:  # we are looking good
-        ret["result"] = True
-        ret["comment"] = "storage pool {} is absent".format(name)
-
-    return ret
-
-
-# vim: tabstop=4 expandtab shiftwidth=4 softtabstop=4
+1 import logging
+2 import os
+3 from salt.utils.odict import OrderedDict
+4 log = logging.getLogger(__name__)
+5 __virtualname__ = "zpool"
+6 def __virtual__():
+7     if not __grains__.get("zfs_support"):
+8         return False, "The zpool state cannot be loaded: zfs not supported"
+9     return __virtualname__
+10 def _layout_to_vdev(layout, device_dir=None):
+11     vdevs = []
+12     if device_dir and not os.path.exists(device_dir):
+13         device_dir = None
+14     if isinstance(layout, list):
+15         for vdev in layout:
+16             if isinstance(vdev, OrderedDict):
+17                 vdevs.extend(_layout_to_vdev(vdev, device_dir))
+18             else:
+19                 if device_dir and vdev[0] != "/":
+20                     vdev = os.path.join(device_dir, vdev)
+21                 vdevs.append(vdev)
+22     elif isinstance(layout, OrderedDict):
+23         for vdev in layout:
+24             vdev_type = vdev.split("-")[0]
+25             vdev_disk = layout[vdev]
+26             if vdev_type != "disk":
+27                 vdevs.append(vdev_type)
+28             if not isinstance(vdev_disk, list):
+29                 vdev_disk = vdev_disk.split(" ")
+30             for disk in vdev_disk:
+31                 if device_dir and disk[0] != "/":
+32                     disk = os.path.join(device_dir, disk)
+33                 vdevs.append(disk)
+34     else:
+35         vdevs = None
+36     return vdevs
+37 def present(
+38     name, properties=None, filesystem_properties=None, layout=None, config=None
+39 ):
+40     ret = {"name": name, "changes": {}, "result": None, "comment": ""}
+41     default_config = {
+42         "import": True,
+43         "import_dirs": None,
+44         "device_dir": None,
+45         "force": False,
+46     }
+47     if __grains__["kernel"] == "SunOS":
+48         default_config["device_dir"] = "/dev/dsk"
+49     elif __grains__["kernel"] == "Linux":
+50         default_config["device_dir"] = "/dev"
+51     if config:
+52         default_config.update(config)
+53     config = default_config
+54     if properties:
+55         properties = __utils__["zfs.from_auto_dict"](properties)
+56     elif properties is None:
+57         properties = {}
+58     if filesystem_properties:
+59         filesystem_properties = __utils__["zfs.from_auto_dict"](filesystem_properties)
+60     elif filesystem_properties is None:
+61         filesystem_properties = {}
+62     vdevs = _layout_to_vdev(layout, config["device_dir"])
+63     if vdevs:
+64         vdevs.insert(0, name)
+65     log.debug("zpool.present::%s::config - %s", name, config)
+66     log.debug("zpool.present::%s::vdevs - %s", name, vdevs)
+67     log.debug("zpool.present::%s::properties -  %s", name, properties)
+68     log.debug(
+69         "zpool.present::%s::filesystem_properties -  %s", name, filesystem_properties
+70     )
+71     ret["result"] = False
+72         if __salt__["zpool.exists"](name):
+73             ret["result"] = True
+74             ret["comment"] <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>= "storage pool {} is {}".format(name, "uptodate")
+75         else:
+76             ret["result"] = None
+77             ret["changes"][name] = "imported" if config["import"] else "created"
+78             ret["comment"] = "storage pool {} would have been {}".</b></font>format(
+79                 name, ret["changes"][name]
+80             )
+81     elif __salt__["zpool.exists"](name):
+82         ret["result"] = True
+83         properties_current = __salt__["zpool.get"](name, parsable=True)
+84         properties_update = []
+85         if properties:
+86             for prop in properties:
+87                 if prop not in properties_current:
+88                     log.warning(
+89                         "zpool.present::%s::update - unknown property: %s", name, prop
+90                     )
+91                     continue
+92                 if properties_current[prop] != properties[prop]:
+93                     properties_update.append(prop)
+94         for prop in properties_update:
+95             res = __salt__["zpool.set"](name, prop, properties[prop])
+96             if res["set"]:
+97                 if name not in ret["changes"]:
+98                     ret["changes"][name] = {}
+99                 ret["changes"][name][prop] = properties[prop]
+100             else:
+101                 ret["result"] = False
+102                 if ret["comment"] == "":
+103                     ret["comment"] = "The following properties were not updated:"
+104                 ret["comment"] = "{} {}".format(ret["comment"], prop)
+105         if ret["result"]:
+106             ret["comment"] = (
+107                 "properties updated" if ret["changes"] else "no update needed"
+108             )
+109     else:
+110         if config["import"]:
+111             mod_res = __salt__["zpool.import"](
+112                 name,
+113                 force=config["force"],
+114                 dir=config["import_dirs"],
+115             )
+116             ret["result"] = mod_res["imported"]
+117             if ret["result"]:
+118                 ret["changes"][name] = "imported"
+119                 ret["comment"] = "storage pool {} was imported".format(name)
+120         if not ret["result"] and vdevs:
+121             log.debug("zpool.present::%s::creating", name)
+122             mod_res = __salt__["zpool.create"](
+123                 *vdevs,
+124                 force=config["force"],
+125                 properties=properties,
+126                 filesystem_properties=filesystem_properties
+127             )
+128             ret["result"] = mod_res["created"]
+129             if ret["result"]:
+130                 ret["changes"][name] = "created"
+131                 ret["comment"] = "storage pool {} was created".format(name)
+132             elif "error" in mod_res:
+133                 ret["comment"] = mod_res["error"]
+134             else:
+135                 ret["comment"] = "could not create storage pool {}".format(name)
+136         if not ret["result"] and not vdevs:
+137             ret["comment"] = (
+138                 "storage pool {} was not imported, no (valid) layout specified for"
+139                 " creation".format(name)
+140             )
+141     return ret
+142 def absent(name, export=False, force=False):
+143     ret = {"name": name, "changes": {}, "result": None, "comment": ""}
+144     log.debug("zpool.absent::%s::config::force = %s", name, force)
+145     log.debug("zpool.absent::%s::config::export = %s", name, export)
+146     if __salt__["zpool.exists"](name):  # looks like we need to do some work
+147         mod_res = {}
+148         ret["result"] = False
+149         if __opts__["test"]:
+150             ret["result"] = True
+151         elif export:
+152             mod_res = __salt__["zpool.export"](name, force=force)
+153             ret["result"] = mod_res["exported"]
+154         else:
+155             mod_res = __salt__["zpool.destroy"](name, force=force)
+156             ret["result"] = mod_res["destroyed"]
+157         if ret["result"]:  # update the changes and comment
+158             ret["changes"][name] = "exported" if export else "destroyed"
+159             ret["comment"] = "storage pool {} was {}".format(name, ret["changes"][name])
+160         elif "error" in mod_res:
+161             ret["comment"] = mod_res["error"]
+162     else:  # we are looking good
+163         ret["result"] = True
+164         ret["comment"] = "storage pool {} is absent".format(name)
+165     return ret
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -493,159 +217,79 @@ def absent(name, export=False, force=False):
 </h3>
 <hr/>
 <pre>
-"""
-Module for managing NFS version 3.
-"""
-
-import logging
-
-import salt.utils.files
-import salt.utils.path
-import salt.utils.stringutils
-
-log = logging.getLogger(__name__)
-
-
-def __virtual__():
-    """
-    Only work on POSIX-like systems
-    """
-    if not salt.utils.path.which("showmount"):
-        return (
-            False,
-            "The nfs3 execution module failed to load: the showmount binary is not in"
-            " the path.",
-        )
-    return True
-
-
-def list_exports(exports="/etc/exports"):
-    """
-    List configured exports
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' nfs.list_exports
-    """
-    ret = {}
-    with salt.utils.files.fopen(exports, "r") as efl:
-        for line in salt.utils.stringutils.to_unicode(efl.read()).splitlines():
-            if not line:
-                continue
-            if line.startswith("#"):
-                continue
-            comps = line.split()
-
-            # Handle the case where the same path is given twice
-            if not comps[0] in ret:
-                ret[comps[0]] = []
-
-            newshares = []
-            for perm in comps[1:]:
-                if perm.startswith("/"):
-                    newshares.append(perm)
-                    continue
-                permcomps = perm.split("(")
-                permcomps[1] = permcomps[1].replace(")", "")
-                hosts = permcomps[0]
-                if not isinstance(hosts, str):
-                    # Lists, etc would silently mangle /etc/exports
-                    raise TypeError("hosts argument must be a string")
-                options = permcomps[1].split(",")
-                ret[comps[0]].append({"hosts": hosts, "options": options})
-            for share in newshares:
-                ret[share] = ret[comps[0]]
-    return ret
-
-
-def del_export(exports="/etc/exports", path=None):
-    """
-    Remove an export
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' nfs.del_export /media/storage
-    """
-    edict = list_exports(exports)
-    del edict[path]
-    _write_exports(exports, edict)
-    return edict
-
-
-def add_export(exports="/etc/exports", path=None, hosts=None, options=None):
-    """
-    Add an export
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' nfs3.add_export path='/srv/test' hosts='127.0.0.1' options=['rw']
-    """
-    if options is None:
-        options = []
-    if not isinstance(hosts, str):
-        # Lists, etc would silently mangle /etc/exports
-        raise TypeError("hosts argument must be a string")
-    edict = list_exports(exports)
-    if path not in edict:
-        edict[path] = []
-    new = {"hosts": hosts, "options": options}
-    edict[path].append(new)
-    _write_exports(exports, edict)
-
-    return new
-
-
-def _write_exports(exports, edict):
-    """
-    Write an exports file to disk
-
-    If multiple shares were initially configured per line, like:
-
-        /media/storage /media/data *(ro,sync,no_subtree_check)
-
-    ...then they will be saved to disk with only one share per line:
-
-        /media/storage *(ro,sync,no_subtree_check)
-        /media/data *(ro,sync,no_subtree_check)
-    """
-    with salt.utils.files.fopen(exports, "w") as efh:
-        for export in edict:
-            line = salt.utils.stringutils.to_str(export)
-            for perms in edict[export]:
-                hosts = perms["hosts"]
-                options = ",".join(perms["options"])
-                line += " {}({})".format(hosts, options)
-            efh.write("{}\n".format(line))
-
-
-def reload_exports():
-    """
-    Trigger a reload of the exports file to apply changes
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' nfs3.reload_exports
-    """
-    ret = {}
-<a name="0"></a>
-    command = "exportfs -r"
-
-    output <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>= __salt__["cmd.run_all"](command)
-    ret["stdout"] = output["stdout"]
-    ret["stderr"] = output["stderr"]
-    # exportfs always returns 0, so retcode is useless
-    # We will consider it an error if stderr is nonempty
-    ret["result"] = output[</b></font>"stderr"] == ""
-
-    return ret
+1 import logging
+2 import salt.utils.files
+3 import salt.utils.path
+4 import salt.utils.stringutils
+5 log = logging.getLogger(__name__)
+6 def __virtual__():
+7     if not salt.utils.path.which("showmount"):
+8         return (
+9             False,
+10             "The nfs3 execution module failed to load: the showmount binary is not in"
+11             " the path.",
+12         )
+13     return True
+14 def list_exports(exports="/etc/exports"):
+15     ret = {}
+16     with salt.utils.files.fopen(exports, "r") as efl:
+17         for line in salt.utils.stringutils.to_unicode(efl.read()).splitlines():
+18             if not line:
+19                 continue
+20             if line.startswith("#"):
+21                 continue
+22             comps = line.split()
+23             if not comps[0] in ret:
+24                 ret[comps[0]] = []
+25             newshares = []
+26             for perm in comps[1:]:
+27                 if perm.startswith("/"):
+28                     newshares.append(perm)
+29                     continue
+30                 permcomps = perm.split("(")
+31                 permcomps[1] = permcomps[1].replace(")", "")
+32                 hosts = permcomps[0]
+33                 if not isinstance(hosts, str):
+34                     raise TypeError("hosts argument must be a string")
+35                 options = permcomps[1].split(",")
+36                 ret[comps[0]].append({"hosts": hosts, "options": options})
+37             for share in newshares:
+38                 ret[share] = ret[comps[0]]
+39     return ret
+40 def del_export(exports="/etc/exports", path=None):
+41     edict = list_exports(exports)
+42     del edict[path]
+43     _write_exports(exports, edict)
+44     return edict
+45 def add_export(exports="/etc/exports", path=None, hosts=None, options=None):
+46     if options is None:
+47         options = []
+48     if not isinstance(hosts, str):
+49         raise TypeError("hosts argument must be a string")
+50     edict = list_exports(exports)
+51     if path not in edict:
+52         edict[path] = []
+53     new = {"hosts": hosts, "options": options}
+54     edict[path].append(new)
+55     _write_exports(exports, edict)
+56     return new
+57 def _write_exports(exports, edict):
+58     with salt.utils.files.fopen(exports, "w") as efh:
+59         for export in edict:
+60             line = salt.utils.stringutils.to_str(export)
+61             for perms in edict[export]:
+62                 hosts = perms["hosts"]
+63                 options = ",".join(perms["options"])
+64                 line += " {}({})".format(hosts, options)
+65             efh.write("{}\n".format(line))
+66 def reload_exports():
+67     ret = {}
+68     command = "exportfs -r"
+69     output <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>= __salt__["cmd.run_all"](command)
+70     ret["stdout"] = output["stdout"]
+71     ret["stderr"] = output["stderr"]
+72     ret["result"] = output[</b></font>"stderr"] == ""
+73     return ret
 </pre>
 </div>
 </div>

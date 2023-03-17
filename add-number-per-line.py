@@ -40,7 +40,9 @@ def add_lines_per_language(path):
 java = "/Users/christinechaniotaki/Desktop/Boilerplate/boilerplate-sample-matches/Java"
 c = "/Users/christinechaniotaki/Desktop/Boilerplate/boilerplate-sample-matches/C"
 cpp = "/Users/christinechaniotaki/Desktop/Boilerplate/boilerplate-sample-matches/Cpp"
+python = "/Users/christinechaniotaki/Desktop/Boilerplate/boilerplate-sample-matches/Python"
 
-add_lines_per_language(java)
-add_lines_per_language(c)
-add_lines_per_language(cpp)
+# add_lines_per_language(java)
+# add_lines_per_language(c)
+# add_lines_per_language(cpp)
+add_lines_per_language(python)

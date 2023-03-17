@@ -1,5 +1,4 @@
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
-
 <html><head><title>Matches for gen.py &amp; version.py</title>
 <meta content="text/html; charset=utf-8" http-equiv="Content-Type"/>
 <style>.modal {display: none;position: fixed;z-index: 1;left: 0;top: 0;width: 100%;height: 100%;overflow: auto;background-color: rgb(0, 0, 0);background-color: rgba(0, 0, 0, 0.4);}  .modal-content {height: 250%;background-color: #fefefe;margin: 5% auto;padding: 20px;border: 1px solid #888;width: 80%;}  .close {color: #aaa;float: right;font-size: 20px;font-weight: bold;}  .close:hover, .close:focus {color: black;text-decoration: none;cursor: pointer;}  .column {float: left;width: 50%;}  .row:after {content: ;display: table;clear: both;}  #column1, #column2 {white-space: pre-wrap;}</style></head>
@@ -41,2216 +40,1004 @@ Matches for gen.py &amp; version.py
 </h3>
 <hr/>
 <pre>
-"""``tornado.gen`` is a generator-based interface to make it easier to
-work in an asynchronous environment.  Code using the ``gen`` module
-is technically asynchronous, but it is written as a single generator
-instead of a collection of separate functions.
-
-For example, the following asynchronous handler:
-
-.. testcode::
-
-    class AsyncHandler(RequestHandler):
-        @asynchronous
-        def get(self):
-            http_client = AsyncHTTPClient()
-            http_client.fetch("http://example.com",
-                              callback=self.on_fetch)
-
-        def on_fetch(self, response):
-            do_something_with_response(response)
-            self.render("template.html")
-
-.. testoutput::
-   :hide:
-
-could be written with ``gen`` as:
-
-.. testcode::
-
-    class GenAsyncHandler(RequestHandler):
-        @gen.coroutine
-        def get(self):
-            http_client = AsyncHTTPClient()
-            response = yield http_client.fetch("http://example.com")
-            do_something_with_response(response)
-            self.render("template.html")
-
-.. testoutput::
-   :hide:
-
-Most asynchronous functions in Tornado return a `.Future`;
-yielding this object returns its `~.Future.result`.
-
-You can also yield a list or dict of ``Futures``, which will be
-started at the same time and run in parallel; a list or dict of results will
-be returned when they are all finished:
-
-.. testcode::
-
-    @gen.coroutine
-    def get(self):
-        http_client = AsyncHTTPClient()
-        response1, response2 = yield [http_client.fetch(url1),
-                                      http_client.fetch(url2)]
-        response_dict = yield dict(response3=http_client.fetch(url3),
-                                   response4=http_client.fetch(url4))
-        response3 = response_dict['response3']
-        response4 = response_dict['response4']
-
-.. testoutput::
-   :hide:
-
-If the `~functools.singledispatch` library is available (standard in
-Python 3.4, available via the `singledispatch
-&lt;https://pypi.python.org/pypi/singledispatch&gt;`_ package on older
-versions), additional types of objects may be yielded. Tornado includes
-support for ``asyncio.Future`` and Twisted's ``Deferred`` class when
-``tornado.platform.asyncio`` and ``tornado.platform.twisted`` are imported.
-See the `convert_yielded` function to extend this mechanism.
-
-.. versionchanged:: 3.2
-   Dict support added.
-
-.. versionchanged:: 4.1
-   Support added for yielding ``asyncio`` Futures and Twisted Deferreds
-   via ``singledispatch``.
-
-"""
-# pylint: skip-file
-from __future__ import absolute_import, division, print_function
-
-import collections
-import functools
-import itertools
-import os
-import sys
-import textwrap
-import types
-import weakref
-
-import salt.ext.tornado as tornado
-from salt.ext.tornado.concurrent import Future, TracebackFuture, is_future, chain_future
-from salt.ext.tornado.ioloop import IOLoop
-from salt.ext.tornado.log import app_log
-from salt.ext.tornado import stack_context
-from salt.ext.tornado.util import PY3, raise_exc_info
-
-try:
-    try:
-        # py34+
-        from functools import singledispatch  # type: ignore
-    except ImportError:
-        from singledispatch import singledispatch  # backport
-except ImportError:
-    # In most cases, singledispatch is required (to avoid
-    # difficult-to-diagnose problems in which the functionality
-    # available differs depending on which invisble packages are
-    # installed). However, in Google App Engine third-party
-    # dependencies are more trouble so we allow this module to be
-    # imported without it.
-    if 'APPENGINE_RUNTIME' not in os.environ:
-        raise
-    singledispatch = None
-
-try:
-    try:
-        # py35+
-        from collections.abc import Generator as GeneratorType  # type: ignore
-    except ImportError:
-        from salt.ext.backports_abc import Generator as GeneratorType  # type: ignore
-
-    try:
-        # py35+
-        from inspect import isawaitable  # type: ignore
-    except ImportError:
-        from salt.ext.backports_abc import isawaitable
-except ImportError:
-    if 'APPENGINE_RUNTIME' not in os.environ:
-        raise
-    from types import GeneratorType
-
-    def isawaitable(x):  # type: ignore
-        return False
-
-if PY3:
-    import builtins
-else:
-    import __builtin__ as builtins
-
-
-class KeyReuseError(Exception):
-    pass
-
-
-class UnknownKeyError(Exception):
-    pass
-
-
-class LeakedCallbackError(Exception):
-    pass
-
-
-class BadYieldError(Exception):
-    pass
-
-
-class ReturnValueIgnoredError(Exception):
-    pass
-
-
-class TimeoutError(Exception):
-    """Exception raised by ``with_timeout``."""
-
-
-def _value_from_stopiteration(e):
-    try:
-        # StopIteration has a value attribute beginning in py33.
-        # So does our Return class.
-        return e.value
-    except AttributeError:
-        pass
-    try:
-        # Cython backports coroutine functionality by putting the value in
-        # e.args[0].
-        return e.args[0]
-    except (AttributeError, IndexError):
-        return None
-
-
-def engine(func):
-    """Callback-oriented decorator for asynchronous generators.
-
-    This is an older interface; for new code that does not need to be
-    compatible with versions of Tornado older than 3.0 the
-    `coroutine` decorator is recommended instead.
-
-    This decorator is similar to `coroutine`, except it does not
-    return a `.Future` and the ``callback`` argument is not treated
-    specially.
-
-    In most cases, functions decorated with `engine` should take
-    a ``callback`` argument and invoke it with their result when
-    they are finished.  One notable exception is the
-    `~tornado.web.RequestHandler` :ref:`HTTP verb methods &lt;verbs&gt;`,
-    which use ``self.finish()`` in place of a callback argument.
-    """
-    func = _make_coroutine_wrapper(func, replace_callback=False)
-
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        future = func(*args, **kwargs)
-
-        def final_callback(future):
-            if future.result() is not None:
-                raise ReturnValueIgnoredError(
-                    "@gen.engine functions cannot return values: %r" %
-                    (future.result(),))
-        # The engine interface doesn't give us any way to return
-        # errors but to raise them into the stack context.
-        # Save the stack context here to use when the Future has resolved.
-        future.add_done_callback(stack_context.wrap(final_callback))
-    return wrapper
-
-
-def coroutine(func, replace_callback=True):
-    """Decorator for asynchronous generators.
-
-    Any generator that yields objects from this module must be wrapped
-    in either this decorator or `engine`.
-
-    Coroutines may "return" by raising the special exception
-    `Return(value) &lt;Return&gt;`.  In Python 3.3+, it is also possible for
-    the function to simply use the ``return value`` statement (prior to
-    Python 3.3 generators were not allowed to also return values).
-    In all versions of Python a coroutine that simply wishes to exit
-    early may use the ``return`` statement without a value.
-
-    Functions with this decorator return a `.Future`.  Additionally,
-    they may be called with a ``callback`` keyword argument, which
-    will be invoked with the future's result when it resolves.  If the
-    coroutine fails, the callback will not be run and an exception
-    will be raised into the surrounding `.StackContext`.  The
-    ``callback`` argument is not visible inside the decorated
-    function; it is handled by the decorator itself.
-
-    From the caller's perspective, ``@gen.coroutine`` is similar to
-    the combination of ``@return_future`` and ``@gen.engine``.
-
-    .. warning::
-
-       When exceptions occur inside a coroutine, the exception
-       information will be stored in the `.Future` object. You must
-       examine the result of the `.Future` object, or the exception
-       may go unnoticed by your code. This means yielding the function
-       if called from another coroutine, using something like
-       `.IOLoop.run_sync` for top-level calls, or passing the `.Future`
-       to `.IOLoop.add_future`.
-
-    """
-    return _make_coroutine_wrapper(func, replace_callback=True)
-
-
-# Ties lifetime of runners to their result futures. Github Issue #1769
-# Generators, like any object in Python, must be strong referenced
-# in order to not be cleaned up by the garbage collector. When using
-# coroutines, the Runner object is what strong-refs the inner
-# generator. However, the only item that strong-reffed the Runner
-# was the last Future that the inner generator yielded (via the
-# Future's internal done_callback list). Usually this is enough, but
-# it is also possible for this Future to not have any strong references
-# other than other objects referenced by the Runner object (usually
-# when using other callback patterns and/or weakrefs). In this
-# situation, if a garbage collection ran, a cycle would be detected and
-# Runner objects could be destroyed along with their inner generators
-# and everything in their local scope.
-# This map provides strong references to Runner objects as long as
-# their result future objects also have strong references (typically
-# from the parent coroutine's Runner). This keeps the coroutine's
-# Runner alive.
-_futures_to_runners = weakref.WeakKeyDictionary()
-
-
-def _make_coroutine_wrapper(func, replace_callback):
-    """The inner workings of ``@gen.coroutine`` and ``@gen.engine``.
-
-    The two decorators differ in their treatment of the ``callback``
-    argument, so we cannot simply implement ``@engine`` in terms of
-    ``@coroutine``.
-    """
-    # On Python 3.5, set the coroutine flag on our generator, to allow it
-    # to be used with 'await'.
-    wrapped = func
-    if hasattr(types, 'coroutine'):
-        func = types.coroutine(func)
-
-    @functools.wraps(wrapped)
-    def wrapper(*args, **kwargs):
-        future = TracebackFuture()
-
-        if replace_callback and 'callback' in kwargs:
-            callback = kwargs.pop('callback')
-            IOLoop.current().add_future(
-                future, lambda future: callback(future.result()))
-
-        try:
-            result = func(*args, **kwargs)
-        except (Return, StopIteration) as e:
-            result = _value_from_stopiteration(e)
-        except Exception:
-            future.set_exc_info(sys.exc_info())
-            return future
-        else:
-            if isinstance(result, GeneratorType):
-                # Inline the first iteration of Runner.run.  This lets us
-                # avoid the cost of creating a Runner when the coroutine
-                # never actually yields, which in turn allows us to
-                # use "optional" coroutines in critical path code without
-                # performance penalty for the synchronous case.
-                try:
-                    orig_stack_contexts = stack_context._state.contexts
-                    yielded = next(result)
-                    if stack_context._state.contexts is not orig_stack_contexts:
-                        yielded = TracebackFuture()
-                        yielded.set_exception(
-                            stack_context.StackContextInconsistentError(
-                                'stack_context inconsistency (probably caused '
-                                'by yield within a "with StackContext" block)'))
-                except (StopIteration, Return) as e:
-                    future.set_result(_value_from_stopiteration(e))
-                except Exception:
-                    future.set_exc_info(sys.exc_info())
-                else:
-                    _futures_to_runners[future] = Runner(result, future, yielded)
-                yielded = None
-                try:
-                    return future
-                finally:
-                    # Subtle memory optimization: if next() raised an exception,
-                    # the future's exc_info contains a traceback which
-                    # includes this stack frame.  This creates a cycle,
-                    # which will be collected at the next full GC but has
-                    # been shown to greatly increase memory usage of
-                    # benchmarks (relative to the refcount-based scheme
-                    # used in the absence of cycles).  We can avoid the
-                    # cycle by clearing the local variable after we return it.
-                    future = None
-        future.set_result(result)
-        return future
-
-    wrapper.__wrapped__ = wrapped
-    wrapper.__tornado_coroutine__ = True
-    return wrapper
-
-
-def is_coroutine_function(func):
-    """Return whether *func* is a coroutine function, i.e. a function
-    wrapped with `~.gen.coroutine`.
-
-    .. versionadded:: 4.5
-    """
-    return getattr(func, '__tornado_coroutine__', False)
-
-
-class Return(Exception):
-    """Special exception to return a value from a `coroutine`.
-
-    If this exception is raised, its value argument is used as the
-    result of the coroutine::
-
-        @gen.coroutine
-        def fetch_json(url):
-            response = yield AsyncHTTPClient().fetch(url)
-            raise gen.Return(json_decode(response.body))
-
-    In Python 3.3, this exception is no longer necessary: the ``return``
-    statement can be used directly to return a value (previously
-    ``yield`` and ``return`` with a value could not be combined in the
-    same function).
-
-    By analogy with the return statement, the value argument is optional,
-    but it is never necessary to ``raise gen.Return()``.  The ``return``
-    statement can be used with no arguments instead.
-    """
-    def __init__(self, value=None):
-        super(Return, self).__init__()
-        self.value = value
-        # Cython recognizes subclasses of StopIteration with a .args tuple.
-        self.args = (value,)
-
-
-class WaitIterator(object):
-    """Provides an iterator to yield the results of futures as they finish.
-
-    Yielding a set of futures like this:
-
-    ``results = yield [future1, future2]``
-
-    pauses the coroutine until both ``future1`` and ``future2``
-    return, and then restarts the coroutine with the results of both
-    futures. If either future is an exception, the expression will
-    raise that exception and all the results will be lost.
-
-    If you need to get the result of each future as soon as possible,
-    or if you need the result of some futures even if others produce
-    errors, you can use ``WaitIterator``::
-
-      wait_iterator = gen.WaitIterator(future1, future2)
-      while not wait_iterator.done():
-          try:
-              result = yield wait_iterator.next()
-          except Exception as e:
-              print("Error {} from {}".format(e, wait_iterator.current_future))
-          else:
-              print("Result {} received from {} at {}".format(
-                  result, wait_iterator.current_future,
-                  wait_iterator.current_index))
-
-    Because results are returned as soon as they are available the
-    output from the iterator *will not be in the same order as the
-    input arguments*. If you need to know which future produced the
-    current result, you can use the attributes
-    ``WaitIterator.current_future``, or ``WaitIterator.current_index``
-    to get the index of the future from the input list. (if keyword
-    arguments were used in the construction of the `WaitIterator`,
-    ``current_index`` will use the corresponding keyword).
-
-    On Python 3.5, `WaitIterator` implements the async iterator
-    protocol, so it can be used with the ``async for`` statement (note
-    that in this version the entire iteration is aborted if any value
-    raises an exception, while the previous example can continue past
-    individual errors)::
-
-      async for result in gen.WaitIterator(future1, future2):
-          print("Result {} received from {} at {}".format(
-              result, wait_iterator.current_future,
-              wait_iterator.current_index))
-
-    .. versionadded:: 4.1
-
-    .. versionchanged:: 4.3
-       Added ``async for`` support in Python 3.5.
-
-    """
-    def __init__(self, *args, **kwargs):
-        if args and kwargs:
-            raise ValueError(
-                "You must provide args or kwargs, not both")
-
-        if kwargs:
-            self._unfinished = dict((f, k) for (k, f) in kwargs.items())
-            futures = list(kwargs.values())
-        else:
-            self._unfinished = dict((f, i) for (i, f) in enumerate(args))
-            futures = args
-
-        self._finished = collections.deque()
-        self.current_index = self.current_future = None
-        self._running_future = None
-
-        for future in futures:
-            future.add_done_callback(self._done_callback)
-
-    def done(self):
-        """Returns True if this iterator has no more results."""
-        if self._finished or self._unfinished:
-            return False
-        # Clear the 'current' values when iteration is done.
-        self.current_index = self.current_future = None
-        return True
-
-    def next(self):
-        """Returns a `.Future` that will yield the next available result.
-
-        Note that this `.Future` will not be the same object as any of
-        the inputs.
-        """
-        self._running_future = TracebackFuture()
-
-        if self._finished:
-            self._return_result(self._finished.popleft())
-
-        return self._running_future
-
-    def _done_callback(self, done):
-        if self._running_future and not self._running_future.done():
-            self._return_result(done)
-        else:
-            self._finished.append(done)
-
-    def _return_result(self, done):
-        """Called set the returned future's state that of the future
-        we yielded, and set the current future for the iterator.
-        """
-        chain_future(done, self._running_future)
-
-        self.current_future = done
-        self.current_index = self._unfinished.pop(done)
-
-    def __aiter__(self):
-        raise self
-
-    def __anext__(self):
-        if self.done():
-            # Lookup by name to silence pyflakes on older versions.
-            raise getattr(builtins, 'StopAsyncIteration')()
-        return self.next()
-
-
-class YieldPoint(object):
-    """Base class for objects that may be yielded from the generator.
-
-    .. deprecated:: 4.0
-       Use `Futures &lt;.Future&gt;` instead.
-    """
-    def start(self, runner):
-        """Called by the runner after the generator has yielded.
-
-        No other methods will be called on this object before ``start``.
-        """
-        raise NotImplementedError()
-
-    def is_ready(self):
-        """Called by the runner to determine whether to resume the generator.
-
-        Returns a boolean; may be called more than once.
-        """
-        raise NotImplementedError()
-
-    def get_result(self):
-        """Returns the value to use as the result of the yield expression.
-
-        This method will only be called once, and only after `is_ready`
-        has returned true.
-        """
-        raise NotImplementedError()
-
-
-class Callback(YieldPoint):
-    """Returns a callable object that will allow a matching `Wait` to proceed.
-
-    The key may be any value suitable for use as a dictionary key, and is
-    used to match ``Callbacks`` to their corresponding ``Waits``.  The key
-    must be unique among outstanding callbacks within a single run of the
-    generator function, but may be reused across different runs of the same
-    function (so constants generally work fine).
-
-    The callback may be called with zero or one arguments; if an argument
-    is given it will be returned by `Wait`.
-
-    .. deprecated:: 4.0
-       Use `Futures &lt;.Future&gt;` instead.
-    """
-    def __init__(self, key):
-        self.key = key
-
-    def start(self, runner):
-        self.runner = runner
-        runner.register_callback(self.key)
-
-    def is_ready(self):
-        return True
-
-    def get_result(self):
-        return self.runner.result_callback(self.key)
-
-
-class Wait(YieldPoint):
-    """Returns the argument passed to the result of a previous `Callback`.
-
-    .. deprecated:: 4.0
-       Use `Futures &lt;.Future&gt;` instead.
-    """
-    def __init__(self, key):
-        self.key = key
-
-    def start(self, runner):
-        self.runner = runner
-
-    def is_ready(self):
-        return self.runner.is_ready(self.key)
-
-    def get_result(self):
-        return self.runner.pop_result(self.key)
-
-
-class WaitAll(YieldPoint):
-    """Returns the results of multiple previous `Callbacks &lt;Callback&gt;`.
-
-    The argument is a sequence of `Callback` keys, and the result is
-    a list of results in the same order.
-
-    `WaitAll` is equivalent to yielding a list of `Wait` objects.
-
-    .. deprecated:: 4.0
-       Use `Futures &lt;.Future&gt;` instead.
-    """
-    def __init__(self, keys):
-        self.keys = keys
-
-    def start(self, runner):
-        self.runner = runner
-
-    def is_ready(self):
-        return all(self.runner.is_ready(key) for key in self.keys)
-
-    def get_result(self):
-        return [self.runner.pop_result(key) for key in self.keys]
-
-
-def Task(func, *args, **kwargs):
-    """Adapts a callback-based asynchronous function for use in coroutines.
-
-    Takes a function (and optional additional arguments) and runs it with
-    those arguments plus a ``callback`` keyword argument.  The argument passed
-    to the callback is returned as the result of the yield expression.
-
-    .. versionchanged:: 4.0
-       ``gen.Task`` is now a function that returns a `.Future`, instead of
-       a subclass of `YieldPoint`.  It still behaves the same way when
-       yielded.
-    """
-    future = Future()
-
-    def handle_exception(typ, value, tb):
-        if future.done():
-            return False
-        future.set_exc_info((typ, value, tb))
-        return True
-
-    def set_result(result):
-        if future.done():
-            return
-        future.set_result(result)
-    with stack_context.ExceptionStackContext(handle_exception):
-        func(*args, callback=_argument_adapter(set_result), **kwargs)
-    return future
-
-
-class YieldFuture(YieldPoint):
-    def __init__(self, future, io_loop=None):
-        """Adapts a `.Future` to the `YieldPoint` interface.
-
-        .. versionchanged:: 4.1
-           The ``io_loop`` argument is deprecated.
-        """
-        self.future = future
-        self.io_loop = io_loop or IOLoop.current()
-
-    def start(self, runner):
-        if not self.future.done():
-            self.runner = runner
-            self.key = object()
-            runner.register_callback(self.key)
-            self.io_loop.add_future(self.future, runner.result_callback(self.key))
-        else:
-            self.runner = None
-            self.result_fn = self.future.result
-
-    def is_ready(self):
-        if self.runner is not None:
-            return self.runner.is_ready(self.key)
-        else:
-            return True
-
-    def get_result(self):
-        if self.runner is not None:
-            return self.runner.pop_result(self.key).result()
-        else:
-            return self.result_fn()
-
-
-def _contains_yieldpoint(children):
-    """Returns True if ``children`` contains any YieldPoints.
-
-    ``children`` may be a dict or a list, as used by `MultiYieldPoint`
-    and `multi_future`.
-    """
-    if isinstance(children, dict):
-        return any(isinstance(i, YieldPoint) for i in children.values())
-    if isinstance(children, list):
-        return any(isinstance(i, YieldPoint) for i in children)
-    return False
-
-
-def multi(children, quiet_exceptions=()):
-    """Runs multiple asynchronous operations in parallel.
-
-    ``children`` may either be a list or a dict whose values are
-    yieldable objects. ``multi()`` returns a new yieldable
-    object that resolves to a parallel structure containing their
-    results. If ``children`` is a list, the result is a list of
-    results in the same order; if it is a dict, the result is a dict
-    with the same keys.
-
-    That is, ``results = yield multi(list_of_futures)`` is equivalent
-    to::
-
-        results = []
-        for future in list_of_futures:
-            results.append(yield future)
-
-    If any children raise exceptions, ``multi()`` will raise the first
-    one. All others will be logged, unless they are of types
-    contained in the ``quiet_exceptions`` argument.
-
-    If any of the inputs are `YieldPoints &lt;YieldPoint&gt;`, the returned
-    yieldable object is a `YieldPoint`. Otherwise, returns a `.Future`.
-    This means that the result of `multi` can be used in a native
-    coroutine if and only if all of its children can be.
-
-    In a ``yield``-based coroutine, it is not normally necessary to
-    call this function directly, since the coroutine runner will
-    do it automatically when a list or dict is yielded. However,
-    it is necessary in ``await``-based coroutines, or to pass
-    the ``quiet_exceptions`` argument.
-
-    This function is available under the names ``multi()`` and ``Multi()``
-    for historical reasons.
-
-    .. versionchanged:: 4.2
-       If multiple yieldables fail, any exceptions after the first
-       (which is raised) will be logged. Added the ``quiet_exceptions``
-       argument to suppress this logging for selected exception types.
-
-    .. versionchanged:: 4.3
-       Replaced the class ``Multi`` and the function ``multi_future``
-       with a unified function ``multi``. Added support for yieldables
-       other than `YieldPoint` and `.Future`.
-
-    """
-    if _contains_yieldpoint(children):
-        return MultiYieldPoint(children, quiet_exceptions=quiet_exceptions)
-    else:
-        return multi_future(children, quiet_exceptions=quiet_exceptions)
-
-
-Multi = multi
-
-
-class MultiYieldPoint(YieldPoint):
-    """Runs multiple asynchronous operations in parallel.
-
-    This class is similar to `multi`, but it always creates a stack
-    context even when no children require it. It is not compatible with
-    native coroutines.
-
-    .. versionchanged:: 4.2
-       If multiple ``YieldPoints`` fail, any exceptions after the first
-       (which is raised) will be logged. Added the ``quiet_exceptions``
-       argument to suppress this logging for selected exception types.
-
-    .. versionchanged:: 4.3
-       Renamed from ``Multi`` to ``MultiYieldPoint``. The name ``Multi``
-       remains as an alias for the equivalent `multi` function.
-
-    .. deprecated:: 4.3
-       Use `multi` instead.
-    """
-    def __init__(self, children, quiet_exceptions=()):
-        self.keys = None
-        if isinstance(children, dict):
-            self.keys = list(children.keys())
-            children = children.values()
-        self.children = []
-        for i in children:
-            if not isinstance(i, YieldPoint):
-                i = convert_yielded(i)
-            if is_future(i):
-                i = YieldFuture(i)
-            self.children.append(i)
-        assert all(isinstance(i, YieldPoint) for i in self.children)
-        self.unfinished_children = set(self.children)
-        self.quiet_exceptions = quiet_exceptions
-
-    def start(self, runner):
-        for i in self.children:
-            i.start(runner)
-
-    def is_ready(self):
-        finished = list(itertools.takewhile(
-            lambda i: i.is_ready(), self.unfinished_children))
-        self.unfinished_children.difference_update(finished)
-        return not self.unfinished_children
-
-    def get_result(self):
-        result_list = []
-        exc_info = None
-        for f in self.children:
-            try:
-                result_list.append(f.get_result())
-            except Exception as e:
-                if exc_info is None:
-                    exc_info = sys.exc_info()
-                else:
-                    if not isinstance(e, self.quiet_exceptions):
-                        app_log.error("Multiple exceptions in yield list",
-                                      exc_info=True)
-        if exc_info is not None:
-            raise_exc_info(exc_info)
-        if self.keys is not None:
-            return dict(zip(self.keys, result_list))
-        else:
-            return list(result_list)
-
-
-def multi_future(children, quiet_exceptions=()):
-    """Wait for multiple asynchronous futures in parallel.
-
-    This function is similar to `multi`, but does not support
-    `YieldPoints &lt;YieldPoint&gt;`.
-
-    .. versionadded:: 4.0
-
-    .. versionchanged:: 4.2
-       If multiple ``Futures`` fail, any exceptions after the first (which is
-       raised) will be logged. Added the ``quiet_exceptions``
-       argument to suppress this logging for selected exception types.
-
-    .. deprecated:: 4.3
-       Use `multi` instead.
-    """
-    if isinstance(children, dict):
-        keys = list(children.keys())
-        children = children.values()
-    else:
-        keys = None
-    children = list(map(convert_yielded, children))
-    assert all(is_future(i) for i in children)
-    unfinished_children = set(children)
-
-    future = Future()
-    if not children:
-        future.set_result({} if keys is not None else [])
-
-    def callback(f):
-        unfinished_children.remove(f)
-        if not unfinished_children:
-            result_list = []
-            for f in children:
-                try:
-                    result_list.append(f.result())
-                except Exception as e:
-                    if future.done():
-                        if not isinstance(e, quiet_exceptions):
-                            app_log.error("Multiple exceptions in yield list",
-                                          exc_info=True)
-                    else:
-                        future.set_exc_info(sys.exc_info())
-            if not future.done():
-                if keys is not None:
-                    future.set_result(dict(zip(keys, result_list)))
-                else:
-                    future.set_result(result_list)
-
-    listening = set()
-    for f in children:
-        if f not in listening:
-            listening.add(f)
-            f.add_done_callback(callback)
-    return future
-
-
-def maybe_future(x):
-    """Converts ``x`` into a `.Future`.
-
-    If ``x`` is already a `.Future`, it is simply returned; otherwise
-    it is wrapped in a new `.Future`.  This is suitable for use as
-    ``result = yield gen.maybe_future(f())`` when you don't know whether
-    ``f()`` returns a `.Future` or not.
-
-    .. deprecated:: 4.3
-       This function only handles ``Futures``, not other yieldable objects.
-       Instead of `maybe_future`, check for the non-future result types
-       you expect (often just ``None``), and ``yield`` anything unknown.
-    """
-    if is_future(x):
-        return x
-    else:
-        fut = Future()
-        fut.set_result(x)
-        return fut
-
-
-def with_timeout(timeout, future, io_loop=None, quiet_exceptions=()):
-    """Wraps a `.Future` (or other yieldable object) in a timeout.
-
-    Raises `TimeoutError` if the input future does not complete before
-    ``timeout``, which may be specified in any form allowed by
-    `.IOLoop.add_timeout` (i.e. a `datetime.timedelta` or an absolute time
-    relative to `.IOLoop.time`)
-
-    If the wrapped `.Future` fails after it has timed out, the exception
-    will be logged unless it is of a type contained in ``quiet_exceptions``
-    (which may be an exception type or a sequence of types).
-
-    Does not support `YieldPoint` subclasses.
-
-    .. versionadded:: 4.0
-
-    .. versionchanged:: 4.1
-       Added the ``quiet_exceptions`` argument and the logging of unhandled
-       exceptions.
-
-    .. versionchanged:: 4.4
-       Added support for yieldable objects other than `.Future`.
-    """
-    # TODO: allow YieldPoints in addition to other yieldables?
-    # Tricky to do with stack_context semantics.
-    #
-    # It's tempting to optimize this by cancelling the input future on timeout
-    # instead of creating a new one, but A) we can't know if we are the only
-    # one waiting on the input future, so cancelling it might disrupt other
-    # callers and B) concurrent futures can only be cancelled while they are
-    # in the queue, so cancellation cannot reliably bound our waiting time.
-    future = convert_yielded(future)
-    result = Future()
-    chain_future(future, result)
-    if io_loop is None:
-        io_loop = IOLoop.current()
-
-    def error_callback(future):
-        try:
-            future.result()
-        except Exception as e:
-            if not isinstance(e, quiet_exceptions):
-                app_log.error("Exception in Future %r after timeout",
-                              future, exc_info=True)
-
-    def timeout_callback():
-        result.set_exception(TimeoutError("Timeout"))
-        # In case the wrapped future goes on to fail, log it.
-        future.add_done_callback(error_callback)
-    timeout_handle = io_loop.add_timeout(
-        timeout, timeout_callback)
-    if isinstance(future, Future):
-        # We know this future will resolve on the IOLoop, so we don't
-        # need the extra thread-safety of IOLoop.add_future (and we also
-        # don't care about StackContext here.
-        future.add_done_callback(
-            lambda future: io_loop.remove_timeout(timeout_handle))
-    else:
-        # concurrent.futures.Futures may resolve on any thread, so we
-        # need to route them back to the IOLoop.
-        io_loop.add_future(
-            future, lambda future: io_loop.remove_timeout(timeout_handle))
-    return result
-
-
-def sleep(duration):
-    """Return a `.Future` that resolves after the given number of seconds.
-
-    When used with ``yield`` in a coroutine, this is a non-blocking
-    analogue to `time.sleep` (which should not be used in coroutines
-    because it is blocking)::
-
-        yield gen.sleep(0.5)
-
-    Note that calling this function on its own does nothing; you must
-    wait on the `.Future` it returns (usually by yielding it).
-
-    .. versionadded:: 4.1
-    """
-    f = Future()
-    IOLoop.current().call_later(duration, lambda: f.set_result(None))
-    return f
-
-
-_null_future = Future()
-_null_future.set_result(None)
-
-moment = Future()
-moment.__doc__ = \
-    """A special object which may be yielded to allow the IOLoop to run for
-one iteration.
-
-This is not needed in normal use but it can be helpful in long-running
-coroutines that are likely to yield Futures that are ready instantly.
-
-Usage: ``yield gen.moment``
-
-.. versionadded:: 4.0
-
-.. deprecated:: 4.5
-   ``yield None`` is now equivalent to ``yield gen.moment``.
-"""
-moment.set_result(None)
-
-
-class Runner(object):
-    """Internal implementation of `tornado.gen.engine`.
-
-    Maintains information about pending callbacks and their results.
-
-    The results of the generator are stored in ``result_future`` (a
-<a name="0"></a>    `.TracebackFuture`)
-    """
-    def __init__(self, gen, result_future, first_yielded):
-        self<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.gen = gen
-        self.result_future = result_future
-        self.future = _null_future
-        self.yield_point = None
-        self.pending_callbacks = None
-        self.results =</b></font> None
-        self.running = False
-        self.finished = False
-        self.had_exception = False
-        self.io_loop = IOLoop.current()
-        # For efficiency, we do not create a stack context until we
-        # reach a YieldPoint (stack contexts are required for the historical
-        # semantics of YieldPoints, but not for Futures).  When we have
-        # done so, this field will be set and must be called at the end
-        # of the coroutine.
-        self.stack_context_deactivate = None
-        if self.handle_yield(first_yielded):
-            gen = result_future = first_yielded = None
-            self.run()
-
-    def register_callback(self, key):
-        """Adds ``key`` to the list of callbacks."""
-        if self.pending_callbacks is None:
-            # Lazily initialize the old-style YieldPoint data structures.
-            self.pending_callbacks = set()
-            self.results = {}
-        if key in self.pending_callbacks:
-            raise KeyReuseError("key %r is already pending" % (key,))
-        self.pending_callbacks.add(key)
-
-    def is_ready(self, key):
-        """Returns true if a result is available for ``key``."""
-        if self.pending_callbacks is None or key not in self.pending_callbacks:
-            raise UnknownKeyError("key %r is not pending" % (key,))
-        return key in self.results
-
-    def set_result(self, key, result):
-        """Sets the result for ``key`` and attempts to resume the generator."""
-        self.results[key] = result
-        if self.yield_point is not None and self.yield_point.is_ready():
-            try:
-                self.future.set_result(self.yield_point.get_result())
-            except:
-                self.future.set_exc_info(sys.exc_info())
-            self.yield_point = None
-            self.run()
-
-    def pop_result(self, key):
-        """Returns the result for ``key`` and unregisters it."""
-        self.pending_callbacks.remove(key)
-        return self.results.pop(key)
-
-    def run(self):
-        """Starts or resumes the generator, running until it reaches a
-        yield point that is not ready.
-        """
-        if self.running or self.finished:
-            return
-        try:
-            self.running = True
-            while True:
-                future = self.future
-                if not future.done():
-                    return
-                self.future = None
-                try:
-                    orig_stack_contexts = stack_context._state.contexts
-                    exc_info = None
-
-                    try:
-                        value = future.result()
-                    except Exception:
-                        self.had_exception = True
-                        exc_info = sys.exc_info()
-                    future = None
-
-                    if exc_info is not None:
-                        try:
-                            yielded = self.gen.throw(*exc_info)
-                        finally:
-                            # Break up a reference to itself
-                            # for faster GC on CPython.
-                            exc_info = None
-                    else:
-                        yielded = self.gen.send(value)
-
-                    if stack_context._state.contexts is not orig_stack_contexts:
-                        self.gen.throw(
-                            stack_context.StackContextInconsistentError(
-                                'stack_context inconsistency (probably caused '
-                                'by yield within a "with StackContext" block)'))
-                except (StopIteration, Return) as e:
-                    self.finished = True
-                    self.future = _null_future
-                    if self.pending_callbacks and not self.had_exception:
-                        # If we ran cleanly without waiting on all callbacks
-                        # raise an error (really more of a warning).  If we
-                        # had an exception then some callbacks may have been
-                        # orphaned, so skip the check in that case.
-                        raise LeakedCallbackError(
-                            "finished without waiting for callbacks %r" %
-                            self.pending_callbacks)
-                    self.result_future.set_result(_value_from_stopiteration(e))
-                    self.result_future = None
-                    self._deactivate_stack_context()
-                    return
-                except Exception:
-                    self.finished = True
-                    self.future = _null_future
-                    self.result_future.set_exc_info(sys.exc_info())
-                    self.result_future = None
-                    self._deactivate_stack_context()
-                    return
-                if not self.handle_yield(yielded):
-                    return
-                yielded = None
-        finally:
-            self.running = False
-
-    def handle_yield(self, yielded):
-        # Lists containing YieldPoints require stack contexts;
-        # other lists are handled in convert_yielded.
-        if _contains_yieldpoint(yielded):
-            yielded = multi(yielded)
-
-        if isinstance(yielded, YieldPoint):
-            # YieldPoints are too closely coupled to the Runner to go
-            # through the generic convert_yielded mechanism.
-            self.future = TracebackFuture()
-
-            def start_yield_point():
-                try:
-                    yielded.start(self)
-                    if yielded.is_ready():
-                        self.future.set_result(
-                            yielded.get_result())
-                    else:
-                        self.yield_point = yielded
-                except Exception:
-                    self.future = TracebackFuture()
-                    self.future.set_exc_info(sys.exc_info())
-
-            if self.stack_context_deactivate is None:
-                # Start a stack context if this is the first
-                # YieldPoint we've seen.
-                with stack_context.ExceptionStackContext(
-                        self.handle_exception) as deactivate:
-                    self.stack_context_deactivate = deactivate
-
-                    def cb():
-                        start_yield_point()
-                        self.run()
-                    self.io_loop.add_callback(cb)
-                    return False
-            else:
-                start_yield_point()
-        else:
-            try:
-                self.future = convert_yielded(yielded)
-            except BadYieldError:
-                self.future = TracebackFuture()
-                self.future.set_exc_info(sys.exc_info())
-
-        if not self.future.done() or self.future is moment:
-            def inner(f):
-                # Break a reference cycle to speed GC.
-                f = None # noqa
-                self.run()
-            self.io_loop.add_future(
-                self.future, inner)
-            return False
-        return True
-
-    def result_callback(self, key):
-        return stack_context.wrap(_argument_adapter(
-            functools.partial(self.set_result, key)))
-
-    def handle_exception(self, typ, value, tb):
-        if not self.running and not self.finished:
-            self.future = TracebackFuture()
-            self.future.set_exc_info((typ, value, tb))
-            self.run()
-            return True
-        else:
-            return False
-
-    def _deactivate_stack_context(self):
-        if self.stack_context_deactivate is not None:
-            self.stack_context_deactivate()
-            self.stack_context_deactivate = None
-
-
-Arguments = collections.namedtuple('Arguments', ['args', 'kwargs'])
-
-
-def _argument_adapter(callback):
-    """Returns a function that when invoked runs ``callback`` with one arg.
-
-    If the function returned by this function is called with exactly
-    one argument, that argument is passed to ``callback``.  Otherwise
-    the args tuple and kwargs dict are wrapped in an `Arguments` object.
-    """
-    def wrapper(*args, **kwargs):
-        if kwargs or len(args) &gt; 1:
-            callback(Arguments(args, kwargs))
-        elif args:
-            callback(args[0])
-        else:
-            callback(None)
-    return wrapper
-
-
-# Convert Awaitables into Futures. It is unfortunately possible
-# to have infinite recursion here if those Awaitables assume that
-# we're using a different coroutine runner and yield objects
-# we don't understand. If that happens, the solution is to
-# register that runner's yieldable objects with convert_yielded.
-if sys.version_info &gt;= (3, 3):
-    exec(textwrap.dedent("""
-    @coroutine
-    def _wrap_awaitable(x):
-        if hasattr(x, '__await__'):
-            x = x.__await__()
-        return (yield from x)
-    """))
-else:
-    # Py2-compatible version for use with Cython.
-    # Copied from PEP 380.
-    @coroutine
-    def _wrap_awaitable(x):
-        if hasattr(x, '__await__'):
-            _i = x.__await__()
-        else:
-            _i = iter(x)
-        try:
-            _y = next(_i)
-        except StopIteration as _e:
-            _r = _value_from_stopiteration(_e)
-        else:
-            while 1:
-                try:
-                    _s = yield _y
-                except GeneratorExit as _e:
-                    try:
-                        _m = _i.close
-                    except AttributeError:
-                        pass
-                    else:
-                        _m()
-                    raise _e
-                except BaseException as _e:
-                    _x = sys.exc_info()
-                    try:
-                        _m = _i.throw
-                    except AttributeError:
-                        raise _e
-                    else:
-                        try:
-                            _y = _m(*_x)
-                        except StopIteration as _e:
-                            _r = _value_from_stopiteration(_e)
-                            break
-                else:
-                    try:
-                        if _s is None:
-                            _y = next(_i)
-                        else:
-                            _y = _i.send(_s)
-                    except StopIteration as _e:
-                        _r = _value_from_stopiteration(_e)
-                        break
-        raise Return(_r)
-
-
-def convert_yielded(yielded):
-    """Convert a yielded object into a `.Future`.
-
-    The default implementation accepts lists, dictionaries, and Futures.
-
-    If the `~functools.singledispatch` library is available, this function
-    may be extended to support additional types. For example::
-
-        @convert_yielded.register(asyncio.Future)
-        def _(asyncio_future):
-            return tornado.platform.asyncio.to_tornado_future(asyncio_future)
-
-    .. versionadded:: 4.1
-    """
-    # Lists and dicts containing YieldPoints were handled earlier.
-    if yielded is None:
-        return moment
-    elif isinstance(yielded, (list, dict)):
-        return multi(yielded)
-    elif is_future(yielded):
-        return yielded
-    elif isawaitable(yielded):
-        return _wrap_awaitable(yielded)
-    else:
-        raise BadYieldError("yielded unknown object %r" % (yielded,))
-
-
-if singledispatch is not None:
-    convert_yielded = singledispatch(convert_yielded)
-
-    try:
-        # If we can import t.p.asyncio, do it for its side effect
-        # (registering asyncio.Future with convert_yielded).
-        # It's ugly to do this here, but it prevents a cryptic
-        # infinite recursion in _wrap_awaitable.
-        # Note that even with this, asyncio integration is unlikely
-        # to work unless the application also configures AsyncIOLoop,
-        # but at least the error messages in that case are more
-        # comprehensible than a stack overflow.
-        import salt.ext.tornado.platform.asyncio
-    except ImportError:
-        pass
-    else:
-        # Reference the imported module to make pyflakes happy.
-        tornado
-</pre>
-</div>
-<div style="flex-grow: 1;">
-<h3>
-<center>
-<span>version.py</span>
-<span> - </span>
-<span></span>
-</center>
-</h3>
-<hr/>
-<pre>
-"""
-Set up the version of Salt
-"""
-
-import operator
-import platform
-import re
-import sys
-from collections import namedtuple
-from functools import total_ordering
-
-MAX_SIZE = sys.maxsize
-VERSION_LIMIT = MAX_SIZE - 200
-
-# ----- ATTENTION ---------------------------------------------------------------------------------------------------&gt;
-#
-# ALL major version bumps, new release codenames, MUST be defined in the SaltStackVersion.NAMES dictionary, i.e.:
-#
-#    class SaltStackVersion:
-#
-#        NAMES = {
-#            'Hydrogen': (2014, 1),   # &lt;- This is the tuple to bump versions
-#            ( ... )
-#        }
-#
-#
-# ONLY UPDATE CODENAMES AFTER BRANCHING
-#
-# As an example, The Helium codename must only be properly defined with "(2014, 7)" after Hydrogen, "(2014, 1)", has
-# been branched out into its own branch.
-#
-# ALL OTHER VERSION INFORMATION IS EXTRACTED FROM THE GIT TAGS
-#
-# &lt;---- ATTENTION ----------------------------------------------------------------------------------------------------
-
-
-@total_ordering
-class SaltVersion(namedtuple("SaltVersion", "name, info, released")):
-    __slots__ = ()
-
-    def __new__(cls, name, info, released=False):
-        if isinstance(info, int):
-            info = (info,)
-        return super().__new__(cls, name, info, released)
-
-    def __eq__(self, other):
-        return self.info == other.info
-
-    def __gt__(self, other):
-        return self.info &gt; other.info
-
-
-class SaltVersionsInfo(type):
-
-    _sorted_versions = ()
-    _current_release = None
-    _previous_release = None
-    _next_release = None
-
-    # pylint: disable=bad-whitespace,multiple-spaces-before-operator
-    # ----- Please refrain from fixing whitespace ----------------------------------&gt;
-    # The idea is to keep this readable.
-    # -------------------------------------------------------------------------------
-    # fmt: off
-    HYDROGEN      = SaltVersion("Hydrogen"     , info=(2014, 1),  released=True)
-    HELIUM        = SaltVersion("Helium"       , info=(2014, 7),  released=True)
-    LITHIUM       = SaltVersion("Lithium"      , info=(2015, 5),  released=True)
-    BERYLLIUM     = SaltVersion("Beryllium"    , info=(2015, 8),  released=True)
-    BORON         = SaltVersion("Boron"        , info=(2016, 3),  released=True)
-    CARBON        = SaltVersion("Carbon"       , info=(2016, 11), released=True)
-    NITROGEN      = SaltVersion("Nitrogen"     , info=(2017, 7),  released=True)
-    OXYGEN        = SaltVersion("Oxygen"       , info=(2018, 3),  released=True)
-    FLUORINE      = SaltVersion("Fluorine"     , info=(2019, 2),  released=True)
-    NEON          = SaltVersion("Neon"         , info=3000,       released=True)
-    SODIUM        = SaltVersion("Sodium"       , info=3001,       released=True)
-    MAGNESIUM     = SaltVersion("Magnesium"    , info=3002,       released=True)
-    ALUMINIUM     = SaltVersion("Aluminium"    , info=3003,       released=True)
-    SILICON       = SaltVersion("Silicon"      , info=3004,       released=True)
-    PHOSPHORUS    = SaltVersion("Phosphorus"   , info=3005)
-    SULFUR        = SaltVersion("Sulfur"       , info=3006)
-    CHLORINE      = SaltVersion("Chlorine"     , info=3007)
-    ARGON         = SaltVersion("Argon"        , info=3008)
-    POTASSIUM     = SaltVersion("Potassium"    , info=3009)
-    CALCIUM       = SaltVersion("Calcium"      , info=3010)
-    SCANDIUM      = SaltVersion("Scandium"     , info=3011)
-    TITANIUM      = SaltVersion("Titanium"     , info=3012)
-    VANADIUM      = SaltVersion("Vanadium"     , info=3013)
-    CHROMIUM      = SaltVersion("Chromium"     , info=3014)
-    MANGANESE     = SaltVersion("Manganese"    , info=3015)
-    IRON          = SaltVersion("Iron"         , info=3016)
-    COBALT        = SaltVersion("Cobalt"       , info=3017)
-    NICKEL        = SaltVersion("Nickel"       , info=3018)
-    COPPER        = SaltVersion("Copper"       , info=3019)
-    ZINC          = SaltVersion("Zinc"         , info=3020)
-    GALLIUM       = SaltVersion("Gallium"      , info=3021)
-    GERMANIUM     = SaltVersion("Germanium"    , info=3022)
-    ARSENIC       = SaltVersion("Arsenic"      , info=3023)
-    SELENIUM      = SaltVersion("Selenium"     , info=3024)
-    BROMINE       = SaltVersion("Bromine"      , info=3025)
-    KRYPTON       = SaltVersion("Krypton"      , info=3026)
-    RUBIDIUM      = SaltVersion("Rubidium"     , info=3027)
-    STRONTIUM     = SaltVersion("Strontium"    , info=3028)
-    YTTRIUM       = SaltVersion("Yttrium"      , info=3029)
-    ZIRCONIUM     = SaltVersion("Zirconium"    , info=3030)
-    NIOBIUM       = SaltVersion("Niobium"      , info=3031)
-    MOLYBDENUM    = SaltVersion("Molybdenum"   , info=3032)
-    TECHNETIUM    = SaltVersion("Technetium"   , info=3033)
-    RUTHENIUM     = SaltVersion("Ruthenium"    , info=3034)
-    RHODIUM       = SaltVersion("Rhodium"      , info=3035)
-    PALLADIUM     = SaltVersion("Palladium"    , info=3036)
-    SILVER        = SaltVersion("Silver"       , info=3037)
-    CADMIUM       = SaltVersion("Cadmium"      , info=3038)
-    INDIUM        = SaltVersion("Indium"       , info=3039)
-    TIN           = SaltVersion("Tin"          , info=3040)
-    ANTIMONY      = SaltVersion("Antimony"     , info=3041)
-    TELLURIUM     = SaltVersion("Tellurium"    , info=3042)
-    IODINE        = SaltVersion("Iodine"       , info=3043)
-    XENON         = SaltVersion("Xenon"        , info=3044)
-    CESIUM        = SaltVersion("Cesium"       , info=3045)
-    BARIUM        = SaltVersion("Barium"       , info=3046)
-    LANTHANUM     = SaltVersion("Lanthanum"    , info=3047)
-    CERIUM        = SaltVersion("Cerium"       , info=3048)
-    PRASEODYMIUM  = SaltVersion("Praseodymium" , info=3049)
-    NEODYMIUM     = SaltVersion("Neodymium"    , info=3050)
-    PROMETHIUM    = SaltVersion("Promethium"   , info=3051)
-    SAMARIUM      = SaltVersion("Samarium"     , info=3052)
-    EUROPIUM      = SaltVersion("Europium"     , info=3053)
-    GADOLINIUM    = SaltVersion("Gadolinium"   , info=3054)
-    TERBIUM       = SaltVersion("Terbium"      , info=3055)
-    DYSPROSIUM    = SaltVersion("Dysprosium"   , info=3056)
-    HOLMIUM       = SaltVersion("Holmium"      , info=3057)
-    ERBIUM        = SaltVersion("Erbium"       , info=3058)
-    THULIUM       = SaltVersion("Thulium"      , info=3059)
-    YTTERBIUM     = SaltVersion("Ytterbium"    , info=3060)
-    LUTETIUM      = SaltVersion("Lutetium"     , info=3061)
-    HAFNIUM       = SaltVersion("Hafnium"      , info=3062)
-    TANTALUM      = SaltVersion("Tantalum"     , info=3063)
-    TUNGSTEN      = SaltVersion("Tungsten"     , info=3064)
-    RHENIUM       = SaltVersion("Rhenium"      , info=3065)
-    OSMIUM        = SaltVersion("Osmium"       , info=3066)
-    IRIDIUM       = SaltVersion("Iridium"      , info=3067)
-    PLATINUM      = SaltVersion("Platinum"     , info=3068)
-    GOLD          = SaltVersion("Gold"         , info=3069)
-    MERCURY       = SaltVersion("Mercury"      , info=3070)
-    THALLIUM      = SaltVersion("Thallium"     , info=3071)
-    LEAD          = SaltVersion("Lead"         , info=3072)
-    BISMUTH       = SaltVersion("Bismuth"      , info=3073)
-    POLONIUM      = SaltVersion("Polonium"     , info=3074)
-    ASTATINE      = SaltVersion("Astatine"     , info=3075)
-    RADON         = SaltVersion("Radon"        , info=3076)
-    FRANCIUM      = SaltVersion("Francium"     , info=3077)
-    RADIUM        = SaltVersion("Radium"       , info=3078)
-    ACTINIUM      = SaltVersion("Actinium"     , info=3079)
-    THORIUM       = SaltVersion("Thorium"      , info=3080)
-    PROTACTINIUM  = SaltVersion("Protactinium" , info=3081)
-    URANIUM       = SaltVersion("Uranium"      , info=3082)
-    NEPTUNIUM     = SaltVersion("Neptunium"    , info=3083)
-    PLUTONIUM     = SaltVersion("Plutonium"    , info=3084)
-    AMERICIUM     = SaltVersion("Americium"    , info=3085)
-    CURIUM        = SaltVersion("Curium"       , info=3086)
-    BERKELIUM     = SaltVersion("Berkelium"    , info=3087)
-    CALIFORNIUM   = SaltVersion("Californium"  , info=3088)
-    EINSTEINIUM   = SaltVersion("Einsteinium"  , info=3089)
-    FERMIUM       = SaltVersion("Fermium"      , info=3090)
-    MENDELEVIUM   = SaltVersion("Mendelevium"  , info=3091)
-    NOBELIUM      = SaltVersion("Nobelium"     , info=3092)
-    LAWRENCIUM    = SaltVersion("Lawrencium"   , info=3093)
-    RUTHERFORDIUM = SaltVersion("Rutherfordium", info=3094)
-    DUBNIUM       = SaltVersion("Dubnium"      , info=3095)
-    SEABORGIUM    = SaltVersion("Seaborgium"   , info=3096)
-    BOHRIUM       = SaltVersion("Bohrium"      , info=3097)
-    HASSIUM       = SaltVersion("Hassium"      , info=3098)
-    MEITNERIUM    = SaltVersion("Meitnerium"   , info=3099)
-    DARMSTADTIUM  = SaltVersion("Darmstadtium" , info=3100)
-    ROENTGENIUM   = SaltVersion("Roentgenium"  , info=3101)
-    COPERNICIUM   = SaltVersion("Copernicium"  , info=3102)
-    NIHONIUM      = SaltVersion("Nihonium"     , info=3103)
-    FLEROVIUM     = SaltVersion("Flerovium"    , info=3104)
-    MOSCOVIUM     = SaltVersion("Moscovium"    , info=3105)
-    LIVERMORIUM   = SaltVersion("Livermorium"  , info=3106)
-    TENNESSINE    = SaltVersion("Tennessine"   , info=3107)
-    OGANESSON     = SaltVersion("Oganesson"    , info=3108)
-    # &lt;---- Please refrain from fixing whitespace -----------------------------------
-    # The idea is to keep this readable.
-    # -------------------------------------------------------------------------------
-    # pylint: enable=bad-whitespace,multiple-spaces-before-operator
-    # fmt: on
-
-    @classmethod
-    def versions(cls):
-        if not cls._sorted_versions:
-            cls._sorted_versions = sorted(
-                (getattr(cls, name) for name in dir(cls) if name.isupper()),
-                key=operator.attrgetter("info"),
-            )
-        return cls._sorted_versions
-
-    @classmethod
-    def current_release(cls):
-        if cls._current_release is None:
-            for version in cls.versions():
-                if version.released is False:
-                    cls._current_release = version
-                    break
-        return cls._current_release
-
-    @classmethod
-    def next_release(cls):
-        if cls._next_release is None:
-            next_release_ahead = False
-            for version in cls.versions():
-                if next_release_ahead:
-                    cls._next_release = version
-                    break
-                if version == cls.current_release():
-                    next_release_ahead = True
-        return cls._next_release
-
-    @classmethod
-    def previous_release(cls):
-        if cls._previous_release is None:
-            previous = None
-            for version in cls.versions():
-                if version == cls.current_release():
-                    break
-                previous = version
-            cls._previous_release = previous
-        return cls._previous_release
-
-
-class SaltStackVersion:
-    """
-    Handle SaltStack versions class.
-
-    Knows how to parse ``git describe`` output, knows about release candidates
-    and also supports version comparison.
-    """
-
-    __slots__ = (
-        "name",
-        "major",
-        "minor",
-        "bugfix",
-        "mbugfix",
-        "pre_type",
-        "pre_num",
-        "noc",
-        "sha",
-    )
-
-    git_sha_regex = r"(?P&lt;sha&gt;g?[a-f0-9]{7,40})"
-
-    git_describe_regex = re.compile(
-        r"(?:[^\d]+)?(?P&lt;major&gt;[\d]{1,4})"
-        r"(?:\.(?P&lt;minor&gt;[\d]{1,2}))?"
-        r"(?:\.(?P&lt;bugfix&gt;[\d]{0,2}))?"
-        r"(?:\.(?P&lt;mbugfix&gt;[\d]{0,2}))?"
-        r"(?:(?P&lt;pre_type&gt;rc|a|b|alpha|beta|nb)(?P&lt;pre_num&gt;[\d]+))?"
-        r"(?:(?:.*)(?:\+|-)(?P&lt;noc&gt;(?:0na|[\d]+|n/a))(?:-|\.)" + git_sha_regex + r")?"
-    )
-    git_sha_regex = r"^" + git_sha_regex
-
-    git_sha_regex = re.compile(git_sha_regex)
-
-    NAMES = {v.name: v.info for v in SaltVersionsInfo.versions()}
-    LNAMES = {k.lower(): v for (k, v) in iter(NAMES.items())}
-    VNAMES = {v: k for (k, v) in iter(NAMES.items())}
-    RMATCH = {v[:2]: k for (k, v) in iter(NAMES.items())}
-
-    def __init__(
-        self,  # pylint: disable=C0103
-        major,
-        minor=None,
-        bugfix=None,
-        mbugfix=0,
-        pre_type=None,
-        pre_num=None,
-        noc=0,
-        sha=None,
-    ):
-
-        if isinstance(major, str):
-            major = int(major)
-
-        if isinstance(minor, str):
-            if not minor:
-                # Empty string
-                minor = None
-            else:
-                minor = int(minor)
-
-        if bugfix is None and not self.new_version(major=major):
-            bugfix = 0
-        elif isinstance(bugfix, str):
-            if not bugfix:
-                bugfix = None
-            else:
-                bugfix = int(bugfix)
-
-        if mbugfix is None:
-            mbugfix = 0
-        elif isinstance(mbugfix, str):
-            mbugfix = int(mbugfix)
-
-        if pre_type is None:
-            pre_type = ""
-        if pre_num is None:
-            pre_num = 0
-        elif isinstance(pre_num, str):
-            pre_num = int(pre_num)
-
-        if noc is None:
-            noc = 0
-        elif isinstance(noc, str) and noc in ("0na", "n/a"):
-            noc = -1
-<a name="0"></a>        elif isinstance(noc, str):
-            noc = int(noc)
-
-        self<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.major = major
-        self.minor = minor
-        self.bugfix = bugfix
-        self.mbugfix = mbugfix
-        self.pre_type = pre_type
-        self.pre_num =</b></font> pre_num
-        if self.new_version(major):
-            vnames_key = (major,)
-        else:
-            vnames_key = (major, minor)
-        self.name = self.VNAMES.get(vnames_key)
-        self.noc = noc
-        self.sha = sha
-
-    def new_version(self, major):
-        """
-        determine if using new versioning scheme
-        """
-        return bool(int(major) &gt;= 3000 and int(major) &lt; VERSION_LIMIT)
-
-    @classmethod
-    def parse(cls, version_string):
-        if version_string.lower() in cls.LNAMES:
-            return cls.from_name(version_string)
-        vstr = (
-            version_string.decode()
-            if isinstance(version_string, bytes)
-            else version_string
-        )
-        match = cls.git_describe_regex.match(vstr)
-        if not match:
-            raise ValueError(
-                "Unable to parse version string: '{}'".format(version_string)
-            )
-        return cls(*match.groups())
-
-    @classmethod
-    def from_name(cls, name):
-        if name.lower() not in cls.LNAMES:
-            raise ValueError("Named version '{}' is not known".format(name))
-        return cls(*cls.LNAMES[name.lower()])
-
-    @classmethod
-    def from_last_named_version(cls):
-        import salt.utils.versions
-
-        salt.utils.versions.warn_until(
-            SaltVersionsInfo.SULFUR,
-            "The use of SaltStackVersion.from_last_named_version() is "
-            "deprecated and set to be removed in {version}. Please use "
-            "SaltStackVersion.current_release() instead.",
-        )
-        return cls.current_release()
-
-    @classmethod
-    def current_release(cls):
-        return cls(*SaltVersionsInfo.current_release().info)
-
-    @classmethod
-    def next_release(cls):
-        return cls(*SaltVersionsInfo.next_release().info)
-
-    @property
-    def sse(self):
-        # Higher than 0.17, lower than first date based
-        return 0 &lt; self.major &lt; 2014
-
-    def min_info(self):
-        info = [self.major]
-        if self.new_version(self.major):
-            if self.minor:
-                info.append(self.minor)
-        else:
-            info.extend([self.minor, self.bugfix, self.mbugfix])
-        return info
-
-    @property
-    def info(self):
-        return tuple(self.min_info())
-
-    @property
-    def pre_info(self):
-        info = self.min_info()
-        info.extend([self.pre_type, self.pre_num])
-        return tuple(info)
-
-    @property
-    def noc_info(self):
-        info = self.min_info()
-        info.extend([self.pre_type, self.pre_num, self.noc])
-        return tuple(info)
-
-    @property
-    def full_info(self):
-        info = self.min_info()
-        info.extend([self.pre_type, self.pre_num, self.noc, self.sha])
-        return tuple(info)
-
-    @property
-    def full_info_all_versions(self):
-        """
-        Return the full info regardless
-        of which versioning scheme we
-        are using.
-        """
-        info = [
-            self.major,
-            self.minor,
-            self.bugfix,
-            self.mbugfix,
-            self.pre_type,
-            self.pre_num,
-            self.noc,
-            self.sha,
-        ]
-        return tuple(info)
-
-    @property
-    def string(self):
-        if self.new_version(self.major):
-            version_string = "{}".format(self.major)
-            if self.minor:
-                version_string = "{}.{}".format(self.major, self.minor)
-        else:
-            version_string = "{}.{}.{}".format(self.major, self.minor, self.bugfix)
-        if self.mbugfix:
-            version_string += ".{}".format(self.mbugfix)
-        if self.pre_type:
-            version_string += "{}{}".format(self.pre_type, self.pre_num)
-        if self.noc and self.sha:
-            noc = self.noc
-            if noc &lt; 0:
-                noc = "0na"
-            version_string += "+{}.{}".format(noc, self.sha)
-        return version_string
-
-    @property
-    def formatted_version(self):
-        if self.name and self.major &gt; 10000:
-            version_string = self.name
-            if self.sse:
-                version_string += " Enterprise"
-            version_string += " (Unreleased)"
-            return version_string
-        version_string = self.string
-        if self.sse:
-            version_string += " Enterprise"
-        if (self.major, self.minor) in self.RMATCH:
-            version_string += " ({})".format(self.RMATCH[(self.major, self.minor)])
-        return version_string
-
-    @property
-    def pre_index(self):
-        if self.new_version(self.major):
-            pre_type = 2
-            if not isinstance(self.minor, int):
-                pre_type = 1
-        else:
-            pre_type = 4
-        return pre_type
-
-    def __str__(self):
-        return self.string
-
-    def __compare__(self, other, method):
-        if not isinstance(other, SaltStackVersion):
-            if isinstance(other, str):
-                other = SaltStackVersion.parse(other)
-            elif isinstance(other, (list, tuple)):
-                other = SaltStackVersion(*other)
-            else:
-                raise ValueError(
-                    "Cannot instantiate Version from type '{}'".format(type(other))
-                )
-
-        pre_type = self.pre_index
-        other_pre_type = other.pre_index
-        other_noc_info = list(other.noc_info)
-        noc_info = list(self.noc_info)
-
-        if self.new_version(self.major):
-            if self.minor and not other.minor:
-                # We have minor information, the other side does not
-                if self.minor &gt; 0:
-                    other_noc_info[1] = 0
-
-            if not self.minor and other.minor:
-                # The other side has minor information, we don't
-                if other.minor &gt; 0:
-                    noc_info[1] = 0
-
-        if self.pre_type and not other.pre_type:
-            # We have pre-release information, the other side doesn't
-            other_noc_info[other_pre_type] = "zzzzz"
-
-        if not self.pre_type and other.pre_type:
-            # The other side has pre-release information, we don't
-            noc_info[pre_type] = "zzzzz"
-
-        return method(tuple(noc_info), tuple(other_noc_info))
-
-    def __lt__(self, other):
-        return self.__compare__(other, lambda _self, _other: _self &lt; _other)
-
-    def __le__(self, other):
-        return self.__compare__(other, lambda _self, _other: _self &lt;= _other)
-
-    def __eq__(self, other):
-        return self.__compare__(other, lambda _self, _other: _self == _other)
-
-    def __ne__(self, other):
-        return self.__compare__(other, lambda _self, _other: _self != _other)
-
-    def __ge__(self, other):
-        return self.__compare__(other, lambda _self, _other: _self &gt;= _other)
-
-    def __gt__(self, other):
-        return self.__compare__(other, lambda _self, _other: _self &gt; _other)
-
-    def __repr__(self):
-        parts = []
-        if self.name:
-            parts.append("name='{}'".format(self.name))
-        parts.extend(["major={}".format(self.major), "minor={}".format(self.minor)])
-
-        if self.new_version(self.major):
-            if not self.minor:
-                parts.remove("".join([x for x in parts if re.search("^minor*", x)]))
-        else:
-            parts.extend(["bugfix={}".format(self.bugfix)])
-
-        if self.mbugfix:
-            parts.append("minor-bugfix={}".format(self.mbugfix))
-        if self.pre_type:
-            parts.append("{}={}".format(self.pre_type, self.pre_num))
-        noc = self.noc
-        if noc == -1:
-            noc = "0na"
-        if noc and self.sha:
-            parts.extend(["noc={}".format(noc), "sha={}".format(self.sha)])
-        return "&lt;{} {}&gt;".format(self.__class__.__name__, " ".join(parts))
-
-
-# ----- Hardcoded Salt Codename Version Information -----------------------------------------------------------------&gt;
-#
-#   There's no need to do anything here. The last released codename will be picked up
-# --------------------------------------------------------------------------------------------------------------------
-__saltstack_version__ = SaltStackVersion.current_release()
-# &lt;---- Hardcoded Salt Version Information ---------------------------------------------------------------------------
-
-
-# ----- Dynamic/Runtime Salt Version Information --------------------------------------------------------------------&gt;
-def __discover_version(saltstack_version):
-    # This might be a 'python setup.py develop' installation type. Let's
-    # discover the version information at runtime.
-    import os
-    import subprocess
-
-    if "SETUP_DIRNAME" in globals():
-        # This is from the exec() call in Salt's setup.py
-        cwd = SETUP_DIRNAME  # pylint: disable=E0602
-        if not os.path.exists(os.path.join(cwd, ".git")):
-            # This is not a Salt git checkout!!! Don't even try to parse...
-            return saltstack_version
-    else:
-        cwd = os.path.abspath(os.path.dirname(__file__))
-        if not os.path.exists(os.path.join(os.path.dirname(cwd), ".git")):
-            # This is not a Salt git checkout!!! Don't even try to parse...
-            return saltstack_version
-
-    try:
-        kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
-
-        if not sys.platform.startswith("win"):
-            # Let's not import `salt.utils` for the above check
-            kwargs["close_fds"] = True
-
-        process = subprocess.Popen(
-            [
-                "git",
-                "describe",
-                "--tags",
-                "--long",
-                "--match",
-                "v[0-9]*",
-                "--always",
-            ],
-            **kwargs
-        )
-
-        out, err = process.communicate()
-
-        out = out.decode().strip()
-        err = err.decode().strip()
-
-        if not out or err:
-            return saltstack_version
-
-        if SaltStackVersion.git_sha_regex.match(out):
-            # We only define the parsed SHA and set NOC as ??? (unknown)
-            saltstack_version.sha = out.strip()
-            saltstack_version.noc = -1
-            return saltstack_version
-
-        return SaltStackVersion.parse(out)
-
-    except OSError as os_err:
-        if os_err.errno != 2:
-            # If the errno is not 2(The system cannot find the file
-            # specified), raise the exception so it can be catch by the
-            # developers
-            raise
-    return saltstack_version
-
-
-def __get_version(saltstack_version):
-    """
-    If we can get a version provided at installation time or from Git, use
-    that instead, otherwise we carry on.
-    """
-    try:
-        # Try to import the version information provided at install time
-        from salt._version import __saltstack_version__  # pylint: disable=E0611,F0401
-
-        return __saltstack_version__
-    except ImportError:
-        return __discover_version(saltstack_version)
-
-
-# Get additional version information if available
-__saltstack_version__ = __get_version(__saltstack_version__)
-if __saltstack_version__.name:
-    # Set SaltVersionsInfo._current_release to avoid lookups when finding previous and next releases
-    SaltVersionsInfo._current_release = getattr(
-        SaltVersionsInfo, __saltstack_version__.name.upper()
-    )
-
-# This function has executed once, we're done with it. Delete it!
-del __get_version
-# &lt;---- Dynamic/Runtime Salt Version Information ---------------------------------------------------------------------
-
-
-# ----- Common version related attributes - NO NEED TO CHANGE -------------------------------------------------------&gt;
-__version_info__ = __saltstack_version__.info
-__version__ = __saltstack_version__.string
-# &lt;---- Common version related attributes - NO NEED TO CHANGE --------------------------------------------------------
-
-
-def salt_information():
-    """
-    Report version of salt.
-    """
-    yield "Salt", __version__
-
-
-def dependency_information(include_salt_cloud=False):
-    """
-    Report versions of library dependencies.
-    """
-    libs = [
-        ("Python", None, sys.version.rsplit("\n")[0].strip()),
-        ("Jinja2", "jinja2", "__version__"),
-        ("M2Crypto", "M2Crypto", "version"),
-        ("msgpack", "msgpack", "version"),
-        ("msgpack-pure", "msgpack_pure", "version"),
-        ("pycrypto", "Crypto", "__version__"),
-        ("pycryptodome", "Cryptodome", "version_info"),
-        ("PyYAML", "yaml", "__version__"),
-        ("PyZMQ", "zmq", "__version__"),
-        ("ZMQ", "zmq", "zmq_version"),
-        ("Mako", "mako", "__version__"),
-        ("Tornado", "tornado", "version"),
-        ("timelib", "timelib", "version"),
-        ("dateutil", "dateutil", "__version__"),
-        ("pygit2", "pygit2", "__version__"),
-        ("libgit2", "pygit2", "LIBGIT2_VERSION"),
-        ("smmap", "smmap", "__version__"),
-        ("cffi", "cffi", "__version__"),
-        ("pycparser", "pycparser", "__version__"),
-        ("gitdb", "gitdb", "__version__"),
-        ("gitpython", "git", "__version__"),
-        ("python-gnupg", "gnupg", "__version__"),
-        ("mysql-python", "MySQLdb", "__version__"),
-        ("cherrypy", "cherrypy", "__version__"),
-        ("docker-py", "docker", "__version__"),
-    ]
-
-    if include_salt_cloud:
-        libs.append(
-            ("Apache Libcloud", "libcloud", "__version__"),
-        )
-
-    for name, imp, attr in libs:
-        if imp is None:
-            yield name, attr
-            continue
-        try:
-            imp = __import__(imp)
-            version = getattr(imp, attr)
-            if callable(version):
-                version = version()
-            if isinstance(version, (tuple, list)):
-                version = ".".join(map(str, version))
-            yield name, version
-        except Exception:  # pylint: disable=broad-except
-            yield name, None
-
-
-def system_information():
-    """
-    Report system versions.
-    """
-    # Late import so that when getting called from setup.py does not break
-    from distro import linux_distribution
-
-    def system_version():
-        """
-        Return host system version.
-        """
-
-        lin_ver = linux_distribution()
-        mac_ver = platform.mac_ver()
-        win_ver = platform.win32_ver()
-
-        # linux_distribution() will return a
-        # distribution on OS X and Windows.
-        # Check mac_ver and win_ver first,
-        # then lin_ver.
-        if mac_ver[0]:
-            if isinstance(mac_ver[1], (tuple, list)) and "".join(mac_ver[1]):
-                return " ".join([mac_ver[0], ".".join(mac_ver[1]), mac_ver[2]])
-            else:
-                return " ".join([mac_ver[0], mac_ver[2]])
-        elif win_ver[0]:
-            return " ".join(win_ver)
-        elif lin_ver[0]:
-            return " ".join(lin_ver)
-        else:
-            return ""
-
-    if platform.win32_ver()[0]:
-        # Get the version and release info based on the Windows Operating
-        # System Product Name. As long as Microsoft maintains a similar format
-        # this should be future proof
-        import win32api  # pylint: disable=3rd-party-module-not-gated
-        import win32con  # pylint: disable=3rd-party-module-not-gated
-
-        # Get the product name from the registry
-        hkey = win32con.HKEY_LOCAL_MACHINE
-        key = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
-        value_name = "ProductName"
-        reg_handle = win32api.RegOpenKey(hkey, key)
-
-        # Returns a tuple of (product_name, value_type)
-        product_name, _ = win32api.RegQueryValueEx(reg_handle, value_name)
-
-        version = "Unknown"
-        release = ""
-        if "Server" in product_name:
-            for item in product_name.split(" "):
-                # If it's all digits, then it's version
-                if re.match(r"\d+", item):
-                    version = item
-                # If it starts with R and then numbers, it's the release
-                # ie: R2
-                if re.match(r"^R\d+$", item):
-                    release = item
-            release = "{}Server{}".format(version, release)
-        else:
-            for item in product_name.split(" "):
-                # If it's a number, decimal number, Thin or Vista, then it's the
-                # version
-                if re.match(r"^(\d+(\.\d+)?)|Thin|Vista$", item):
-                    version = item
-            release = version
-
-        _, ver, service_pack, extra = platform.win32_ver()
-        version = " ".join([release, ver, service_pack, extra])
-    else:
-        version = system_version()
-        release = platform.release()
-
-    system = [
-        ("system", platform.system()),
-        ("dist", " ".join(linux_distribution(full_distribution_name=False))),
-        ("release", release),
-        ("machine", platform.machine()),
-        ("version", version),
-        ("locale", __salt_system_encoding__),
-    ]
-
-    for name, attr in system:
-        yield name, attr
-        continue
-
-
-def extensions_information():
-    """
-    Gather infomation about any installed salt extensions
-    """
-    # Late import
-    import salt.utils.entrypoints
-
-    extensions = {}
-    for entry_point in salt.utils.entrypoints.iter_entry_points("salt.loader"):
-        dist_nv = salt.utils.entrypoints.name_and_version_from_entry_point(entry_point)
-        if not dist_nv:
-            continue
-        if dist_nv.name in extensions:
-            continue
-        extensions[dist_nv.name] = dist_nv.version
-    return extensions
-
-
-def versions_information(include_salt_cloud=False, include_extensions=True):
-    """
-    Report the versions of dependent software.
-    """
-    salt_info = list(salt_information())
-    lib_info = list(dependency_information(include_salt_cloud))
-    sys_info = list(system_information())
-
-    info = {
-        "Salt Version": dict(salt_info),
-        "Dependency Versions": dict(lib_info),
-        "System Versions": dict(sys_info),
-    }
-    if include_extensions:
-        extensions_info = extensions_information()
-        if extensions_info:
-            info["Salt Extensions"] = extensions_info
-    return info
-
-
-def versions_report(include_salt_cloud=False, include_extensions=True):
-    """
-    Yield each version properly formatted for console output.
-    """
-    ver_info = versions_information(
-        include_salt_cloud=include_salt_cloud, include_extensions=include_extensions
-    )
-    not_installed = "Not Installed"
-    ns_pad = len(not_installed)
-    lib_pad = max(len(name) for name in ver_info["Dependency Versions"])
-    sys_pad = max(len(name) for name in ver_info["System Versions"])
-    if include_extensions and "Salt Extensions" in ver_info:
-        ext_pad = max(len(name) for name in ver_info["Salt Extensions"])
-    else:
-        ext_pad = 1
-    padding = max(lib_pad, sys_pad, ns_pad, ext_pad) + 1
-
-    fmt = "{0:&gt;{pad}}: {1}"
-    info = []
-    for ver_type in (
-        "Salt Version",
-        "Dependency Versions",
-        "Salt Extensions",
-        "System Versions",
-    ):
-        if ver_type == "Salt Extensions" and ver_type not in ver_info:
-            # No salt Extensions to report
-            continue
-        info.append("{}:".format(ver_type))
-        # List dependencies in alphabetical, case insensitive order
-        for name in sorted(ver_info[ver_type], key=lambda x: x.lower()):
-            ver = fmt.format(
-                name, ver_info[ver_type][name] or not_installed, pad=padding
-            )
-            info.append(ver)
-        info.append(" ")
-
-    yield from info
-
-
-if __name__ == "__main__":
-    print(__version__)
+1 from __future__ import absolute_import, division, print_function
+2 import collections
+3 import functools
+4 import itertools
+5 import os
+6 import sys
+7 import textwrap
+8 import types
+9 import weakref
+10 import salt.ext.tornado as tornado
+11 from salt.ext.tornado.concurrent import Future, TracebackFuture, is_future, chain_future
+12 from salt.ext.tornado.ioloop import IOLoop
+13 from salt.ext.tornado.log import app_log
+14 from salt.ext.tornado import stack_context
+15 from salt.ext.tornado.util import PY3, raise_exc_info
+16 try:
+17     try:
+18         from functools import singledispatch  # type: ignore
+19     except ImportError:
+20         from singledispatch import singledispatch  # backport
+21 except ImportError:
+22     if 'APPENGINE_RUNTIME' not in os.environ:
+23         raise
+24     singledispatch = None
+25 try:
+26     try:
+27         from collections.abc import Generator as GeneratorType  # type: ignore
+28     except ImportError:
+29         from salt.ext.backports_abc import Generator as GeneratorType  # type: ignore
+30     try:
+31         from inspect import isawaitable  # type: ignore
+32     except ImportError:
+33         from salt.ext.backports_abc import isawaitable
+34 except ImportError:
+35     if 'APPENGINE_RUNTIME' not in os.environ:
+36         raise
+37     from types import GeneratorType
+38     def isawaitable(x):  # type: ignore
+39         return False
+40 if PY3:
+41     import builtins
+42 else:
+43     import __builtin__ as builtins
+44 class KeyReuseError(Exception):
+45     pass
+46 class UnknownKeyError(Exception):
+47     pass
+48 class LeakedCallbackError(Exception):
+49     pass
+50 class BadYieldError(Exception):
+51     pass
+52 class ReturnValueIgnoredError(Exception):
+53     pass
+54 class TimeoutError(Exception):
+55 def _value_from_stopiteration(e):
+56     try:
+57         return e.value
+58     except AttributeError:
+59         pass
+60     try:
+61         return e.args[0]
+62     except (AttributeError, IndexError):
+63         return None
+64 def engine(func):
+65     func = _make_coroutine_wrapper(func, replace_callback=False)
+66     @functools.wraps(func)
+67     def wrapper(*args, **kwargs):
+68         future = func(*args, **kwargs)
+69         def final_callback(future):
+70             if future.result() is not None:
+71                 raise ReturnValueIgnoredError(
+72                     "@gen.engine functions cannot return values: %r" %
+73                     (future.result(),))
+74         future.add_done_callback(stack_context.wrap(final_callback))
+75     return wrapper
+76 def coroutine(func, replace_callback=True):
+77     return _make_coroutine_wrapper(func, replace_callback=True)
+78 _futures_to_runners = weakref.WeakKeyDictionary()
+79 def _make_coroutine_wrapper(func, replace_callback):
+80     wrapped = func
+81     if hasattr(types, 'coroutine'):
+82         func = types.coroutine(func)
+83     @functools.wraps(wrapped)
+84     def wrapper(*args, **kwargs):
+85         future = TracebackFuture()
+86         if replace_callback and 'callback' in kwargs:
+87             callback = kwargs.pop('callback')
+88             IOLoop.current().add_future(
+89                 future, lambda future: callback(future.result()))
+90         try:
+91             result = func(*args, **kwargs)
+92         except (Return, StopIteration) as e:
+93             result = _value_from_stopiteration(e)
+94         except Exception:
+95             future.set_exc_info(sys.exc_info())
+96             return future
+97         else:
+98             if isinstance(result, GeneratorType):
+99                 try:
+100                     orig_stack_contexts = stack_context._state.contexts
+101                     yielded = next(result)
+102                     if stack_context._state.contexts is not orig_stack_contexts:
+103                         yielded = TracebackFuture()
+104                         yielded.set_exception(
+105                             stack_context.StackContextInconsistentError(
+106                                 'stack_context inconsistency (probably caused '
+107                                 'by yield within a "with StackContext" block)'))
+108                 except (StopIteration, Return) as e:
+109                     future.set_result(_value_from_stopiteration(e))
+110                 except Exception:
+111                     future.set_exc_info(sys.exc_info())
+112                 else:
+113                     _futures_to_runners[future] = Runner(result, future, yielded)
+114                 yielded = None
+115                 try:
+116                     return future
+117                 finally:
+118                     future = None
+119         future.set_result(result)
+120         return future
+121     wrapper.__wrapped__ = wrapped
+122     wrapper.__tornado_coroutine__ = True
+123     return wrapper
+124 def is_coroutine_function(func):
+125     return getattr(func, '__tornado_coroutine__', False)
+126 class Return(Exception):
+127     def __init__(self, value=None):
+128         super(Return, self).__init__()
+129         self.value = value
+130         self.args = (value,)
+131 class WaitIterator(object):
+132     def __init__(self, *args, **kwargs):
+133         if args and kwargs:
+134             raise ValueError(
+135                 "You must provide args or kwargs, not both")
+136         if kwargs:
+137             self._unfinished = dict((f, k) for (k, f) in kwargs.items())
+138             futures = list(kwargs.values())
+139         else:
+140             self._unfinished = dict((f, i) for (i, f) in enumerate(args))
+141             futures = args
+142         self._finished = collections.deque()
+143         self.current_index = self.current_future = None
+144         self._running_future = None
+145         for future in futures:
+146             future.add_done_callback(self._done_callback)
+147     def done(self):
+148         if self._finished or self._unfinished:
+149             return False
+150         self.current_index = self.current_future = None
+151         return True
+152     def next(self):
+153         self._running_future = TracebackFuture()
+154         if self._finished:
+155             self._return_result(self._finished.popleft())
+156         return self._running_future
+157     def _done_callback(self, done):
+158         if self._running_future and not self._running_future.done():
+159             self._return_result(done)
+160         else:
+161             self._finished.append(done)
+162     def _return_result(self, done):
+163         chain_future(done, self._running_future)
+164         self.current_future = done
+165         self.current_index = self._unfinished.pop(done)
+166     def __aiter__(self):
+167         raise self
+168     def __anext__(self):
+169         if self.done():
+170             raise getattr(builtins, 'StopAsyncIteration')()
+171         return self.next()
+172 class YieldPoint(object):
+173     def start(self, runner):
+174         raise NotImplementedError()
+175     def is_ready(self):
+176         raise NotImplementedError()
+177     def get_result(self):
+178         raise NotImplementedError()
+179 class Callback(YieldPoint):
+180     def __init__(self, key):
+181         self.key = key
+182     def start(self, runner):
+183         self.runner = runner
+184         runner.register_callback(self.key)
+185     def is_ready(self):
+186         return True
+187     def get_result(self):
+188         return self.runner.result_callback(self.key)
+189 class Wait(YieldPoint):
+190     def __init__(self, key):
+191         self.key = key
+192     def start(self, runner):
+193         self.runner = runner
+194     def is_ready(self):
+195         return self.runner.is_ready(self.key)
+196     def get_result(self):
+197         return self.runner.pop_result(self.key)
+198 class WaitAll(YieldPoint):
+199     def __init__(self, keys):
+200         self.keys = keys
+201     def start(self, runner):
+202         self.runner = runner
+203     def is_ready(self):
+204         return all(self.runner.is_ready(key) for key in self.keys)
+205     def get_result(self):
+206         return [self.runner.pop_result(key) for key in self.keys]
+207 def Task(func, *args, **kwargs):
+208     future = Future()
+209     def handle_exception(typ, value, tb):
+210         if future.done():
+211             return False
+212         future.set_exc_info((typ, value, tb))
+213         return True
+214     def set_result(result):
+215         if future.done():
+216             return
+217         future.set_result(result)
+218     with stack_context.ExceptionStackContext(handle_exception):
+219         func(*args, callback=_argument_adapter(set_result), **kwargs)
+220     return future
+221 class YieldFuture(YieldPoint):
+222     def __init__(self, future, io_loop=None):
+223         self.future = future
+224         self.io_loop = io_loop or IOLoop.current()
+225     def start(self, runner):
+226         if not self.future.done():
+227             self.runner = runner
+228             self.key = object()
+229             runner.register_callback(self.key)
+230             self.io_loop.add_future(self.future, runner.result_callback(self.key))
+231         else:
+232             self.runner = None
+233             self.result_fn = self.future.result
+234     def is_ready(self):
+235         if self.runner is not None:
+236             return self.runner.is_ready(self.key)
+237         else:
+238             return True
+239     def get_result(self):
+240         if self.runner is not None:
+241             return self.runner.pop_result(self.key).result()
+242         else:
+243             return self.result_fn()
+244 def _contains_yieldpoint(children):
+245     if isinstance(children, dict):
+246         return any(isinstance(i, YieldPoint) for i in children.values())
+247     if isinstance(children, list):
+248         return any(isinstance(i, YieldPoint) for i in children)
+249     return False
+250 def multi(children, quiet_exceptions=()):
+251     if _contains_yieldpoint(children):
+252         return MultiYieldPoint(children, quiet_exceptions=quiet_exceptions)
+253     else:
+254         return multi_future(children, quiet_exceptions=quiet_exceptions)
+255 Multi = multi
+256 class MultiYieldPoint(YieldPoint):
+257     def __init__(self, children, quiet_exceptions=()):
+258         self.keys = None
+259         if isinstance(children, dict):
+260             self.keys = list(children.keys())
+261             children = children.values()
+262         self.children = []
+263         for i in children:
+264             if not isinstance(i, YieldPoint):
+265                 i = convert_yielded(i)
+266             if is_future(i):
+267                 i = YieldFuture(i)
+268             self.children.append(i)
+269         assert all(isinstance(i, YieldPoint) for i in self.children)
+270         self.unfinished_children = set(self.children)
+271         self.quiet_exceptions = quiet_exceptions
+272     def start(self, runner):
+273         for i in self.children:
+274             i.start(runner)
+275     def is_ready(self):
+276         finished = list(itertools.takewhile(
+277             lambda i: i.is_ready(), self.unfinished_children))
+278         self.unfinished_children.difference_update(finished)
+279         return not self.unfinished_children
+280     def get_result(self):
+281         result_list = []
+282         exc_info = None
+283         for f in self.children:
+284             try:
+285                 result_list.append(f.get_result())
+286             except Exception as e:
+287                 if exc_info is None:
+288                     exc_info = sys.exc_info()
+289                 else:
+290                     if not isinstance(e, self.quiet_exceptions):
+291                         app_log.error("Multiple exceptions in yield list",
+292                                       exc_info=True)
+293         if exc_info is not None:
+294             raise_exc_info(exc_info)
+295         if self.keys is not None:
+296             return dict(zip(self.keys, result_list))
+297         else:
+298             return list(result_list)
+299 def multi_future(children, quiet_exceptions=()):
+300     if isinstance(children, dict):
+301         keys = list(children.keys())
+302         children = children.values()
+303     else:
+304         keys = None
+305     children = list(map(convert_yielded, children))
+306     assert all(is_future(i) for i in children)
+307     unfinished_children = set(children)
+308     future = Future()
+309     if not children:
+310         future.set_result({} if keys is not None else [])
+311     def callback(f):
+312         unfinished_children.remove(f)
+313         if not unfinished_children:
+314             result_list = []
+315             for f in children:
+316                 try:
+317                     result_list.append(f.result())
+318                 except Exception as e:
+319                     if future.done():
+320                         if not isinstance(e, quiet_exceptions):
+321                             app_log.error("Multiple exceptions in yield list",
+322                                           exc_info=True)
+323                     else:
+324                         future.set_exc_info(sys.exc_info())
+325             if not future.done():
+326                 if keys is not None:
+327                     future.set_result(dict(zip(keys, result_list)))
+328                 else:
+329                     future.set_result(result_list)
+330     listening = set()
+331     for f in children:
+332         if f not in listening:
+333             listening.add(f)
+334             f.add_done_callback(callback)
+335     return future
+336 def maybe_future(x):
+337     if is_future(x):
+338         return x
+339     else:
+340         fut = Future()
+341         fut.set_result(x)
+342         return fut
+343 def with_timeout(timeout, future, io_loop=None, quiet_exceptions=()):
+344     future = convert_yielded(future)
+345     result = Future()
+346     chain_future(future, result)
+347     if io_loop is None:
+348         io_loop = IOLoop.current()
+349     def error_callback(future):
+350         try:
+351             future.result()
+352         except Exception as e:
+353             if not isinstance(e, quiet_exceptions):
+354                 app_log.error("Exception in Future %r after timeout",
+355                               future, exc_info=True)
+356     def timeout_callback():
+357         result.set_exception(TimeoutError("Timeout"))
+358         future.add_done_callback(error_callback)
+359     timeout_handle = io_loop.add_timeout(
+360         timeout, timeout_callback)
+361     if isinstance(future, Future):
+362         future.add_done_callback(
+363             lambda future: io_loop.remove_timeout(timeout_handle))
+364     else:
+365         io_loop.add_future(
+366             future, lambda future: io_loop.remove_timeout(timeout_handle))
+367     return result
+368 def sleep(duration):
+369     f = Future()
+370     IOLoop.current().call_later(duration, lambda: f.set_result(None))
+371     return f
+372 _null_future = Future()
+373 _null_future.set_result(None)
+374 moment = Future()
+375 moment.__doc__ = \
+376 moment.set_result(None)
+377 class Runner(object):
+378     def __init__(self, gen, result_future, first_yielded):
+379         self<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.gen = gen
+380         self.result_future = result_future
+381         self.future = _null_future
+382         self.yield_point = None
+383         self.pending_callbacks = None
+384         self.results =</b></font> None
+385         self.running = False
+386         self.finished = False
+387         self.had_exception = False
+388         self.io_loop = IOLoop.current()
+389         self.stack_context_deactivate = None
+390         if self.handle_yield(first_yielded):
+391             gen = result_future = first_yielded = None
+392             self.run()
+393     def register_callback(self, key):
+394         if self.pending_callbacks is None:
+395             self.pending_callbacks = set()
+396             self.results = {}
+397         if key in self.pending_callbacks:
+398             raise KeyReuseError("key %r is already pending" % (key,))
+399         self.pending_callbacks.add(key)
+400     def is_ready(self, key):
+401         if self.pending_callbacks is None or key not in self.pending_callbacks:
+402             raise UnknownKeyError("key %r is not pending" % (key,))
+403         return key in self.results
+404     def set_result(self, key, result):
+405         self.results[key] = result
+406         if self.yield_point is not None and self.yield_point.is_ready():
+407             try:
+408                 self.future.set_result(self.yield_point.get_result())
+409             except:
+410                 self.future.set_exc_info(sys.exc_info())
+411             self.yield_point = None
+412             self.run()
+413     def pop_result(self, key):
+414         self.pending_callbacks.remove(key)
+415         return self.results.pop(key)
+416     def run(self):
+417         if self.running or self.finished:
+418             return
+419         try:
+420             self.running = True
+421             while True:
+422                 future = self.future
+423                 if not future.done():
+424                     return
+425                 self.future = None
+426                 try:
+427                     orig_stack_contexts = stack_context._state.contexts
+428                     exc_info = None
+429                     try:
+430                         value = future.result()
+431                     except Exception:
+432                         self.had_exception = True
+433                         exc_info = sys.exc_info()
+434                     future = None
+435                     if exc_info is not None:
+436                         try:
+437                             yielded = self.gen.throw(*exc_info)
+438                         finally:
+439                             exc_info = None
+440                     else:
+441                         yielded = self.gen.send(value)
+442                     if stack_context._state.contexts is not orig_stack_contexts:
+443                         self.gen.throw(
+444                             stack_context.StackContextInconsistentError(
+445                                 'stack_context inconsistency (probably caused '
+446                                 'by yield within a "with StackContext" block)'))
+447                 except (StopIteration, Return) as e:
+448                     self.finished = True
+449                     self.future = _null_future
+450                     if self.pending_callbacks and not self.had_exception:
+451                         raise LeakedCallbackError(
+452                             "finished without waiting for callbacks %r" %
+453                             self.pending_callbacks)
+454                     self.result_future.set_result(_value_from_stopiteration(e))
+455                     self.result_future = None
+456                     self._deactivate_stack_context()
+457                     return
+458                 except Exception:
+459                     self.finished = True
+460                     self.future = _null_future
+461                     self.result_future.set_exc_info(sys.exc_info())
+462                     self.result_future = None
+463                     self._deactivate_stack_context()
+464                     return
+465                 if not self.handle_yield(yielded):
+466                     return
+467                 yielded = None
+468         finally:
+469             self.running = False
+470     def handle_yield(self, yielded):
+471         if _contains_yieldpoint(yielded):
+472             yielded = multi(yielded)
+473         if isinstance(yielded, YieldPoint):
+474             self.future = TracebackFuture()
+475             def start_yield_point():
+476                 try:
+477                     yielded.start(self)
+478                     if yielded.is_ready():
+479                         self.future.set_result(
+480                             yielded.get_result())
+481                     else:
+482                         self.yield_point = yielded
+483                 except Exception:
+484                     self.future = TracebackFuture()
+485                     self.future.set_exc_info(sys.exc_info())
+486             if self.stack_context_deactivate is None:
+487                 with stack_context.ExceptionStackContext(
+488                         self.handle_exception) as deactivate:
+489                     self.stack_context_deactivate = deactivate
+490                     def cb():
+491                         start_yield_point()
+492                         self.run()
+493                     self.io_loop.add_callback(cb)
+494                     return False
+495             else:
+496                 start_yield_point()
+497         else:
+498             try:
+499                 self.future = convert_yielded(yielded)
+500             except BadYieldError:
+501                 self.future = TracebackFuture()
+502                 self.future.set_exc_info(sys.exc_info())
+503         if not self.future.done() or self.future is moment:
+504             def inner(f):
+505                 f = None # noqa
+506                 self.run()
+507             self.io_loop.add_future(
+508                 self.future, inner)
+509             return False
+510         return True
+511     def result_callback(self, key):
+512         return stack_context.wrap(_argument_adapter(
+513             functools.partial(self.set_result, key)))
+514     def handle_exception(self, typ, value, tb):
+515         if not self.running and not self.finished:
+516             self.future = TracebackFuture()
+517             self.future.set_exc_info((typ, value, tb))
+518             self.run()
+519             return True
+520         else:
+521             return False
+522     def _deactivate_stack_context(self):
+523         if self.stack_context_deactivate is not None:
+524             self.stack_context_deactivate()
+525             self.stack_context_deactivate = None
+526 Arguments = collections.namedtuple('Arguments', ['args', 'kwargs'])
+527 def _argument_adapter(callback):
+528     def wrapper(*args, **kwargs):
+529         if kwargs or len(args) &gt; 1:
+530             callback(Arguments(args, kwargs))
+531         elif args:
+532             callback(args[0])
+533         else:
+534             callback(None)
+535     return wrapper
+536 if sys.version_info &gt;= (3, 3):
+537     exec(textwrap.dedent("""
+538     @coroutine
+539     def _wrap_awaitable(x):
+540         if hasattr(x, '__await__'):
+541             x = x.__await__()
+542         return (yield from x)
+543     The default implementation accepts lists, dictionaries, and Futures.
+544     If the `~functools.singledispatch` library is available, this function
+545     may be extended to support additional types. For example::
+546         @convert_yielded.register(asyncio.Future)
+547         def _(asyncio_future):
+548             return tornado.platform.asyncio.to_tornado_future(asyncio_future)
+549     .. versionadded:: 4.1
+550 Set up the version of Salt
+551     Handle SaltStack versions class.
+552     Knows how to parse ``git describe`` output, knows about release candidates
+553     and also supports version comparison.
+554     """
+555         self<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.major = major
+556         self.minor = minor
+557         self.bugfix = bugfix
+558         self.mbugfix = mbugfix
+559         self.pre_type = pre_type
+560         self.pre_num =</b></font> pre_num
+561         if self.new_version(major):
+562             vnames_key = (major,)
+563         else:
+564             vnames_key = (major, minor)
+565         self.name = self.VNAMES.get(vnames_key)
+566         self.noc = noc
+567         self.sha = sha
+568     def new_version(self, major):
+569         """
+570         determine if using new versioning scheme
+571         """
+572         return bool(int(major) &gt;= 3000 and int(major) &lt; VERSION_LIMIT)
+573     @classmethod
+574     def parse(cls, version_string):
+575         if version_string.lower() in cls.LNAMES:
+576             return cls.from_name(version_string)
+577         vstr = (
+578             version_string.decode()
+579             if isinstance(version_string, bytes)
+580             else version_string
+581         )
+582         match = cls.git_describe_regex.match(vstr)
+583         if not match:
+584             raise ValueError(
+585                 "Unable to parse version string: '{}'".format(version_string)
+586             )
+587         return cls(*match.groups())
+588     @classmethod
+589     def from_name(cls, name):
+590         if name.lower() not in cls.LNAMES:
+591             raise ValueError("Named version '{}' is not known".format(name))
+592         return cls(*cls.LNAMES[name.lower()])
+593     @classmethod
+594     def from_last_named_version(cls):
+595         import salt.utils.versions
+596         salt.utils.versions.warn_until(
+597             SaltVersionsInfo.SULFUR,
+598             "The use of SaltStackVersion.from_last_named_version() is "
+599             "deprecated and set to be removed in {version}. Please use "
+600             "SaltStackVersion.current_release() instead.",
+601         )
+602         return cls.current_release()
+603     @classmethod
+604     def current_release(cls):
+605         return cls(*SaltVersionsInfo.current_release().info)
+606     @classmethod
+607     def next_release(cls):
+608         return cls(*SaltVersionsInfo.next_release().info)
+609     @property
+610     def sse(self):
+611         return 0 &lt; self.major &lt; 2014
+612     def min_info(self):
+613         info = [self.major]
+614         if self.new_version(self.major):
+615             if self.minor:
+616                 info.append(self.minor)
+617         else:
+618             info.extend([self.minor, self.bugfix, self.mbugfix])
+619         return info
+620     @property
+621     def info(self):
+622         return tuple(self.min_info())
+623     @property
+624     def pre_info(self):
+625         info = self.min_info()
+626         info.extend([self.pre_type, self.pre_num])
+627         return tuple(info)
+628     @property
+629     def noc_info(self):
+630         info = self.min_info()
+631         info.extend([self.pre_type, self.pre_num, self.noc])
+632         return tuple(info)
+633     @property
+634     def full_info(self):
+635         info = self.min_info()
+636         info.extend([self.pre_type, self.pre_num, self.noc, self.sha])
+637         return tuple(info)
+638     @property
+639     def full_info_all_versions(self):
+640         """
+641         Return the full info regardless
+642         of which versioning scheme we
+643         are using.
+644         """
+645         info = [
+646             self.major,
+647             self.minor,
+648             self.bugfix,
+649             self.mbugfix,
+650             self.pre_type,
+651             self.pre_num,
+652             self.noc,
+653             self.sha,
+654         ]
+655         return tuple(info)
+656     @property
+657     def string(self):
+658         if self.new_version(self.major):
+659             version_string = "{}".format(self.major)
+660             if self.minor:
+661                 version_string = "{}.{}".format(self.major, self.minor)
+662         else:
+663             version_string = "{}.{}.{}".format(self.major, self.minor, self.bugfix)
+664         if self.mbugfix:
+665             version_string += ".{}".format(self.mbugfix)
+666         if self.pre_type:
+667             version_string += "{}{}".format(self.pre_type, self.pre_num)
+668         if self.noc and self.sha:
+669             noc = self.noc
+670             if noc &lt; 0:
+671                 noc = "0na"
+672             version_string += "+{}.{}".format(noc, self.sha)
+673         return version_string
+674     @property
+675     def formatted_version(self):
+676         if self.name and self.major &gt; 10000:
+677             version_string = self.name
+678             if self.sse:
+679                 version_string += " Enterprise"
+680             version_string += " (Unreleased)"
+681             return version_string
+682         version_string = self.string
+683         if self.sse:
+684             version_string += " Enterprise"
+685         if (self.major, self.minor) in self.RMATCH:
+686             version_string += " ({})".format(self.RMATCH[(self.major, self.minor)])
+687         return version_string
+688     @property
+689     def pre_index(self):
+690         if self.new_version(self.major):
+691             pre_type = 2
+692             if not isinstance(self.minor, int):
+693                 pre_type = 1
+694         else:
+695             pre_type = 4
+696         return pre_type
+697     def __str__(self):
+698         return self.string
+699     def __compare__(self, other, method):
+700         if not isinstance(other, SaltStackVersion):
+701             if isinstance(other, str):
+702                 other = SaltStackVersion.parse(other)
+703             elif isinstance(other, (list, tuple)):
+704                 other = SaltStackVersion(*other)
+705             else:
+706                 raise ValueError(
+707                     "Cannot instantiate Version from type '{}'".format(type(other))
+708                 )
+709         pre_type = self.pre_index
+710         other_pre_type = other.pre_index
+711         other_noc_info = list(other.noc_info)
+712         noc_info = list(self.noc_info)
+713         if self.new_version(self.major):
+714             if self.minor and not other.minor:
+715                 if self.minor &gt; 0:
+716                     other_noc_info[1] = 0
+717             if not self.minor and other.minor:
+718                 if other.minor &gt; 0:
+719                     noc_info[1] = 0
+720         if self.pre_type and not other.pre_type:
+721             other_noc_info[other_pre_type] = "zzzzz"
+722         if not self.pre_type and other.pre_type:
+723             noc_info[pre_type] = "zzzzz"
+724         return method(tuple(noc_info), tuple(other_noc_info))
+725     def __lt__(self, other):
+726         return self.__compare__(other, lambda _self, _other: _self &lt; _other)
+727     def __le__(self, other):
+728         return self.__compare__(other, lambda _self, _other: _self &lt;= _other)
+729     def __eq__(self, other):
+730         return self.__compare__(other, lambda _self, _other: _self == _other)
+731     def __ne__(self, other):
+732         return self.__compare__(other, lambda _self, _other: _self != _other)
+733     def __ge__(self, other):
+734         return self.__compare__(other, lambda _self, _other: _self &gt;= _other)
+735     def __gt__(self, other):
+736         return self.__compare__(other, lambda _self, _other: _self &gt; _other)
+737     def __repr__(self):
+738         parts = []
+739         if self.name:
+740             parts.append("name='{}'".format(self.name))
+741         parts.extend(["major={}".format(self.major), "minor={}".format(self.minor)])
+742         if self.new_version(self.major):
+743             if not self.minor:
+744                 parts.remove("".join([x for x in parts if re.search("^minor*", x)]))
+745         else:
+746             parts.extend(["bugfix={}".format(self.bugfix)])
+747         if self.mbugfix:
+748             parts.append("minor-bugfix={}".format(self.mbugfix))
+749         if self.pre_type:
+750             parts.append("{}={}".format(self.pre_type, self.pre_num))
+751         noc = self.noc
+752         if noc == -1:
+753             noc = "0na"
+754         if noc and self.sha:
+755             parts.extend(["noc={}".format(noc), "sha={}".format(self.sha)])
+756         return "&lt;{} {}&gt;".format(self.__class__.__name__, " ".join(parts))
+757 __saltstack_version__ = SaltStackVersion.current_release()
+758 def __discover_version(saltstack_version):
+759     import os
+760     import subprocess
+761     if "SETUP_DIRNAME" in globals():
+762         cwd = SETUP_DIRNAME  # pylint: disable=E0602
+763         if not os.path.exists(os.path.join(cwd, ".git")):
+764             return saltstack_version
+765     else:
+766         cwd = os.path.abspath(os.path.dirname(__file__))
+767         if not os.path.exists(os.path.join(os.path.dirname(cwd), ".git")):
+768             return saltstack_version
+769     try:
+770         kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
+771         if not sys.platform.startswith("win"):
+772             kwargs["close_fds"] = True
+773         process = subprocess.Popen(
+774             [
+775                 "git",
+776                 "describe",
+777                 "--tags",
+778                 "--long",
+779                 "--match",
+780                 "v[0-9]*",
+781                 "--always",
+782             ],
+783             **kwargs
+784         )
+785         out, err = process.communicate()
+786         out = out.decode().strip()
+787         err = err.decode().strip()
+788         if not out or err:
+789             return saltstack_version
+790         if SaltStackVersion.git_sha_regex.match(out):
+791             saltstack_version.sha = out.strip()
+792             saltstack_version.noc = -1
+793             return saltstack_version
+794         return SaltStackVersion.parse(out)
+795     except OSError as os_err:
+796         if os_err.errno != 2:
+797             raise
+798     return saltstack_version
+799 def __get_version(saltstack_version):
+800     """
+801     If we can get a version provided at installation time or from Git, use
+802     that instead, otherwise we carry on.
+803     """
+804     try:
+805         from salt._version import __saltstack_version__  # pylint: disable=E0611,F0401
+806         return __saltstack_version__
+807     except ImportError:
+808         return __discover_version(saltstack_version)
+809 __saltstack_version__ = __get_version(__saltstack_version__)
+810 if __saltstack_version__.name:
+811     SaltVersionsInfo._current_release = getattr(
+812         SaltVersionsInfo, __saltstack_version__.name.upper()
+813     )
+814 del __get_version
+815 __version_info__ = __saltstack_version__.info
+816 __version__ = __saltstack_version__.string
+817 def salt_information():
+818     """
+819     Report version of salt.
+820     """
+821     yield "Salt", __version__
+822 def dependency_information(include_salt_cloud=False):
+823     """
+824     Report versions of library dependencies.
+825     """
+826     libs = [
+827         ("Python", None, sys.version.rsplit("\n")[0].strip()),
+828         ("Jinja2", "jinja2", "__version__"),
+829         ("M2Crypto", "M2Crypto", "version"),
+830         ("msgpack", "msgpack", "version"),
+831         ("msgpack-pure", "msgpack_pure", "version"),
+832         ("pycrypto", "Crypto", "__version__"),
+833         ("pycryptodome", "Cryptodome", "version_info"),
+834         ("PyYAML", "yaml", "__version__"),
+835         ("PyZMQ", "zmq", "__version__"),
+836         ("ZMQ", "zmq", "zmq_version"),
+837         ("Mako", "mako", "__version__"),
+838         ("Tornado", "tornado", "version"),
+839         ("timelib", "timelib", "version"),
+840         ("dateutil", "dateutil", "__version__"),
+841         ("pygit2", "pygit2", "__version__"),
+842         ("libgit2", "pygit2", "LIBGIT2_VERSION"),
+843         ("smmap", "smmap", "__version__"),
+844         ("cffi", "cffi", "__version__"),
+845         ("pycparser", "pycparser", "__version__"),
+846         ("gitdb", "gitdb", "__version__"),
+847         ("gitpython", "git", "__version__"),
+848         ("python-gnupg", "gnupg", "__version__"),
+849         ("mysql-python", "MySQLdb", "__version__"),
+850         ("cherrypy", "cherrypy", "__version__"),
+851         ("docker-py", "docker", "__version__"),
+852     ]
+853     if include_salt_cloud:
+854         libs.append(
+855             ("Apache Libcloud", "libcloud", "__version__"),
+856         )
+857     for name, imp, attr in libs:
+858         if imp is None:
+859             yield name, attr
+860             continue
+861         try:
+862             imp = __import__(imp)
+863             version = getattr(imp, attr)
+864             if callable(version):
+865                 version = version()
+866             if isinstance(version, (tuple, list)):
+867                 version = ".".join(map(str, version))
+868             yield name, version
+869         except Exception:  # pylint: disable=broad-except
+870             yield name, None
+871 def system_information():
+872     """
+873     Report system versions.
+874     """
+875     from distro import linux_distribution
+876     def system_version():
+877         """
+878         Return host system version.
+879         """
+880         lin_ver = linux_distribution()
+881         mac_ver = platform.mac_ver()
+882         win_ver = platform.win32_ver()
+883         if mac_ver[0]:
+884             if isinstance(mac_ver[1], (tuple, list)) and "".join(mac_ver[1]):
+885                 return " ".join([mac_ver[0], ".".join(mac_ver[1]), mac_ver[2]])
+886             else:
+887                 return " ".join([mac_ver[0], mac_ver[2]])
+888         elif win_ver[0]:
+889             return " ".join(win_ver)
+890         elif lin_ver[0]:
+891             return " ".join(lin_ver)
+892         else:
+893             return ""
+894     if platform.win32_ver()[0]:
+895         import win32api  # pylint: disable=3rd-party-module-not-gated
+896         import win32con  # pylint: disable=3rd-party-module-not-gated
+897         hkey = win32con.HKEY_LOCAL_MACHINE
+898         key = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
+899         value_name = "ProductName"
+900         reg_handle = win32api.RegOpenKey(hkey, key)
+901         product_name, _ = win32api.RegQueryValueEx(reg_handle, value_name)
+902         version = "Unknown"
+903         release = ""
+904         if "Server" in product_name:
+905             for item in product_name.split(" "):
+906                 if re.match(r"\d+", item):
+907                     version = item
+908                 if re.match(r"^R\d+$", item):
+909                     release = item
+910             release = "{}Server{}".format(version, release)
+911         else:
+912             for item in product_name.split(" "):
+913                 if re.match(r"^(\d+(\.\d+)?)|Thin|Vista$", item):
+914                     version = item
+915             release = version
+916         _, ver, service_pack, extra = platform.win32_ver()
+917         version = " ".join([release, ver, service_pack, extra])
+918     else:
+919         version = system_version()
+920         release = platform.release()
+921     system = [
+922         ("system", platform.system()),
+923         ("dist", " ".join(linux_distribution(full_distribution_name=False))),
+924         ("release", release),
+925         ("machine", platform.machine()),
+926         ("version", version),
+927         ("locale", __salt_system_encoding__),
+928     ]
+929     for name, attr in system:
+930         yield name, attr
+931         continue
+932 def extensions_information():
+933     """
+934     Gather infomation about any installed salt extensions
+935     """
+936     import salt.utils.entrypoints
+937     extensions = {}
+938     for entry_point in salt.utils.entrypoints.iter_entry_points("salt.loader"):
+939         dist_nv = salt.utils.entrypoints.name_and_version_from_entry_point(entry_point)
+940         if not dist_nv:
+941             continue
+942         if dist_nv.name in extensions:
+943             continue
+944         extensions[dist_nv.name] = dist_nv.version
+945     return extensions
+946 def versions_information(include_salt_cloud=False, include_extensions=True):
+947     """
+948     Report the versions of dependent software.
+949     """
+950     salt_info = list(salt_information())
+951     lib_info = list(dependency_information(include_salt_cloud))
+952     sys_info = list(system_information())
+953     info = {
+954         "Salt Version": dict(salt_info),
+955         "Dependency Versions": dict(lib_info),
+956         "System Versions": dict(sys_info),
+957     }
+958     if include_extensions:
+959         extensions_info = extensions_information()
+960         if extensions_info:
+961             info["Salt Extensions"] = extensions_info
+962     return info
+963 def versions_report(include_salt_cloud=False, include_extensions=True):
+964     """
+965     Yield each version properly formatted for console output.
+966     """
+967     ver_info = versions_information(
+968         include_salt_cloud=include_salt_cloud, include_extensions=include_extensions
+969     )
+970     not_installed = "Not Installed"
+971     ns_pad = len(not_installed)
+972     lib_pad = max(len(name) for name in ver_info["Dependency Versions"])
+973     sys_pad = max(len(name) for name in ver_info["System Versions"])
+974     if include_extensions and "Salt Extensions" in ver_info:
+975         ext_pad = max(len(name) for name in ver_info["Salt Extensions"])
+976     else:
+977         ext_pad = 1
+978     padding = max(lib_pad, sys_pad, ns_pad, ext_pad) + 1
+979     fmt = "{0:&gt;{pad}}: {1}"
+980     info = []
+981     for ver_type in (
+982         "Salt Version",
+983         "Dependency Versions",
+984         "Salt Extensions",
+985         "System Versions",
+986     ):
+987         if ver_type == "Salt Extensions" and ver_type not in ver_info:
+988             continue
+989         info.append("{}:".format(ver_type))
+990         for name in sorted(ver_info[ver_type], key=lambda x: x.lower()):
+991             ver = fmt.format(
+992                 name, ver_info[ver_type][name] or not_installed, pad=padding
+993             )
+994             info.append(ver)
+995         info.append(" ")
+996     yield from info
+997 if __name__ == "__main__":
+998     print(__version__)
 </pre>
 </div>
 </div>
