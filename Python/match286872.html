@@ -40,1289 +40,1289 @@ Matches for mysql_2.py &amp; csf_1.py
 </h3>
 <hr/>
 <pre>
-import copy
-import hashlib
-import logging
-import os
-import re
-import shlex
-import sys
-import time
-import salt.utils.data
-import salt.utils.files
-import salt.utils.stringutils
-try:
-    import MySQLdb
-    import MySQLdb.cursors
-    import MySQLdb.converters
-    from MySQLdb.constants import FIELD_TYPE, FLAG, CLIENT
-    from MySQLdb import OperationalError
-except ImportError:
-    try:
-        import pymysql
-        pymysql.install_as_MySQLdb()
-        import MySQLdb
-        import MySQLdb.cursors
-        import MySQLdb.converters
-        from MySQLdb.constants import FIELD_TYPE, FLAG, CLIENT
-        from MySQLdb import OperationalError
-    except ImportError:
-        MySQLdb = None
-try:
-    import sqlparse
-    HAS_SQLPARSE = True
-except ImportError:
-    HAS_SQLPARSE = False
-log = logging.getLogger(__name__)
-__opts__ = {}
-__grants__ = [
-    "ALL PRIVILEGES",
-    "ALTER",
-    "ALTER ROUTINE",
-    "BACKUP_ADMIN",
-    "BINLOG_ADMIN",
-    "CONNECTION_ADMIN",
-    "CREATE",
-    "CREATE ROLE",
-    "CREATE ROUTINE",
-    "CREATE TABLESPACE",
-    "CREATE TEMPORARY TABLES",
-    "CREATE USER",
-    "CREATE VIEW",
-    "DELETE",
-    "DROP",
-    "DROP ROLE",
-    "ENCRYPTION_KEY_ADMIN",
-    "EVENT",
-    "EXECUTE",
-    "FILE",
-    "GRANT OPTION",
-    "GROUP_REPLICATION_ADMIN",
-    "INDEX",
-    "INSERT",
-    "LOCK TABLES",
-    "PERSIST_RO_VARIABLES_ADMIN",
-    "PROCESS",
-    "REFERENCES",
-    "RELOAD",
-    "REPLICATION CLIENT",
-    "REPLICATION SLAVE",
-    "REPLICATION_SLAVE_ADMIN",
-    "RESOURCE_GROUP_ADMIN",
-    "RESOURCE_GROUP_USER",
-    "ROLE_ADMIN",
-    "SELECT",
-    "SET_USER_ID",
-    "SHOW DATABASES",
-    "SHOW VIEW",
-    "SHUTDOWN",
-    "SLAVE MONITOR",
-    "SUPER",
-    "SYSTEM_VARIABLES_ADMIN",
-    "TRIGGER",
-    "UPDATE",
-    "USAGE",
-    "XA_RECOVER_ADMIN",
-]
-__ssl_options_parameterized__ = ["CIPHER", "ISSUER", "SUBJECT"]
-__ssl_options__ = __ssl_options_parameterized__ + ["SSL", "X509"]
-__all_privileges__ = [
-    "ALTER",
-    "ALTER ROUTINE",
-    "BACKUP_ADMIN",
-    "BINLOG_ADMIN",
-    "CONNECTION_ADMIN",
-    "CREATE",
-    "CREATE ROLE",
-    "CREATE ROUTINE",
-    "CREATE TABLESPACE",
-    "CREATE TEMPORARY TABLES",
-    "CREATE USER",
-    "CREATE VIEW",
-    "DELETE",
-    "DROP",
-    "DROP ROLE",
-    "ENCRYPTION_KEY_ADMIN",
-    "EVENT",
-    "EXECUTE",
-    "FILE",
-    "GROUP_REPLICATION_ADMIN",
-    "INDEX",
-    "INSERT",
-    "LOCK TABLES",
-    "PERSIST_RO_VARIABLES_ADMIN",
-    "PROCESS",
-    "REFERENCES",
-    "RELOAD",
-    "REPLICATION CLIENT",
-    "REPLICATION SLAVE",
-    "REPLICATION_SLAVE_ADMIN",
-    "RESOURCE_GROUP_ADMIN",
-    "RESOURCE_GROUP_USER",
-    "ROLE_ADMIN",
-    "SELECT",
-    "SET_USER_ID",
-    "SHOW DATABASES",
-    "SHOW VIEW",
-    "SHUTDOWN",
-    "SUPER",
-    "SYSTEM_VARIABLES_ADMIN",
-    "TRIGGER",
-    "UPDATE",
-    "XA_RECOVER_ADMIN",
-]
-r'''
-DEVELOPER NOTE: ABOUT arguments management, escapes, formats, arguments and
-security of SQL.
-A general rule of SQL security is to use queries with _execute call in this
-code using args parameter to let MySQLdb manage the arguments proper escaping.
-Another way of escaping values arguments could be '{0!r}'.format(), using
-__repr__ to ensure things get properly used as strings. But this could lead
-to three problems:
- * In ANSI mode, which is available on MySQL, but not by default, double
-quotes " should not be used as a string delimiters, in ANSI mode this is an
-identifier delimiter (like `).
- * Some rare exploits with bad multibytes management, either on python or
-MySQL could defeat this barrier, bindings internal escape functions
-should manage theses cases.
- * Unicode strings in Python 2 will include the 'u' before the repr'ed string,
-   like so:
-    Python 2.7.10 (default, May 26 2015, 04:16:29)
-    [GCC 5.1.0] on linux2
-    Type "help", "copyright", "credits" or "license" for more information.
-    &gt;&gt;&gt; u'something something {0!r}'.format(u'foo')
-    u"something something u'foo'"
-So query with arguments should use a paramstyle defined in PEP249:
-http://www.python.org/dev/peps/pep-0249/#paramstyle
-We use pyformat, which means 'SELECT * FROM foo WHERE bar=%(myval)s'
-used with {'myval': 'some user input'}
-So far so good. But this cannot be used for identifier escapes. Identifiers
-are database names, table names and column names. Theses names are not values
-and do not follow the same escape rules (see quote_identifier function for
-details on `_ and % escape policies on identifiers). Using value escaping on
-identifier could fool the SQL engine (badly escaping quotes and not doubling
-` characters. So for identifiers a call to quote_identifier should be done and
-theses identifiers should then be added in strings with format, but without
-__repr__ filter.
-Note also that when using query with arguments in _execute all '%' characters
-used in the query should get escaped to '%%' fo MySQLdb, but should not be
-escaped if the query runs without arguments. This is managed by _execute() and
-quote_identifier. This is not the same as escaping '%' to '\%' or '_' to '\%'
-when using a LIKE query (example in db_exists), as this escape is there to
-avoid having _ or % characters interpreted in LIKE queries. The string parted
-of the first query could become (still used with args dictionary for myval):
-'SELECT * FROM {0} WHERE bar=%(myval)s'.format(quote_identifier('user input'))
-Check integration tests if you find a hole in theses strings and escapes rules
-Finally some examples to sum up.
-Given a name f_o%o`b'a"r, in python that would be """f_o%o`b'a"r""". I'll
-avoid python syntax for clarity:
-The MySQL way of writing this name is:
-value                         : 'f_o%o`b\'a"r' (managed by MySQLdb)
-identifier                    : `f_o%o``b'a"r`
-db identifier in general GRANT: `f\_o\%o``b'a"r`
-db identifier in table GRANT  : `f_o%o``b'a"r`
-in mySQLdb, query with args   : `f_o%%o``b'a"r` (as identifier)
-in mySQLdb, query without args: `f_o%o``b'a"r` (as identifier)
-value in a LIKE query         : 'f\_o\%o`b\'a"r' (quotes managed by MySQLdb)
-And theses could be mixed, in a like query value with args: 'f\_o\%%o`b\'a"r'
-    log<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.debug(results)
-    return results
-def _mysql_user_exists(
-    user,
-    host="localhost",
-    password=None,
-    password_hash=None,
-    passwordless=False,
-    unix_socket=False,
-    password_column=None,
-    auth_plugin=</b></font>"mysql_native_password",
-    **connection_args
-):
-    server_version = salt.utils.data.decode(version(**connection_args))
-    compare_version = "8.0.11"
-    qry = "SELECT User,Host FROM mysql.user WHERE User = %(user)s AND Host = %(host)s"
-    args = {}
-    args["user"] = user
-    args["host"] = host
-    if salt.utils.data.is_true(passwordless):
-        if salt.utils.data.is_true(unix_socket):
-            qry += " AND plugin=%(unix_socket)s"
-            args["unix_socket"] = "auth_socket"
-        else:
-            qry += " AND " + password_column + " = ''"
-    elif password:
-        if salt.utils.versions.version_cmp(server_version, compare_version) &gt;= 0:
-            if auth_plugin == "mysql_native_password":
-                _password = __mysql_hash_password(str(password))
-                qry += " AND " + password_column + " = %(password)s"
-                args["password"] = str(_password)
-            else:
-                err = "Unable to verify password."
-                log.error(err)
-                __context__["mysql.error"] = err
-        else:
-            qry += " AND " + password_column + " = PASSWORD(%(password)s)"
-            args["password"] = str(password)
-    elif password_hash:
-        qry += " AND " + password_column + " = %(password)s"
-        args["password"] = password_hash
-    return qry, args
-def _mariadb_user_exists(
-    user,
-    host="localhost",
-    password=None,
-    password_hash=None,
-    passwordless=False,
-    unix_socket=False,
-    password_column=None,
-    auth_plugin="mysql_native_password",
-    **connection_args
-):
-    qry = "SELECT User,Host FROM mysql.user WHERE User = %(user)s AND Host = %(host)s"
-    args = {}
-    args["user"] = user
-    args["host"] = host
-    if salt.utils.data.is_true(passwordless):
-        if salt.utils.data.is_true(unix_socket):
-            qry += " AND plugin=%(unix_socket)s"
-            args["unix_socket"] = "unix_socket"
-        else:
-            qry += " AND " + password_column + " = ''"
-    elif password:
-        qry += " AND " + password_column + " = PASSWORD(%(password)s)"
-        args["password"] = str(password)
-    elif password_hash:
-        qry += " AND " + password_column + " = %(password)s"
-        args["password"] = password_hash
-    return qry, args
-def user_exists(
-    user,
-    host="localhost",
-    password=None,
-    password_hash=None,
-    passwordless=False,
-    unix_socket=False,
-    password_column=None,
-    **connection_args
-):
-    run_verify = False
-    server_version = salt.utils.data.decode(version(**connection_args))
-    if not server_version and password:
-        __context__["mysql.error"] = None
-        connection_args["connection_pass"] = password
-        server_version = salt.utils.data.decode(version(**connection_args))
-        if not server_version:
-            last_err = __context__["mysql.error"]
-            err = (
-                "MySQL Error: Unable to fetch current server version. Last error was:"
-                ' "{}"'.format(last_err)
-            )
-            log.error(err)
-            return False
-    dbc = _connect(**connection_args)
-    if (
-        dbc is None
-        and __context__["mysql.error"].startswith(
-            "MySQL Error 1045: Access denied for user '{}'@".format(user)
-        )
-        and password
-    ):
-        __context__["mysql.error"] = None
-        connection_args["connection_pass"] = password
-        dbc = _connect(**connection_args)
-    if dbc is None:
-        return False
-    if not password_column:
-        password_column = __password_column(**connection_args)
-    auth_plugin = __get_auth_plugin(user, host, **connection_args)
-    cur = dbc.cursor()
-    if "MariaDB" in server_version:
-        qry, args = _mariadb_user_exists(
-            user,
-            host,
-            password,
-            password_hash,
-            passwordless,
-            unix_socket,
-            password_column=password_column,
-            auth_plugin=auth_plugin,
-            **connection_args
-        )
-    else:
-        qry, args = _mysql_user_exists(
-            user,
-            host,
-            password,
-            password_hash,
-            passwordless,
-            unix_socket,
-            password_column=password_column,
-            auth_plugin=auth_plugin,
-            **connection_args
-        )
-    try:
-        _execute(cur, qry, args)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return False
-    return cur.rowcount == 1
-def user_info(user, host="localhost", **connection_args):
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return False
-    cur = dbc.cursor(MySQLdb.cursors.DictCursor)
-    qry = "SELECT * FROM mysql.user WHERE User = %(user)s AND Host = %(host)s"
-    args = {}
-    args["user"] = user
-    args["host"] = host
-    try:
-        _execute(cur, qry, args)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return False
-    result = cur.fetchone()
-    log.debug(result)
-    return result
-def _mysql_user_create(
-    user,
-    host="localhost",
-    password=None,
-    password_hash=None,
-    allow_passwordless=False,
-    unix_socket=False,
-    password_column=None,
-    auth_plugin="mysql_native_password",
-    **connection_args
-):
-    server_version = salt.utils.data.decode(version(**connection_args))
-    compare_version = "8.0.11"
-    qry = "CREATE USER %(user)s@%(host)s"
-    args = {}
-    args["user"] = user
-    args["host"] = host
-    if unix_socket:
-        if not plugin_status("auth_socket", **connection_args):
-            err = "The auth_socket plugin is not enabled."
-            log.error(err)
-            __context__["mysql.error"] = err
-            qry = False
-        else:
-            if host == "localhost":
-                qry += " IDENTIFIED WITH auth_socket"
-            else:
-                log.error("Auth via unix_socket can be set only for host=localhost")
-                __context__["mysql.error"] = err
-                qry = False
-    else:
-        if not salt.utils.data.is_true(allow_passwordless):
-            if password is not None:
-                if (
-                    salt.utils.versions.version_cmp(server_version, compare_version)
-                    &gt;= 0
-                ):
-                    args["auth_plugin"] = auth_plugin
-                    qry += " IDENTIFIED WITH %(auth_plugin)s BY %(password)s"
-                else:
-                    qry += " IDENTIFIED BY %(password)s"
-                args["password"] = str(password)
-            elif password_hash is not None:
-                if (
-                    salt.utils.versions.version_cmp(server_version, compare_version)
-                    &gt;= 0
-                ):
-                    args["auth_plugin"] = auth_plugin
-                    qry += " IDENTIFIED WITH %(auth_plugin)s AS %(password)s"
-                else:
-                    qry += " IDENTIFIED BY PASSWORD %(password)s"
-                args["password"] = password_hash
-            else:
-                log.error(
-                    "password or password_hash must be specified, unless "
-                    "allow_passwordless=True"
-                )
-                qry = False
-    return qry, args
-def _mariadb_user_create(
-    user,
-    host="localhost",
-    password=None,
-    password_hash=None,
-    allow_passwordless=False,
-    unix_socket=False,
-    password_column=None,
-    auth_plugin="mysql_native_password",
-    **connection_args
-):
-    qry = "CREATE USER %(user)s@%(host)s"
-    args = {}
-    args["user"] = user
-    args["host"] = host
-    if unix_socket:
-        if not plugin_status("unix_socket", **connection_args):
-            err = "The unix_socket plugin is not enabled."
-            log.error(err)
-            __context__["mysql.error"] = err
-            qry = False
-        else:
-            if host == "localhost":
-                qry += " IDENTIFIED VIA unix_socket"
-            else:
-                log.error("Auth via unix_socket can be set only for host=localhost")
-                __context__["mysql.error"] = err
-                qry = False
-    else:
-        if not salt.utils.data.is_true(allow_passwordless):
-            if password is not None:
-                qry += " IDENTIFIED BY %(password)s"
-                args["password"] = str(password)
-            elif password_hash is not None:
-                qry += " IDENTIFIED BY PASSWORD %(password)s"
-                args["password"] = password_hash
-            else:
-                log.error(
-                    "password or password_hash must be specified, unless "
-                    "allow_passwordless=True"
-                )
-                qry = False
-    return qry, args
-def user_create(
-    user,
-    host="localhost",
-    password=None,
-    password_hash=None,
-    allow_passwordless=False,
-    unix_socket=False,
-    password_column=None,
-    auth_plugin="mysql_native_password",
-    **connection_args
-):
-    server_version = salt.utils.data.decode(version(**connection_args))
-    if not server_version and password:
-        __context__["mysql.error"] = None
-        connection_args["connection_pass"] = password
-        server_version = salt.utils.data.decode(version(**connection_args))
-        if not server_version:
-            last_err = __context__["mysql.error"]
-            err = (
-                "MySQL Error: Unable to fetch current server version. Last error was:"
-                ' "{}"'.format(last_err)
-            )
-            log.error(err)
-            return False
-    if user_exists(user, host, **connection_args):
-        log.info("User '%s'@'%s' already exists", user, host)
-        return False
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return False
-    if not password_column:
-        password_column = __password_column(**connection_args)
-    cur = dbc.cursor()
-    if "MariaDB" in server_version:
-        qry, args = _mariadb_user_create(
-            user,
-            host,
-            password,
-            password_hash,
-            allow_passwordless,
-            unix_socket,
-            password_column=password_column,
-            auth_plugin=auth_plugin,
-            **connection_args
-        )
-    else:
-        qry, args = _mysql_user_create(
-            user,
-            host,
-            password,
-            password_hash,
-            allow_passwordless,
-            unix_socket,
-            password_column=password_column,
-            auth_plugin=auth_plugin,
-            **connection_args
-        )
-    if isinstance(qry, bool):
-        return qry
-    try:
-        _execute(cur, qry, args)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return False
-    if user_exists(
-        user,
-        host,
-        password,
-        password_hash,
-        password_column=password_column,
-        **connection_args
-    ):
-        msg = "User '{}'@'{}' has been created".format(user, host)
-        if not any((password, password_hash)):
-            msg += " with passwordless login"
-        log.info(msg)
-        return True
-    log.info("User '%s'@'%s' was not created", user, host)
-    return False
-def _mysql_user_chpass(
-    user,
-    host="localhost",
-    password=None,
-    password_hash=None,
-    allow_passwordless=False,
-    unix_socket=None,
-    password_column=None,
-    auth_plugin="mysql_native_password",
-    **connection_args
-):
-    server_version = salt.utils.data.decode(version(**connection_args))
-    compare_version = "8.0.11"
-    args = {}
-    if password is not None:
-        if salt.utils.versions.version_cmp(server_version, compare_version) &gt;= 0:
-            password_sql = "%(password)s"
-        else:
-            password_sql = "PASSWORD(%(password)s)"
-        args["password"] = password
-    elif password_hash is not None:
-        password_sql = "%(password)s"
-        args["password"] = password_hash
-    elif not salt.utils.data.is_true(allow_passwordless):
-        log.error(
-            "password or password_hash must be specified, unless "
-            "allow_passwordless=True"
-        )
-        return False
-    else:
-        password_sql = "''"
-    args["user"] = user
-    args["host"] = host
-    if salt.utils.versions.version_cmp(server_version, compare_version) &gt;= 0:
-        args["auth_plugin"] = auth_plugin
-        qry = "ALTER USER %(user)s@%(host)s IDENTIFIED WITH %(auth_plugin)s "
-        if password is not None:
-            qry += "BY %(password)s;"
-        elif password_hash is not None:
-            qry += "AS %(password)s;"
-    else:
-        qry = (
-            "UPDATE mysql.user SET "
-            + password_column
-            + "="
-            + password_sql
-            + " WHERE User=%(user)s AND Host = %(host)s;"
-        )
-    if salt.utils.data.is_true(allow_passwordless) and salt.utils.data.is_true(
-        unix_socket
-    ):
-        if host == "localhost":
-            if not plugin_status("auth_socket", **connection_args):
-                err = "The auth_socket plugin is not enabled."
-                log.error(err)
-                __context__["mysql.error"] = err
-                qry = False
-            else:
-                args["unix_socket"] = "auth_socket"
-                if (
-                    salt.utils.versions.version_cmp(server_version, compare_version)
-                    &gt;= 0
-                ):
-                    qry = (
-                        "ALTER USER %(user)s@%(host)s IDENTIFIED WITH %(unix_socket)s"
-                        " AS %(user)s;"
-                    )
-                else:
-                    qry = (
-                        "UPDATE mysql.user SET "
-                        + password_column
-                        + "="
-                        + password_sql
-                        + ", plugin=%(unix_socket)s"
-                        + " WHERE User=%(user)s AND Host = %(host)s;"
-                    )
-        else:
-            log.error("Auth via unix_socket can be set only for host=localhost")
-    return qry, args
-def _mariadb_user_chpass(
-    user,
-    host="localhost",
-    password=None,
-    password_hash=None,
-    allow_passwordless=False,
-    unix_socket=None,
-    password_column=None,
-    auth_plugin="mysql_native_password",
-    **connection_args
-):
-    server_version = salt.utils.data.decode(version(**connection_args))
-    compare_version = "10.4"
-    args = {}
-    if password is not None:
-        password_sql = "PASSWORD(%(password)s)"
-        args["password"] = password
-    elif password_hash is not None:
-        password_sql = "%(password)s"
-        args["password"] = password_hash
-    elif not salt.utils.data.is_true(allow_passwordless):
-        log.error(
-            "password or password_hash must be specified, unless "
-            "allow_passwordless=True"
-        )
-        return False
-    else:
-        password_sql = "''"
-    args["user"] = user
-    args["host"] = host
-    if salt.utils.versions.version_cmp(server_version, compare_version) &gt;= 0:
-        args["auth_plugin"] = auth_plugin
-        qry = "ALTER USER %(user)s@%(host)s IDENTIFIED VIA %(auth_plugin)s USING "
-        qry += password_sql
-    else:
-        qry = (
-            "UPDATE mysql.user SET "
-            + password_column
-            + "="
-            + password_sql
-            + " WHERE User=%(user)s AND Host = %(host)s;"
-        )
-    if salt.utils.data.is_true(allow_passwordless) and salt.utils.data.is_true(
-        unix_socket
-    ):
-        if host == "localhost":
-            if not plugin_status("unix_socket", **connection_args):
-                err = "The unix_socket plugin is not enabled."
-                log.error(err)
-                __context__["mysql.error"] = err
-                qry = False
-            else:
-                args["unix_socket"] = "unix_socket"
-                qry = (
-                    "UPDATE mysql.user SET "
-                    + password_column
-                    + "="
-                    + password_sql
-                    + ", plugin=%(unix_socket)s"
-                    + " WHERE User=%(user)s AND Host = %(host)s;"
-                )
-        else:
-            log.error("Auth via unix_socket can be set only for host=localhost")
-    return qry, args
-def user_chpass(
-    user,
-    host="localhost",
-    password=None,
-    password_hash=None,
-    allow_passwordless=False,
-    unix_socket=None,
-    password_column=None,
-    **connection_args
-):
-    server_version = salt.utils.data.decode(version(**connection_args))
-    if not server_version and password:
-        __context__["mysql.error"] = None
-        connection_args["connection_pass"] = password
-        server_version = salt.utils.data.decode(version(**connection_args))
-        if not server_version:
-            last_err = __context__["mysql.error"]
-            err = (
-                "MySQL Error: Unable to fetch current server version. Last error was:"
-                ' "{}"'.format(last_err)
-            )
-            log.error(err)
-            return False
-    if not user_exists(user, host, **connection_args):
-        log.info("User '%s'@'%s' does not exists", user, host)
-        return False
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return False
-    if not password_column:
-        password_column = __password_column(**connection_args)
-    auth_plugin = __get_auth_plugin(user, host, **connection_args)
-    cur = dbc.cursor()
-    if "MariaDB" in server_version:
-        qry, args = _mariadb_user_chpass(
-            user,
-            host,
-            password,
-            password_hash,
-            allow_passwordless,
-            unix_socket,
-            password_column=password_column,
-            auth_plugin=auth_plugin,
-            **connection_args
-        )
-    else:
-        qry, args = _mysql_user_chpass(
-            user,
-            host,
-            password,
-            password_hash,
-            allow_passwordless,
-            unix_socket,
-            password_column=password_column,
-            auth_plugin=auth_plugin,
-            **connection_args
-        )
-    try:
-        result = _execute(cur, qry, args)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return False
-    compare_version = "10.4.0" if "MariaDB" in server_version else "8.0.11"
-    res = False
-    if salt.utils.versions.version_cmp(server_version, compare_version) &gt;= 0:
-        _execute(cur, "FLUSH PRIVILEGES;")
-        res = True
-    else:
-        if result:
-            _execute(cur, "FLUSH PRIVILEGES;")
-            res = True
-    if res:
-        log.info(
-            "Password for user '%s'@'%s' has been %s",
-            user,
-            host,
-            "changed" if any((password, password_hash)) else "cleared",
-        )
-        return True
-    else:
-        log.info(
-            "Password for user '%s'@'%s' was not %s",
-            user,
-            host,
-            "changed" if any((password, password_hash)) else "cleared",
-        )
-        return False
-def user_remove(user, host="localhost", **connection_args):
-    if not user_exists(user, host, **connection_args):
-        err = "User '%s'@'%s' does not exists", user, host
-        __context__["mysql.error"] = err
-        log.info(err)
-        return False
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return False
-    cur = dbc.cursor()
-    qry = "DROP USER %(user)s@%(host)s"
-    args = {}
-    args["user"] = user
-    args["host"] = host
-    try:
-        _execute(cur, qry, args)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return False
-    if not user_exists(user, host, **connection_args):
-        log.info("User '%s'@'%s' has been removed", user, host)
-        return True
-    log.info("User '%s'@'%s' has NOT been removed", user, host)
-    return False
-def tokenize_grant(grant):
-    return _grant_to_tokens(grant)
-def db_check(name, table=None, **connection_args):
-    ret = []
-    if table is None:
-        tables = db_tables(name, **connection_args)
-        for table in tables:
-            log.info("Checking table '%s' in db '%s'..", name, table)
-            ret.append(__check_table(name, table, **connection_args))
-    else:
-        log.info("Checking table '%s' in db '%s'..", name, table)
-        ret = __check_table(name, table, **connection_args)
-    return ret
-def db_repair(name, table=None, **connection_args):
-    ret = []
-    if table is None:
-        tables = db_tables(name, **connection_args)
-        for table in tables:
-            log.info("Repairing table '%s' in db '%s'..", name, table)
-            ret.append(__repair_table(name, table, **connection_args))
-    else:
-        log.info("Repairing table '%s' in db '%s'..", name, table)
-        ret = __repair_table(name, table, **connection_args)
-    return ret
-def db_optimize(name, table=None, **connection_args):
-    ret = []
-    if table is None:
-        tables = db_tables(name, **connection_args)
-        for table in tables:
-            log.info("Optimizing table '%s' in db '%s'..", name, table)
-            ret.append(__optimize_table(name, table, **connection_args))
-    else:
-        log.info("Optimizing table '%s' in db '%s'..", name, table)
-        ret = __optimize_table(name, table, **connection_args)
-    return ret
-def __grant_normalize(grant):
-    if grant.strip().upper() == "ALL":
-        grant = "ALL PRIVILEGES"
-    exploded_grants = __grant_split(grant)
-    for chkgrant, _ in exploded_grants:
-        if chkgrant.strip().upper() not in __grants__:
-            raise Exception("Invalid grant : '{}'".format(chkgrant))
-    return grant
-def __grant_split(grant):
-    pattern = re.compile(r"([\w\s]+)(\([^)(]*\))?\s*,?")
-    return pattern.findall(grant)
-def __ssl_option_sanitize(ssl_option):
-    new_ssl_option = []
-    for opt in ssl_option:
-        key = next(iter(opt.keys()))
-        normal_key = key.strip().upper()
-        if normal_key not in __ssl_options__:
-            raise Exception("Invalid SSL option : '{}'".format(key))
-        if normal_key in __ssl_options_parameterized__:
-            new_ssl_option.append(
-                "{} '{}'".format(normal_key, opt[key].replace("'", ""))
-            )
-        elif opt[key]:
-            new_ssl_option.append(normal_key)
-    return " REQUIRE " + " AND ".join(new_ssl_option)
-def __grant_generate(
-    grant,
-    database,
-    user,
-    host="localhost",
-    grant_option=False,
-    escape=True,
-    ssl_option=False,
-):
-    grant = re.sub(r"\s*,\s*", ", ", grant).upper()
-    grant = __grant_normalize(grant)
-    db_part = database.rpartition(".")
-    dbc = db_part[0]
-    table = db_part[2]
-    if escape:
-        if dbc != "*":
-            dbc = quote_identifier(dbc, for_grants=(table == "*"))
-        if table != "*":
-            table = quote_identifier(table)
-    qry = "GRANT {} ON {}.{} TO %(user)s@%(host)s".format(grant, dbc, table)
-    args = {}
-    args["user"] = user
-    args["host"] = host
-    if ssl_option and isinstance(ssl_option, list):
-        qry += __ssl_option_sanitize(ssl_option)
-    if salt.utils.data.is_true(grant_option):
-        qry += " WITH GRANT OPTION"
-    log.debug("Grant Query generated: %s args %s", qry, repr(args))
-    return {"qry": qry, "args": args}
-def user_grants(user, host="localhost", **connection_args):
-    if not user_exists(user, host, **connection_args):
-        log.info("User '%s'@'%s' does not exist", user, host)
-        return False
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return False
-    cur = dbc.cursor()
-    qry = "SHOW GRANTS FOR %(user)s@%(host)s"
-    args = {}
-    args["user"] = user
-    args["host"] = host
-    try:
-        _execute(cur, qry, args)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return False
-    ret = []
-    results = salt.utils.data.decode(cur.fetchall())
-    for grant in results:
-        tmp = grant[0].split(" IDENTIFIED BY")[0]
-        if "WITH GRANT OPTION" in grant[0] and "WITH GRANT OPTION" not in tmp:
-            tmp = "{} WITH GRANT OPTION".format(tmp)
-        ret.append(tmp)
-    log.debug(ret)
-    return ret
-def grant_exists(
-    grant,
-    database,
-    user,
-    host="localhost",
-    grant_option=False,
-    escape=True,
-    **connection_args
-):
-    server_version = salt.utils.data.decode(version(**connection_args))
-    if not server_version:
-        last_err = __context__["mysql.error"]
-        err = 'MySQL Error: Unable to fetch current server version. Last error was: "{}"'.format(
-            last_err
-        )
-        log.error(err)
-        return False
-    if "ALL" in grant.upper():
-        if (
-            salt.utils.versions.version_cmp(server_version, "8.0") &gt;= 0
-            and "MariaDB" not in server_version
-            and database == "*.*"
-        ):
-            grant = ",".join([i for i in __all_privileges__])
-        else:
-            grant = "ALL PRIVILEGES"
-    try:
-        target = __grant_generate(grant, database, user, host, grant_option, escape)
-    except Exception:  # pylint: disable=broad-except
-        log.error("Error during grant generation.")
-        return False
-    grants = user_grants(user, host, **connection_args)
-    if grants is False:
-        log.error(
-            "Grant does not exist or may not be ordered properly. In some cases, "
-            "this could also indicate a connection error. Check your configuration."
-        )
-        return False
-    _grants = {}
-    for grant in grants:
-        grant_token = _grant_to_tokens(grant)
-        if grant_token["database"] not in _grants:
-            _grants[grant_token["database"]] = {
-                "user": grant_token["user"],
-                "database": grant_token["database"],
-                "host": grant_token["host"],
-                "grant": grant_token["grant"],
-            }
-        else:
-            _grants[grant_token["database"]]["grant"].extend(grant_token["grant"])
-    target_tokens = _grant_to_tokens(target)
-    for database, grant_tokens in _grants.items():
-        try:
-            _grant_tokens = {}
-            _target_tokens = {}
-            _grant_matches = [
-                True if i in grant_tokens["grant"] else False
-                for i in target_tokens["grant"]
-            ]
-            for item in ["user", "database", "host"]:
-                _grant_tokens[item] = (
-                    grant_tokens[item]
-                    .replace('"', "")
-                    .replace("\\", "")
-                    .replace("`", "")
-                )
-                _target_tokens[item] = (
-                    target_tokens[item]
-                    .replace('"', "")
-                    .replace("\\", "")
-                    .replace("`", "")
-                )
-            if (
-                _grant_tokens["user"] == _target_tokens["user"]
-                and _grant_tokens["database"] == _target_tokens["database"]
-                and _grant_tokens["host"] == _target_tokens["host"]
-                and all(_grant_matches)
-            ):
-                return True
-            else:
-                log.debug("grants mismatch '%s'&lt;&gt;'%s'", grant_tokens, target_tokens)
-        except Exception as exc:  # pylint: disable=broad-except
-            log.exception(exc)
-            if grants is not False and target in grants:
-                log.debug("Grant exists.")
-                return True
-    log.debug("Grant does not exist, or is perhaps not ordered properly?")
-    return False
-def grant_add(
-    grant,
-    database,
-    user,
-    host="localhost",
-    grant_option=False,
-    escape=True,
-    ssl_option=False,
-    **connection_args
-):
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return False
-    cur = dbc.cursor()
-    grant = grant.strip()
-    try:
-        qry = __grant_generate(
-            grant, database, user, host, grant_option, escape, ssl_option
-        )
-    except Exception:  # pylint: disable=broad-except
-        log.error("Error during grant generation")
-        return False
-    try:
-        _execute(cur, qry["qry"], qry["args"])
-    except (MySQLdb.OperationalError, MySQLdb.ProgrammingError) as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return False
-    if grant_exists(
-        grant, database, user, host, grant_option, escape, **connection_args
-    ):
-        log.info(
-            "Grant '%s' on '%s' for user '%s' has been added", grant, database, user
-        )
-        return True
-    log.info(
-        "Grant '%s' on '%s' for user '%s' has NOT been added", grant, database, user
-    )
-    return False
-def grant_revoke(
-    grant,
-    database,
-    user,
-    host="localhost",
-    grant_option=False,
-    escape=True,
-    **connection_args
-):
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return False
-    cur = dbc.cursor()
-    grant = __grant_normalize(grant)
-    if salt.utils.data.is_true(grant_option):
-        grant += ", GRANT OPTION"
-    db_part = database.rpartition(".")
-    dbc = db_part[0]
-    table = db_part[2]
-    if dbc != "*":
-        s_database = quote_identifier(dbc, for_grants=(table == "*"))
-    if dbc == "*":
-        s_database = dbc
-    if table != "*":
-        table = quote_identifier(table)
-    qry = "REVOKE {} ON {}.{} FROM %(user)s@%(host)s;".format(grant, s_database, table)
-    args = {}
-    args["user"] = user
-    args["host"] = host
-    try:
-        _execute(cur, qry, args)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return False
-    if not grant_exists(
-        grant, database, user, host, grant_option, escape, **connection_args
-    ):
-        log.info(
-            "Grant '%s' on '%s' for user '%s' has been revoked",
-            grant,
-            database,
-            user,
-        )
-        return True
-    log.info(
-        "Grant '%s' on '%s' for user '%s' has NOT been revoked",
-        grant,
-        database,
-        user,
-    )
-    return False
-def processlist(**connection_args):
-    ret = []
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return []
-    cur = dbc.cursor()
-    _execute(cur, "SHOW FULL PROCESSLIST")
-    hdr = [c[0] for c in cur.description]
-    for _ in range(cur.rowcount):
-        row = cur.fetchone()
-        idx_r = {}
-        for idx_j, value_j in enumerate(hdr):
-            idx_r[hdr[idx_j]] = row[idx_j]
-        ret.append(idx_r)
-    cur.close()
-    return ret
-def __do_query_into_hash(conn, sql_str):
-    mod = sys._getframe().f_code.co_name
-    log.debug("%s&lt;--(%s)", mod, sql_str)
-    rtn_results = []
-    try:
-        cursor = conn.cursor()
-    except MySQLdb.MySQLError:
-        log.error("%s: Can't get cursor for SQL-&gt;%s", mod, sql_str)
-        cursor.close()
-        log.debug("%s--&gt;", mod)
-        return rtn_results
-    try:
-        _execute(cursor, sql_str)
-    except MySQLdb.MySQLError:
-        log.error("%s: try to execute : SQL-&gt;%s", mod, sql_str)
-        cursor.close()
-        log.debug("%s--&gt;", mod)
-        return rtn_results
-    qrs = cursor.fetchall()
-    for row_data in qrs:
-        col_cnt = 0
-        row = {}
-        for col_data in cursor.description:
-            col_name = col_data[0]
-            row[col_name] = row_data[col_cnt]
-            col_cnt += 1
-        rtn_results.append(row)
-    cursor.close()
-    log.debug("%s--&gt;", mod)
-    return rtn_results
-def get_master_status(**connection_args):
-    mod = sys._getframe().f_code.co_name
-    log.debug("%s&lt;--", mod)
-    conn = _connect(**connection_args)
-    if conn is None:
-        return []
-    rtnv = __do_query_into_hash(conn, "SHOW MASTER STATUS")
-    conn.close()
-    if not rtnv:
-        rtnv.append([])
-    log.debug("%s--&gt;%s", mod, len(rtnv[0]))
-    return rtnv[0]
-def get_slave_status(**connection_args):
-    mod = sys._getframe().f_code.co_name
-    log.debug("%s&lt;--", mod)
-    conn = _connect(**connection_args)
-    if conn is None:
-        return []
-    rtnv = __do_query_into_hash(conn, "SHOW SLAVE STATUS")
-    conn.close()
-    if not rtnv:
-        rtnv.append([])
-    log.debug("%s--&gt;%s", mod, len(rtnv[0]))
-    return rtnv[0]
-def showvariables(**connection_args):
-    mod = sys._getframe().f_code.co_name
-    log.debug("%s&lt;--", mod)
-    conn = _connect(**connection_args)
-    if conn is None:
-        return []
-    rtnv = __do_query_into_hash(conn, "SHOW VARIABLES")
-    conn.close()
-    if not rtnv:
-        rtnv.append([])
-    log.debug("%s--&gt;%s", mod, len(rtnv[0]))
-    return rtnv
-def showglobal(**connection_args):
-    mod = sys._getframe().f_code.co_name
-    log.debug("%s&lt;--", mod)
-    conn = _connect(**connection_args)
-    if conn is None:
-        return []
-    rtnv = __do_query_into_hash(conn, "SHOW GLOBAL VARIABLES")
-    conn.close()
-    if not rtnv:
-        rtnv.append([])
-    log.debug("%s--&gt;%s", mod, len(rtnv[0]))
-    return rtnv
-def verify_login(user, password=None, **connection_args):
-    connection_args["connection_user"] = user
-    connection_args["connection_pass"] = password
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        if "mysql.error" in __context__:
-            del __context__["mysql.error"]
-        return False
-    return True
-def plugins_list(**connection_args):
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return []
-    cur = dbc.cursor()
-    qry = "SHOW PLUGINS"
-    try:
-        _execute(cur, qry)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return []
-    ret = []
-    results = cur.fetchall()
-    for dbs in results:
-        ret.append({"name": dbs[0], "status": dbs[1]})
-    log.debug(ret)
-    return ret
-def plugin_add(name, soname=None, **connection_args):
-    if not name:
-        log.error("Plugin name is required.")
-        return False
-    if plugin_status(name, **connection_args):
-        log.error("Plugin %s is already installed.", name)
-        return True
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return False
-    cur = dbc.cursor()
-    qry = "INSTALL PLUGIN {}".format(name)
-    if soname:
-        qry += ' SONAME "{}"'.format(soname)
-    else:
-        qry += ' SONAME "{}.so"'.format(name)
-    try:
-        _execute(cur, qry)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return False
-    return True
-def plugin_remove(name, **connection_args):
-    if not name:
-        log.error("Plugin name is required.")
-        return False
-    if not plugin_status(name, **connection_args):
-        log.error("Plugin %s is not installed.", name)
-        return True
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return False
-    cur = dbc.cursor()
-    qry = "UNINSTALL PLUGIN {}".format(name)
-    args = {}
-    args["name"] = name
-    try:
-        _execute(cur, qry)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return False
-    return True
-def plugin_status(name, **connection_args):
-    if not name:
-        log.error("Plugin name is required.")
-        return False
-    dbc = _connect(**connection_args)
-    if dbc is None:
-        return ""
-    cur = dbc.cursor()
-    qry = (
-        "SELECT PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME ="
-        " %(name)s"
-    )
-    args = {}
-    args["name"] = name
-    try:
-        _execute(cur, qry, args)
-    except MySQLdb.OperationalError as exc:
-        err = "MySQL Error {}: {}".format(*exc.args)
-        __context__["mysql.error"] = err
-        log.error(err)
-        return ""
-    try:
-        status = cur.fetchone()
-        if status is None:
-            return ""
-        else:
-            return status[0]
-    except IndexError:
-        return ""
+1 import copy
+2 import hashlib
+3 import logging
+4 import os
+5 import re
+6 import shlex
+7 import sys
+8 import time
+9 import salt.utils.data
+10 import salt.utils.files
+11 import salt.utils.stringutils
+12 try:
+13     import MySQLdb
+14     import MySQLdb.cursors
+15     import MySQLdb.converters
+16     from MySQLdb.constants import FIELD_TYPE, FLAG, CLIENT
+17     from MySQLdb import OperationalError
+18 except ImportError:
+19     try:
+20         import pymysql
+21         pymysql.install_as_MySQLdb()
+22         import MySQLdb
+23         import MySQLdb.cursors
+24         import MySQLdb.converters
+25         from MySQLdb.constants import FIELD_TYPE, FLAG, CLIENT
+26         from MySQLdb import OperationalError
+27     except ImportError:
+28         MySQLdb = None
+29 try:
+30     import sqlparse
+31     HAS_SQLPARSE = True
+32 except ImportError:
+33     HAS_SQLPARSE = False
+34 log = logging.getLogger(__name__)
+35 __opts__ = {}
+36 __grants__ = [
+37     "ALL PRIVILEGES",
+38     "ALTER",
+39     "ALTER ROUTINE",
+40     "BACKUP_ADMIN",
+41     "BINLOG_ADMIN",
+42     "CONNECTION_ADMIN",
+43     "CREATE",
+44     "CREATE ROLE",
+45     "CREATE ROUTINE",
+46     "CREATE TABLESPACE",
+47     "CREATE TEMPORARY TABLES",
+48     "CREATE USER",
+49     "CREATE VIEW",
+50     "DELETE",
+51     "DROP",
+52     "DROP ROLE",
+53     "ENCRYPTION_KEY_ADMIN",
+54     "EVENT",
+55     "EXECUTE",
+56     "FILE",
+57     "GRANT OPTION",
+58     "GROUP_REPLICATION_ADMIN",
+59     "INDEX",
+60     "INSERT",
+61     "LOCK TABLES",
+62     "PERSIST_RO_VARIABLES_ADMIN",
+63     "PROCESS",
+64     "REFERENCES",
+65     "RELOAD",
+66     "REPLICATION CLIENT",
+67     "REPLICATION SLAVE",
+68     "REPLICATION_SLAVE_ADMIN",
+69     "RESOURCE_GROUP_ADMIN",
+70     "RESOURCE_GROUP_USER",
+71     "ROLE_ADMIN",
+72     "SELECT",
+73     "SET_USER_ID",
+74     "SHOW DATABASES",
+75     "SHOW VIEW",
+76     "SHUTDOWN",
+77     "SLAVE MONITOR",
+78     "SUPER",
+79     "SYSTEM_VARIABLES_ADMIN",
+80     "TRIGGER",
+81     "UPDATE",
+82     "USAGE",
+83     "XA_RECOVER_ADMIN",
+84 ]
+85 __ssl_options_parameterized__ = ["CIPHER", "ISSUER", "SUBJECT"]
+86 __ssl_options__ = __ssl_options_parameterized__ + ["SSL", "X509"]
+87 __all_privileges__ = [
+88     "ALTER",
+89     "ALTER ROUTINE",
+90     "BACKUP_ADMIN",
+91     "BINLOG_ADMIN",
+92     "CONNECTION_ADMIN",
+93     "CREATE",
+94     "CREATE ROLE",
+95     "CREATE ROUTINE",
+96     "CREATE TABLESPACE",
+97     "CREATE TEMPORARY TABLES",
+98     "CREATE USER",
+99     "CREATE VIEW",
+100     "DELETE",
+101     "DROP",
+102     "DROP ROLE",
+103     "ENCRYPTION_KEY_ADMIN",
+104     "EVENT",
+105     "EXECUTE",
+106     "FILE",
+107     "GROUP_REPLICATION_ADMIN",
+108     "INDEX",
+109     "INSERT",
+110     "LOCK TABLES",
+111     "PERSIST_RO_VARIABLES_ADMIN",
+112     "PROCESS",
+113     "REFERENCES",
+114     "RELOAD",
+115     "REPLICATION CLIENT",
+116     "REPLICATION SLAVE",
+117     "REPLICATION_SLAVE_ADMIN",
+118     "RESOURCE_GROUP_ADMIN",
+119     "RESOURCE_GROUP_USER",
+120     "ROLE_ADMIN",
+121     "SELECT",
+122     "SET_USER_ID",
+123     "SHOW DATABASES",
+124     "SHOW VIEW",
+125     "SHUTDOWN",
+126     "SUPER",
+127     "SYSTEM_VARIABLES_ADMIN",
+128     "TRIGGER",
+129     "UPDATE",
+130     "XA_RECOVER_ADMIN",
+131 ]
+132 r'''
+133 DEVELOPER NOTE: ABOUT arguments management, escapes, formats, arguments and
+134 security of SQL.
+135 A general rule of SQL security is to use queries with _execute call in this
+136 code using args parameter to let MySQLdb manage the arguments proper escaping.
+137 Another way of escaping values arguments could be '{0!r}'.format(), using
+138 __repr__ to ensure things get properly used as strings. But this could lead
+139 to three problems:
+140  * In ANSI mode, which is available on MySQL, but not by default, double
+141 quotes " should not be used as a string delimiters, in ANSI mode this is an
+142 identifier delimiter (like `).
+143  * Some rare exploits with bad multibytes management, either on python or
+144 MySQL could defeat this barrier, bindings internal escape functions
+145 should manage theses cases.
+146  * Unicode strings in Python 2 will include the 'u' before the repr'ed string,
+147    like so:
+148     Python 2.7.10 (default, May 26 2015, 04:16:29)
+149     [GCC 5.1.0] on linux2
+150     Type "help", "copyright", "credits" or "license" for more information.
+151     &gt;&gt;&gt; u'something something {0!r}'.format(u'foo')
+152     u"something something u'foo'"
+153 So query with arguments should use a paramstyle defined in PEP249:
+154 http://www.python.org/dev/peps/pep-0249/#paramstyle
+155 We use pyformat, which means 'SELECT * FROM foo WHERE bar=%(myval)s'
+156 used with {'myval': 'some user input'}
+157 So far so good. But this cannot be used for identifier escapes. Identifiers
+158 are database names, table names and column names. Theses names are not values
+159 and do not follow the same escape rules (see quote_identifier function for
+160 details on `_ and % escape policies on identifiers). Using value escaping on
+161 identifier could fool the SQL engine (badly escaping quotes and not doubling
+162 ` characters. So for identifiers a call to quote_identifier should be done and
+163 theses identifiers should then be added in strings with format, but without
+164 __repr__ filter.
+165 Note also that when using query with arguments in _execute all '%' characters
+166 used in the query should get escaped to '%%' fo MySQLdb, but should not be
+167 escaped if the query runs without arguments. This is managed by _execute() and
+168 quote_identifier. This is not the same as escaping '%' to '\%' or '_' to '\%'
+169 when using a LIKE query (example in db_exists), as this escape is there to
+170 avoid having _ or % characters interpreted in LIKE queries. The string parted
+171 of the first query could become (still used with args dictionary for myval):
+172 'SELECT * FROM {0} WHERE bar=%(myval)s'.format(quote_identifier('user input'))
+173 Check integration tests if you find a hole in theses strings and escapes rules
+174 Finally some examples to sum up.
+175 Given a name f_o%o`b'a"r, in python that would be """f_o%o`b'a"r""". I'll
+176 avoid python syntax for clarity:
+177 The MySQL way of writing this name is:
+178 value                         : 'f_o%o`b\'a"r' (managed by MySQLdb)
+179 identifier                    : `f_o%o``b'a"r`
+180 db identifier in general GRANT: `f\_o\%o``b'a"r`
+181 db identifier in table GRANT  : `f_o%o``b'a"r`
+182 in mySQLdb, query with args   : `f_o%%o``b'a"r` (as identifier)
+183 in mySQLdb, query without args: `f_o%o``b'a"r` (as identifier)
+184 value in a LIKE query         : 'f\_o\%o`b\'a"r' (quotes managed by MySQLdb)
+185 And theses could be mixed, in a like query value with args: 'f\_o\%%o`b\'a"r'
+186     log<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.debug(results)
+187     return results
+188 def _mysql_user_exists(
+189     user,
+190     host="localhost",
+191     password=None,
+192     password_hash=None,
+193     passwordless=False,
+194     unix_socket=False,
+195     password_column=None,
+196     auth_plugin=</b></font>"mysql_native_password",
+197     **connection_args
+198 ):
+199     server_version = salt.utils.data.decode(version(**connection_args))
+200     compare_version = "8.0.11"
+201     qry = "SELECT User,Host FROM mysql.user WHERE User = %(user)s AND Host = %(host)s"
+202     args = {}
+203     args["user"] = user
+204     args["host"] = host
+205     if salt.utils.data.is_true(passwordless):
+206         if salt.utils.data.is_true(unix_socket):
+207             qry += " AND plugin=%(unix_socket)s"
+208             args["unix_socket"] = "auth_socket"
+209         else:
+210             qry += " AND " + password_column + " = ''"
+211     elif password:
+212         if salt.utils.versions.version_cmp(server_version, compare_version) &gt;= 0:
+213             if auth_plugin == "mysql_native_password":
+214                 _password = __mysql_hash_password(str(password))
+215                 qry += " AND " + password_column + " = %(password)s"
+216                 args["password"] = str(_password)
+217             else:
+218                 err = "Unable to verify password."
+219                 log.error(err)
+220                 __context__["mysql.error"] = err
+221         else:
+222             qry += " AND " + password_column + " = PASSWORD(%(password)s)"
+223             args["password"] = str(password)
+224     elif password_hash:
+225         qry += " AND " + password_column + " = %(password)s"
+226         args["password"] = password_hash
+227     return qry, args
+228 def _mariadb_user_exists(
+229     user,
+230     host="localhost",
+231     password=None,
+232     password_hash=None,
+233     passwordless=False,
+234     unix_socket=False,
+235     password_column=None,
+236     auth_plugin="mysql_native_password",
+237     **connection_args
+238 ):
+239     qry = "SELECT User,Host FROM mysql.user WHERE User = %(user)s AND Host = %(host)s"
+240     args = {}
+241     args["user"] = user
+242     args["host"] = host
+243     if salt.utils.data.is_true(passwordless):
+244         if salt.utils.data.is_true(unix_socket):
+245             qry += " AND plugin=%(unix_socket)s"
+246             args["unix_socket"] = "unix_socket"
+247         else:
+248             qry += " AND " + password_column + " = ''"
+249     elif password:
+250         qry += " AND " + password_column + " = PASSWORD(%(password)s)"
+251         args["password"] = str(password)
+252     elif password_hash:
+253         qry += " AND " + password_column + " = %(password)s"
+254         args["password"] = password_hash
+255     return qry, args
+256 def user_exists(
+257     user,
+258     host="localhost",
+259     password=None,
+260     password_hash=None,
+261     passwordless=False,
+262     unix_socket=False,
+263     password_column=None,
+264     **connection_args
+265 ):
+266     run_verify = False
+267     server_version = salt.utils.data.decode(version(**connection_args))
+268     if not server_version and password:
+269         __context__["mysql.error"] = None
+270         connection_args["connection_pass"] = password
+271         server_version = salt.utils.data.decode(version(**connection_args))
+272         if not server_version:
+273             last_err = __context__["mysql.error"]
+274             err = (
+275                 "MySQL Error: Unable to fetch current server version. Last error was:"
+276                 ' "{}"'.format(last_err)
+277             )
+278             log.error(err)
+279             return False
+280     dbc = _connect(**connection_args)
+281     if (
+282         dbc is None
+283         and __context__["mysql.error"].startswith(
+284             "MySQL Error 1045: Access denied for user '{}'@".format(user)
+285         )
+286         and password
+287     ):
+288         __context__["mysql.error"] = None
+289         connection_args["connection_pass"] = password
+290         dbc = _connect(**connection_args)
+291     if dbc is None:
+292         return False
+293     if not password_column:
+294         password_column = __password_column(**connection_args)
+295     auth_plugin = __get_auth_plugin(user, host, **connection_args)
+296     cur = dbc.cursor()
+297     if "MariaDB" in server_version:
+298         qry, args = _mariadb_user_exists(
+299             user,
+300             host,
+301             password,
+302             password_hash,
+303             passwordless,
+304             unix_socket,
+305             password_column=password_column,
+306             auth_plugin=auth_plugin,
+307             **connection_args
+308         )
+309     else:
+310         qry, args = _mysql_user_exists(
+311             user,
+312             host,
+313             password,
+314             password_hash,
+315             passwordless,
+316             unix_socket,
+317             password_column=password_column,
+318             auth_plugin=auth_plugin,
+319             **connection_args
+320         )
+321     try:
+322         _execute(cur, qry, args)
+323     except MySQLdb.OperationalError as exc:
+324         err = "MySQL Error {}: {}".format(*exc.args)
+325         __context__["mysql.error"] = err
+326         log.error(err)
+327         return False
+328     return cur.rowcount == 1
+329 def user_info(user, host="localhost", **connection_args):
+330     dbc = _connect(**connection_args)
+331     if dbc is None:
+332         return False
+333     cur = dbc.cursor(MySQLdb.cursors.DictCursor)
+334     qry = "SELECT * FROM mysql.user WHERE User = %(user)s AND Host = %(host)s"
+335     args = {}
+336     args["user"] = user
+337     args["host"] = host
+338     try:
+339         _execute(cur, qry, args)
+340     except MySQLdb.OperationalError as exc:
+341         err = "MySQL Error {}: {}".format(*exc.args)
+342         __context__["mysql.error"] = err
+343         log.error(err)
+344         return False
+345     result = cur.fetchone()
+346     log.debug(result)
+347     return result
+348 def _mysql_user_create(
+349     user,
+350     host="localhost",
+351     password=None,
+352     password_hash=None,
+353     allow_passwordless=False,
+354     unix_socket=False,
+355     password_column=None,
+356     auth_plugin="mysql_native_password",
+357     **connection_args
+358 ):
+359     server_version = salt.utils.data.decode(version(**connection_args))
+360     compare_version = "8.0.11"
+361     qry = "CREATE USER %(user)s@%(host)s"
+362     args = {}
+363     args["user"] = user
+364     args["host"] = host
+365     if unix_socket:
+366         if not plugin_status("auth_socket", **connection_args):
+367             err = "The auth_socket plugin is not enabled."
+368             log.error(err)
+369             __context__["mysql.error"] = err
+370             qry = False
+371         else:
+372             if host == "localhost":
+373                 qry += " IDENTIFIED WITH auth_socket"
+374             else:
+375                 log.error("Auth via unix_socket can be set only for host=localhost")
+376                 __context__["mysql.error"] = err
+377                 qry = False
+378     else:
+379         if not salt.utils.data.is_true(allow_passwordless):
+380             if password is not None:
+381                 if (
+382                     salt.utils.versions.version_cmp(server_version, compare_version)
+383                     &gt;= 0
+384                 ):
+385                     args["auth_plugin"] = auth_plugin
+386                     qry += " IDENTIFIED WITH %(auth_plugin)s BY %(password)s"
+387                 else:
+388                     qry += " IDENTIFIED BY %(password)s"
+389                 args["password"] = str(password)
+390             elif password_hash is not None:
+391                 if (
+392                     salt.utils.versions.version_cmp(server_version, compare_version)
+393                     &gt;= 0
+394                 ):
+395                     args["auth_plugin"] = auth_plugin
+396                     qry += " IDENTIFIED WITH %(auth_plugin)s AS %(password)s"
+397                 else:
+398                     qry += " IDENTIFIED BY PASSWORD %(password)s"
+399                 args["password"] = password_hash
+400             else:
+401                 log.error(
+402                     "password or password_hash must be specified, unless "
+403                     "allow_passwordless=True"
+404                 )
+405                 qry = False
+406     return qry, args
+407 def _mariadb_user_create(
+408     user,
+409     host="localhost",
+410     password=None,
+411     password_hash=None,
+412     allow_passwordless=False,
+413     unix_socket=False,
+414     password_column=None,
+415     auth_plugin="mysql_native_password",
+416     **connection_args
+417 ):
+418     qry = "CREATE USER %(user)s@%(host)s"
+419     args = {}
+420     args["user"] = user
+421     args["host"] = host
+422     if unix_socket:
+423         if not plugin_status("unix_socket", **connection_args):
+424             err = "The unix_socket plugin is not enabled."
+425             log.error(err)
+426             __context__["mysql.error"] = err
+427             qry = False
+428         else:
+429             if host == "localhost":
+430                 qry += " IDENTIFIED VIA unix_socket"
+431             else:
+432                 log.error("Auth via unix_socket can be set only for host=localhost")
+433                 __context__["mysql.error"] = err
+434                 qry = False
+435     else:
+436         if not salt.utils.data.is_true(allow_passwordless):
+437             if password is not None:
+438                 qry += " IDENTIFIED BY %(password)s"
+439                 args["password"] = str(password)
+440             elif password_hash is not None:
+441                 qry += " IDENTIFIED BY PASSWORD %(password)s"
+442                 args["password"] = password_hash
+443             else:
+444                 log.error(
+445                     "password or password_hash must be specified, unless "
+446                     "allow_passwordless=True"
+447                 )
+448                 qry = False
+449     return qry, args
+450 def user_create(
+451     user,
+452     host="localhost",
+453     password=None,
+454     password_hash=None,
+455     allow_passwordless=False,
+456     unix_socket=False,
+457     password_column=None,
+458     auth_plugin="mysql_native_password",
+459     **connection_args
+460 ):
+461     server_version = salt.utils.data.decode(version(**connection_args))
+462     if not server_version and password:
+463         __context__["mysql.error"] = None
+464         connection_args["connection_pass"] = password
+465         server_version = salt.utils.data.decode(version(**connection_args))
+466         if not server_version:
+467             last_err = __context__["mysql.error"]
+468             err = (
+469                 "MySQL Error: Unable to fetch current server version. Last error was:"
+470                 ' "{}"'.format(last_err)
+471             )
+472             log.error(err)
+473             return False
+474     if user_exists(user, host, **connection_args):
+475         log.info("User '%s'@'%s' already exists", user, host)
+476         return False
+477     dbc = _connect(**connection_args)
+478     if dbc is None:
+479         return False
+480     if not password_column:
+481         password_column = __password_column(**connection_args)
+482     cur = dbc.cursor()
+483     if "MariaDB" in server_version:
+484         qry, args = _mariadb_user_create(
+485             user,
+486             host,
+487             password,
+488             password_hash,
+489             allow_passwordless,
+490             unix_socket,
+491             password_column=password_column,
+492             auth_plugin=auth_plugin,
+493             **connection_args
+494         )
+495     else:
+496         qry, args = _mysql_user_create(
+497             user,
+498             host,
+499             password,
+500             password_hash,
+501             allow_passwordless,
+502             unix_socket,
+503             password_column=password_column,
+504             auth_plugin=auth_plugin,
+505             **connection_args
+506         )
+507     if isinstance(qry, bool):
+508         return qry
+509     try:
+510         _execute(cur, qry, args)
+511     except MySQLdb.OperationalError as exc:
+512         err = "MySQL Error {}: {}".format(*exc.args)
+513         __context__["mysql.error"] = err
+514         log.error(err)
+515         return False
+516     if user_exists(
+517         user,
+518         host,
+519         password,
+520         password_hash,
+521         password_column=password_column,
+522         **connection_args
+523     ):
+524         msg = "User '{}'@'{}' has been created".format(user, host)
+525         if not any((password, password_hash)):
+526             msg += " with passwordless login"
+527         log.info(msg)
+528         return True
+529     log.info("User '%s'@'%s' was not created", user, host)
+530     return False
+531 def _mysql_user_chpass(
+532     user,
+533     host="localhost",
+534     password=None,
+535     password_hash=None,
+536     allow_passwordless=False,
+537     unix_socket=None,
+538     password_column=None,
+539     auth_plugin="mysql_native_password",
+540     **connection_args
+541 ):
+542     server_version = salt.utils.data.decode(version(**connection_args))
+543     compare_version = "8.0.11"
+544     args = {}
+545     if password is not None:
+546         if salt.utils.versions.version_cmp(server_version, compare_version) &gt;= 0:
+547             password_sql = "%(password)s"
+548         else:
+549             password_sql = "PASSWORD(%(password)s)"
+550         args["password"] = password
+551     elif password_hash is not None:
+552         password_sql = "%(password)s"
+553         args["password"] = password_hash
+554     elif not salt.utils.data.is_true(allow_passwordless):
+555         log.error(
+556             "password or password_hash must be specified, unless "
+557             "allow_passwordless=True"
+558         )
+559         return False
+560     else:
+561         password_sql = "''"
+562     args["user"] = user
+563     args["host"] = host
+564     if salt.utils.versions.version_cmp(server_version, compare_version) &gt;= 0:
+565         args["auth_plugin"] = auth_plugin
+566         qry = "ALTER USER %(user)s@%(host)s IDENTIFIED WITH %(auth_plugin)s "
+567         if password is not None:
+568             qry += "BY %(password)s;"
+569         elif password_hash is not None:
+570             qry += "AS %(password)s;"
+571     else:
+572         qry = (
+573             "UPDATE mysql.user SET "
+574             + password_column
+575             + "="
+576             + password_sql
+577             + " WHERE User=%(user)s AND Host = %(host)s;"
+578         )
+579     if salt.utils.data.is_true(allow_passwordless) and salt.utils.data.is_true(
+580         unix_socket
+581     ):
+582         if host == "localhost":
+583             if not plugin_status("auth_socket", **connection_args):
+584                 err = "The auth_socket plugin is not enabled."
+585                 log.error(err)
+586                 __context__["mysql.error"] = err
+587                 qry = False
+588             else:
+589                 args["unix_socket"] = "auth_socket"
+590                 if (
+591                     salt.utils.versions.version_cmp(server_version, compare_version)
+592                     &gt;= 0
+593                 ):
+594                     qry = (
+595                         "ALTER USER %(user)s@%(host)s IDENTIFIED WITH %(unix_socket)s"
+596                         " AS %(user)s;"
+597                     )
+598                 else:
+599                     qry = (
+600                         "UPDATE mysql.user SET "
+601                         + password_column
+602                         + "="
+603                         + password_sql
+604                         + ", plugin=%(unix_socket)s"
+605                         + " WHERE User=%(user)s AND Host = %(host)s;"
+606                     )
+607         else:
+608             log.error("Auth via unix_socket can be set only for host=localhost")
+609     return qry, args
+610 def _mariadb_user_chpass(
+611     user,
+612     host="localhost",
+613     password=None,
+614     password_hash=None,
+615     allow_passwordless=False,
+616     unix_socket=None,
+617     password_column=None,
+618     auth_plugin="mysql_native_password",
+619     **connection_args
+620 ):
+621     server_version = salt.utils.data.decode(version(**connection_args))
+622     compare_version = "10.4"
+623     args = {}
+624     if password is not None:
+625         password_sql = "PASSWORD(%(password)s)"
+626         args["password"] = password
+627     elif password_hash is not None:
+628         password_sql = "%(password)s"
+629         args["password"] = password_hash
+630     elif not salt.utils.data.is_true(allow_passwordless):
+631         log.error(
+632             "password or password_hash must be specified, unless "
+633             "allow_passwordless=True"
+634         )
+635         return False
+636     else:
+637         password_sql = "''"
+638     args["user"] = user
+639     args["host"] = host
+640     if salt.utils.versions.version_cmp(server_version, compare_version) &gt;= 0:
+641         args["auth_plugin"] = auth_plugin
+642         qry = "ALTER USER %(user)s@%(host)s IDENTIFIED VIA %(auth_plugin)s USING "
+643         qry += password_sql
+644     else:
+645         qry = (
+646             "UPDATE mysql.user SET "
+647             + password_column
+648             + "="
+649             + password_sql
+650             + " WHERE User=%(user)s AND Host = %(host)s;"
+651         )
+652     if salt.utils.data.is_true(allow_passwordless) and salt.utils.data.is_true(
+653         unix_socket
+654     ):
+655         if host == "localhost":
+656             if not plugin_status("unix_socket", **connection_args):
+657                 err = "The unix_socket plugin is not enabled."
+658                 log.error(err)
+659                 __context__["mysql.error"] = err
+660                 qry = False
+661             else:
+662                 args["unix_socket"] = "unix_socket"
+663                 qry = (
+664                     "UPDATE mysql.user SET "
+665                     + password_column
+666                     + "="
+667                     + password_sql
+668                     + ", plugin=%(unix_socket)s"
+669                     + " WHERE User=%(user)s AND Host = %(host)s;"
+670                 )
+671         else:
+672             log.error("Auth via unix_socket can be set only for host=localhost")
+673     return qry, args
+674 def user_chpass(
+675     user,
+676     host="localhost",
+677     password=None,
+678     password_hash=None,
+679     allow_passwordless=False,
+680     unix_socket=None,
+681     password_column=None,
+682     **connection_args
+683 ):
+684     server_version = salt.utils.data.decode(version(**connection_args))
+685     if not server_version and password:
+686         __context__["mysql.error"] = None
+687         connection_args["connection_pass"] = password
+688         server_version = salt.utils.data.decode(version(**connection_args))
+689         if not server_version:
+690             last_err = __context__["mysql.error"]
+691             err = (
+692                 "MySQL Error: Unable to fetch current server version. Last error was:"
+693                 ' "{}"'.format(last_err)
+694             )
+695             log.error(err)
+696             return False
+697     if not user_exists(user, host, **connection_args):
+698         log.info("User '%s'@'%s' does not exists", user, host)
+699         return False
+700     dbc = _connect(**connection_args)
+701     if dbc is None:
+702         return False
+703     if not password_column:
+704         password_column = __password_column(**connection_args)
+705     auth_plugin = __get_auth_plugin(user, host, **connection_args)
+706     cur = dbc.cursor()
+707     if "MariaDB" in server_version:
+708         qry, args = _mariadb_user_chpass(
+709             user,
+710             host,
+711             password,
+712             password_hash,
+713             allow_passwordless,
+714             unix_socket,
+715             password_column=password_column,
+716             auth_plugin=auth_plugin,
+717             **connection_args
+718         )
+719     else:
+720         qry, args = _mysql_user_chpass(
+721             user,
+722             host,
+723             password,
+724             password_hash,
+725             allow_passwordless,
+726             unix_socket,
+727             password_column=password_column,
+728             auth_plugin=auth_plugin,
+729             **connection_args
+730         )
+731     try:
+732         result = _execute(cur, qry, args)
+733     except MySQLdb.OperationalError as exc:
+734         err = "MySQL Error {}: {}".format(*exc.args)
+735         __context__["mysql.error"] = err
+736         log.error(err)
+737         return False
+738     compare_version = "10.4.0" if "MariaDB" in server_version else "8.0.11"
+739     res = False
+740     if salt.utils.versions.version_cmp(server_version, compare_version) &gt;= 0:
+741         _execute(cur, "FLUSH PRIVILEGES;")
+742         res = True
+743     else:
+744         if result:
+745             _execute(cur, "FLUSH PRIVILEGES;")
+746             res = True
+747     if res:
+748         log.info(
+749             "Password for user '%s'@'%s' has been %s",
+750             user,
+751             host,
+752             "changed" if any((password, password_hash)) else "cleared",
+753         )
+754         return True
+755     else:
+756         log.info(
+757             "Password for user '%s'@'%s' was not %s",
+758             user,
+759             host,
+760             "changed" if any((password, password_hash)) else "cleared",
+761         )
+762         return False
+763 def user_remove(user, host="localhost", **connection_args):
+764     if not user_exists(user, host, **connection_args):
+765         err = "User '%s'@'%s' does not exists", user, host
+766         __context__["mysql.error"] = err
+767         log.info(err)
+768         return False
+769     dbc = _connect(**connection_args)
+770     if dbc is None:
+771         return False
+772     cur = dbc.cursor()
+773     qry = "DROP USER %(user)s@%(host)s"
+774     args = {}
+775     args["user"] = user
+776     args["host"] = host
+777     try:
+778         _execute(cur, qry, args)
+779     except MySQLdb.OperationalError as exc:
+780         err = "MySQL Error {}: {}".format(*exc.args)
+781         __context__["mysql.error"] = err
+782         log.error(err)
+783         return False
+784     if not user_exists(user, host, **connection_args):
+785         log.info("User '%s'@'%s' has been removed", user, host)
+786         return True
+787     log.info("User '%s'@'%s' has NOT been removed", user, host)
+788     return False
+789 def tokenize_grant(grant):
+790     return _grant_to_tokens(grant)
+791 def db_check(name, table=None, **connection_args):
+792     ret = []
+793     if table is None:
+794         tables = db_tables(name, **connection_args)
+795         for table in tables:
+796             log.info("Checking table '%s' in db '%s'..", name, table)
+797             ret.append(__check_table(name, table, **connection_args))
+798     else:
+799         log.info("Checking table '%s' in db '%s'..", name, table)
+800         ret = __check_table(name, table, **connection_args)
+801     return ret
+802 def db_repair(name, table=None, **connection_args):
+803     ret = []
+804     if table is None:
+805         tables = db_tables(name, **connection_args)
+806         for table in tables:
+807             log.info("Repairing table '%s' in db '%s'..", name, table)
+808             ret.append(__repair_table(name, table, **connection_args))
+809     else:
+810         log.info("Repairing table '%s' in db '%s'..", name, table)
+811         ret = __repair_table(name, table, **connection_args)
+812     return ret
+813 def db_optimize(name, table=None, **connection_args):
+814     ret = []
+815     if table is None:
+816         tables = db_tables(name, **connection_args)
+817         for table in tables:
+818             log.info("Optimizing table '%s' in db '%s'..", name, table)
+819             ret.append(__optimize_table(name, table, **connection_args))
+820     else:
+821         log.info("Optimizing table '%s' in db '%s'..", name, table)
+822         ret = __optimize_table(name, table, **connection_args)
+823     return ret
+824 def __grant_normalize(grant):
+825     if grant.strip().upper() == "ALL":
+826         grant = "ALL PRIVILEGES"
+827     exploded_grants = __grant_split(grant)
+828     for chkgrant, _ in exploded_grants:
+829         if chkgrant.strip().upper() not in __grants__:
+830             raise Exception("Invalid grant : '{}'".format(chkgrant))
+831     return grant
+832 def __grant_split(grant):
+833     pattern = re.compile(r"([\w\s]+)(\([^)(]*\))?\s*,?")
+834     return pattern.findall(grant)
+835 def __ssl_option_sanitize(ssl_option):
+836     new_ssl_option = []
+837     for opt in ssl_option:
+838         key = next(iter(opt.keys()))
+839         normal_key = key.strip().upper()
+840         if normal_key not in __ssl_options__:
+841             raise Exception("Invalid SSL option : '{}'".format(key))
+842         if normal_key in __ssl_options_parameterized__:
+843             new_ssl_option.append(
+844                 "{} '{}'".format(normal_key, opt[key].replace("'", ""))
+845             )
+846         elif opt[key]:
+847             new_ssl_option.append(normal_key)
+848     return " REQUIRE " + " AND ".join(new_ssl_option)
+849 def __grant_generate(
+850     grant,
+851     database,
+852     user,
+853     host="localhost",
+854     grant_option=False,
+855     escape=True,
+856     ssl_option=False,
+857 ):
+858     grant = re.sub(r"\s*,\s*", ", ", grant).upper()
+859     grant = __grant_normalize(grant)
+860     db_part = database.rpartition(".")
+861     dbc = db_part[0]
+862     table = db_part[2]
+863     if escape:
+864         if dbc != "*":
+865             dbc = quote_identifier(dbc, for_grants=(table == "*"))
+866         if table != "*":
+867             table = quote_identifier(table)
+868     qry = "GRANT {} ON {}.{} TO %(user)s@%(host)s".format(grant, dbc, table)
+869     args = {}
+870     args["user"] = user
+871     args["host"] = host
+872     if ssl_option and isinstance(ssl_option, list):
+873         qry += __ssl_option_sanitize(ssl_option)
+874     if salt.utils.data.is_true(grant_option):
+875         qry += " WITH GRANT OPTION"
+876     log.debug("Grant Query generated: %s args %s", qry, repr(args))
+877     return {"qry": qry, "args": args}
+878 def user_grants(user, host="localhost", **connection_args):
+879     if not user_exists(user, host, **connection_args):
+880         log.info("User '%s'@'%s' does not exist", user, host)
+881         return False
+882     dbc = _connect(**connection_args)
+883     if dbc is None:
+884         return False
+885     cur = dbc.cursor()
+886     qry = "SHOW GRANTS FOR %(user)s@%(host)s"
+887     args = {}
+888     args["user"] = user
+889     args["host"] = host
+890     try:
+891         _execute(cur, qry, args)
+892     except MySQLdb.OperationalError as exc:
+893         err = "MySQL Error {}: {}".format(*exc.args)
+894         __context__["mysql.error"] = err
+895         log.error(err)
+896         return False
+897     ret = []
+898     results = salt.utils.data.decode(cur.fetchall())
+899     for grant in results:
+900         tmp = grant[0].split(" IDENTIFIED BY")[0]
+901         if "WITH GRANT OPTION" in grant[0] and "WITH GRANT OPTION" not in tmp:
+902             tmp = "{} WITH GRANT OPTION".format(tmp)
+903         ret.append(tmp)
+904     log.debug(ret)
+905     return ret
+906 def grant_exists(
+907     grant,
+908     database,
+909     user,
+910     host="localhost",
+911     grant_option=False,
+912     escape=True,
+913     **connection_args
+914 ):
+915     server_version = salt.utils.data.decode(version(**connection_args))
+916     if not server_version:
+917         last_err = __context__["mysql.error"]
+918         err = 'MySQL Error: Unable to fetch current server version. Last error was: "{}"'.format(
+919             last_err
+920         )
+921         log.error(err)
+922         return False
+923     if "ALL" in grant.upper():
+924         if (
+925             salt.utils.versions.version_cmp(server_version, "8.0") &gt;= 0
+926             and "MariaDB" not in server_version
+927             and database == "*.*"
+928         ):
+929             grant = ",".join([i for i in __all_privileges__])
+930         else:
+931             grant = "ALL PRIVILEGES"
+932     try:
+933         target = __grant_generate(grant, database, user, host, grant_option, escape)
+934     except Exception:  # pylint: disable=broad-except
+935         log.error("Error during grant generation.")
+936         return False
+937     grants = user_grants(user, host, **connection_args)
+938     if grants is False:
+939         log.error(
+940             "Grant does not exist or may not be ordered properly. In some cases, "
+941             "this could also indicate a connection error. Check your configuration."
+942         )
+943         return False
+944     _grants = {}
+945     for grant in grants:
+946         grant_token = _grant_to_tokens(grant)
+947         if grant_token["database"] not in _grants:
+948             _grants[grant_token["database"]] = {
+949                 "user": grant_token["user"],
+950                 "database": grant_token["database"],
+951                 "host": grant_token["host"],
+952                 "grant": grant_token["grant"],
+953             }
+954         else:
+955             _grants[grant_token["database"]]["grant"].extend(grant_token["grant"])
+956     target_tokens = _grant_to_tokens(target)
+957     for database, grant_tokens in _grants.items():
+958         try:
+959             _grant_tokens = {}
+960             _target_tokens = {}
+961             _grant_matches = [
+962                 True if i in grant_tokens["grant"] else False
+963                 for i in target_tokens["grant"]
+964             ]
+965             for item in ["user", "database", "host"]:
+966                 _grant_tokens[item] = (
+967                     grant_tokens[item]
+968                     .replace('"', "")
+969                     .replace("\\", "")
+970                     .replace("`", "")
+971                 )
+972                 _target_tokens[item] = (
+973                     target_tokens[item]
+974                     .replace('"', "")
+975                     .replace("\\", "")
+976                     .replace("`", "")
+977                 )
+978             if (
+979                 _grant_tokens["user"] == _target_tokens["user"]
+980                 and _grant_tokens["database"] == _target_tokens["database"]
+981                 and _grant_tokens["host"] == _target_tokens["host"]
+982                 and all(_grant_matches)
+983             ):
+984                 return True
+985             else:
+986                 log.debug("grants mismatch '%s'&lt;&gt;'%s'", grant_tokens, target_tokens)
+987         except Exception as exc:  # pylint: disable=broad-except
+988             log.exception(exc)
+989             if grants is not False and target in grants:
+990                 log.debug("Grant exists.")
+991                 return True
+992     log.debug("Grant does not exist, or is perhaps not ordered properly?")
+993     return False
+994 def grant_add(
+995     grant,
+996     database,
+997     user,
+998     host="localhost",
+999     grant_option=False,
+1000     escape=True,
+1001     ssl_option=False,
+1002     **connection_args
+1003 ):
+1004     dbc = _connect(**connection_args)
+1005     if dbc is None:
+1006         return False
+1007     cur = dbc.cursor()
+1008     grant = grant.strip()
+1009     try:
+1010         qry = __grant_generate(
+1011             grant, database, user, host, grant_option, escape, ssl_option
+1012         )
+1013     except Exception:  # pylint: disable=broad-except
+1014         log.error("Error during grant generation")
+1015         return False
+1016     try:
+1017         _execute(cur, qry["qry"], qry["args"])
+1018     except (MySQLdb.OperationalError, MySQLdb.ProgrammingError) as exc:
+1019         err = "MySQL Error {}: {}".format(*exc.args)
+1020         __context__["mysql.error"] = err
+1021         log.error(err)
+1022         return False
+1023     if grant_exists(
+1024         grant, database, user, host, grant_option, escape, **connection_args
+1025     ):
+1026         log.info(
+1027             "Grant '%s' on '%s' for user '%s' has been added", grant, database, user
+1028         )
+1029         return True
+1030     log.info(
+1031         "Grant '%s' on '%s' for user '%s' has NOT been added", grant, database, user
+1032     )
+1033     return False
+1034 def grant_revoke(
+1035     grant,
+1036     database,
+1037     user,
+1038     host="localhost",
+1039     grant_option=False,
+1040     escape=True,
+1041     **connection_args
+1042 ):
+1043     dbc = _connect(**connection_args)
+1044     if dbc is None:
+1045         return False
+1046     cur = dbc.cursor()
+1047     grant = __grant_normalize(grant)
+1048     if salt.utils.data.is_true(grant_option):
+1049         grant += ", GRANT OPTION"
+1050     db_part = database.rpartition(".")
+1051     dbc = db_part[0]
+1052     table = db_part[2]
+1053     if dbc != "*":
+1054         s_database = quote_identifier(dbc, for_grants=(table == "*"))
+1055     if dbc == "*":
+1056         s_database = dbc
+1057     if table != "*":
+1058         table = quote_identifier(table)
+1059     qry = "REVOKE {} ON {}.{} FROM %(user)s@%(host)s;".format(grant, s_database, table)
+1060     args = {}
+1061     args["user"] = user
+1062     args["host"] = host
+1063     try:
+1064         _execute(cur, qry, args)
+1065     except MySQLdb.OperationalError as exc:
+1066         err = "MySQL Error {}: {}".format(*exc.args)
+1067         __context__["mysql.error"] = err
+1068         log.error(err)
+1069         return False
+1070     if not grant_exists(
+1071         grant, database, user, host, grant_option, escape, **connection_args
+1072     ):
+1073         log.info(
+1074             "Grant '%s' on '%s' for user '%s' has been revoked",
+1075             grant,
+1076             database,
+1077             user,
+1078         )
+1079         return True
+1080     log.info(
+1081         "Grant '%s' on '%s' for user '%s' has NOT been revoked",
+1082         grant,
+1083         database,
+1084         user,
+1085     )
+1086     return False
+1087 def processlist(**connection_args):
+1088     ret = []
+1089     dbc = _connect(**connection_args)
+1090     if dbc is None:
+1091         return []
+1092     cur = dbc.cursor()
+1093     _execute(cur, "SHOW FULL PROCESSLIST")
+1094     hdr = [c[0] for c in cur.description]
+1095     for _ in range(cur.rowcount):
+1096         row = cur.fetchone()
+1097         idx_r = {}
+1098         for idx_j, value_j in enumerate(hdr):
+1099             idx_r[hdr[idx_j]] = row[idx_j]
+1100         ret.append(idx_r)
+1101     cur.close()
+1102     return ret
+1103 def __do_query_into_hash(conn, sql_str):
+1104     mod = sys._getframe().f_code.co_name
+1105     log.debug("%s&lt;--(%s)", mod, sql_str)
+1106     rtn_results = []
+1107     try:
+1108         cursor = conn.cursor()
+1109     except MySQLdb.MySQLError:
+1110         log.error("%s: Can't get cursor for SQL-&gt;%s", mod, sql_str)
+1111         cursor.close()
+1112         log.debug("%s--&gt;", mod)
+1113         return rtn_results
+1114     try:
+1115         _execute(cursor, sql_str)
+1116     except MySQLdb.MySQLError:
+1117         log.error("%s: try to execute : SQL-&gt;%s", mod, sql_str)
+1118         cursor.close()
+1119         log.debug("%s--&gt;", mod)
+1120         return rtn_results
+1121     qrs = cursor.fetchall()
+1122     for row_data in qrs:
+1123         col_cnt = 0
+1124         row = {}
+1125         for col_data in cursor.description:
+1126             col_name = col_data[0]
+1127             row[col_name] = row_data[col_cnt]
+1128             col_cnt += 1
+1129         rtn_results.append(row)
+1130     cursor.close()
+1131     log.debug("%s--&gt;", mod)
+1132     return rtn_results
+1133 def get_master_status(**connection_args):
+1134     mod = sys._getframe().f_code.co_name
+1135     log.debug("%s&lt;--", mod)
+1136     conn = _connect(**connection_args)
+1137     if conn is None:
+1138         return []
+1139     rtnv = __do_query_into_hash(conn, "SHOW MASTER STATUS")
+1140     conn.close()
+1141     if not rtnv:
+1142         rtnv.append([])
+1143     log.debug("%s--&gt;%s", mod, len(rtnv[0]))
+1144     return rtnv[0]
+1145 def get_slave_status(**connection_args):
+1146     mod = sys._getframe().f_code.co_name
+1147     log.debug("%s&lt;--", mod)
+1148     conn = _connect(**connection_args)
+1149     if conn is None:
+1150         return []
+1151     rtnv = __do_query_into_hash(conn, "SHOW SLAVE STATUS")
+1152     conn.close()
+1153     if not rtnv:
+1154         rtnv.append([])
+1155     log.debug("%s--&gt;%s", mod, len(rtnv[0]))
+1156     return rtnv[0]
+1157 def showvariables(**connection_args):
+1158     mod = sys._getframe().f_code.co_name
+1159     log.debug("%s&lt;--", mod)
+1160     conn = _connect(**connection_args)
+1161     if conn is None:
+1162         return []
+1163     rtnv = __do_query_into_hash(conn, "SHOW VARIABLES")
+1164     conn.close()
+1165     if not rtnv:
+1166         rtnv.append([])
+1167     log.debug("%s--&gt;%s", mod, len(rtnv[0]))
+1168     return rtnv
+1169 def showglobal(**connection_args):
+1170     mod = sys._getframe().f_code.co_name
+1171     log.debug("%s&lt;--", mod)
+1172     conn = _connect(**connection_args)
+1173     if conn is None:
+1174         return []
+1175     rtnv = __do_query_into_hash(conn, "SHOW GLOBAL VARIABLES")
+1176     conn.close()
+1177     if not rtnv:
+1178         rtnv.append([])
+1179     log.debug("%s--&gt;%s", mod, len(rtnv[0]))
+1180     return rtnv
+1181 def verify_login(user, password=None, **connection_args):
+1182     connection_args["connection_user"] = user
+1183     connection_args["connection_pass"] = password
+1184     dbc = _connect(**connection_args)
+1185     if dbc is None:
+1186         if "mysql.error" in __context__:
+1187             del __context__["mysql.error"]
+1188         return False
+1189     return True
+1190 def plugins_list(**connection_args):
+1191     dbc = _connect(**connection_args)
+1192     if dbc is None:
+1193         return []
+1194     cur = dbc.cursor()
+1195     qry = "SHOW PLUGINS"
+1196     try:
+1197         _execute(cur, qry)
+1198     except MySQLdb.OperationalError as exc:
+1199         err = "MySQL Error {}: {}".format(*exc.args)
+1200         __context__["mysql.error"] = err
+1201         log.error(err)
+1202         return []
+1203     ret = []
+1204     results = cur.fetchall()
+1205     for dbs in results:
+1206         ret.append({"name": dbs[0], "status": dbs[1]})
+1207     log.debug(ret)
+1208     return ret
+1209 def plugin_add(name, soname=None, **connection_args):
+1210     if not name:
+1211         log.error("Plugin name is required.")
+1212         return False
+1213     if plugin_status(name, **connection_args):
+1214         log.error("Plugin %s is already installed.", name)
+1215         return True
+1216     dbc = _connect(**connection_args)
+1217     if dbc is None:
+1218         return False
+1219     cur = dbc.cursor()
+1220     qry = "INSTALL PLUGIN {}".format(name)
+1221     if soname:
+1222         qry += ' SONAME "{}"'.format(soname)
+1223     else:
+1224         qry += ' SONAME "{}.so"'.format(name)
+1225     try:
+1226         _execute(cur, qry)
+1227     except MySQLdb.OperationalError as exc:
+1228         err = "MySQL Error {}: {}".format(*exc.args)
+1229         __context__["mysql.error"] = err
+1230         log.error(err)
+1231         return False
+1232     return True
+1233 def plugin_remove(name, **connection_args):
+1234     if not name:
+1235         log.error("Plugin name is required.")
+1236         return False
+1237     if not plugin_status(name, **connection_args):
+1238         log.error("Plugin %s is not installed.", name)
+1239         return True
+1240     dbc = _connect(**connection_args)
+1241     if dbc is None:
+1242         return False
+1243     cur = dbc.cursor()
+1244     qry = "UNINSTALL PLUGIN {}".format(name)
+1245     args = {}
+1246     args["name"] = name
+1247     try:
+1248         _execute(cur, qry)
+1249     except MySQLdb.OperationalError as exc:
+1250         err = "MySQL Error {}: {}".format(*exc.args)
+1251         __context__["mysql.error"] = err
+1252         log.error(err)
+1253         return False
+1254     return True
+1255 def plugin_status(name, **connection_args):
+1256     if not name:
+1257         log.error("Plugin name is required.")
+1258         return False
+1259     dbc = _connect(**connection_args)
+1260     if dbc is None:
+1261         return ""
+1262     cur = dbc.cursor()
+1263     qry = (
+1264         "SELECT PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME ="
+1265         " %(name)s"
+1266     )
+1267     args = {}
+1268     args["name"] = name
+1269     try:
+1270         _execute(cur, qry, args)
+1271     except MySQLdb.OperationalError as exc:
+1272         err = "MySQL Error {}: {}".format(*exc.args)
+1273         __context__["mysql.error"] = err
+1274         log.error(err)
+1275         return ""
+1276     try:
+1277         status = cur.fetchone()
+1278         if status is None:
+1279             return ""
+1280         else:
+1281             return status[0]
+1282     except IndexError:
+1283         return ""
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -1335,424 +1335,424 @@ def plugin_status(name, **connection_args):
 </h3>
 <hr/>
 <pre>
-import re
-import salt.utils.path
-from salt.exceptions import CommandExecutionError, SaltInvocationError
-def __virtual__():
-    if salt.utils.path.which("csf") is None:
-        return (False, "The csf execution module cannot be loaded: csf unavailable.")
-    else:
-        return True
-def _temp_exists(method, ip):
-    _type = method.replace("temp", "").upper()
-    cmd = (
-        "csf -t | awk -v code=1 -v type=_type -v ip=ip '$1==type &amp;&amp; $2==ip {{code=0}}"
-        " END {{exit code}}'".format(_type=_type, ip=ip)
-    )
-    exists = __salt__["cmd.run_all"](cmd)
-    return not bool(exists["retcode"])
-def _exists_with_port(method, rule):
-    path = "/etc/csf/csf.{}".format(method)
-    return __salt__["file.contains"](path, rule)
-def exists(
-    method,
-    ip,
-    port=None,
-    proto="tcp",
-    direction="in",
-    port_origin="d",
-    ip_origin="d",
-    ttl=None,
-    comment="",
-):
-    if method.startswith("temp"):
-        return _temp_exists(method, ip)
-    if port:
-        rule = _build_port_rule(
-            ip, port, proto, direction, port_origin, ip_origin, comment
-        )
-        return _exists_with_port(method, rule)
-    exists = __salt__["cmd.run_all"]("egrep ^'{} +' /etc/csf/csf.{}".format(ip, method))
-    return not bool(exists["retcode"])
-def __csf_cmd(cmd):
-    csf_cmd = "{} {}".format(salt.utils.path.which("csf"), cmd)
-    out = __salt__["cmd.run_all"](csf_cmd)
-    if out["retcode"] != 0:
-        if not out["stderr"]:
-            ret = out["stdout"]
-        else:
-            ret = out["stderr"]
-        raise CommandExecutionError("csf failed: {}".format(ret))
-    else:
-        ret = out["stdout"]
-    return ret
-def _status_csf():
-    cmd = "test -e /etc/csf/csf.disable"
-    out = __salt__["cmd.run_all"](cmd)
-    return bool(out["retcode"])
-def _get_opt(method):
-    opts = {
-        "allow": "-a",
-        "deny": "-d",
-        "unallow": "-ar",
-        "undeny": "-dr",
-        "tempallow": "-ta",
-        "tempdeny": "-td",
-        "temprm": "-tr",
-    }
-    return opts[method]
-def _build_args(method, ip, comment):
-    opt = _get_opt(method)
-    args = "{} {}".format(opt, ip)
-    if comment:
-        args += " {}".format(comment)
-    return args
-def _access_rule(
-    method,
-    ip=None,
-    port=None,
-    proto="tcp",
-    direction="in",
-    port_origin="d",
-    ip_origin="d",
-    comment="",
-):
-    if _status_csf():
-        if ip is None:
-            return {"error": "You must supply an ip address or CIDR."}
-        if port is None:
-            args = _build_args(method, ip, comment)
-            return __csf_cmd(args)
-        else:
-            if method not in ["allow", "deny"]:
-                return {
-                    "error": (
-                        "Only allow and deny rules are allowed when specifying a port."
-                    )
-                }
-            return _access_rule_with_port(
-                method=method,
-                ip=ip,
-                port=port,
-                proto=proto,
-                direction=direction,
-                port_origin=port_origin,
-                ip_origin=ip_origin,
-                comment=comment,
-            )
-def _build_port_rule(ip, port, proto, direction, port_origin, ip_origin, comment):
-    kwargs = {
-        "ip": ip,
-        "port": port,
-        "proto": proto,
-        "direction": direction,
-        "port_origin": port_origin,
-        "ip_origin": ip_origin,
-    }
-    rule = "{proto}|{direction}|{port_origin}={port}|{ip_origin}={ip}".format(**kwargs)
-    if comment:
-        rule += " #{}".format(comment)
-    return rule
-def _remove_access_rule_with_port(
-    method,
-    ip,
-    port,
-    proto="tcp",
-    direction="in",
-    port_origin="d",
-    ip_origin="d",
-    ttl=None,
-):
-    rule = _build_port_rule(
-        ip,
-        port=port,
-        proto=proto,
-        direction=direction,
-        port_origin=port_origin,
-        ip_origin=ip_origin,
-        comment="",
-    )
-    rule = rule.replace("|", "[|]")
-    rule = rule.replace(".", "[.]")
-    result = __salt__["file.replace"](
-        "/etc/csf/csf.{}".format(method),
-        pattern="^{}(( +)?\\#.*)?$\n".format(rule),  # pylint: disable=W1401
-        repl="",
-    )
-    return result
-def _csf_to_list(option):
-    result = []
-    line = get_option(option)
-    if line:
-        csv = line.split("=")[1].replace(" ", "").replace('"', "")
-        result = csv.split(",")
-    return result
-def split_option(option):
-    return re.split(r"(?: +)?\=(?: +)?", option)
-def get_option(option):
-    pattern = r'^{}(\ +)?\=(\ +)?".*"$'.format(option)  # pylint: disable=W1401
-    grep = __salt__["file.grep"]("/etc/csf/csf.conf", pattern, "-E")
-    if "stdout" in grep and grep["stdout"]:
-        line = grep["stdout"]
-        return line
-    return None
-def set_option(option, value):
-    current_option = get_option(option)
-    if not current_option:
-        return {"error": "No such option exists in csf.conf"}
-    result = __salt__["file.replace"](
-        "/etc/csf/csf.conf",
-        pattern=r'^{}(\ +)?\=(\ +)?".*"'.format(option),  # pylint: disable=W1401
-        repl='{} = "{}"'.format(option, value),
-    )
-    return result
-def get_skipped_nics(ipv6=False):
-    if ipv6:
-        option = "ETH6_DEVICE_SKIP"
-    else:
-        option = "ETH_DEVICE_SKIP"
-    skipped_nics = _csf_to_list(option)
-    return skipped_nics
-def skip_nic(nic, ipv6=False):
-    nics = get_skipped_nics(ipv6=ipv6)
-    nics.append(nic)
-    return skip_nics(nics, ipv6)
-def skip_nics(nics, ipv6=False):
-    if ipv6:
-        ipv6 = "6"
-    else:
-        ipv6 = ""
-    nics_csv = ",".join(map(str, nics))
-    result = __salt__["file.replace"](
-        "/etc/csf/csf.conf",
-        pattern=r'^ETH{}_DEVICE_SKIP(\ +)?\=(\ +)?".*"'.format(ipv6),
-        repl='ETH{}_DEVICE_SKIP = "{}"'<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.format(ipv6, nics_csv),
-    )
-    return result
-def _access_rule_with_port(
-    method,
-    ip,
-    port,
-    proto="tcp",
-    direction="in",
-    port_origin="d",
-    ip_origin="d",
-    ttl=None,
-    comment="",
-):
-    results =</b></font> {}
-    if direction == "both":
-        directions = ["in", "out"]
-    else:
-        directions = [direction]
-    for direction in directions:
-        _exists = exists(
-            method,
-            ip,
-            port=port,
-            proto=proto,
-            direction=direction,
-            port_origin=port_origin,
-            ip_origin=ip_origin,
-            ttl=ttl,
-            comment=comment,
-        )
-        if not _exists:
-            rule = _build_port_rule(
-                ip,
-                port=port,
-                proto=proto,
-                direction=direction,
-                port_origin=port_origin,
-                ip_origin=ip_origin,
-                comment=comment,
-            )
-            path = "/etc/csf/csf.{}".format(method)
-            results[direction] = __salt__["file.append"](path, rule)
-    return results
-def _tmp_access_rule(
-    method,
-    ip=None,
-    ttl=None,
-    port=None,
-    direction="in",
-    port_origin="d",
-    ip_origin="d",
-    comment="",
-):
-    if _status_csf():
-        if ip is None:
-            return {"error": "You must supply an ip address or CIDR."}
-        if ttl is None:
-            return {"error": "You must supply a ttl."}
-        args = _build_tmp_access_args(method, ip, ttl, port, direction, comment)
-        return __csf_cmd(args)
-def _build_tmp_access_args(method, ip, ttl, port, direction, comment):
-    opt = _get_opt(method)
-    args = "{} {} {}".format(opt, ip, ttl)
-    if port:
-        args += " -p {}".format(port)
-    if direction:
-        args += " -d {}".format(direction)
-    if comment:
-        args += " #{}".format(comment)
-    return args
-def running():
-    return _status_csf()
-def disable():
-    if _status_csf():
-        return __csf_cmd("-x")
-def enable():
-    if not _status_csf():
-        return __csf_cmd("-e")
-def reload():
-    return __csf_cmd("-r")
-def tempallow(ip=None, ttl=None, port=None, direction=None, comment=""):
-    return _tmp_access_rule("tempallow", ip, ttl, port, direction, comment)
-def tempdeny(ip=None, ttl=None, port=None, direction=None, comment=""):
-    return _tmp_access_rule("tempdeny", ip, ttl, port, direction, comment)
-def allow(
-    ip,
-    port=None,
-    proto="tcp",
-    direction="in",
-    port_origin="d",
-    ip_origin="s",
-    ttl=None,
-    comment="",
-):
-    return _access_rule(
-        "allow",
-        ip,
-        port=port,
-        proto=proto,
-        direction=direction,
-        port_origin=port_origin,
-        ip_origin=ip_origin,
-        comment=comment,
-    )
-def deny(
-    ip,
-    port=None,
-    proto="tcp",
-    direction="in",
-    port_origin="d",
-    ip_origin="d",
-    ttl=None,
-    comment="",
-):
-    return _access_rule(
-        "deny", ip, port, proto, direction, port_origin, ip_origin, comment
-    )
-def remove_temp_rule(ip):
-    opt = _get_opt("temprm")
-    args = "{} {}".format(opt, ip)
-    return __csf_cmd(args)
-def unallow(ip):
-    return _access_rule("unallow", ip)
-def undeny(ip):
-    return _access_rule("undeny", ip)
-def remove_rule(
-    method,
-    ip,
-    port=None,
-    proto="tcp",
-    direction="in",
-    port_origin="d",
-    ip_origin="s",
-    ttl=None,
-    comment="",
-):
-    if method.startswith("temp") or ttl:
-        return remove_temp_rule(ip)
-    if not port:
-        if method == "allow":
-            return unallow(ip)
-        elif method == "deny":
-            return undeny(ip)
-    if port:
-        return _remove_access_rule_with_port(
-            method=method,
-            ip=ip,
-            port=port,
-            proto=proto,
-            direction=direction,
-            port_origin=port_origin,
-            ip_origin=ip_origin,
-        )
-def allow_ports(ports, proto="tcp", direction="in"):
-    results = []
-    ports = set(ports)
-    ports = list(ports)
-    proto = proto.upper()
-    direction = direction.upper()
-    _validate_direction_and_proto(direction, proto)
-    ports_csv = ",".join(map(str, ports))
-    directions = build_directions(direction)
-    for direction in directions:
-        result = __salt__["file.replace"](
-            "/etc/csf/csf.conf",
-            pattern=r'^{}_{}(\ +)?\=(\ +)?".*"$'.format(proto, direction),
-            repl='{}_{} = "{}"'.format(proto, direction, ports_csv),
-        )
-        results.append(result)
-    return results
-def get_ports(proto="tcp", direction="in"):
-    proto = proto.upper()
-    direction = direction.upper()
-    results = {}
-    _validate_direction_and_proto(direction, proto)
-    directions = build_directions(direction)
-    for direction in directions:
-        option = "{}_{}".format(proto, direction)
-        results[direction] = _csf_to_list(option)
-    return results
-def _validate_direction_and_proto(direction, proto):
-    if direction.upper() not in ["IN", "OUT", "BOTH"]:
-        raise SaltInvocationError("You must supply a direction of in, out, or both")
-    if proto.upper() not in ["TCP", "UDP", "TCP6", "UDP6"]:
-        raise SaltInvocationError(
-            "You must supply tcp, udp, tcp6, or udp6 for the proto keyword"
-        )
-    return
-def build_directions(direction):
-    direction = direction.upper()
-    if direction == "BOTH":
-        directions = ["IN", "OUT"]
-    else:
-        directions = [direction]
-    return directions
-def allow_port(port, proto="tcp", direction="both"):
-    ports = get_ports(proto=proto, direction=direction)
-    direction = direction.upper()
-    _validate_direction_and_proto(direction, proto)
-    directions = build_directions(direction)
-    results = []
-    for direction in directions:
-        _ports = ports[direction]
-        _ports.append(port)
-        results += allow_ports(_ports, proto=proto, direction=direction)
-    return results
-def get_testing_status():
-    testing = _csf_to_list("TESTING")[0]
-    return testing
-def _toggle_testing(val):
-    if val == "on":
-        val = "1"
-    elif val == "off":
-        val = "0"
-    else:
-        raise SaltInvocationError("Only valid arg is 'on' or 'off' here.")
-    result = __salt__["file.replace"](
-        "/etc/csf/csf.conf",
-        pattern=r'^TESTING(\ +)?\=(\ +)?".*"',  # pylint: disable=W1401
-        repl='TESTING = "{}"'.format(val),
-    )
-    return result
-def enable_testing_mode():
-    return _toggle_testing("on")
-def disable_testing_mode():
-    return _toggle_testing("off")
+1 import re
+2 import salt.utils.path
+3 from salt.exceptions import CommandExecutionError, SaltInvocationError
+4 def __virtual__():
+5     if salt.utils.path.which("csf") is None:
+6         return (False, "The csf execution module cannot be loaded: csf unavailable.")
+7     else:
+8         return True
+9 def _temp_exists(method, ip):
+10     _type = method.replace("temp", "").upper()
+11     cmd = (
+12         "csf -t | awk -v code=1 -v type=_type -v ip=ip '$1==type &amp;&amp; $2==ip {{code=0}}"
+13         " END {{exit code}}'".format(_type=_type, ip=ip)
+14     )
+15     exists = __salt__["cmd.run_all"](cmd)
+16     return not bool(exists["retcode"])
+17 def _exists_with_port(method, rule):
+18     path = "/etc/csf/csf.{}".format(method)
+19     return __salt__["file.contains"](path, rule)
+20 def exists(
+21     method,
+22     ip,
+23     port=None,
+24     proto="tcp",
+25     direction="in",
+26     port_origin="d",
+27     ip_origin="d",
+28     ttl=None,
+29     comment="",
+30 ):
+31     if method.startswith("temp"):
+32         return _temp_exists(method, ip)
+33     if port:
+34         rule = _build_port_rule(
+35             ip, port, proto, direction, port_origin, ip_origin, comment
+36         )
+37         return _exists_with_port(method, rule)
+38     exists = __salt__["cmd.run_all"]("egrep ^'{} +' /etc/csf/csf.{}".format(ip, method))
+39     return not bool(exists["retcode"])
+40 def __csf_cmd(cmd):
+41     csf_cmd = "{} {}".format(salt.utils.path.which("csf"), cmd)
+42     out = __salt__["cmd.run_all"](csf_cmd)
+43     if out["retcode"] != 0:
+44         if not out["stderr"]:
+45             ret = out["stdout"]
+46         else:
+47             ret = out["stderr"]
+48         raise CommandExecutionError("csf failed: {}".format(ret))
+49     else:
+50         ret = out["stdout"]
+51     return ret
+52 def _status_csf():
+53     cmd = "test -e /etc/csf/csf.disable"
+54     out = __salt__["cmd.run_all"](cmd)
+55     return bool(out["retcode"])
+56 def _get_opt(method):
+57     opts = {
+58         "allow": "-a",
+59         "deny": "-d",
+60         "unallow": "-ar",
+61         "undeny": "-dr",
+62         "tempallow": "-ta",
+63         "tempdeny": "-td",
+64         "temprm": "-tr",
+65     }
+66     return opts[method]
+67 def _build_args(method, ip, comment):
+68     opt = _get_opt(method)
+69     args = "{} {}".format(opt, ip)
+70     if comment:
+71         args += " {}".format(comment)
+72     return args
+73 def _access_rule(
+74     method,
+75     ip=None,
+76     port=None,
+77     proto="tcp",
+78     direction="in",
+79     port_origin="d",
+80     ip_origin="d",
+81     comment="",
+82 ):
+83     if _status_csf():
+84         if ip is None:
+85             return {"error": "You must supply an ip address or CIDR."}
+86         if port is None:
+87             args = _build_args(method, ip, comment)
+88             return __csf_cmd(args)
+89         else:
+90             if method not in ["allow", "deny"]:
+91                 return {
+92                     "error": (
+93                         "Only allow and deny rules are allowed when specifying a port."
+94                     )
+95                 }
+96             return _access_rule_with_port(
+97                 method=method,
+98                 ip=ip,
+99                 port=port,
+100                 proto=proto,
+101                 direction=direction,
+102                 port_origin=port_origin,
+103                 ip_origin=ip_origin,
+104                 comment=comment,
+105             )
+106 def _build_port_rule(ip, port, proto, direction, port_origin, ip_origin, comment):
+107     kwargs = {
+108         "ip": ip,
+109         "port": port,
+110         "proto": proto,
+111         "direction": direction,
+112         "port_origin": port_origin,
+113         "ip_origin": ip_origin,
+114     }
+115     rule = "{proto}|{direction}|{port_origin}={port}|{ip_origin}={ip}".format(**kwargs)
+116     if comment:
+117         rule += " #{}".format(comment)
+118     return rule
+119 def _remove_access_rule_with_port(
+120     method,
+121     ip,
+122     port,
+123     proto="tcp",
+124     direction="in",
+125     port_origin="d",
+126     ip_origin="d",
+127     ttl=None,
+128 ):
+129     rule = _build_port_rule(
+130         ip,
+131         port=port,
+132         proto=proto,
+133         direction=direction,
+134         port_origin=port_origin,
+135         ip_origin=ip_origin,
+136         comment="",
+137     )
+138     rule = rule.replace("|", "[|]")
+139     rule = rule.replace(".", "[.]")
+140     result = __salt__["file.replace"](
+141         "/etc/csf/csf.{}".format(method),
+142         pattern="^{}(( +)?\\#.*)?$\n".format(rule),  # pylint: disable=W1401
+143         repl="",
+144     )
+145     return result
+146 def _csf_to_list(option):
+147     result = []
+148     line = get_option(option)
+149     if line:
+150         csv = line.split("=")[1].replace(" ", "").replace('"', "")
+151         result = csv.split(",")
+152     return result
+153 def split_option(option):
+154     return re.split(r"(?: +)?\=(?: +)?", option)
+155 def get_option(option):
+156     pattern = r'^{}(\ +)?\=(\ +)?".*"$'.format(option)  # pylint: disable=W1401
+157     grep = __salt__["file.grep"]("/etc/csf/csf.conf", pattern, "-E")
+158     if "stdout" in grep and grep["stdout"]:
+159         line = grep["stdout"]
+160         return line
+161     return None
+162 def set_option(option, value):
+163     current_option = get_option(option)
+164     if not current_option:
+165         return {"error": "No such option exists in csf.conf"}
+166     result = __salt__["file.replace"](
+167         "/etc/csf/csf.conf",
+168         pattern=r'^{}(\ +)?\=(\ +)?".*"'.format(option),  # pylint: disable=W1401
+169         repl='{} = "{}"'.format(option, value),
+170     )
+171     return result
+172 def get_skipped_nics(ipv6=False):
+173     if ipv6:
+174         option = "ETH6_DEVICE_SKIP"
+175     else:
+176         option = "ETH_DEVICE_SKIP"
+177     skipped_nics = _csf_to_list(option)
+178     return skipped_nics
+179 def skip_nic(nic, ipv6=False):
+180     nics = get_skipped_nics(ipv6=ipv6)
+181     nics.append(nic)
+182     return skip_nics(nics, ipv6)
+183 def skip_nics(nics, ipv6=False):
+184     if ipv6:
+185         ipv6 = "6"
+186     else:
+187         ipv6 = ""
+188     nics_csv = ",".join(map(str, nics))
+189     result = __salt__["file.replace"](
+190         "/etc/csf/csf.conf",
+191         pattern=r'^ETH{}_DEVICE_SKIP(\ +)?\=(\ +)?".*"'.format(ipv6),
+192         repl='ETH{}_DEVICE_SKIP = "{}"'<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.format(ipv6, nics_csv),
+193     )
+194     return result
+195 def _access_rule_with_port(
+196     method,
+197     ip,
+198     port,
+199     proto="tcp",
+200     direction="in",
+201     port_origin="d",
+202     ip_origin="d",
+203     ttl=None,
+204     comment="",
+205 ):
+206     results =</b></font> {}
+207     if direction == "both":
+208         directions = ["in", "out"]
+209     else:
+210         directions = [direction]
+211     for direction in directions:
+212         _exists = exists(
+213             method,
+214             ip,
+215             port=port,
+216             proto=proto,
+217             direction=direction,
+218             port_origin=port_origin,
+219             ip_origin=ip_origin,
+220             ttl=ttl,
+221             comment=comment,
+222         )
+223         if not _exists:
+224             rule = _build_port_rule(
+225                 ip,
+226                 port=port,
+227                 proto=proto,
+228                 direction=direction,
+229                 port_origin=port_origin,
+230                 ip_origin=ip_origin,
+231                 comment=comment,
+232             )
+233             path = "/etc/csf/csf.{}".format(method)
+234             results[direction] = __salt__["file.append"](path, rule)
+235     return results
+236 def _tmp_access_rule(
+237     method,
+238     ip=None,
+239     ttl=None,
+240     port=None,
+241     direction="in",
+242     port_origin="d",
+243     ip_origin="d",
+244     comment="",
+245 ):
+246     if _status_csf():
+247         if ip is None:
+248             return {"error": "You must supply an ip address or CIDR."}
+249         if ttl is None:
+250             return {"error": "You must supply a ttl."}
+251         args = _build_tmp_access_args(method, ip, ttl, port, direction, comment)
+252         return __csf_cmd(args)
+253 def _build_tmp_access_args(method, ip, ttl, port, direction, comment):
+254     opt = _get_opt(method)
+255     args = "{} {} {}".format(opt, ip, ttl)
+256     if port:
+257         args += " -p {}".format(port)
+258     if direction:
+259         args += " -d {}".format(direction)
+260     if comment:
+261         args += " #{}".format(comment)
+262     return args
+263 def running():
+264     return _status_csf()
+265 def disable():
+266     if _status_csf():
+267         return __csf_cmd("-x")
+268 def enable():
+269     if not _status_csf():
+270         return __csf_cmd("-e")
+271 def reload():
+272     return __csf_cmd("-r")
+273 def tempallow(ip=None, ttl=None, port=None, direction=None, comment=""):
+274     return _tmp_access_rule("tempallow", ip, ttl, port, direction, comment)
+275 def tempdeny(ip=None, ttl=None, port=None, direction=None, comment=""):
+276     return _tmp_access_rule("tempdeny", ip, ttl, port, direction, comment)
+277 def allow(
+278     ip,
+279     port=None,
+280     proto="tcp",
+281     direction="in",
+282     port_origin="d",
+283     ip_origin="s",
+284     ttl=None,
+285     comment="",
+286 ):
+287     return _access_rule(
+288         "allow",
+289         ip,
+290         port=port,
+291         proto=proto,
+292         direction=direction,
+293         port_origin=port_origin,
+294         ip_origin=ip_origin,
+295         comment=comment,
+296     )
+297 def deny(
+298     ip,
+299     port=None,
+300     proto="tcp",
+301     direction="in",
+302     port_origin="d",
+303     ip_origin="d",
+304     ttl=None,
+305     comment="",
+306 ):
+307     return _access_rule(
+308         "deny", ip, port, proto, direction, port_origin, ip_origin, comment
+309     )
+310 def remove_temp_rule(ip):
+311     opt = _get_opt("temprm")
+312     args = "{} {}".format(opt, ip)
+313     return __csf_cmd(args)
+314 def unallow(ip):
+315     return _access_rule("unallow", ip)
+316 def undeny(ip):
+317     return _access_rule("undeny", ip)
+318 def remove_rule(
+319     method,
+320     ip,
+321     port=None,
+322     proto="tcp",
+323     direction="in",
+324     port_origin="d",
+325     ip_origin="s",
+326     ttl=None,
+327     comment="",
+328 ):
+329     if method.startswith("temp") or ttl:
+330         return remove_temp_rule(ip)
+331     if not port:
+332         if method == "allow":
+333             return unallow(ip)
+334         elif method == "deny":
+335             return undeny(ip)
+336     if port:
+337         return _remove_access_rule_with_port(
+338             method=method,
+339             ip=ip,
+340             port=port,
+341             proto=proto,
+342             direction=direction,
+343             port_origin=port_origin,
+344             ip_origin=ip_origin,
+345         )
+346 def allow_ports(ports, proto="tcp", direction="in"):
+347     results = []
+348     ports = set(ports)
+349     ports = list(ports)
+350     proto = proto.upper()
+351     direction = direction.upper()
+352     _validate_direction_and_proto(direction, proto)
+353     ports_csv = ",".join(map(str, ports))
+354     directions = build_directions(direction)
+355     for direction in directions:
+356         result = __salt__["file.replace"](
+357             "/etc/csf/csf.conf",
+358             pattern=r'^{}_{}(\ +)?\=(\ +)?".*"$'.format(proto, direction),
+359             repl='{}_{} = "{}"'.format(proto, direction, ports_csv),
+360         )
+361         results.append(result)
+362     return results
+363 def get_ports(proto="tcp", direction="in"):
+364     proto = proto.upper()
+365     direction = direction.upper()
+366     results = {}
+367     _validate_direction_and_proto(direction, proto)
+368     directions = build_directions(direction)
+369     for direction in directions:
+370         option = "{}_{}".format(proto, direction)
+371         results[direction] = _csf_to_list(option)
+372     return results
+373 def _validate_direction_and_proto(direction, proto):
+374     if direction.upper() not in ["IN", "OUT", "BOTH"]:
+375         raise SaltInvocationError("You must supply a direction of in, out, or both")
+376     if proto.upper() not in ["TCP", "UDP", "TCP6", "UDP6"]:
+377         raise SaltInvocationError(
+378             "You must supply tcp, udp, tcp6, or udp6 for the proto keyword"
+379         )
+380     return
+381 def build_directions(direction):
+382     direction = direction.upper()
+383     if direction == "BOTH":
+384         directions = ["IN", "OUT"]
+385     else:
+386         directions = [direction]
+387     return directions
+388 def allow_port(port, proto="tcp", direction="both"):
+389     ports = get_ports(proto=proto, direction=direction)
+390     direction = direction.upper()
+391     _validate_direction_and_proto(direction, proto)
+392     directions = build_directions(direction)
+393     results = []
+394     for direction in directions:
+395         _ports = ports[direction]
+396         _ports.append(port)
+397         results += allow_ports(_ports, proto=proto, direction=direction)
+398     return results
+399 def get_testing_status():
+400     testing = _csf_to_list("TESTING")[0]
+401     return testing
+402 def _toggle_testing(val):
+403     if val == "on":
+404         val = "1"
+405     elif val == "off":
+406         val = "0"
+407     else:
+408         raise SaltInvocationError("Only valid arg is 'on' or 'off' here.")
+409     result = __salt__["file.replace"](
+410         "/etc/csf/csf.conf",
+411         pattern=r'^TESTING(\ +)?\=(\ +)?".*"',  # pylint: disable=W1401
+412         repl='TESTING = "{}"'.format(val),
+413     )
+414     return result
+415 def enable_testing_mode():
+416     return _toggle_testing("on")
+417 def disable_testing_mode():
+418     return _toggle_testing("off")
 </pre>
 </div>
 </div>

@@ -41,630 +41,630 @@ Matches for systemd_service.py &amp; gpg_1.py
 </h3>
 <hr/>
 <pre>
-<a name="0"></a>import errno
-import fnmatch
-import glob
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>import logging
-import os
-import re
-import shlex
-import salt.utils.files
-import salt.utils.itertools
-import salt.utils.path
-import salt.utils.stringutils
-import salt.utils.systemd
-from salt.exceptions import CommandExecutionError
-log = logging.getLogger(__name__)
-__func_alias__ =</b></font> {
-    "reload_": "reload",
-    "unmask_": "unmask",
-}
-SYSTEM_CONFIG_PATHS = ("/lib/systemd/system", "/usr/lib/systemd/system")
-LOCAL_CONFIG_PATH = "/etc/systemd/system"
-INITSCRIPT_PATH = "/etc/init.d"
-VALID_UNIT_TYPES = (
-    "service",
-    "socket",
-    "device",
-    "mount",
-    "automount",
-    "swap",
-    "target",
-    "path",
-    "timer",
-)
-__virtualname__ = "service"
-def __virtual__():
-    is_linux = __grains__.get("kernel") == "Linux"
-    is_booted = salt.utils.systemd.booted(__context__)
-    is_offline = salt.utils.systemd.offline(__context__)
-    if is_linux and (is_booted or is_offline):
-        return __virtualname__
-    return (
-        False,
-        "The systemd execution module failed to load: only available on Linux "
-        "systems which have been booted with systemd.",
-    )
-def _root(path, root):
-    if root:
-        return os.path.join(root, os.path.relpath(path, os.path.sep))
-    else:
-        return path
-def _canonical_unit_name(name):
-    if not isinstance(name, str):
-        name = str(name)
-    if any(name.endswith(suffix) for suffix in VALID_UNIT_TYPES):
-        return name
-    return "%s.service" % name
-def _check_available(name):
-    if offline():
-        raise CommandExecutionError(
-            "Cannot run in offline mode. Failed to get information on unit '%s'" % name
-        )
-    _status = _systemctl_status(name)
-    sd_version = salt.utils.systemd.version(__context__)
-    if sd_version is not None and sd_version &gt;= 231:
-        return 0 &lt;= _status["retcode"] &lt; 4
-    out = _status["stdout"].lower()
-    if "could not be found" in out:
-        return False
-    for line in salt.utils.itertools.split(out, "\n"):
-        match = re.match(r"\s+loaded:\s+(\S+)", line)
-        if match:
-            ret = match.group(1) != "not-found"
-            break
-    else:
-        raise CommandExecutionError("Failed to get information on unit '%s'" % name)
-    return ret
-def _check_for_unit_changes(name):
-    contextkey = "systemd._check_for_unit_changes.{}".format(name)
-    if contextkey not in __context__:
-        if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-            systemctl_reload()
-        __context__[contextkey] = True
-def _check_unmask(name, unmask, unmask_runtime, root=None):
-    if unmask:
-        unmask_(name, runtime=False, root=root)
-    if unmask_runtime:
-        unmask_(name, runtime=True, root=root)
-def _clear_context():
-    for key in list(__context__):
-        try:
-            if key.startswith("systemd._systemctl_status."):
-                __context__.pop(key)
-        except AttributeError:
-            continue
-def _default_runlevel():
-    try:
-        with salt.utils.files.fopen("/etc/init/rc-sysinit.conf") as fp_:
-            for line in fp_:
-                line = salt.utils.stringutils.to_unicode(line)
-                if line.startswith("env DEFAULT_RUNLEVEL"):
-                    runlevel = line.split("=")[-1].strip()
-    except Exception:  # pylint: disable=broad-except
-        return "2"
-    try:
-        with salt.utils.files.fopen("/etc/inittab") as fp_:
-            for line in fp_:
-                line = salt.utils.stringutils.to_unicode(line)
-                if not line.startswith("#") and "initdefault" in line:
-                    runlevel = line.split(":")[1]
-    except Exception:  # pylint: disable=broad-except
-        pass
-    try:
-        valid_strings = {"0", "1", "2", "3", "4", "5", "6", "s", "S", "-s", "single"}
-        with salt.utils.files.fopen("/proc/cmdline") as fp_:
-            for line in fp_:
-                line = salt.utils.stringutils.to_unicode(line)
-                for arg in line.strip().split():
-                    if arg in valid_strings:
-                        runlevel = arg
-                        break
-    except Exception:  # pylint: disable=broad-except
-        pass
-    return runlevel
-def _get_systemd_services(root):
-    ret = set()
-    for path in SYSTEM_CONFIG_PATHS + (LOCAL_CONFIG_PATH,):
-        path = _root(path, root)
-        if os.access(path, os.R_OK) and not os.path.islink(path):
-            for fullname in os.listdir(path):
-                try:
-                    unit_name, unit_type = fullname.rsplit(".", 1)
-                except ValueError:
-                    continue
-                if unit_type in VALID_UNIT_TYPES:
-                    ret.add(unit_name if unit_type == "service" else fullname)
-    return ret
-def _get_sysv_services(root, systemd_services=None):
-    initscript_path = _root(INITSCRIPT_PATH, root)
-    try:
-        sysv_services = os.listdir(initscript_path)
-    except OSError as exc:
-        if exc.errno == errno.ENOENT:
-            pass
-        elif exc.errno == errno.EACCES:
-            log.error(
-                "Unable to check sysvinit scripts, permission denied to %s",
-                initscript_path,
-            )
-        else:
-            log.error(
-                "Error %d encountered trying to check sysvinit scripts: %s",
-                exc.errno,
-                exc.strerror,
-            )
-        return []
-    if systemd_services is None:
-        systemd_services = _get_systemd_services(root)
-    ret = []
-    for sysv_service in sysv_services:
-        if os.access(os.path.join(initscript_path, sysv_service), os.X_OK):
-            if sysv_service in systemd_services:
-                log.debug(
-                    "sysvinit script '%s' found, but systemd unit "
-                    "'%s.service' already exists",
-                    sysv_service,
-                    sysv_service,
-                )
-                continue
-            ret.append(sysv_service)
-    return ret
-def _get_service_exec():
-    contextkey = "systemd._get_service_exec"
-    if contextkey not in __context__:
-        executables = ("update-rc.d", "chkconfig")
-        for executable in executables:
-            service_exec = salt.utils.path.which(executable)
-            if service_exec is not None:
-                break
-        else:
-            raise CommandExecutionError(
-                "Unable to find sysv service manager (tried {})".format(
-                    ", ".join(executables)
-                )
-            )
-        __context__[contextkey] = service_exec
-    return __context__[contextkey]
-def _runlevel():
-    contextkey = "systemd._runlevel"
-    if contextkey in __context__:
-        return __context__[contextkey]
-    out = __salt__["cmd.run"]("runlevel", python_shell=False, ignore_retcode=True)
-    try:
-        ret = out.split()[1]
-    except IndexError:
-        ret = _default_runlevel()
-    __context__[contextkey] = ret
-    return ret
-def _strip_scope(msg):
-    ret = []
-    for line in msg.splitlines():
-        if not line.endswith(".scope"):
-            ret.append(line)
-    return "\n".join(ret).strip()
-def _systemctl_cmd(action, name=None, systemd_scope=False, no_block=False, root=None):
-    ret = []
-    if (
-        systemd_scope
-        and salt.utils.systemd.has_scope(__context__)
-        and __salt__["config.get"]("systemd.scope", True)
-    ):
-        ret.extend(["systemd-run", "--scope"])
-    ret.append("systemctl")
-    if no_block:
-        ret.append("--no-block")
-    if root:
-        ret.extend(["--root", root])
-    if isinstance(action, str):
-        action = shlex.split(action)
-    ret.extend(action)
-    if name is not None:
-        ret.append(_canonical_unit_name(name))
-    if "status" in ret:
-        ret.extend(["-n", "0"])
-    return ret
-def _systemctl_status(name):
-    contextkey = "systemd._systemctl_status.%s" % name
-    if contextkey in __context__:
-        return __context__[contextkey]
-    __context__[contextkey] = __salt__["cmd.run_all"](
-        _systemctl_cmd("status", name),
-        python_shell=False,
-        redirect_stderr=True,
-        ignore_retcode=True,
-    )
-    return __context__[contextkey]
-def _sysv_enabled(name, root):
-    rc = _root("/etc/rc{}.d/S*{}".format(_runlevel(), name), root)
-    for match in glob.glob(rc):
-        if re.match(r"S\d{,2}%s" % name, os.path.basename(match)):
-            return True
-    return False
-def _untracked_custom_unit_found(name, root=None):
-    system = _root("/etc/systemd/system", root)
-    unit_path = os.path.join(system, _canonical_unit_name(name))
-    return os.access(unit_path, os.R_OK) and not _check_available(name)
-def _unit_file_changed(name):
-    status = _systemctl_status(name)["stdout"].lower()
-    return "'systemctl daemon-reload'" in status
-def systemctl_reload():
-    out = __salt__["cmd.run_all"](
-        _systemctl_cmd("--system daemon-reload"),
-        python_shell=False,
-        redirect_stderr=True,
-    )
-    if out["retcode"] != 0:
-        raise CommandExecutionError(
-            "Problem performing systemctl daemon-reload: %s" % out["stdout"]
-        )
-    _clear_context()
-    return True
-def get_running():
-    ret = set()
-    out = __salt__["cmd.run"](
-        _systemctl_cmd("--full --no-legend --no-pager"),
-        python_shell=False,
-        ignore_retcode=True,
-    )
-    for line in salt.utils.itertools.split(out, "\n"):
-        try:
-            comps = line.strip().split()
-            fullname = comps[0]
-            if len(comps) &gt; 3:
-                active_state = comps[3]
-        except ValueError as exc:
-            log.error(exc)
-            continue
-        else:
-            if active_state != "running":
-                continue
-        try:
-            unit_name, unit_type = fullname.rsplit(".", 1)
-        except ValueError:
-            continue
-        if unit_type in VALID_UNIT_TYPES:
-            ret.add(unit_name if unit_type == "service" else fullname)
-    return sorted(ret)
-def get_enabled(root=None):
-    ret = set()
-    out = __salt__["cmd.run"](
-        _systemctl_cmd("--full --no-legend --no-pager list-unit-files", root=root),
-        python_shell=False,
-        ignore_retcode=True,
-    )
-    for line in salt.utils.itertools.split(out, "\n"):
-        try:
-            fullname, unit_state = line.strip().split()[:2]
-        except ValueError:
-            continue
-        else:
-            if unit_state.split()[0] != "enabled":
-                continue
-        try:
-            unit_name, unit_type = fullname.rsplit(".", 1)
-        except ValueError:
-            continue
-        if unit_type in VALID_UNIT_TYPES:
-            ret.add(unit_name if unit_type == "service" else fullname)
-    ret.update({x for x in _get_sysv_services(root) if _sysv_enabled(x, root)})
-    return sorted(ret)
-def get_disabled(root=None):
-    ret = set()
-    out = __salt__["cmd.run"](
-        _systemctl_cmd("--full --no-legend --no-pager list-unit-files", root=root),
-        python_shell=False,
-        ignore_retcode=True,
-    )
-    for line in salt.utils.itertools.split(out, "\n"):
-        try:
-            fullname, unit_state = line.strip().split()[:2]
-        except ValueError:
-            continue
-        else:
-            if unit_state.split()[0] != "disabled":
-                continue
-        try:
-            unit_name, unit_type = fullname.rsplit(".", 1)
-        except ValueError:
-            continue
-        if unit_type in VALID_UNIT_TYPES:
-            ret.add(unit_name if unit_type == "service" else fullname)
-    ret.update({x for x in _get_sysv_services(root) if not _sysv_enabled(x, root)})
-    return sorted(ret)
-def get_static(root=None):
-    ret = set()
-    out = __salt__["cmd.run"](
-        _systemctl_cmd("--full --no-legend --no-pager list-unit-files", root=root),
-        python_shell=False,
-        ignore_retcode=True,
-    )
-    for line in salt.utils.itertools.split(out, "\n"):
-        try:
-            fullname, unit_state = line.strip().split()[:2]
-        except ValueError:
-            continue
-        else:
-            if unit_state != "static":
-                continue
-        try:
-            unit_name, unit_type = fullname.rsplit(".", 1)
-        except ValueError:
-            continue
-        if unit_type in VALID_UNIT_TYPES:
-            ret.add(unit_name if unit_type == "service" else fullname)
-    return sorted(ret)
-def get_all(root=None):
-    ret = _get_systemd_services(root)
-    ret.update(set(_get_sysv_services(root, systemd_services=ret)))
-    return sorted(ret)
-def available(name):
-    _check_for_unit_changes(name)
-    return _check_available(name)
-def missing(name):
-    return not available(name)
-def unmask_(name, runtime=False, root=None):
-    _check_for_unit_changes(name)
-    if not masked(name, runtime, root=root):
-        log.debug("Service '%s' is not %smasked", name, "runtime-" if runtime else "")
-        return True
-    cmd = "unmask --runtime" if runtime else "unmask"
-    out = __salt__["cmd.run_all"](
-        _systemctl_cmd(cmd, name, systemd_scope=True, root=root),
-        python_shell=False,
-        redirect_stderr=True,
-    )
-    if out["retcode"] != 0:
-        raise CommandExecutionError("Failed to unmask service '%s'" % name)
-    return True
-def mask(name, runtime=False, root=None):
-    _check_for_unit_changes(name)
-    cmd = "mask --runtime" if runtime else "mask"
-    out = __salt__["cmd.run_all"](
-        _systemctl_cmd(cmd, name, systemd_scope=True, root=root),
-        python_shell=False,
-        redirect_stderr=True,
-    )
-    if out["retcode"] != 0:
-        raise CommandExecutionError(
-            "Failed to mask service '%s'" % name, info=out["stdout"]
-        )
-    return True
-def masked(name, runtime=False, root=None):
-    _check_for_unit_changes(name)
-    root_dir = _root("/run" if runtime else "/etc", root)
-    link_path = os.path.join(root_dir, "systemd", "system", _canonical_unit_name(name))
-    try:
-        return os.readlink(link_path) == "/dev/null"
-    except OSError as exc:
-        if exc.errno == errno.ENOENT:
-            log.trace(
-                "Path %s does not exist. This is normal if service '%s' is "
-                "not masked or does not exist.",
-                link_path,
-                name,
-            )
-        elif exc.errno == errno.EINVAL:
-            log.error(
-                "Failed to check mask status for service %s. Path %s is a "
-                "file, not a symlink. This could be caused by changes in "
-                "systemd and is probably a bug in Salt. Please report this "
-                "to the developers.",
-                name,
-                link_path,
-            )
-        return False
-def start(name, no_block=False, unmask=False, unmask_runtime=False):
-    _check_for_unit_changes(name)
-    _check_unmask(name, unmask, unmask_runtime)
-    ret = __salt__["cmd.run_all"](
-        _systemctl_cmd("start", name, systemd_scope=True, no_block=no_block),
-        python_shell=False,
-    )
-    if ret["retcode"] != 0:
-        raise CommandExecutionError(_strip_scope(ret["stderr"]))
-    return True
-def stop(name, no_block=False):
-    _check_for_unit_changes(name)
-    return (
-        __salt__["cmd.run_all"](
-            _systemctl_cmd("stop", name, systemd_scope=True, no_block=no_block),
-            python_shell=False,
-        )["retcode"]
-        == 0
-    )
-def restart(name, no_block=False, unmask=False, unmask_runtime=False):
-    _check_for_unit_changes(name)
-    _check_unmask(name, unmask, unmask_runtime)
-    ret = __salt__["cmd.run_all"](
-        _systemctl_cmd("restart", name, systemd_scope=True, no_block=no_block),
-        python_shell=False,
-    )
-    if ret["retcode"] != 0:
-        raise CommandExecutionError(_strip_scope(ret["stderr"]))
-    return True
-def reload_(name, no_block=False, unmask=False, unmask_runtime=False):
-    _check_for_unit_changes(name)
-    _check_unmask(name, unmask, unmask_runtime)
-    ret = __salt__["cmd.run_all"](
-        _systemctl_cmd("reload", name, systemd_scope=True, no_block=no_block),
-        python_shell=False,
-    )
-    if ret["retcode"] != 0:
-        raise CommandExecutionError(_strip_scope(ret["stderr"]))
-    return True
-def force_reload(name, no_block=True, unmask=False, unmask_runtime=False):
-    _check_for_unit_changes(name)
-    _check_unmask(name, unmask, unmask_runtime)
-    ret = __salt__["cmd.run_all"](
-        _systemctl_cmd("force-reload", name, systemd_scope=True, no_block=no_block),
-        python_shell=False,
-    )
-    if ret["retcode"] != 0:
-        raise CommandExecutionError(_strip_scope(ret["stderr"]))
-    return True
-def status(name, sig=None):  # pylint: disable=unused-argument
-    contains_globbing = bool(re.search(r"\*|\?|\[.+\]", name))
-    if contains_globbing:
-        services = fnmatch.filter(get_all(), name)
-    else:
-        services = [name]
-    results = {}
-    for service in services:
-        _check_for_unit_changes(service)
-        results[service] = (
-            __salt__["cmd.retcode"](
-                _systemctl_cmd("is-active", service),
-                python_shell=False,
-                ignore_retcode=True,
-            )
-            == 0
-        )
-    if contains_globbing:
-        return results
-    return results[name]
-def enable(
-    name, no_block=False, unmask=False, unmask_runtime=False, root=None, **kwargs
-):  # pylint: disable=unused-argument
-    _check_for_unit_changes(name)
-    _check_unmask(name, unmask, unmask_runtime, root)
-    if name in _get_sysv_services(root):
-        cmd = []
-        if salt.utils.systemd.has_scope(__context__) and __salt__["config.get"](
-            "systemd.scope", True
-        ):
-            cmd.extend(["systemd-run", "--scope"])
-        service_exec = _get_service_exec()
-        if service_exec.endswith("/update-rc.d"):
-            cmd.extend([service_exec, "-f", name, "defaults", "99"])
-        elif service_exec.endswith("/chkconfig"):
-            cmd.extend([service_exec, name, "on"])
-        return (
-            __salt__["cmd.retcode"](cmd, python_shell=False, ignore_retcode=True) == 0
-        )
-    ret = __salt__["cmd.run_all"](
-        _systemctl_cmd(
-            "enable", name, systemd_scope=True, no_block=no_block, root=root
-        ),
-        python_shell=False,
-        ignore_retcode=True,
-    )
-    if ret["retcode"] != 0:
-        raise CommandExecutionError(_strip_scope(ret["stderr"]))
-    return True
-def disable(
-    name, no_block=False, root=None, **kwargs
-):  # pylint: disable=unused-argument
-    _check_for_unit_changes(name)
-    if name in _get_sysv_services(root):
-        cmd = []
-        if salt.utils.systemd.has_scope(__context__) and __salt__["config.get"](
-            "systemd.scope", True
-        ):
-            cmd.extend(["systemd-run", "--scope"])
-        service_exec = _get_service_exec()
-        if service_exec.endswith("/update-rc.d"):
-            cmd.extend([service_exec, "-f", name, "remove"])
-        elif service_exec.endswith("/chkconfig"):
-            cmd.extend([service_exec, name, "off"])
-        return (
-            __salt__["cmd.retcode"](cmd, python_shell=False, ignore_retcode=True) == 0
-        )
-    return (
-        __salt__["cmd.run_all"](
-            _systemctl_cmd(
-                "disable", name, systemd_scope=True, no_block=no_block, root=root
-            ),
-            python_shell=False,
-            ignore_retcode=True,
-        )["retcode"]
-        == 0
-    )
-def enabled(name, root=None, **kwargs):  # pylint: disable=unused-argument
-    if (
-        __salt__["cmd.retcode"](
-            _systemctl_cmd("is-enabled", name, root=root),
-            python_shell=False,
-            ignore_retcode=True,
-        )
-        == 0
-    ):
-        return True
-    elif "@" in name:
-        local_config_path = _root(LOCAL_CONFIG_PATH, "/")
-        cmd = [
-            "find",
-            local_config_path,
-            "-name",
-            name,
-            "-type",
-            "l",
-            "-print",
-            "-quit",
-        ]
-        if bool(__salt__["cmd.run"](cmd, python_shell=False)):
-            return True
-    elif name in _get_sysv_services(root):
-        return _sysv_enabled(name, root)
-    return False
-def disabled(name, root=None):
-    return not enabled(name, root=root)
-def show(name, root=None):
-    ret = {}
-    out = __salt__["cmd.run"](
-        _systemctl_cmd("show", name, root=root), python_shell=False
-    )
-    for line in salt.utils.itertools.split(out, "\n"):
-        comps = line.split("=")
-        name = comps[0]
-        value = "=".join(comps[1:])
-        if value.startswith("{"):
-            value = value.replace("{", "").replace("}", "")
-            ret[name] = {}
-            for item in value.split(" ; "):
-                comps = item.split("=")
-                ret[name][comps[0].strip()] = comps[1].strip()
-        elif name in ("Before", "After", "Wants"):
-            ret[name] = value.split()
-        else:
-            ret[name] = value
-    return ret
-def execs(root=None):
-    ret = {}
-    for service in get_all(root=root):
-        data = show(service, root=root)
-<a name="1"></a>        if "ExecStart" not in data:
-            continue
-        ret[service] = data["ExecStart"]["path"]
-    <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>return ret
-def firstboot(
-    locale=None,
-    locale_message=None,
-    keymap=None,
-    timezone=None,
-    hostname=None,
-    machine_id=None,
-    root=None,
-):
-    cmd = ["systemd-firstboot"]
-    parameters =</b></font> [
-        ("locale", locale),
-        ("locale-message", locale_message),
-        ("keymap", keymap),
-        ("timezone", timezone),
-        ("hostname", hostname),
-        ("machine-ID", machine_id),
-        ("root", root),
-    ]
-    for parameter, value in parameters:
-        if value:
-            cmd.extend(["--{}".format(parameter), str(value)])
-    out = __salt__["cmd.run_all"](cmd)
-    if out["retcode"] != 0:
-        raise CommandExecutionError("systemd-firstboot error: {}".format(out["stderr"]))
-    return True
-def offline():
-    return salt.utils.systemd.offline(__context__)
+1 <a name="0"></a>import errno
+2 import fnmatch
+3 import glob
+4 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>import logging
+5 import os
+6 import re
+7 import shlex
+8 import salt.utils.files
+9 import salt.utils.itertools
+10 import salt.utils.path
+11 import salt.utils.stringutils
+12 import salt.utils.systemd
+13 from salt.exceptions import CommandExecutionError
+14 log = logging.getLogger(__name__)
+15 __func_alias__ =</b></font> {
+16     "reload_": "reload",
+17     "unmask_": "unmask",
+18 }
+19 SYSTEM_CONFIG_PATHS = ("/lib/systemd/system", "/usr/lib/systemd/system")
+20 LOCAL_CONFIG_PATH = "/etc/systemd/system"
+21 INITSCRIPT_PATH = "/etc/init.d"
+22 VALID_UNIT_TYPES = (
+23     "service",
+24     "socket",
+25     "device",
+26     "mount",
+27     "automount",
+28     "swap",
+29     "target",
+30     "path",
+31     "timer",
+32 )
+33 __virtualname__ = "service"
+34 def __virtual__():
+35     is_linux = __grains__.get("kernel") == "Linux"
+36     is_booted = salt.utils.systemd.booted(__context__)
+37     is_offline = salt.utils.systemd.offline(__context__)
+38     if is_linux and (is_booted or is_offline):
+39         return __virtualname__
+40     return (
+41         False,
+42         "The systemd execution module failed to load: only available on Linux "
+43         "systems which have been booted with systemd.",
+44     )
+45 def _root(path, root):
+46     if root:
+47         return os.path.join(root, os.path.relpath(path, os.path.sep))
+48     else:
+49         return path
+50 def _canonical_unit_name(name):
+51     if not isinstance(name, str):
+52         name = str(name)
+53     if any(name.endswith(suffix) for suffix in VALID_UNIT_TYPES):
+54         return name
+55     return "%s.service" % name
+56 def _check_available(name):
+57     if offline():
+58         raise CommandExecutionError(
+59             "Cannot run in offline mode. Failed to get information on unit '%s'" % name
+60         )
+61     _status = _systemctl_status(name)
+62     sd_version = salt.utils.systemd.version(__context__)
+63     if sd_version is not None and sd_version &gt;= 231:
+64         return 0 &lt;= _status["retcode"] &lt; 4
+65     out = _status["stdout"].lower()
+66     if "could not be found" in out:
+67         return False
+68     for line in salt.utils.itertools.split(out, "\n"):
+69         match = re.match(r"\s+loaded:\s+(\S+)", line)
+70         if match:
+71             ret = match.group(1) != "not-found"
+72             break
+73     else:
+74         raise CommandExecutionError("Failed to get information on unit '%s'" % name)
+75     return ret
+76 def _check_for_unit_changes(name):
+77     contextkey = "systemd._check_for_unit_changes.{}".format(name)
+78     if contextkey not in __context__:
+79         if _untracked_custom_unit_found(name) or _unit_file_changed(name):
+80             systemctl_reload()
+81         __context__[contextkey] = True
+82 def _check_unmask(name, unmask, unmask_runtime, root=None):
+83     if unmask:
+84         unmask_(name, runtime=False, root=root)
+85     if unmask_runtime:
+86         unmask_(name, runtime=True, root=root)
+87 def _clear_context():
+88     for key in list(__context__):
+89         try:
+90             if key.startswith("systemd._systemctl_status."):
+91                 __context__.pop(key)
+92         except AttributeError:
+93             continue
+94 def _default_runlevel():
+95     try:
+96         with salt.utils.files.fopen("/etc/init/rc-sysinit.conf") as fp_:
+97             for line in fp_:
+98                 line = salt.utils.stringutils.to_unicode(line)
+99                 if line.startswith("env DEFAULT_RUNLEVEL"):
+100                     runlevel = line.split("=")[-1].strip()
+101     except Exception:  # pylint: disable=broad-except
+102         return "2"
+103     try:
+104         with salt.utils.files.fopen("/etc/inittab") as fp_:
+105             for line in fp_:
+106                 line = salt.utils.stringutils.to_unicode(line)
+107                 if not line.startswith("#") and "initdefault" in line:
+108                     runlevel = line.split(":")[1]
+109     except Exception:  # pylint: disable=broad-except
+110         pass
+111     try:
+112         valid_strings = {"0", "1", "2", "3", "4", "5", "6", "s", "S", "-s", "single"}
+113         with salt.utils.files.fopen("/proc/cmdline") as fp_:
+114             for line in fp_:
+115                 line = salt.utils.stringutils.to_unicode(line)
+116                 for arg in line.strip().split():
+117                     if arg in valid_strings:
+118                         runlevel = arg
+119                         break
+120     except Exception:  # pylint: disable=broad-except
+121         pass
+122     return runlevel
+123 def _get_systemd_services(root):
+124     ret = set()
+125     for path in SYSTEM_CONFIG_PATHS + (LOCAL_CONFIG_PATH,):
+126         path = _root(path, root)
+127         if os.access(path, os.R_OK) and not os.path.islink(path):
+128             for fullname in os.listdir(path):
+129                 try:
+130                     unit_name, unit_type = fullname.rsplit(".", 1)
+131                 except ValueError:
+132                     continue
+133                 if unit_type in VALID_UNIT_TYPES:
+134                     ret.add(unit_name if unit_type == "service" else fullname)
+135     return ret
+136 def _get_sysv_services(root, systemd_services=None):
+137     initscript_path = _root(INITSCRIPT_PATH, root)
+138     try:
+139         sysv_services = os.listdir(initscript_path)
+140     except OSError as exc:
+141         if exc.errno == errno.ENOENT:
+142             pass
+143         elif exc.errno == errno.EACCES:
+144             log.error(
+145                 "Unable to check sysvinit scripts, permission denied to %s",
+146                 initscript_path,
+147             )
+148         else:
+149             log.error(
+150                 "Error %d encountered trying to check sysvinit scripts: %s",
+151                 exc.errno,
+152                 exc.strerror,
+153             )
+154         return []
+155     if systemd_services is None:
+156         systemd_services = _get_systemd_services(root)
+157     ret = []
+158     for sysv_service in sysv_services:
+159         if os.access(os.path.join(initscript_path, sysv_service), os.X_OK):
+160             if sysv_service in systemd_services:
+161                 log.debug(
+162                     "sysvinit script '%s' found, but systemd unit "
+163                     "'%s.service' already exists",
+164                     sysv_service,
+165                     sysv_service,
+166                 )
+167                 continue
+168             ret.append(sysv_service)
+169     return ret
+170 def _get_service_exec():
+171     contextkey = "systemd._get_service_exec"
+172     if contextkey not in __context__:
+173         executables = ("update-rc.d", "chkconfig")
+174         for executable in executables:
+175             service_exec = salt.utils.path.which(executable)
+176             if service_exec is not None:
+177                 break
+178         else:
+179             raise CommandExecutionError(
+180                 "Unable to find sysv service manager (tried {})".format(
+181                     ", ".join(executables)
+182                 )
+183             )
+184         __context__[contextkey] = service_exec
+185     return __context__[contextkey]
+186 def _runlevel():
+187     contextkey = "systemd._runlevel"
+188     if contextkey in __context__:
+189         return __context__[contextkey]
+190     out = __salt__["cmd.run"]("runlevel", python_shell=False, ignore_retcode=True)
+191     try:
+192         ret = out.split()[1]
+193     except IndexError:
+194         ret = _default_runlevel()
+195     __context__[contextkey] = ret
+196     return ret
+197 def _strip_scope(msg):
+198     ret = []
+199     for line in msg.splitlines():
+200         if not line.endswith(".scope"):
+201             ret.append(line)
+202     return "\n".join(ret).strip()
+203 def _systemctl_cmd(action, name=None, systemd_scope=False, no_block=False, root=None):
+204     ret = []
+205     if (
+206         systemd_scope
+207         and salt.utils.systemd.has_scope(__context__)
+208         and __salt__["config.get"]("systemd.scope", True)
+209     ):
+210         ret.extend(["systemd-run", "--scope"])
+211     ret.append("systemctl")
+212     if no_block:
+213         ret.append("--no-block")
+214     if root:
+215         ret.extend(["--root", root])
+216     if isinstance(action, str):
+217         action = shlex.split(action)
+218     ret.extend(action)
+219     if name is not None:
+220         ret.append(_canonical_unit_name(name))
+221     if "status" in ret:
+222         ret.extend(["-n", "0"])
+223     return ret
+224 def _systemctl_status(name):
+225     contextkey = "systemd._systemctl_status.%s" % name
+226     if contextkey in __context__:
+227         return __context__[contextkey]
+228     __context__[contextkey] = __salt__["cmd.run_all"](
+229         _systemctl_cmd("status", name),
+230         python_shell=False,
+231         redirect_stderr=True,
+232         ignore_retcode=True,
+233     )
+234     return __context__[contextkey]
+235 def _sysv_enabled(name, root):
+236     rc = _root("/etc/rc{}.d/S*{}".format(_runlevel(), name), root)
+237     for match in glob.glob(rc):
+238         if re.match(r"S\d{,2}%s" % name, os.path.basename(match)):
+239             return True
+240     return False
+241 def _untracked_custom_unit_found(name, root=None):
+242     system = _root("/etc/systemd/system", root)
+243     unit_path = os.path.join(system, _canonical_unit_name(name))
+244     return os.access(unit_path, os.R_OK) and not _check_available(name)
+245 def _unit_file_changed(name):
+246     status = _systemctl_status(name)["stdout"].lower()
+247     return "'systemctl daemon-reload'" in status
+248 def systemctl_reload():
+249     out = __salt__["cmd.run_all"](
+250         _systemctl_cmd("--system daemon-reload"),
+251         python_shell=False,
+252         redirect_stderr=True,
+253     )
+254     if out["retcode"] != 0:
+255         raise CommandExecutionError(
+256             "Problem performing systemctl daemon-reload: %s" % out["stdout"]
+257         )
+258     _clear_context()
+259     return True
+260 def get_running():
+261     ret = set()
+262     out = __salt__["cmd.run"](
+263         _systemctl_cmd("--full --no-legend --no-pager"),
+264         python_shell=False,
+265         ignore_retcode=True,
+266     )
+267     for line in salt.utils.itertools.split(out, "\n"):
+268         try:
+269             comps = line.strip().split()
+270             fullname = comps[0]
+271             if len(comps) &gt; 3:
+272                 active_state = comps[3]
+273         except ValueError as exc:
+274             log.error(exc)
+275             continue
+276         else:
+277             if active_state != "running":
+278                 continue
+279         try:
+280             unit_name, unit_type = fullname.rsplit(".", 1)
+281         except ValueError:
+282             continue
+283         if unit_type in VALID_UNIT_TYPES:
+284             ret.add(unit_name if unit_type == "service" else fullname)
+285     return sorted(ret)
+286 def get_enabled(root=None):
+287     ret = set()
+288     out = __salt__["cmd.run"](
+289         _systemctl_cmd("--full --no-legend --no-pager list-unit-files", root=root),
+290         python_shell=False,
+291         ignore_retcode=True,
+292     )
+293     for line in salt.utils.itertools.split(out, "\n"):
+294         try:
+295             fullname, unit_state = line.strip().split()[:2]
+296         except ValueError:
+297             continue
+298         else:
+299             if unit_state.split()[0] != "enabled":
+300                 continue
+301         try:
+302             unit_name, unit_type = fullname.rsplit(".", 1)
+303         except ValueError:
+304             continue
+305         if unit_type in VALID_UNIT_TYPES:
+306             ret.add(unit_name if unit_type == "service" else fullname)
+307     ret.update({x for x in _get_sysv_services(root) if _sysv_enabled(x, root)})
+308     return sorted(ret)
+309 def get_disabled(root=None):
+310     ret = set()
+311     out = __salt__["cmd.run"](
+312         _systemctl_cmd("--full --no-legend --no-pager list-unit-files", root=root),
+313         python_shell=False,
+314         ignore_retcode=True,
+315     )
+316     for line in salt.utils.itertools.split(out, "\n"):
+317         try:
+318             fullname, unit_state = line.strip().split()[:2]
+319         except ValueError:
+320             continue
+321         else:
+322             if unit_state.split()[0] != "disabled":
+323                 continue
+324         try:
+325             unit_name, unit_type = fullname.rsplit(".", 1)
+326         except ValueError:
+327             continue
+328         if unit_type in VALID_UNIT_TYPES:
+329             ret.add(unit_name if unit_type == "service" else fullname)
+330     ret.update({x for x in _get_sysv_services(root) if not _sysv_enabled(x, root)})
+331     return sorted(ret)
+332 def get_static(root=None):
+333     ret = set()
+334     out = __salt__["cmd.run"](
+335         _systemctl_cmd("--full --no-legend --no-pager list-unit-files", root=root),
+336         python_shell=False,
+337         ignore_retcode=True,
+338     )
+339     for line in salt.utils.itertools.split(out, "\n"):
+340         try:
+341             fullname, unit_state = line.strip().split()[:2]
+342         except ValueError:
+343             continue
+344         else:
+345             if unit_state != "static":
+346                 continue
+347         try:
+348             unit_name, unit_type = fullname.rsplit(".", 1)
+349         except ValueError:
+350             continue
+351         if unit_type in VALID_UNIT_TYPES:
+352             ret.add(unit_name if unit_type == "service" else fullname)
+353     return sorted(ret)
+354 def get_all(root=None):
+355     ret = _get_systemd_services(root)
+356     ret.update(set(_get_sysv_services(root, systemd_services=ret)))
+357     return sorted(ret)
+358 def available(name):
+359     _check_for_unit_changes(name)
+360     return _check_available(name)
+361 def missing(name):
+362     return not available(name)
+363 def unmask_(name, runtime=False, root=None):
+364     _check_for_unit_changes(name)
+365     if not masked(name, runtime, root=root):
+366         log.debug("Service '%s' is not %smasked", name, "runtime-" if runtime else "")
+367         return True
+368     cmd = "unmask --runtime" if runtime else "unmask"
+369     out = __salt__["cmd.run_all"](
+370         _systemctl_cmd(cmd, name, systemd_scope=True, root=root),
+371         python_shell=False,
+372         redirect_stderr=True,
+373     )
+374     if out["retcode"] != 0:
+375         raise CommandExecutionError("Failed to unmask service '%s'" % name)
+376     return True
+377 def mask(name, runtime=False, root=None):
+378     _check_for_unit_changes(name)
+379     cmd = "mask --runtime" if runtime else "mask"
+380     out = __salt__["cmd.run_all"](
+381         _systemctl_cmd(cmd, name, systemd_scope=True, root=root),
+382         python_shell=False,
+383         redirect_stderr=True,
+384     )
+385     if out["retcode"] != 0:
+386         raise CommandExecutionError(
+387             "Failed to mask service '%s'" % name, info=out["stdout"]
+388         )
+389     return True
+390 def masked(name, runtime=False, root=None):
+391     _check_for_unit_changes(name)
+392     root_dir = _root("/run" if runtime else "/etc", root)
+393     link_path = os.path.join(root_dir, "systemd", "system", _canonical_unit_name(name))
+394     try:
+395         return os.readlink(link_path) == "/dev/null"
+396     except OSError as exc:
+397         if exc.errno == errno.ENOENT:
+398             log.trace(
+399                 "Path %s does not exist. This is normal if service '%s' is "
+400                 "not masked or does not exist.",
+401                 link_path,
+402                 name,
+403             )
+404         elif exc.errno == errno.EINVAL:
+405             log.error(
+406                 "Failed to check mask status for service %s. Path %s is a "
+407                 "file, not a symlink. This could be caused by changes in "
+408                 "systemd and is probably a bug in Salt. Please report this "
+409                 "to the developers.",
+410                 name,
+411                 link_path,
+412             )
+413         return False
+414 def start(name, no_block=False, unmask=False, unmask_runtime=False):
+415     _check_for_unit_changes(name)
+416     _check_unmask(name, unmask, unmask_runtime)
+417     ret = __salt__["cmd.run_all"](
+418         _systemctl_cmd("start", name, systemd_scope=True, no_block=no_block),
+419         python_shell=False,
+420     )
+421     if ret["retcode"] != 0:
+422         raise CommandExecutionError(_strip_scope(ret["stderr"]))
+423     return True
+424 def stop(name, no_block=False):
+425     _check_for_unit_changes(name)
+426     return (
+427         __salt__["cmd.run_all"](
+428             _systemctl_cmd("stop", name, systemd_scope=True, no_block=no_block),
+429             python_shell=False,
+430         )["retcode"]
+431         == 0
+432     )
+433 def restart(name, no_block=False, unmask=False, unmask_runtime=False):
+434     _check_for_unit_changes(name)
+435     _check_unmask(name, unmask, unmask_runtime)
+436     ret = __salt__["cmd.run_all"](
+437         _systemctl_cmd("restart", name, systemd_scope=True, no_block=no_block),
+438         python_shell=False,
+439     )
+440     if ret["retcode"] != 0:
+441         raise CommandExecutionError(_strip_scope(ret["stderr"]))
+442     return True
+443 def reload_(name, no_block=False, unmask=False, unmask_runtime=False):
+444     _check_for_unit_changes(name)
+445     _check_unmask(name, unmask, unmask_runtime)
+446     ret = __salt__["cmd.run_all"](
+447         _systemctl_cmd("reload", name, systemd_scope=True, no_block=no_block),
+448         python_shell=False,
+449     )
+450     if ret["retcode"] != 0:
+451         raise CommandExecutionError(_strip_scope(ret["stderr"]))
+452     return True
+453 def force_reload(name, no_block=True, unmask=False, unmask_runtime=False):
+454     _check_for_unit_changes(name)
+455     _check_unmask(name, unmask, unmask_runtime)
+456     ret = __salt__["cmd.run_all"](
+457         _systemctl_cmd("force-reload", name, systemd_scope=True, no_block=no_block),
+458         python_shell=False,
+459     )
+460     if ret["retcode"] != 0:
+461         raise CommandExecutionError(_strip_scope(ret["stderr"]))
+462     return True
+463 def status(name, sig=None):  # pylint: disable=unused-argument
+464     contains_globbing = bool(re.search(r"\*|\?|\[.+\]", name))
+465     if contains_globbing:
+466         services = fnmatch.filter(get_all(), name)
+467     else:
+468         services = [name]
+469     results = {}
+470     for service in services:
+471         _check_for_unit_changes(service)
+472         results[service] = (
+473             __salt__["cmd.retcode"](
+474                 _systemctl_cmd("is-active", service),
+475                 python_shell=False,
+476                 ignore_retcode=True,
+477             )
+478             == 0
+479         )
+480     if contains_globbing:
+481         return results
+482     return results[name]
+483 def enable(
+484     name, no_block=False, unmask=False, unmask_runtime=False, root=None, **kwargs
+485 ):  # pylint: disable=unused-argument
+486     _check_for_unit_changes(name)
+487     _check_unmask(name, unmask, unmask_runtime, root)
+488     if name in _get_sysv_services(root):
+489         cmd = []
+490         if salt.utils.systemd.has_scope(__context__) and __salt__["config.get"](
+491             "systemd.scope", True
+492         ):
+493             cmd.extend(["systemd-run", "--scope"])
+494         service_exec = _get_service_exec()
+495         if service_exec.endswith("/update-rc.d"):
+496             cmd.extend([service_exec, "-f", name, "defaults", "99"])
+497         elif service_exec.endswith("/chkconfig"):
+498             cmd.extend([service_exec, name, "on"])
+499         return (
+500             __salt__["cmd.retcode"](cmd, python_shell=False, ignore_retcode=True) == 0
+501         )
+502     ret = __salt__["cmd.run_all"](
+503         _systemctl_cmd(
+504             "enable", name, systemd_scope=True, no_block=no_block, root=root
+505         ),
+506         python_shell=False,
+507         ignore_retcode=True,
+508     )
+509     if ret["retcode"] != 0:
+510         raise CommandExecutionError(_strip_scope(ret["stderr"]))
+511     return True
+512 def disable(
+513     name, no_block=False, root=None, **kwargs
+514 ):  # pylint: disable=unused-argument
+515     _check_for_unit_changes(name)
+516     if name in _get_sysv_services(root):
+517         cmd = []
+518         if salt.utils.systemd.has_scope(__context__) and __salt__["config.get"](
+519             "systemd.scope", True
+520         ):
+521             cmd.extend(["systemd-run", "--scope"])
+522         service_exec = _get_service_exec()
+523         if service_exec.endswith("/update-rc.d"):
+524             cmd.extend([service_exec, "-f", name, "remove"])
+525         elif service_exec.endswith("/chkconfig"):
+526             cmd.extend([service_exec, name, "off"])
+527         return (
+528             __salt__["cmd.retcode"](cmd, python_shell=False, ignore_retcode=True) == 0
+529         )
+530     return (
+531         __salt__["cmd.run_all"](
+532             _systemctl_cmd(
+533                 "disable", name, systemd_scope=True, no_block=no_block, root=root
+534             ),
+535             python_shell=False,
+536             ignore_retcode=True,
+537         )["retcode"]
+538         == 0
+539     )
+540 def enabled(name, root=None, **kwargs):  # pylint: disable=unused-argument
+541     if (
+542         __salt__["cmd.retcode"](
+543             _systemctl_cmd("is-enabled", name, root=root),
+544             python_shell=False,
+545             ignore_retcode=True,
+546         )
+547         == 0
+548     ):
+549         return True
+550     elif "@" in name:
+551         local_config_path = _root(LOCAL_CONFIG_PATH, "/")
+552         cmd = [
+553             "find",
+554             local_config_path,
+555             "-name",
+556             name,
+557             "-type",
+558             "l",
+559             "-print",
+560             "-quit",
+561         ]
+562         if bool(__salt__["cmd.run"](cmd, python_shell=False)):
+563             return True
+564     elif name in _get_sysv_services(root):
+565         return _sysv_enabled(name, root)
+566     return False
+567 def disabled(name, root=None):
+568     return not enabled(name, root=root)
+569 def show(name, root=None):
+570     ret = {}
+571     out = __salt__["cmd.run"](
+572         _systemctl_cmd("show", name, root=root), python_shell=False
+573     )
+574     for line in salt.utils.itertools.split(out, "\n"):
+575         comps = line.split("=")
+576         name = comps[0]
+577         value = "=".join(comps[1:])
+578         if value.startswith("{"):
+579             value = value.replace("{", "").replace("}", "")
+580             ret[name] = {}
+581             for item in value.split(" ; "):
+582                 comps = item.split("=")
+583                 ret[name][comps[0].strip()] = comps[1].strip()
+584         elif name in ("Before", "After", "Wants"):
+585             ret[name] = value.split()
+586         else:
+587             ret[name] = value
+588     return ret
+589 def execs(root=None):
+590     ret = {}
+591     for service in get_all(root=root):
+592         data = show(service, root=root)
+593 <a name="1"></a>        if "ExecStart" not in data:
+594             continue
+595         ret[service] = data["ExecStart"]["path"]
+596     <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>return ret
+597 def firstboot(
+598     locale=None,
+599     locale_message=None,
+600     keymap=None,
+601     timezone=None,
+602     hostname=None,
+603     machine_id=None,
+604     root=None,
+605 ):
+606     cmd = ["systemd-firstboot"]
+607     parameters =</b></font> [
+608         ("locale", locale),
+609         ("locale-message", locale_message),
+610         ("keymap", keymap),
+611         ("timezone", timezone),
+612         ("hostname", hostname),
+613         ("machine-ID", machine_id),
+614         ("root", root),
+615     ]
+616     for parameter, value in parameters:
+617         if value:
+618             cmd.extend(["--{}".format(parameter), str(value)])
+619     out = __salt__["cmd.run_all"](cmd)
+620     if out["retcode"] != 0:
+621         raise CommandExecutionError("systemd-firstboot error: {}".format(out["stderr"]))
+622     return True
+623 def offline():
+624     return salt.utils.systemd.offline(__context__)
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -677,630 +677,630 @@ def offline():
 </h3>
 <hr/>
 <pre>
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>import functools
-import logging
-import os
-import re
-import time
-import salt.utils.files
-import salt.utils.path
-import salt.utils.stringutils
-from salt.exceptions import SaltInvocationError
-from salt.utils.versions import LooseVersion as _LooseVersion
-log = logging.getLogger(__name__)
-__virtualname__ =</b></font> "gpg"
-LETTER_TRUST_DICT = {
-    "e": "Expired",
-    "q": "Unknown",
-    "n": "Not Trusted",
-    "f": "Fully Trusted",
-    "m": "Marginally Trusted",
-    "u": "Ultimately Trusted",
-    "-": "Unknown",
-}
-NUM_TRUST_DICT = {
-    "expired": "1",
-    "unknown": "2",
-    "not_trusted": "3",
-    "marginally": "4",
-    "fully": "5",
-    "ultimately": "6",
-}
-INV_NUM_TRUST_DICT = {
-    "1": "Expired",
-    "2": "Unknown",
-    "3": "Not Trusted",
-    "4": "Marginally",
-    "5": "Fully Trusted",
-    "6": "Ultimately Trusted",
-}
-VERIFY_TRUST_LEVELS = {
-    "0": "Undefined",
-    "1": "Never",
-    "2": "Marginal",
-    "3": "Fully",
-    "4": "Ultimate",
-}
-GPG_1_3_1 = False
-try:
-    import gnupg
-    HAS_GPG_BINDINGS = True
-    GPG_1_3_1 = _LooseVersion(gnupg.__version__) &gt;= _LooseVersion("1.3.1")
-except ImportError:
-    HAS_GPG_BINDINGS = False
-def _gpg():
-    return salt.utils.path.which("gpg")
-def __virtual__():
-    if not _gpg():
-        return (
-            False,
-            "The gpg execution module cannot be loaded: gpg binary is not in the path.",
-        )
-    return (
-        __virtualname__
-        if HAS_GPG_BINDINGS
-        else (
-            False,
-            "The gpg execution module cannot be loaded; the gnupg python module is not"
-            " installed.",
-        )
-    )
-def _get_user_info(user=None):
-    if not user:
-        user = __salt__["config.option"]("user")
-    userinfo = __salt__["user.info"](user)
-    if not userinfo:
-        if user == "salt":
-            userinfo = _get_user_info()
-        else:
-            raise SaltInvocationError("User {} does not exist".format(user))
-    return userinfo
-def _get_user_gnupghome(user):
-    if user == "salt":
-        gnupghome = os.path.join(__salt__["config.get"]("config_dir"), "gpgkeys")
-    else:
-        gnupghome = os.path.join(_get_user_info(user)["home"], ".gnupg")
-    return gnupghome
-def _restore_ownership(func):
-    @functools.wraps(func)
-    def func_wrapper(*args, **kwargs):
-        user = kwargs.get("user")
-        gnupghome = kwargs.get("gnupghome")
-        if not gnupghome:
-            gnupghome = _get_user_gnupghome(user)
-        userinfo = _get_user_info(user)
-        run_user = _get_user_info()
-        if userinfo["uid"] != run_user["uid"] and os.path.exists(gnupghome):
-            group = __salt__["file.gid_to_group"](run_user["gid"])
-            for path in [gnupghome] + __salt__["file.find"](gnupghome):
-                __salt__["file.chown"](path, run_user["name"], group)
-        for key in list(kwargs):
-            if key.startswith("__"):
-                del kwargs[key]
-        ret = func(*args, **kwargs)
-        if userinfo["uid"] != run_user["uid"]:
-            group = __salt__["file.gid_to_group"](userinfo["gid"])
-            for path in [gnupghome] + __salt__["file.find"](gnupghome):
-                __salt__["file.chown"](path, user, group)
-        return ret
-    return func_wrapper
-def _create_gpg(user=None, gnupghome=None):
-    if not gnupghome:
-        gnupghome = _get_user_gnupghome(user)
-    if GPG_1_3_1:
-        gpg = gnupg.GPG(homedir=gnupghome)  # pylint: disable=unexpected-keyword-arg
-    else:
-        gpg = gnupg.GPG(gnupghome=gnupghome)
-    return gpg
-def _list_keys(user=None, gnupghome=None, secret=False):
-    gpg = _create_gpg(user, gnupghome)
-    _keys = gpg.list_keys(secret)
-    return _keys
-def _search_keys(text, keyserver, user=None):
-    gpg = _create_gpg(user)
-    if keyserver:
-        _keys = gpg.search_keys(text, keyserver)
-    else:
-        _keys = gpg.search_keys(text)
-    return _keys
-def search_keys(text, keyserver=None, user=None):
-    if GPG_1_3_1:
-        raise SaltInvocationError(
-            "The search_keys function is not support with this version of python-gnupg."
-        )
-    else:
-        if not keyserver:
-            keyserver = "pgp.mit.edu"
-        _keys = []
-        for _key in _search_keys(text, keyserver, user):
-            tmp = {"keyid": _key["keyid"], "uids": _key["uids"]}
-            expires = _key.get("expires", None)
-            date = _key.get("date", None)
-            length = _key.get("length", None)
-            if expires:
-                tmp["expires"] = time.strftime(
-                    "%Y-%m-%d", time.localtime(float(_key["expires"]))
-                )
-            if date:
-                tmp["created"] = time.strftime(
-                    "%Y-%m-%d", time.localtime(float(_key["date"]))
-                )
-            if length:
-                tmp["keyLength"] = _key["length"]
-            _keys.append(tmp)
-        return _keys
-def list_keys(user=None, gnupghome=None):
-    _keys = []
-    for _key in _list_keys(user, gnupghome):
-        tmp = {
-            "keyid": _key["keyid"],
-            "fingerprint": _key["fingerprint"],
-            "uids": _key["uids"],
-        }
-        expires = _key.get("expires", None)
-        date = _key.get("date", None)
-        length = _key.get("length", None)
-        owner_trust = _key.get("ownertrust", None)
-        trust = _key.get("trust", None)
-        if expires:
-            tmp["expires"] = time.strftime(
-                "%Y-%m-%d", time.localtime(float(_key["expires"]))
-            )
-        if date:
-            tmp["created"] = time.strftime(
-                "%Y-%m-%d", time.localtime(float(_key["date"]))
-            )
-        if length:
-            tmp["keyLength"] = _key["length"]
-        if owner_trust:
-            tmp["ownerTrust"] = LETTER_TRUST_DICT[_key["ownertrust"]]
-        if trust:
-            tmp["trust"] = LETTER_TRUST_DICT[_key["trust"]]
-        _keys.append(tmp)
-    return _keys
-def list_secret_keys(user=None, gnupghome=None):
-    _keys = []
-    for _key in _list_keys(user, gnupghome, secret=True):
-        tmp = {
-            "keyid": _key["keyid"],
-            "fingerprint": _key["fingerprint"],
-            "uids": _key["uids"],
-        }
-        expires = _key.get("expires", None)
-        date = _key.get("date", None)
-        length = _key.get("length", None)
-        owner_trust = _key.get("ownertrust", None)
-        trust = _key.get("trust", None)
-        if expires:
-            tmp["expires"] = time.strftime(
-                "%Y-%m-%d", time.localtime(float(_key["expires"]))
-            )
-        if date:
-            tmp["created"] = time.strftime(
-                "%Y-%m-%d", time.localtime(float(_key["date"]))
-            )
-        if length:
-            tmp["keyLength"] = _key["length"]
-        if owner_trust:
-            tmp["ownerTrust"] = LETTER_TRUST_DICT[_key["ownertrust"]]
-        if trust:
-            tmp["trust"] = LETTER_TRUST_DICT[_key["trust"]]
-        _keys.append(tmp)
-    return _keys
-@_restore_ownership
-def create_key(
-    key_type="RSA",
-    key_length=1024,
-    name_real="Autogenerated Key",
-    name_comment="Generated by SaltStack",
-    name_email=None,
-    subkey_type=None,
-    subkey_length=None,
-    expire_date=None,
-    use_passphrase=False,
-    user=None,
-    gnupghome=None,
-):
-    ret = {"res": True, "fingerprint": "", "message": ""}
-    create_params = {
-        "key_type": key_type,
-        "key_length": key_length,
-        "name_real": name_real,
-        "name_comment": name_comment,
-    }
-    gpg = _create_gpg(user, gnupghome)
-    if name_email:
-        create_params["name_email"] = name_email
-    if subkey_type:
-        create_params["subkey_type"] = subkey_type
-    if subkey_length:
-        create_params["subkey_length"] = subkey_length
-    if expire_date:
-        create_params["expire_date"] = expire_date
-    if use_passphrase:
-        gpg_passphrase = __salt__["pillar.get"]("gpg_passphrase")
-        if not gpg_passphrase:
-            ret["res"] = False
-            ret["message"] = "gpg_passphrase not available in pillar."
-            return ret
-        else:
-            create_params["passphrase"] = gpg_passphrase
-    else:
-        create_params["no_protection"] = True
-    input_data = gpg.gen_key_input(**create_params)
-    if "No-Protection: True" in input_data:
-        temp_data = input_data.splitlines()
-        temp_data.remove("No-Protection: True")
-        temp_data.insert(temp_data.index("%commit"), "%no-protection")
-        input_data = "\n".join(temp_data) + "\n"
-    key = gpg.gen_key(input_data)
-    if key.fingerprint:
-        ret["fingerprint"] = key.fingerprint
-        ret["message"] = "GPG key pair successfully generated."
-    else:
-        ret["res"] = False
-        ret["message"] = "Unable to generate GPG key pair."
-    return ret
-def delete_key(
-    keyid=None,
-    fingerprint=None,
-    delete_secret=False,
-    user=None,
-    gnupghome=None,
-    use_passphrase=True,
-):
-    ret = {"res": True, "message": ""}
-    if fingerprint and keyid:
-        ret["res"] = False
-        ret["message"] = "Only specify one argument, fingerprint or keyid"
-        return ret
-    if not fingerprint and not keyid:
-        ret["res"] = False
-        ret["message"] = "Required argument, fingerprint or keyid"
-        return ret
-    gpg = _create_gpg(user, gnupghome)
-    key = get_key(keyid, fingerprint, user)
-    def __delete_key(fingerprint, secret, use_passphrase):
-        if use_passphrase:
-            gpg_passphrase = __salt__["pillar.get"]("gpg_passphrase")
-            if not gpg_passphrase:
-                ret["res"] = False
-                ret["message"] = "gpg_passphrase not available in pillar."
-                return ret
-            else:
-                out = gpg.delete_keys(fingerprint, secret, passphrase=gpg_passphrase)
-        else:
-            out = gpg.delete_keys(fingerprint, secret, expect_passphrase=False)
-        return out
-    if key:
-        fingerprint = key["fingerprint"]
-        skey = get_secret_key(keyid, fingerprint, user)
-        if skey:
-            if not delete_secret:
-                ret["res"] = False
-                ret[
-                    "message"
-                ] = "Secret key exists, delete first or pass delete_secret=True."
-                return ret
-            else:
-                if str(__delete_key(fingerprint, True, use_passphrase)) == "ok":
-                    ret["message"] = "Secret key for {} deleted\n".format(fingerprint)
-        if str(__delete_key(fingerprint, False, use_passphrase)) == "ok":
-            ret["message"] += "Public key for {} deleted".format(fingerprint)
-        ret["res"] = True
-        return ret
-    else:
-        ret["res"] = False
-        ret["message"] = "Key not available in keychain."
-        return ret
-def get_key(keyid=None, fingerprint=None, user=None, gnupghome=None):
-    tmp = {}
-    for _key in _list_keys(user, gnupghome):
-        if (
-            _key["fingerprint"] == fingerprint
-            or _key["keyid"] == keyid
-            or _key["keyid"][8:] == keyid
-        ):
-            tmp["keyid"] = _key["keyid"]
-            tmp["fingerprint"] = _key["fingerprint"]
-            tmp["uids"] = _key["uids"]
-            expires = _key.get("expires", None)
-            date = _key.get("date", None)
-            length = _key.get("length", None)
-            owner_trust = _key.get("ownertrust", None)
-            trust = _key.get("trust", None)
-            if expires:
-                tmp["expires"] = time.strftime(
-                    "%Y-%m-%d", time.localtime(float(_key["expires"]))
-                )
-            if date:
-                tmp["created"] = time.strftime(
-                    "%Y-%m-%d", time.localtime(float(_key["date"]))
-                )
-            if length:
-                tmp["keyLength"] = _key["length"]
-            if owner_trust:
-                tmp["ownerTrust"] = LETTER_TRUST_DICT[_key["ownertrust"]]
-            if trust:
-                tmp["trust"] = LETTER_TRUST_DICT[_key["trust"]]
-    if not tmp:
-        return False
-    else:
-        return tmp
-def get_secret_key(keyid=None, fingerprint=None, user=None, gnupghome=None):
-    tmp = {}
-    for _key in _list_keys(user, gnupghome, secret=True):
-        if (
-            _key["fingerprint"] == fingerprint
-            or _key["keyid"] == keyid
-            or _key["keyid"][8:] == keyid
-        ):
-            tmp["keyid"] = _key["keyid"]
-            tmp["fingerprint"] = _key["fingerprint"]
-            tmp["uids"] = _key["uids"]
-            expires = _key.get("expires", None)
-            date = _key.get("date", None)
-            length = _key.get("length", None)
-            owner_trust = _key.get("ownertrust", None)
-            trust = _key.get("trust", None)
-            if expires:
-                tmp["expires"] = time.strftime(
-                    "%Y-%m-%d", time.localtime(float(_key["expires"]))
-                )
-            if date:
-                tmp["created"] = time.strftime(
-                    "%Y-%m-%d", time.localtime(float(_key["date"]))
-                )
-            if length:
-                tmp["keyLength"] = _key["length"]
-            if owner_trust:
-                tmp["ownerTrust"] = LETTER_TRUST_DICT[_key["ownertrust"]]
-            if trust:
-                tmp["trust"] = LETTER_TRUST_DICT[_key["trust"]]
-    if not tmp:
-        return False
-    else:
-        return tmp
-@_restore_ownership
-def import_key(text=None, filename=None, user=None, gnupghome=None):
-    r"""
-    Import a key from text or file
-    text
-        The text containing to import.
-    filename
-        The filename containing the key to import.
-    user
-        Which user's keychain to access, defaults to user Salt is running as.
-        Passing the user as ``salt`` will set the GnuPG home directory to the
-        ``/etc/salt/gpgkeys``.
-    gnupghome
-        Specify the location where GPG keyring and related files are stored.
-    CLI Example:
-    .. code-block:: bash
-        salt '*' gpg.import_key text='-----BEGIN PGP PUBLIC KEY BLOCK-----\n ... -----END PGP PUBLIC KEY BLOCK-----'
-        salt '*' gpg.import_key filename='/path/to/public-key-file'
-    Export a key from the GPG keychain
-    keyids
-        The key ID(s) of the key(s) to be exported. Can be specified as a comma
-        separated string or a list. Anything which GnuPG itself accepts to
-        identify a key - for example, the key ID or the fingerprint could be
-        used.
-    secret
-        Export the secret key identified by the ``keyids`` information passed.
-    user
-        Which user's keychain to access, defaults to user Salt is running as.
-        Passing the user as ``salt`` will set the GnuPG home directory to the
-        ``/etc/salt/gpgkeys``.
-    gnupghome
-        Specify the location where GPG keyring and related files are stored.
-    use_passphrase
-        Whether to use a passphrase with the signing key. Passphrase is received
-        from Pillar.
-        .. versionadded:: 3003
-    CLI Example:
-    .. code-block:: bash
-        salt '*' gpg.export_key keyids=3FAD9F1E
-        salt '*' gpg.export_key keyids=3FAD9F1E secret=True
-        salt '*' gpg.export_key keyids="['3FAD9F1E','3FBD8F1E']" user=username
-    Receive key(s) from keyserver and add them to keychain
-    keyserver
-        Keyserver to use for searching for GPG keys, defaults to pgp.mit.edu
-    keys
-        The keyID(s) to retrieve from the keyserver.  Can be specified as a comma
-        separated string or a list.
-    user
-        Which user's keychain to access, defaults to user Salt is running as.
-        Passing the user as ``salt`` will set the GnuPG home directory to the
-        ``/etc/salt/gpgkeys``.
-    gnupghome
-        Specify the location where GPG keyring and related files are stored.
-    CLI Example:
-    .. code-block:: bash
-        salt '*' gpg.receive_keys keys='3FAD9F1E'
-        salt '*' gpg.receive_keys keys="['3FAD9F1E','3FBD9F2E']"
-        salt '*' gpg.receive_keys keys=3FAD9F1E user=username
-    Set the trust level for a key in GPG keychain
-    keyid
-        The keyid of the key to set the trust level for.
-    fingerprint
-        The fingerprint of the key to set the trust level for.
-    trust_level
-        The trust level to set for the specified key, must be one
-        of the following:
-        expired, unknown, not_trusted, marginally, fully, ultimately
-    user
-        Which user's keychain to access, defaults to user Salt is running as.
-        Passing the user as ``salt`` will set the GnuPG home directory to the
-        ``/etc/salt/gpgkeys``.
-    CLI Example:
-    .. code-block:: bash
-        salt '*' gpg.trust_key keyid='3FAD9F1E' trust_level='marginally'
-        salt '*' gpg.trust_key fingerprint='53C96788253E58416D20BCD352952C84C3252192' trust_level='not_trusted'
-        salt '*' gpg.trust_key keys=3FAD9F1E trust_level='ultimately' user='username'
-    Sign message or file
-    user
-        Which user's keychain to access, defaults to user Salt is running as.
-        Passing the user as ``salt`` will set the GnuPG home directory to the
-        ``/etc/salt/gpgkeys``.
-    keyid
-        The keyid of the key to set the trust level for, defaults to
-        first key in the secret keyring.
-    text
-        The text to sign.
-    filename
-        The filename to sign.
-    output
-        The filename where the signed file will be written, default is standard out.
-    use_passphrase
-        Whether to use a passphrase with the signing key. Passphrase is received
-        from Pillar.
-    gnupghome
-        Specify the location where GPG keyring and related files are stored.
-    CLI Example:
-    .. code-block:: bash
-        salt '*' gpg.sign text='Hello there.  How are you?'
-        salt '*' gpg.sign filename='/path/to/important.file'
-        salt '*' gpg.sign filename='/path/to/important.file' use_passphrase=True
-    Verify a message or file
-    text
-        The text to verify.
-    filename
-        The filename to verify.
-    user
-        Which user's keychain to access, defaults to user Salt is running as.
-        Passing the user as ``salt`` will set the GnuPG home directory to the
-        ``/etc/salt/gpgkeys``.
-    gnupghome
-        Specify the location where GPG keyring and related files are stored.
-    signature
-        Specify the filename of a detached signature.
-        .. versionadded:: 2018.3.0
-    trustmodel
-        Explicitly define the used trust model. One of:
-          - pgp
-          - classic
-          - tofu
-          - tofu+pgp
-          - direct
-          - always
-          - auto
-        .. versionadded:: 2019.2.0
-    CLI Example:
-    .. code-block:: bash
-        salt '*' gpg.verify text='Hello there.  How are you?'
-        salt '*' gpg.verify filename='/path/to/important.file'
-        salt '*' gpg.verify filename='/path/to/important.file' use_passphrase=True
-        salt '*' gpg.verify filename='/path/to/important.file' trustmodel=direct
-    <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>return ret
-def encrypt(
-    user=None,
-    recipients=None,
-    text=None,
-    filename=None,
-    output=None,
-    sign=None,
-    use_passphrase=False,
-    gnupghome=None,
-    bare=</b></font>False,
-):
-    ret = {"res": True, "comment": ""}
-    gpg = _create_gpg(user, gnupghome)
-    if use_passphrase:
-        gpg_passphrase = __salt__["pillar.get"]("gpg_passphrase")
-        if not gpg_passphrase:
-            raise SaltInvocationError("gpg_passphrase not available in pillar.")
-        gpg_passphrase = gpg_passphrase["gpg_passphrase"]
-    else:
-        gpg_passphrase = None
-    if text:
-        result = gpg.encrypt(text, recipients, passphrase=gpg_passphrase)
-    elif filename:
-        if GPG_1_3_1:
-            with salt.utils.files.flopen(filename, "rb") as _fp:
-                _contents = salt.utils.stringutils.to_unicode(_fp.read())
-            result = gpg.encrypt(
-                _contents, recipients, passphrase=gpg_passphrase, output=output
-            )
-        else:
-            with salt.utils.files.flopen(filename, "rb") as _fp:
-                if output:
-                    result = gpg.encrypt_file(
-                        _fp,
-                        recipients,
-                        passphrase=gpg_passphrase,
-                        output=output,
-                        sign=sign,
-                    )
-                else:
-                    result = gpg.encrypt_file(
-                        _fp, recipients, passphrase=gpg_passphrase, sign=sign
-                    )
-    else:
-        raise SaltInvocationError("filename or text must be passed.")
-    if result.ok:
-        if not bare:
-            if output:
-                ret["comment"] = "Encrypted data has been written to {}".format(output)
-            else:
-                ret["comment"] = result.data
-        else:
-            ret = result.data
-    else:
-        if not bare:
-            ret["res"] = False
-            ret["comment"] = "{}.\nPlease check the salt-minion log.".format(
-                result.status
-            )
-        else:
-            ret = False
-        log.error(result.stderr)
-    return ret
-def decrypt(
-    user=None,
-    text=None,
-    filename=None,
-    output=None,
-    use_passphrase=False,
-    gnupghome=None,
-    bare=False,
-):
-    ret = {"res": True, "comment": ""}
-    gpg = _create_gpg(user, gnupghome)
-    if use_passphrase:
-        gpg_passphrase = __salt__["pillar.get"]("gpg_passphrase")
-        if not gpg_passphrase:
-            raise SaltInvocationError("gpg_passphrase not available in pillar.")
-        gpg_passphrase = gpg_passphrase["gpg_passphrase"]
-    else:
-        gpg_passphrase = None
-    if text:
-        result = gpg.decrypt(text, passphrase=gpg_passphrase)
-    elif filename:
-        with salt.utils.files.flopen(filename, "rb") as _fp:
-            if output:
-                result = gpg.decrypt_file(_fp, passphrase=gpg_passphrase, output=output)
-            else:
-                result = gpg.decrypt_file(_fp, passphrase=gpg_passphrase)
-    else:
-        raise SaltInvocationError("filename or text must be passed.")
-    if result.ok:
-        if not bare:
-            if output:
-                ret["comment"] = "Decrypted data has been written to {}".format(output)
-            else:
-                ret["comment"] = result.data
-        else:
-            ret = result.data
-    else:
-        if not bare:
-            ret["res"] = False
-            ret["comment"] = "{}.\nPlease check the salt-minion log.".format(
-                result.status
-            )
-        else:
-            ret = False
-        log.error(result.stderr)
-    return ret
+1 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>import functools
+2 import logging
+3 import os
+4 import re
+5 import time
+6 import salt.utils.files
+7 import salt.utils.path
+8 import salt.utils.stringutils
+9 from salt.exceptions import SaltInvocationError
+10 from salt.utils.versions import LooseVersion as _LooseVersion
+11 log = logging.getLogger(__name__)
+12 __virtualname__ =</b></font> "gpg"
+13 LETTER_TRUST_DICT = {
+14     "e": "Expired",
+15     "q": "Unknown",
+16     "n": "Not Trusted",
+17     "f": "Fully Trusted",
+18     "m": "Marginally Trusted",
+19     "u": "Ultimately Trusted",
+20     "-": "Unknown",
+21 }
+22 NUM_TRUST_DICT = {
+23     "expired": "1",
+24     "unknown": "2",
+25     "not_trusted": "3",
+26     "marginally": "4",
+27     "fully": "5",
+28     "ultimately": "6",
+29 }
+30 INV_NUM_TRUST_DICT = {
+31     "1": "Expired",
+32     "2": "Unknown",
+33     "3": "Not Trusted",
+34     "4": "Marginally",
+35     "5": "Fully Trusted",
+36     "6": "Ultimately Trusted",
+37 }
+38 VERIFY_TRUST_LEVELS = {
+39     "0": "Undefined",
+40     "1": "Never",
+41     "2": "Marginal",
+42     "3": "Fully",
+43     "4": "Ultimate",
+44 }
+45 GPG_1_3_1 = False
+46 try:
+47     import gnupg
+48     HAS_GPG_BINDINGS = True
+49     GPG_1_3_1 = _LooseVersion(gnupg.__version__) &gt;= _LooseVersion("1.3.1")
+50 except ImportError:
+51     HAS_GPG_BINDINGS = False
+52 def _gpg():
+53     return salt.utils.path.which("gpg")
+54 def __virtual__():
+55     if not _gpg():
+56         return (
+57             False,
+58             "The gpg execution module cannot be loaded: gpg binary is not in the path.",
+59         )
+60     return (
+61         __virtualname__
+62         if HAS_GPG_BINDINGS
+63         else (
+64             False,
+65             "The gpg execution module cannot be loaded; the gnupg python module is not"
+66             " installed.",
+67         )
+68     )
+69 def _get_user_info(user=None):
+70     if not user:
+71         user = __salt__["config.option"]("user")
+72     userinfo = __salt__["user.info"](user)
+73     if not userinfo:
+74         if user == "salt":
+75             userinfo = _get_user_info()
+76         else:
+77             raise SaltInvocationError("User {} does not exist".format(user))
+78     return userinfo
+79 def _get_user_gnupghome(user):
+80     if user == "salt":
+81         gnupghome = os.path.join(__salt__["config.get"]("config_dir"), "gpgkeys")
+82     else:
+83         gnupghome = os.path.join(_get_user_info(user)["home"], ".gnupg")
+84     return gnupghome
+85 def _restore_ownership(func):
+86     @functools.wraps(func)
+87     def func_wrapper(*args, **kwargs):
+88         user = kwargs.get("user")
+89         gnupghome = kwargs.get("gnupghome")
+90         if not gnupghome:
+91             gnupghome = _get_user_gnupghome(user)
+92         userinfo = _get_user_info(user)
+93         run_user = _get_user_info()
+94         if userinfo["uid"] != run_user["uid"] and os.path.exists(gnupghome):
+95             group = __salt__["file.gid_to_group"](run_user["gid"])
+96             for path in [gnupghome] + __salt__["file.find"](gnupghome):
+97                 __salt__["file.chown"](path, run_user["name"], group)
+98         for key in list(kwargs):
+99             if key.startswith("__"):
+100                 del kwargs[key]
+101         ret = func(*args, **kwargs)
+102         if userinfo["uid"] != run_user["uid"]:
+103             group = __salt__["file.gid_to_group"](userinfo["gid"])
+104             for path in [gnupghome] + __salt__["file.find"](gnupghome):
+105                 __salt__["file.chown"](path, user, group)
+106         return ret
+107     return func_wrapper
+108 def _create_gpg(user=None, gnupghome=None):
+109     if not gnupghome:
+110         gnupghome = _get_user_gnupghome(user)
+111     if GPG_1_3_1:
+112         gpg = gnupg.GPG(homedir=gnupghome)  # pylint: disable=unexpected-keyword-arg
+113     else:
+114         gpg = gnupg.GPG(gnupghome=gnupghome)
+115     return gpg
+116 def _list_keys(user=None, gnupghome=None, secret=False):
+117     gpg = _create_gpg(user, gnupghome)
+118     _keys = gpg.list_keys(secret)
+119     return _keys
+120 def _search_keys(text, keyserver, user=None):
+121     gpg = _create_gpg(user)
+122     if keyserver:
+123         _keys = gpg.search_keys(text, keyserver)
+124     else:
+125         _keys = gpg.search_keys(text)
+126     return _keys
+127 def search_keys(text, keyserver=None, user=None):
+128     if GPG_1_3_1:
+129         raise SaltInvocationError(
+130             "The search_keys function is not support with this version of python-gnupg."
+131         )
+132     else:
+133         if not keyserver:
+134             keyserver = "pgp.mit.edu"
+135         _keys = []
+136         for _key in _search_keys(text, keyserver, user):
+137             tmp = {"keyid": _key["keyid"], "uids": _key["uids"]}
+138             expires = _key.get("expires", None)
+139             date = _key.get("date", None)
+140             length = _key.get("length", None)
+141             if expires:
+142                 tmp["expires"] = time.strftime(
+143                     "%Y-%m-%d", time.localtime(float(_key["expires"]))
+144                 )
+145             if date:
+146                 tmp["created"] = time.strftime(
+147                     "%Y-%m-%d", time.localtime(float(_key["date"]))
+148                 )
+149             if length:
+150                 tmp["keyLength"] = _key["length"]
+151             _keys.append(tmp)
+152         return _keys
+153 def list_keys(user=None, gnupghome=None):
+154     _keys = []
+155     for _key in _list_keys(user, gnupghome):
+156         tmp = {
+157             "keyid": _key["keyid"],
+158             "fingerprint": _key["fingerprint"],
+159             "uids": _key["uids"],
+160         }
+161         expires = _key.get("expires", None)
+162         date = _key.get("date", None)
+163         length = _key.get("length", None)
+164         owner_trust = _key.get("ownertrust", None)
+165         trust = _key.get("trust", None)
+166         if expires:
+167             tmp["expires"] = time.strftime(
+168                 "%Y-%m-%d", time.localtime(float(_key["expires"]))
+169             )
+170         if date:
+171             tmp["created"] = time.strftime(
+172                 "%Y-%m-%d", time.localtime(float(_key["date"]))
+173             )
+174         if length:
+175             tmp["keyLength"] = _key["length"]
+176         if owner_trust:
+177             tmp["ownerTrust"] = LETTER_TRUST_DICT[_key["ownertrust"]]
+178         if trust:
+179             tmp["trust"] = LETTER_TRUST_DICT[_key["trust"]]
+180         _keys.append(tmp)
+181     return _keys
+182 def list_secret_keys(user=None, gnupghome=None):
+183     _keys = []
+184     for _key in _list_keys(user, gnupghome, secret=True):
+185         tmp = {
+186             "keyid": _key["keyid"],
+187             "fingerprint": _key["fingerprint"],
+188             "uids": _key["uids"],
+189         }
+190         expires = _key.get("expires", None)
+191         date = _key.get("date", None)
+192         length = _key.get("length", None)
+193         owner_trust = _key.get("ownertrust", None)
+194         trust = _key.get("trust", None)
+195         if expires:
+196             tmp["expires"] = time.strftime(
+197                 "%Y-%m-%d", time.localtime(float(_key["expires"]))
+198             )
+199         if date:
+200             tmp["created"] = time.strftime(
+201                 "%Y-%m-%d", time.localtime(float(_key["date"]))
+202             )
+203         if length:
+204             tmp["keyLength"] = _key["length"]
+205         if owner_trust:
+206             tmp["ownerTrust"] = LETTER_TRUST_DICT[_key["ownertrust"]]
+207         if trust:
+208             tmp["trust"] = LETTER_TRUST_DICT[_key["trust"]]
+209         _keys.append(tmp)
+210     return _keys
+211 @_restore_ownership
+212 def create_key(
+213     key_type="RSA",
+214     key_length=1024,
+215     name_real="Autogenerated Key",
+216     name_comment="Generated by SaltStack",
+217     name_email=None,
+218     subkey_type=None,
+219     subkey_length=None,
+220     expire_date=None,
+221     use_passphrase=False,
+222     user=None,
+223     gnupghome=None,
+224 ):
+225     ret = {"res": True, "fingerprint": "", "message": ""}
+226     create_params = {
+227         "key_type": key_type,
+228         "key_length": key_length,
+229         "name_real": name_real,
+230         "name_comment": name_comment,
+231     }
+232     gpg = _create_gpg(user, gnupghome)
+233     if name_email:
+234         create_params["name_email"] = name_email
+235     if subkey_type:
+236         create_params["subkey_type"] = subkey_type
+237     if subkey_length:
+238         create_params["subkey_length"] = subkey_length
+239     if expire_date:
+240         create_params["expire_date"] = expire_date
+241     if use_passphrase:
+242         gpg_passphrase = __salt__["pillar.get"]("gpg_passphrase")
+243         if not gpg_passphrase:
+244             ret["res"] = False
+245             ret["message"] = "gpg_passphrase not available in pillar."
+246             return ret
+247         else:
+248             create_params["passphrase"] = gpg_passphrase
+249     else:
+250         create_params["no_protection"] = True
+251     input_data = gpg.gen_key_input(**create_params)
+252     if "No-Protection: True" in input_data:
+253         temp_data = input_data.splitlines()
+254         temp_data.remove("No-Protection: True")
+255         temp_data.insert(temp_data.index("%commit"), "%no-protection")
+256         input_data = "\n".join(temp_data) + "\n"
+257     key = gpg.gen_key(input_data)
+258     if key.fingerprint:
+259         ret["fingerprint"] = key.fingerprint
+260         ret["message"] = "GPG key pair successfully generated."
+261     else:
+262         ret["res"] = False
+263         ret["message"] = "Unable to generate GPG key pair."
+264     return ret
+265 def delete_key(
+266     keyid=None,
+267     fingerprint=None,
+268     delete_secret=False,
+269     user=None,
+270     gnupghome=None,
+271     use_passphrase=True,
+272 ):
+273     ret = {"res": True, "message": ""}
+274     if fingerprint and keyid:
+275         ret["res"] = False
+276         ret["message"] = "Only specify one argument, fingerprint or keyid"
+277         return ret
+278     if not fingerprint and not keyid:
+279         ret["res"] = False
+280         ret["message"] = "Required argument, fingerprint or keyid"
+281         return ret
+282     gpg = _create_gpg(user, gnupghome)
+283     key = get_key(keyid, fingerprint, user)
+284     def __delete_key(fingerprint, secret, use_passphrase):
+285         if use_passphrase:
+286             gpg_passphrase = __salt__["pillar.get"]("gpg_passphrase")
+287             if not gpg_passphrase:
+288                 ret["res"] = False
+289                 ret["message"] = "gpg_passphrase not available in pillar."
+290                 return ret
+291             else:
+292                 out = gpg.delete_keys(fingerprint, secret, passphrase=gpg_passphrase)
+293         else:
+294             out = gpg.delete_keys(fingerprint, secret, expect_passphrase=False)
+295         return out
+296     if key:
+297         fingerprint = key["fingerprint"]
+298         skey = get_secret_key(keyid, fingerprint, user)
+299         if skey:
+300             if not delete_secret:
+301                 ret["res"] = False
+302                 ret[
+303                     "message"
+304                 ] = "Secret key exists, delete first or pass delete_secret=True."
+305                 return ret
+306             else:
+307                 if str(__delete_key(fingerprint, True, use_passphrase)) == "ok":
+308                     ret["message"] = "Secret key for {} deleted\n".format(fingerprint)
+309         if str(__delete_key(fingerprint, False, use_passphrase)) == "ok":
+310             ret["message"] += "Public key for {} deleted".format(fingerprint)
+311         ret["res"] = True
+312         return ret
+313     else:
+314         ret["res"] = False
+315         ret["message"] = "Key not available in keychain."
+316         return ret
+317 def get_key(keyid=None, fingerprint=None, user=None, gnupghome=None):
+318     tmp = {}
+319     for _key in _list_keys(user, gnupghome):
+320         if (
+321             _key["fingerprint"] == fingerprint
+322             or _key["keyid"] == keyid
+323             or _key["keyid"][8:] == keyid
+324         ):
+325             tmp["keyid"] = _key["keyid"]
+326             tmp["fingerprint"] = _key["fingerprint"]
+327             tmp["uids"] = _key["uids"]
+328             expires = _key.get("expires", None)
+329             date = _key.get("date", None)
+330             length = _key.get("length", None)
+331             owner_trust = _key.get("ownertrust", None)
+332             trust = _key.get("trust", None)
+333             if expires:
+334                 tmp["expires"] = time.strftime(
+335                     "%Y-%m-%d", time.localtime(float(_key["expires"]))
+336                 )
+337             if date:
+338                 tmp["created"] = time.strftime(
+339                     "%Y-%m-%d", time.localtime(float(_key["date"]))
+340                 )
+341             if length:
+342                 tmp["keyLength"] = _key["length"]
+343             if owner_trust:
+344                 tmp["ownerTrust"] = LETTER_TRUST_DICT[_key["ownertrust"]]
+345             if trust:
+346                 tmp["trust"] = LETTER_TRUST_DICT[_key["trust"]]
+347     if not tmp:
+348         return False
+349     else:
+350         return tmp
+351 def get_secret_key(keyid=None, fingerprint=None, user=None, gnupghome=None):
+352     tmp = {}
+353     for _key in _list_keys(user, gnupghome, secret=True):
+354         if (
+355             _key["fingerprint"] == fingerprint
+356             or _key["keyid"] == keyid
+357             or _key["keyid"][8:] == keyid
+358         ):
+359             tmp["keyid"] = _key["keyid"]
+360             tmp["fingerprint"] = _key["fingerprint"]
+361             tmp["uids"] = _key["uids"]
+362             expires = _key.get("expires", None)
+363             date = _key.get("date", None)
+364             length = _key.get("length", None)
+365             owner_trust = _key.get("ownertrust", None)
+366             trust = _key.get("trust", None)
+367             if expires:
+368                 tmp["expires"] = time.strftime(
+369                     "%Y-%m-%d", time.localtime(float(_key["expires"]))
+370                 )
+371             if date:
+372                 tmp["created"] = time.strftime(
+373                     "%Y-%m-%d", time.localtime(float(_key["date"]))
+374                 )
+375             if length:
+376                 tmp["keyLength"] = _key["length"]
+377             if owner_trust:
+378                 tmp["ownerTrust"] = LETTER_TRUST_DICT[_key["ownertrust"]]
+379             if trust:
+380                 tmp["trust"] = LETTER_TRUST_DICT[_key["trust"]]
+381     if not tmp:
+382         return False
+383     else:
+384         return tmp
+385 @_restore_ownership
+386 def import_key(text=None, filename=None, user=None, gnupghome=None):
+387     r"""
+388     Import a key from text or file
+389     text
+390         The text containing to import.
+391     filename
+392         The filename containing the key to import.
+393     user
+394         Which user's keychain to access, defaults to user Salt is running as.
+395         Passing the user as ``salt`` will set the GnuPG home directory to the
+396         ``/etc/salt/gpgkeys``.
+397     gnupghome
+398         Specify the location where GPG keyring and related files are stored.
+399     CLI Example:
+400     .. code-block:: bash
+401         salt '*' gpg.import_key text='-----BEGIN PGP PUBLIC KEY BLOCK-----\n ... -----END PGP PUBLIC KEY BLOCK-----'
+402         salt '*' gpg.import_key filename='/path/to/public-key-file'
+403     Export a key from the GPG keychain
+404     keyids
+405         The key ID(s) of the key(s) to be exported. Can be specified as a comma
+406         separated string or a list. Anything which GnuPG itself accepts to
+407         identify a key - for example, the key ID or the fingerprint could be
+408         used.
+409     secret
+410         Export the secret key identified by the ``keyids`` information passed.
+411     user
+412         Which user's keychain to access, defaults to user Salt is running as.
+413         Passing the user as ``salt`` will set the GnuPG home directory to the
+414         ``/etc/salt/gpgkeys``.
+415     gnupghome
+416         Specify the location where GPG keyring and related files are stored.
+417     use_passphrase
+418         Whether to use a passphrase with the signing key. Passphrase is received
+419         from Pillar.
+420         .. versionadded:: 3003
+421     CLI Example:
+422     .. code-block:: bash
+423         salt '*' gpg.export_key keyids=3FAD9F1E
+424         salt '*' gpg.export_key keyids=3FAD9F1E secret=True
+425         salt '*' gpg.export_key keyids="['3FAD9F1E','3FBD8F1E']" user=username
+426     Receive key(s) from keyserver and add them to keychain
+427     keyserver
+428         Keyserver to use for searching for GPG keys, defaults to pgp.mit.edu
+429     keys
+430         The keyID(s) to retrieve from the keyserver.  Can be specified as a comma
+431         separated string or a list.
+432     user
+433         Which user's keychain to access, defaults to user Salt is running as.
+434         Passing the user as ``salt`` will set the GnuPG home directory to the
+435         ``/etc/salt/gpgkeys``.
+436     gnupghome
+437         Specify the location where GPG keyring and related files are stored.
+438     CLI Example:
+439     .. code-block:: bash
+440         salt '*' gpg.receive_keys keys='3FAD9F1E'
+441         salt '*' gpg.receive_keys keys="['3FAD9F1E','3FBD9F2E']"
+442         salt '*' gpg.receive_keys keys=3FAD9F1E user=username
+443     Set the trust level for a key in GPG keychain
+444     keyid
+445         The keyid of the key to set the trust level for.
+446     fingerprint
+447         The fingerprint of the key to set the trust level for.
+448     trust_level
+449         The trust level to set for the specified key, must be one
+450         of the following:
+451         expired, unknown, not_trusted, marginally, fully, ultimately
+452     user
+453         Which user's keychain to access, defaults to user Salt is running as.
+454         Passing the user as ``salt`` will set the GnuPG home directory to the
+455         ``/etc/salt/gpgkeys``.
+456     CLI Example:
+457     .. code-block:: bash
+458         salt '*' gpg.trust_key keyid='3FAD9F1E' trust_level='marginally'
+459         salt '*' gpg.trust_key fingerprint='53C96788253E58416D20BCD352952C84C3252192' trust_level='not_trusted'
+460         salt '*' gpg.trust_key keys=3FAD9F1E trust_level='ultimately' user='username'
+461     Sign message or file
+462     user
+463         Which user's keychain to access, defaults to user Salt is running as.
+464         Passing the user as ``salt`` will set the GnuPG home directory to the
+465         ``/etc/salt/gpgkeys``.
+466     keyid
+467         The keyid of the key to set the trust level for, defaults to
+468         first key in the secret keyring.
+469     text
+470         The text to sign.
+471     filename
+472         The filename to sign.
+473     output
+474         The filename where the signed file will be written, default is standard out.
+475     use_passphrase
+476         Whether to use a passphrase with the signing key. Passphrase is received
+477         from Pillar.
+478     gnupghome
+479         Specify the location where GPG keyring and related files are stored.
+480     CLI Example:
+481     .. code-block:: bash
+482         salt '*' gpg.sign text='Hello there.  How are you?'
+483         salt '*' gpg.sign filename='/path/to/important.file'
+484         salt '*' gpg.sign filename='/path/to/important.file' use_passphrase=True
+485     Verify a message or file
+486     text
+487         The text to verify.
+488     filename
+489         The filename to verify.
+490     user
+491         Which user's keychain to access, defaults to user Salt is running as.
+492         Passing the user as ``salt`` will set the GnuPG home directory to the
+493         ``/etc/salt/gpgkeys``.
+494     gnupghome
+495         Specify the location where GPG keyring and related files are stored.
+496     signature
+497         Specify the filename of a detached signature.
+498         .. versionadded:: 2018.3.0
+499     trustmodel
+500         Explicitly define the used trust model. One of:
+501           - pgp
+502           - classic
+503           - tofu
+504           - tofu+pgp
+505           - direct
+506           - always
+507           - auto
+508         .. versionadded:: 2019.2.0
+509     CLI Example:
+510     .. code-block:: bash
+511         salt '*' gpg.verify text='Hello there.  How are you?'
+512         salt '*' gpg.verify filename='/path/to/important.file'
+513         salt '*' gpg.verify filename='/path/to/important.file' use_passphrase=True
+514         salt '*' gpg.verify filename='/path/to/important.file' trustmodel=direct
+515     <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>return ret
+516 def encrypt(
+517     user=None,
+518     recipients=None,
+519     text=None,
+520     filename=None,
+521     output=None,
+522     sign=None,
+523     use_passphrase=False,
+524     gnupghome=None,
+525     bare=</b></font>False,
+526 ):
+527     ret = {"res": True, "comment": ""}
+528     gpg = _create_gpg(user, gnupghome)
+529     if use_passphrase:
+530         gpg_passphrase = __salt__["pillar.get"]("gpg_passphrase")
+531         if not gpg_passphrase:
+532             raise SaltInvocationError("gpg_passphrase not available in pillar.")
+533         gpg_passphrase = gpg_passphrase["gpg_passphrase"]
+534     else:
+535         gpg_passphrase = None
+536     if text:
+537         result = gpg.encrypt(text, recipients, passphrase=gpg_passphrase)
+538     elif filename:
+539         if GPG_1_3_1:
+540             with salt.utils.files.flopen(filename, "rb") as _fp:
+541                 _contents = salt.utils.stringutils.to_unicode(_fp.read())
+542             result = gpg.encrypt(
+543                 _contents, recipients, passphrase=gpg_passphrase, output=output
+544             )
+545         else:
+546             with salt.utils.files.flopen(filename, "rb") as _fp:
+547                 if output:
+548                     result = gpg.encrypt_file(
+549                         _fp,
+550                         recipients,
+551                         passphrase=gpg_passphrase,
+552                         output=output,
+553                         sign=sign,
+554                     )
+555                 else:
+556                     result = gpg.encrypt_file(
+557                         _fp, recipients, passphrase=gpg_passphrase, sign=sign
+558                     )
+559     else:
+560         raise SaltInvocationError("filename or text must be passed.")
+561     if result.ok:
+562         if not bare:
+563             if output:
+564                 ret["comment"] = "Encrypted data has been written to {}".format(output)
+565             else:
+566                 ret["comment"] = result.data
+567         else:
+568             ret = result.data
+569     else:
+570         if not bare:
+571             ret["res"] = False
+572             ret["comment"] = "{}.\nPlease check the salt-minion log.".format(
+573                 result.status
+574             )
+575         else:
+576             ret = False
+577         log.error(result.stderr)
+578     return ret
+579 def decrypt(
+580     user=None,
+581     text=None,
+582     filename=None,
+583     output=None,
+584     use_passphrase=False,
+585     gnupghome=None,
+586     bare=False,
+587 ):
+588     ret = {"res": True, "comment": ""}
+589     gpg = _create_gpg(user, gnupghome)
+590     if use_passphrase:
+591         gpg_passphrase = __salt__["pillar.get"]("gpg_passphrase")
+592         if not gpg_passphrase:
+593             raise SaltInvocationError("gpg_passphrase not available in pillar.")
+594         gpg_passphrase = gpg_passphrase["gpg_passphrase"]
+595     else:
+596         gpg_passphrase = None
+597     if text:
+598         result = gpg.decrypt(text, passphrase=gpg_passphrase)
+599     elif filename:
+600         with salt.utils.files.flopen(filename, "rb") as _fp:
+601             if output:
+602                 result = gpg.decrypt_file(_fp, passphrase=gpg_passphrase, output=output)
+603             else:
+604                 result = gpg.decrypt_file(_fp, passphrase=gpg_passphrase)
+605     else:
+606         raise SaltInvocationError("filename or text must be passed.")
+607     if result.ok:
+608         if not bare:
+609             if output:
+610                 ret["comment"] = "Decrypted data has been written to {}".format(output)
+611             else:
+612                 ret["comment"] = result.data
+613         else:
+614             ret = result.data
+615     else:
+616         if not bare:
+617             ret["res"] = False
+618             ret["comment"] = "{}.\nPlease check the salt-minion log.".format(
+619                 result.status
+620             )
+621         else:
+622             ret = False
+623         log.error(result.stderr)
+624     return ret
 </pre>
 </div>
 </div>

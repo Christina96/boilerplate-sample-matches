@@ -42,232 +42,232 @@ Matches for test_pub_server_channel.py &amp; test_git_2.py
 </h3>
 <hr/>
 <pre>
-<a name="0"></a>import logging
-<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>import multiprocessing
-import time
-from concurrent.futures.thread import ThreadPoolExecutor
-import pytest
-import salt.config
-import salt.exceptions
-import salt.ext.tornado.gen
-import salt.ext.tornado.ioloop
-import salt.log.setup
-import salt.master
-import salt.transport.zeromq
-import salt.utils.platform
-import salt.utils.process
-import salt.utils.stringutils
-import zmq
-from saltfactories.utils.processes import terminate_process
-from tests.support.mock import MagicMock, patch
-log =</b></font> logging.getLogger(__name__)
-class Collector(salt.utils.process.SignalHandlingProcess):
-    def __init__(self, minion_config, pub_uri, timeout=30, zmq_filtering=False):
-        super().__init__()
-<a name="1"></a>        self.minion_config = minion_config
-        self.pub_uri = pub_uri
-        self.timeout = timeout
-        self.hard_timeout = time<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.time() + timeout + 30
-        self.manager = multiprocessing.Manager()
-        self.results = self.manager.list()
-        self.zmq_filtering = zmq_filtering
-        self.</b></font>stopped = multiprocessing.Event()
-        self.started = multiprocessing.Event()
-        self.running = multiprocessing.Event()
-    def run(self):
-        ctx = zmq.Context()
-        sock = ctx<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.socket(zmq.SUB)
-        sock.setsockopt(zmq.LINGER, -1)
-        sock.setsockopt(zmq.SUBSCRIBE, b"")
-        sock.connect(self.</b></font>pub_uri)
-        last_msg = time.time()
-        self.started.set()
-        while True:
-            curr_time = time.time()
-            if time.time() &gt; self.hard_timeout:
-                break
-            if curr_time - last_msg &gt;= self.timeout:
-                break
-            try:
-                payload = sock.recv(zmq.NOBLOCK)
-            except zmq.ZMQError:
-                time.sleep(0.1)
-            else:
-                try:
-                    payload = salt.payload.loads(payload)
-                    if "start" in payload:
-                        self.running.set()
-                        continue
-                    if "stop" in payload:
-                        break
-                    last_msg = time.time()
-                    self.results.append(payload["jid"])
-                except salt.exceptions.SaltDeserializationError:
-                    if not self.zmq_filtering:
-                        log.exception("Failed to deserialize...")
-                        break
-    def __enter__(self):
-        self.manager.__enter__()
-        self.start()
-        self.started.wait()
-        self.started.clear()
-        return self
-    def __exit__(self, *args):
-        join_secs = self.hard_timeout - time.time()
-        log.info("Waiting at most %s seconds before exiting the collector", join_secs)
-        self.join(join_secs)
-        self.terminate()
-        self.results = list(self.results)
-        self.manager.__exit__(*args)
-        log.debug("The collector has exited")
-        self.stopped.set()
-class PubServerChannelProcess(salt.utils.process.SignalHandlingProcess):
-    def __init__(self, master_config, minion_config, **collector_kwargs):
-        super().__init__()
-        self._closing = False
-        self.master_config = master_config
-        self.minion_config = minion_config
-        self.collector_kwargs = collector_kwargs
-        self.process_manager = salt.utils.process.ProcessManager(
-            name="ZMQ-PubServer-ProcessManager"
-        )
-        self.pub_server_channel = salt.transport.zeromq.PublishServer(
-            self.master_config
-        )
-        self.pub_server_channel.pre_fork(self.process_manager)
-        self.pub_uri = "tcp://{interface}:{publish_port}".format(**self.master_config)
-        self.queue = multiprocessing.Queue()
-        self.stopped = multiprocessing.Event()
-        self.collector = Collector(
-            self.minion_config, self.pub_uri, **self.collector_kwargs
-        )
-    def run(self):
-        try:
-            while True:
-                payload = self.queue.get()
-                if payload is None:
-                    log.debug("We received the stop sentinel")
-                    break
-                self.pub_server_channel.publish(payload)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.stopped.set()
-    def _handle_signals(self, signum, sigframe):
-        self.close()
-        super()._handle_signals(signum, sigframe)
-    def close(self):
-        if self._closing:
-            return
-        self._closing = True
-        if self.process_manager is None:
-            return
-        self.process_manager.terminate()
-        self.pub_server_channel.pub_close()
-        for pid in self.process_manager._process_map:
-            terminate_process(pid=pid, kill_children=True, slow_stop=False)
-        self.process_manager = None
-    def publish(self, payload):
-        self.queue.put(payload)
-    def __enter__(self):
-        self.start()
-        self.collector.__enter__()
-        attempts = 30
-        while attempts &gt; 0:
-            self.publish({"tgt_type": "glob", "tgt": "*", "jid": -1, "start": True})
-            if self.collector.running.wait(1) is True:
-                break
-            attempts -= 1
-        else:
-            pytest.fail("Failed to confirm the collector has started")
-        return self
-    def __exit__(self, *args):
-        self.publish({"tgt_type": "glob", "tgt": "*", "jid": -1, "stop": True})
-        self.collector.__exit__(*args)
-        self.collector.stopped.wait()
-        self.queue.put(None)
-        self.stopped.wait(10)
-        self.close()
-        self.terminate()
-        log.info("The PubServerChannelProcess has terminated")
-@pytest.mark.skip_on_windows
-@pytest.mark.slow_test
-def test_publish_to_pubserv_ipc(salt_master, salt_minion):
-    opts = dict(salt_master.config.copy(), ipc_mode="ipc", pub_hwm=0)
-    with PubServerChannelProcess(opts, salt_minion.config.copy()) as server_channel:
-        send_num = 10000
-        expect = []
-        for idx in range(send_num):
-            expect.append(idx)
-            load = {"tgt_type": "glob", "tgt": "*", "jid": idx}
-            server_channel.publish(load)
-    results = server_channel.collector.results
-    assert len(results) == send_num, "{} != {}, difference: {}".format(
-        len(results), send_num, set(expect).difference(results)
-    )
-@pytest.mark.skip_on_freebsd
-@pytest.mark.slow_test
-def test_issue_36469_tcp(salt_master, salt_minion):
-    def _send_small(server_channel, sid, num=10):
-        for idx in range(num):
-            load = {"tgt_type": "glob", "tgt": "*", "jid": "{}-s{}".format(sid, idx)}
-            server_channel.publish(load)
-    def _send_large(server_channel, sid, num=10, size=250000 * 3):
-        for idx in range(num):
-            load = {
-                "tgt_type": "glob",
-                "tgt": "*",
-                "jid": "{}-l{}".format(sid, idx),
-                "xdata": "0" * size,
-            }
-            server_channel.publish(load)
-    opts = dict(salt_master.config.copy(), ipc_mode="tcp", pub_hwm=0)
-    send_num = 10 * 4
-    expect = []
-    with PubServerChannelProcess(opts, salt_minion.config.copy()) as server_channel:
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            executor.submit(_send_small, server_channel, 1)
-            executor.submit(_send_large, server_channel, 2)
-            executor.submit(_send_small, server_channel, 3)
-            executor.submit(_send_large, server_channel, 4)
-        expect.extend(["{}-s{}".format(a, b) for a in range(10) for b in (1, 3)])
-        expect.extend(["{}-l{}".format(a, b) for a in range(10) for b in (2, 4)])
-    results = server_channel.collector.results
-    assert len(results) == send_num, "{} != {}, difference: {}".format(
-        len(results), send_num, set(expect).difference(results)
-    )
-@pytest.mark.skip_on_windows
-@pytest.mark.slow_test
-def test_zeromq_filtering(salt_master, salt_minion):
-    opts = dict(
-        salt_master.config.copy(),
-        ipc_mode="ipc",
-        pub_hwm=0,
-        zmq_filtering=True,
-        acceptance_wait_time=5,
-    )
-    send_num = 1
-    expect = []
-    with patch(
-        "salt.utils.minions.CkMinions.check_minions",
-        MagicMock(
-            return_value={
-                "minions": [salt_minion.id],
-                "missing": [],
-                "ssh_minions": False,
-            }
-        ),
-    ):
-        with PubServerChannelProcess(
-            opts, salt_minion.config.copy(), zmq_filtering=True
-        ) as server_channel:
-            expect.append(send_num)
-            load = {"tgt_type": "glob", "tgt": "*", "jid": send_num}
-            server_channel.publish(load)
-        results = server_channel.collector.results
-        assert len(results) == send_num, "{} != {}, difference: {}".format(
-            len(results), send_num, set(expect).difference(results)
-        )
+1 <a name="0"></a>import logging
+2 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>import multiprocessing
+3 import time
+4 from concurrent.futures.thread import ThreadPoolExecutor
+5 import pytest
+6 import salt.config
+7 import salt.exceptions
+8 import salt.ext.tornado.gen
+9 import salt.ext.tornado.ioloop
+10 import salt.log.setup
+11 import salt.master
+12 import salt.transport.zeromq
+13 import salt.utils.platform
+14 import salt.utils.process
+15 import salt.utils.stringutils
+16 import zmq
+17 from saltfactories.utils.processes import terminate_process
+18 from tests.support.mock import MagicMock, patch
+19 log =</b></font> logging.getLogger(__name__)
+20 class Collector(salt.utils.process.SignalHandlingProcess):
+21     def __init__(self, minion_config, pub_uri, timeout=30, zmq_filtering=False):
+22         super().__init__()
+23 <a name="1"></a>        self.minion_config = minion_config
+24         self.pub_uri = pub_uri
+25         self.timeout = timeout
+26         self.hard_timeout = time<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.time() + timeout + 30
+27         self.manager = multiprocessing.Manager()
+28         self.results = self.manager.list()
+29         self.zmq_filtering = zmq_filtering
+30         self.</b></font>stopped = multiprocessing.Event()
+31         self.started = multiprocessing.Event()
+32         self.running = multiprocessing.Event()
+33     def run(self):
+34         ctx = zmq.Context()
+35         sock = ctx<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.socket(zmq.SUB)
+36         sock.setsockopt(zmq.LINGER, -1)
+37         sock.setsockopt(zmq.SUBSCRIBE, b"")
+38         sock.connect(self.</b></font>pub_uri)
+39         last_msg = time.time()
+40         self.started.set()
+41         while True:
+42             curr_time = time.time()
+43             if time.time() &gt; self.hard_timeout:
+44                 break
+45             if curr_time - last_msg &gt;= self.timeout:
+46                 break
+47             try:
+48                 payload = sock.recv(zmq.NOBLOCK)
+49             except zmq.ZMQError:
+50                 time.sleep(0.1)
+51             else:
+52                 try:
+53                     payload = salt.payload.loads(payload)
+54                     if "start" in payload:
+55                         self.running.set()
+56                         continue
+57                     if "stop" in payload:
+58                         break
+59                     last_msg = time.time()
+60                     self.results.append(payload["jid"])
+61                 except salt.exceptions.SaltDeserializationError:
+62                     if not self.zmq_filtering:
+63                         log.exception("Failed to deserialize...")
+64                         break
+65     def __enter__(self):
+66         self.manager.__enter__()
+67         self.start()
+68         self.started.wait()
+69         self.started.clear()
+70         return self
+71     def __exit__(self, *args):
+72         join_secs = self.hard_timeout - time.time()
+73         log.info("Waiting at most %s seconds before exiting the collector", join_secs)
+74         self.join(join_secs)
+75         self.terminate()
+76         self.results = list(self.results)
+77         self.manager.__exit__(*args)
+78         log.debug("The collector has exited")
+79         self.stopped.set()
+80 class PubServerChannelProcess(salt.utils.process.SignalHandlingProcess):
+81     def __init__(self, master_config, minion_config, **collector_kwargs):
+82         super().__init__()
+83         self._closing = False
+84         self.master_config = master_config
+85         self.minion_config = minion_config
+86         self.collector_kwargs = collector_kwargs
+87         self.process_manager = salt.utils.process.ProcessManager(
+88             name="ZMQ-PubServer-ProcessManager"
+89         )
+90         self.pub_server_channel = salt.transport.zeromq.PublishServer(
+91             self.master_config
+92         )
+93         self.pub_server_channel.pre_fork(self.process_manager)
+94         self.pub_uri = "tcp://{interface}:{publish_port}".format(**self.master_config)
+95         self.queue = multiprocessing.Queue()
+96         self.stopped = multiprocessing.Event()
+97         self.collector = Collector(
+98             self.minion_config, self.pub_uri, **self.collector_kwargs
+99         )
+100     def run(self):
+101         try:
+102             while True:
+103                 payload = self.queue.get()
+104                 if payload is None:
+105                     log.debug("We received the stop sentinel")
+106                     break
+107                 self.pub_server_channel.publish(payload)
+108         except KeyboardInterrupt:
+109             pass
+110         finally:
+111             self.stopped.set()
+112     def _handle_signals(self, signum, sigframe):
+113         self.close()
+114         super()._handle_signals(signum, sigframe)
+115     def close(self):
+116         if self._closing:
+117             return
+118         self._closing = True
+119         if self.process_manager is None:
+120             return
+121         self.process_manager.terminate()
+122         self.pub_server_channel.pub_close()
+123         for pid in self.process_manager._process_map:
+124             terminate_process(pid=pid, kill_children=True, slow_stop=False)
+125         self.process_manager = None
+126     def publish(self, payload):
+127         self.queue.put(payload)
+128     def __enter__(self):
+129         self.start()
+130         self.collector.__enter__()
+131         attempts = 30
+132         while attempts &gt; 0:
+133             self.publish({"tgt_type": "glob", "tgt": "*", "jid": -1, "start": True})
+134             if self.collector.running.wait(1) is True:
+135                 break
+136             attempts -= 1
+137         else:
+138             pytest.fail("Failed to confirm the collector has started")
+139         return self
+140     def __exit__(self, *args):
+141         self.publish({"tgt_type": "glob", "tgt": "*", "jid": -1, "stop": True})
+142         self.collector.__exit__(*args)
+143         self.collector.stopped.wait()
+144         self.queue.put(None)
+145         self.stopped.wait(10)
+146         self.close()
+147         self.terminate()
+148         log.info("The PubServerChannelProcess has terminated")
+149 @pytest.mark.skip_on_windows
+150 @pytest.mark.slow_test
+151 def test_publish_to_pubserv_ipc(salt_master, salt_minion):
+152     opts = dict(salt_master.config.copy(), ipc_mode="ipc", pub_hwm=0)
+153     with PubServerChannelProcess(opts, salt_minion.config.copy()) as server_channel:
+154         send_num = 10000
+155         expect = []
+156         for idx in range(send_num):
+157             expect.append(idx)
+158             load = {"tgt_type": "glob", "tgt": "*", "jid": idx}
+159             server_channel.publish(load)
+160     results = server_channel.collector.results
+161     assert len(results) == send_num, "{} != {}, difference: {}".format(
+162         len(results), send_num, set(expect).difference(results)
+163     )
+164 @pytest.mark.skip_on_freebsd
+165 @pytest.mark.slow_test
+166 def test_issue_36469_tcp(salt_master, salt_minion):
+167     def _send_small(server_channel, sid, num=10):
+168         for idx in range(num):
+169             load = {"tgt_type": "glob", "tgt": "*", "jid": "{}-s{}".format(sid, idx)}
+170             server_channel.publish(load)
+171     def _send_large(server_channel, sid, num=10, size=250000 * 3):
+172         for idx in range(num):
+173             load = {
+174                 "tgt_type": "glob",
+175                 "tgt": "*",
+176                 "jid": "{}-l{}".format(sid, idx),
+177                 "xdata": "0" * size,
+178             }
+179             server_channel.publish(load)
+180     opts = dict(salt_master.config.copy(), ipc_mode="tcp", pub_hwm=0)
+181     send_num = 10 * 4
+182     expect = []
+183     with PubServerChannelProcess(opts, salt_minion.config.copy()) as server_channel:
+184         with ThreadPoolExecutor(max_workers=4) as executor:
+185             executor.submit(_send_small, server_channel, 1)
+186             executor.submit(_send_large, server_channel, 2)
+187             executor.submit(_send_small, server_channel, 3)
+188             executor.submit(_send_large, server_channel, 4)
+189         expect.extend(["{}-s{}".format(a, b) for a in range(10) for b in (1, 3)])
+190         expect.extend(["{}-l{}".format(a, b) for a in range(10) for b in (2, 4)])
+191     results = server_channel.collector.results
+192     assert len(results) == send_num, "{} != {}, difference: {}".format(
+193         len(results), send_num, set(expect).difference(results)
+194     )
+195 @pytest.mark.skip_on_windows
+196 @pytest.mark.slow_test
+197 def test_zeromq_filtering(salt_master, salt_minion):
+198     opts = dict(
+199         salt_master.config.copy(),
+200         ipc_mode="ipc",
+201         pub_hwm=0,
+202         zmq_filtering=True,
+203         acceptance_wait_time=5,
+204     )
+205     send_num = 1
+206     expect = []
+207     with patch(
+208         "salt.utils.minions.CkMinions.check_minions",
+209         MagicMock(
+210             return_value={
+211                 "minions": [salt_minion.id],
+212                 "missing": [],
+213                 "ssh_minions": False,
+214             }
+215         ),
+216     ):
+217         with PubServerChannelProcess(
+218             opts, salt_minion.config.copy(), zmq_filtering=True
+219         ) as server_channel:
+220             expect.append(send_num)
+221             load = {"tgt_type": "glob", "tgt": "*", "jid": send_num}
+222             server_channel.publish(load)
+223         results = server_channel.collector.results
+224         assert len(results) == send_num, "{} != {}, difference: {}".format(
+225             len(results), send_num, set(expect).difference(results)
+226         )
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -280,693 +280,693 @@ def test_zeromq_filtering(salt_master, salt_minion):
 </h3>
 <hr/>
 <pre>
-<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>import functools
-import inspect
-import logging
-import os
-import shutil
-import socket
-import string
-import tempfile
-import urllib.parse
-import pytest
-import salt.utils.files
-import salt.utils.path
-from salt.utils.versions import LooseVersion as _LooseVersion
-from tests.support.case import ModuleCase
-from tests.support.helpers import TstSuiteLoggingHandler, with_tempdir
-from tests.support.mixins import SaltReturnAssertsMixin
-from tests.support.runtests import RUNTIME_VARS
-TEST_REPO =</b></font> "https://github.com/saltstack/salt-test-repo.git"
-def __check_git_version(caller, min_version, skip_msg):
-    if inspect.isclass(caller):
-        actual_setup = getattr(caller, "setUp", None)
-        def setUp(self, *args, **kwargs):
-            if not salt.utils.path.which("git"):
-                self.skipTest("git is not installed")
-            git_version = self.run_function("git.version")
-            if _LooseVersion(git_version) &lt; _LooseVersion(min_version):
-                self.skipTest(skip_msg.format(min_version, git_version))
-            if actual_setup is not None:
-                actual_setup(self, *args, **kwargs)
-        caller.setUp = setUp
-        return caller
-    @functools.wraps(caller)
-    def wrapper(self, *args, **kwargs):
-        if not salt.utils.path.which("git"):
-            self.skipTest("git is not installed")
-        git_version = self.run_function("git.version")
-        if _LooseVersion(git_version) &lt; _LooseVersion(min_version):
-            self.skipTest(skip_msg.format(min_version, git_version))
-        return caller(self, *args, **kwargs)
-    return wrapper
-def ensure_min_git(caller=None, min_version="1.6.5"):
-    if caller is None:
-        return functools.partial(ensure_min_git, min_version=min_version)
-    return __check_git_version(
-        caller, min_version, "git {0} or newer required to run this test (detected {1})"
-    )
-def uses_git_opts(caller):
-    min_version = "1.7.2"
-    return __check_git_version(
-        caller,
-        min_version,
-        "git_opts only supported in git {0} and newer (detected {1})",
-    )
-class WithGitMirror:
-    def __init__(self, repo_url, **kwargs):
-        self.repo_url = repo_url
-        if "dir" not in kwargs:
-            kwargs["dir"] = RUNTIME_VARS.TMP
-        self.kwargs = kwargs
-    def __call__(self, func):
-        self.func = func
-        return functools.wraps(func)(
-            lambda testcase, *args, **kwargs: self.wrap(testcase, *args, **kwargs)
-        )
-    def wrap(self, testcase, *args, **kwargs):
-        mirror_dir = tempfile.mkdtemp(**self.kwargs)
-        admin_dir = tempfile.mkdtemp(**self.kwargs)
-        clone_dir = tempfile.mkdtemp(**self.kwargs)
-        os.rmdir(mirror_dir)
-        os.rmdir(admin_dir)
-        os.rmdir(clone_dir)
-        mirror_url = "file://" + mirror_dir
-        testcase.run_function("git.clone", [mirror_dir], url=TEST_REPO, opts="--mirror")
-        assert os.path.exists(mirror_dir)
-        ret = testcase.run_state("git.latest", name=mirror_url, target=admin_dir)
-        ret = ret[next(iter(ret))]
-        assert os.path.exists(admin_dir)
-        try:
-            return self.func(
-                testcase, mirror_url, admin_dir, clone_dir, *args, **kwargs
-            )
-        finally:
-            shutil.rmtree(mirror_dir, ignore_errors=True)
-            shutil.rmtree(admin_dir, ignore_errors=True)
-            shutil.rmtree(clone_dir, ignore_errors=True)
-with_git_mirror = WithGitMirror
-@ensure_min_git
-class GitTest(ModuleCase, SaltReturnAssertsMixin):
-    def setUp(self):
-        domain = urllib.parse.urlparse(TEST_REPO).netloc
-        try:
-            if hasattr(socket, "setdefaulttimeout"):
-                socket.setdefaulttimeout(10)
-            socket.gethostbyname(domain)
-        except OSError:
-            msg = "error resolving {0}, possible network issue?"
-            self.skipTest(msg.format(domain))
-    def tearDown(self):
-        socket.setdefaulttimeout(None)
-    def _head(self, cwd):
-        return self.run_function("git.rev_parse", [cwd, "HEAD"])
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_latest(self, target):
-        ret = self.run_state("git.latest", name=TEST_REPO, target=target)
-        self.assertSaltTrueReturn(ret)
-        self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_latest_config_get_regexp_retcode(self, target):
-        log_format = "[%(levelname)-8s] %(jid)s %(message)s"
-        self.handler = TstSuiteLoggingHandler(format=log_format, level=logging.DEBUG)
-        ret_code_err = "failed with return code: 1"
-        with self.handler:
-            ret = self.run_state("git.latest", name=TEST_REPO, target=target)
-            self.assertSaltTrueReturn(ret)
-            self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
-            assert any(ret_code_err in s for s in self.handler.messages) is False, False
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_latest_with_rev_and_submodules(self, target):
-        ret = self.run_state(
-            "git.latest", name=TEST_REPO, rev="develop", target=target, submodules=True
-        )
-        self.assertSaltTrueReturn(ret)
-        self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_latest_failure(self, target):
-        ret = self.run_state(
-            "git.latest",
-            name="https://youSpelledGitHubWrong.com/saltstack/salt-test-repo.git",
-            rev="develop",
-            target=target,
-            submodules=True,
-        )
-        self.assertSaltFalseReturn(ret)
-        self.assertFalse(os.path.isdir(os.path.join(target, ".git")))
-    @with_tempdir()
-    @pytest.mark.slow_test
-    def test_latest_empty_dir(self, target):
-        ret = self.run_state(
-            "git.latest", name=TEST_REPO, rev="develop", target=target, submodules=True
-        )
-        self.assertSaltTrueReturn(ret)
-        self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_latest_unless_no_cwd_issue_6800(self, target):
-        ret = self.run_state(
-            "git.latest",
-            name=TEST_REPO,
-            rev="develop",
-            target=target,
-            unless="test -e {}".format(target),
-            submodules=True,
-        )
-        self.assertSaltTrueReturn(ret)
-        self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_numeric_rev(self, target):
-        ret = self.run_state(
-            "git.latest",
-            name=TEST_REPO,
-            rev=0.11,
-            target=target,
-            submodules=True,
-            timeout=120,
-        )
-        self.assertSaltTrueReturn(ret)
-        self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_latest_with_local_changes(self, target):
-        ret = self.run_state("git.latest", name=TEST_REPO, target=target)
-        self.assertSaltTrueReturn(ret)
-        self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
-        with salt.utils.files.fopen(os.path.join(target, "LICENSE"), "a") as fp_:
-            fp_.write("Lorem ipsum dolor blah blah blah....\n")
-        self.assertTrue(self.run_function("git.diff", [target, "HEAD"]))
-        ret = self.run_state(
-            "git.latest", name=TEST_REPO, target=target, force_reset=False
-        )
-        self.assertSaltTrueReturn(ret)
-        self.assertEqual(
-            ret[next(iter(ret))]["comment"],
-            "Repository {} is up-to-date, but with uncommitted changes. "
-            "Set 'force_reset' to True to purge uncommitted changes.".format(target),
-        )
-        ret = self.run_state(
-            "git.latest", name=TEST_REPO, target=target, force_reset=True
-        )
-        self.assertSaltTrueReturn(ret)
-        self.assertFalse(self.run_function("git.diff", [target, "HEAD"]))
-    @with_git_mirror(TEST_REPO)
-    @uses_git_opts
-    @pytest.mark.slow_test
-    def test_latest_fast_forward(self, mirror_url, admin_dir, clone_dir):
-        ret = self.run_state("git.latest", name=mirror_url, target=clone_dir)
-        ret = ret[next(iter(ret))]
-        assert ret["result"]
-        head_pre = self._head(admin_dir)
-        with salt.utils.files.fopen(os.path.join(admin_dir, "LICENSE"), "a") as fp_:
-            fp_.write("Hello world!")
-        self.run_function(
-            "git.commit",
-            [admin_dir, "added a line"],
-            git_opts='-c user.name="Foo Bar" -c user.email=foo@bar.com',
-            opts="-a",
-        )
-        head_post = self._head(admin_dir)
-        assert head_pre != head_post
-        self.run_function("git.push", [admin_dir, "origin", "develop"])
-        ret = self.run_state("git.latest", name=mirror_url, target=clone_dir)
-        ret = ret[next(iter(ret))]
-        assert ret["result"]
-        assert head_post == self._head(clone_dir)
-    @with_tempdir(create=False)
-    def _changed_local_branch_helper(self, target, rev, hint):
-        ret = self.run_state("git.latest", name=TEST_REPO, rev=rev, target=target)
-        self.assertSaltTrueReturn(ret)
-        self.run_function("git.checkout", [target, "new_branch"], opts="-b")
-        with salt.utils.files.fopen(os.path.join(target, "foo"), "w"):
-            pass
-        self.run_function("git.add", [target, "."])
-        self.run_function(
-            "git.commit",
-            [target, "add file"],
-            git_opts='-c user.name="Foo Bar" -c user.email=foo@bar.com',
-        )
-        ret = self.run_state("git.latest", name=TEST_REPO, rev=rev, target=target)
-        self.assertSaltFalseReturn(ret)
-        comment = ret[next(iter(ret))]["comment"]
-        self.assertTrue(hint in comment)
-    @uses_git_opts
-    @pytest.mark.slow_test
-    def test_latest_changed_local_branch_rev_head(self):
-        self._changed_local_branch_helper(  # pylint: disable=no-value-for-parameter
-            "HEAD",
-            "The default remote branch (develop) differs from the local "
-            "branch (new_branch)",
-        )
-    @uses_git_opts
-    @pytest.mark.slow_test
-    def test_latest_changed_local_branch_rev_develop(self):
-        self._changed_local_branch_helper(  # pylint: disable=no-value-for-parameter
-            "develop",
-            "The desired rev (develop) differs from the name of the local "
-            "branch (new_branch)",
-        )
-    @uses_git_opts
-    @with_tempdir(create=False)
-    @with_tempdir()
-    @pytest.mark.slow_test
-    def test_latest_updated_remote_rev(self, name, target):
-        self.run_function("git.init", [name])
-        with salt.utils.files.fopen(os.path.join(name, "foo.txt"), "w") as fp_:
-            fp_.write("Hello world\n")
-        self.run_function("git.add", [name, "."])
-        self.run_function(
-            "git.commit",
-            [name, "initial commit"],
-            git_opts='-c user.name="Foo Bar" -c user.email=foo@bar.com',
-        )
-        ret = self.run_state(
-            "git.latest",
-            name=name,
-            target=target,
-        )
-        self.assertSaltTrueReturn(ret)
-        with salt.utils.files.fopen(os.path.join(name, "foo.txt"), "w") as fp_:
-            fp_.write("Added a line\n")
-        self.run_function(
-            "git.commit",
-            [name, "added a line"],
-            git_opts='-c user.name="Foo Bar" -c user.email=foo@bar.com',
-            opts="-a",
-        )
-        ret = self.run_state(
-            "git.latest",
-            name=name,
-            target=target,
-        )
-        self.assertSaltTrueReturn(ret)
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_latest_depth(self, target):
-        ret = self.run_state(
-            "git.latest", name=TEST_REPO, rev="HEAD", target=target, depth=1
-        )
-        self.assertSaltFalseReturn(ret)
-        self.assertIn(
-            "must be set to the name of a branch", ret[next(iter(ret))]["comment"]
-        )
-        ret = self.run_state(
-            "git.latest",
-            name=TEST_REPO,
-            rev="non-default-branch",
-            target=target,
-            depth=1,
-        )
-        self.assertSaltTrueReturn(ret)
-        self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
-    @with_git_mirror(TEST_REPO)
-    @uses_git_opts
-    @pytest.mark.slow_test
-    def test_latest_sync_tags(self, mirror_url, admin_dir, clone_dir):
-        tag1 = "mytag1"
-        tag2 = "mytag2"
-        self.run_function("git.tag", [admin_dir, tag1])
-        self.run_function("git.push", [admin_dir, "origin", tag1])
-        ret = self.run_state("git.latest", name=mirror_url, target=clone_dir)
-        ret = ret[next(iter(ret))]
-        assert ret["result"]
-        self.run_function("git.push", [admin_dir, "origin", ":{}".format(tag1)])
-        self.run_function("git.tag", [admin_dir, tag2])
-        self.run_function("git.push", [admin_dir, "origin", tag2])
-        ret = self.run_state(
-            "git.latest", name=mirror_url, target=clone_dir, sync_tags=False
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"]
-        all_tags = self.run_function("git.list_tags", [clone_dir])
-        assert tag1 in all_tags
-        assert tag2 in all_tags
-        expected_changes = {"new_tags": [tag2]}
-        assert ret["changes"] == expected_changes, ret["changes"]
-        ret = self.run_state(
-            "git.latest", name=mirror_url, target=clone_dir, sync_tags=True
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"]
-        all_tags = self.run_function("git.list_tags", [clone_dir])
-        assert tag1 not in all_tags
-        assert tag2 in all_tags
-        expected_changes = {"deleted_tags": [tag1]}
-        assert ret["changes"] == expected_changes, ret["changes"]
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_cloned(self, target):
-        ret = self.run_state("git.cloned", name=TEST_REPO, target=target, test=True)
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is None
-        assert ret["changes"] == {"new": "{} =&gt; {}".format(TEST_REPO, target)}
-        assert ret["comment"] == "{} would be cloned to {}".format(TEST_REPO, target)
-        ret = self.run_state("git.cloned", name=TEST_REPO, target=target)
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is True
-        assert ret["changes"] == {"new": "{} =&gt; {}".format(TEST_REPO, target)}
-        assert ret["comment"] == "{} cloned to {}".format(TEST_REPO, target)
-        ret = self.run_state("git.cloned", name=TEST_REPO, target=target)
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is True
-        assert not ret["changes"]
-        assert ret["comment"] == "Repository already exists at {}".format(target)
-        ret = self.run_state("git.cloned", name=TEST_REPO, target=target, test=True)
-        ret = ret[next(iter(ret))]
-        assert not ret["changes"]
-        assert ret["result"] is True
-        assert ret["comment"] == "Repository already exists at {}".format(target)
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_cloned_with_branch(self, target):
-        old_branch = "master"
-        new_branch = "develop"
-        bad_branch = "thisbranchdoesnotexist"
-        ret = self.run_state(
-            "git.cloned", name=TEST_REPO, target=target, branch=old_branch, test=True
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is None
-        assert ret["changes"] == {"new": "{} =&gt; {}".format(TEST_REPO, target)}
-        assert ret["comment"] == "{} would be cloned to {} with branch '{}'".format(
-            TEST_REPO, target, old_branch
-        )
-        ret = self.run_state(
-            "git.cloned", name=TEST_REPO, target=target, branch=old_branch
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is True
-        assert ret["changes"] == {"new": "{} =&gt; {}".format(TEST_REPO, target)}
-        assert ret["comment"] == "{} cloned to {} with branch '{}'".format(
-            TEST_REPO, target, old_branch
-        )
-        ret = self.run_state(
-            "git.cloned", name=TEST_REPO, target=target, branch=old_branch
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is True
-        assert not ret["changes"]
-        assert ret[
-            "comment"
-        ] == "Repository already exists at {} and is checked out to branch '{}'".format(
-            target, old_branch
-        )
-        ret = self.run_state(
-            "git.cloned", name=TEST_REPO, target=target, test=True, branch=old_branch
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is True
-        assert not ret["changes"]
-        assert ret[
-            "comment"
-        ] == "Repository already exists at {} and is checked out to branch '{}'".format(
-            target, old_branch
-        )
-        ret = self.run_state(
-            "git.cloned", name=TEST_REPO, target=target, branch=new_branch, test=True
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is None
-        assert ret["changes"] == {"branch": {"old": old_branch, "new": new_branch}}
-        assert ret["comment"] == "Branch would be changed to '{}'".format(new_branch)
-        ret = self.run_state(
-            "git.cloned", name=TEST_REPO, target=target, branch=new_branch
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is True
-        assert ret["changes"] == {"branch": {"old": old_branch, "new": new_branch}}
-        assert ret["comment"] == "Branch changed to '{}'".format(new_branch)
-        ret = self.run_state(
-            "git.cloned", name=TEST_REPO, target=target, branch=old_branch
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is True
-        assert ret["changes"] == {"branch": {"old": new_branch, "new": old_branch}}
-        assert ret["comment"] == "Branch changed to '{}'".format(old_branch)
-        ret = self.run_state(
-            "git.cloned", name=TEST_REPO, target=target, branch=bad_branch
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is False
-        assert not ret["changes"]
-        assert ret["comment"].startswith(
-            "Failed to change branch to '{}':".format(bad_branch)
-        )
-    @with_tempdir(create=False)
-    @ensure_min_git(min_version="1.7.10")
-    @pytest.mark.slow_test
-    def test_cloned_with_nonexistant_branch(self, target):
-        branch = "thisbranchdoesnotexist"
-        ret = self.run_state(
-            "git.cloned", name=TEST_REPO, target=target, branch=branch, test=True
-        )
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is None
-        assert ret["changes"]
-        assert ret["comment"] == "{} would be cloned to {} with branch '{}'".format(
-            TEST_REPO, target, branch
-        )
-        ret = self.run_state("git.cloned", name=TEST_REPO, target=target, branch=branch)
-        ret = ret[next(iter(ret))]
-        assert ret["result"] is False
-        assert not ret["changes"]
-        assert ret["comment"].startswith("Clone failed:")
-        assert "not found in upstream origin" in ret["comment"]
-    @with_tempdir(create=False)
-    @pytest.mark.slow_test
-    def test_present(self, name):
-        ret = self.run_state("git.present", name=name, bare=True)
-        self.assertSaltTrueReturn(ret)
-        self.assertTrue(os.path.isfile(os.path.join(name, "HEAD")))
-    @with_tempdir()
-    @pytest.mark.slow_test
-    def test_present_failure(self, name):
-        fname = os.path.join(name, "stoptheprocess")
-        with salt.utils.files.fopen(fname, "a"):
-            pass
-        ret = self.run_state("git.present", name=name, bare=True)
-        self.assertSaltFalseReturn(ret)
-        self.assertFalse(os.path.isfile(os.path.join(name, "HEAD")))
-    @with_tempdir()
-    @pytest.mark.slow_test
-    def test_present_empty_dir(self, name):
-        ret = self.run_state("git.present", name=name, bare=True)
-        self.assertSaltTrueReturn(ret)
-        self.assertTrue(os.path.isfile(os.path.join(name, "HEAD")))
-    @with_tempdir()
-    @pytest.mark.slow_test
-    def test_config_set_value_with_space_character(self, name):
-        self.run_function("git.init", [name])
-        ret = self.run_state(
-            "git.config_set",
-            name="user.name",
-            value="foo bar",
-            repo=name,
-            **{"global": False}
-        )
-        self.assertSaltTrueReturn(ret)
-@ensure_min_git
-@uses_git_opts
-class LocalRepoGitTest(ModuleCase, SaltReturnAssertsMixin):
-    def setUp(self):
-        self.repo = tempfile.mkdtemp(dir=RUNTIME_VARS.TMP)
-        self.admin = tempfile.mkdtemp(dir=RUNTIME_VARS.TMP)
-        self.target = tempfile.mkdtemp(dir=RUNTIME_VARS.TMP)
-        for dirname in (self.repo, self.admin, self.target):
-<a name="1"></a>            self.addCleanup(shutil.rmtree, dirname, ignore_errors=True)
-        self<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.run_function("git.init", [self.repo], bare=True)
-        self.run_function("git.clone", [self.admin], url=self.repo)
-        self._commit(self.admin, "", message="initial commit")
-        self.</b></font>_push(self.admin)
-    def _commit(self, repo_path, content, message):
-        with salt.utils.files.fopen(os.path.join(repo_path, "foo"), "a") as fp_:
-            fp_.write(content)
-        self.run_function("git.add", [repo_path, "."])
-        self.run_function(
-            "git.commit",
-            [repo_path, message],
-            git_opts='-c user.name="Foo Bar" -c user.email=foo@bar.com',
-        )
-    def _push(self, repo_path, remote="origin", ref="master"):
-        self.run_function("git.push", [repo_path], remote=remote, ref=ref)
-    def _test_latest_force_reset_setup(self):
-        ret = self.run_state("git.latest", name=self.repo, target=self.target)
-        self.assertSaltTrueReturn(ret)
-        self._commit(self.admin, content="Hello world!\n", message="added a line")
-        self._push(self.admin)
-        with salt.utils.files.fopen(os.path.join(self.target, "foo"), "a") as fp_:
-            fp_.write("Local changes!\n")
-    @pytest.mark.slow_test
-    def test_latest_force_reset_remote_changes(self):
-        self._test_latest_force_reset_setup()
-        ret = self.run_state("git.latest", name=self.repo, target=self.target)
-        self.assertSaltFalseReturn(ret)
-        ret = ret[next(iter(ret))]
-        self.assertIn("there are uncommitted changes", ret["comment"])
-        self.assertIn("Set 'force_reset' to True (or 'remote-changes')", ret["comment"])
-        self.assertEqual(ret["changes"], {})
-        ret = self.run_state(
-            "git.latest",
-            name=self.repo,
-            target=self.target,
-            force_reset="remote-changes",
-<a name="2"></a>        )
-        self.assertSaltTrueReturn(ret)
-        ret = ret[next(iter(ret))]
-        self<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.assertIn("Uncommitted changes were discarded", ret["comment"])
-        self.assertIn("Repository was fast-forwarded", ret["comment"])
-        self.assertNotIn("forced update", ret["changes"])
-        self.assertIn("revision", ret[</b></font>"changes"])
-        with salt.utils.files.fopen(os.path.join(self.target, "foo"), "a") as fp_:
-            fp_.write("More local changes!\n")
-        ret = self.run_state(
-            "git.latest",
-            name=self.repo,
-            target=self.target,
-            force_reset="remote-changes",
-        )
-        self.assertSaltTrueReturn(ret)
-        ret = ret[next(iter(ret))]
-        self.assertIn("up-to-date, but with uncommitted changes", ret["comment"])
-        self.assertIn(
-            "Set 'force_reset' to True to purge uncommitted changes", ret["comment"]
-        )
-        self.assertEqual(ret["changes"], {})
-    @pytest.mark.slow_test
-    def test_latest_force_reset_true_fast_forward(self):
-        self._test_latest_force_reset_setup()
-        ret = self.run_state(
-            "git.latest", name=self.repo, target=self.target, force_reset=True
-        )
-        self.assertSaltTrueReturn(ret)
-        ret = ret[next(iter(ret))]
-        self.assertIn("Uncommitted changes were discarded", ret["comment"])
-        self.assertIn("Repository was fast-forwarded", ret["comment"])
-        with salt.utils.files.fopen(os.path.join(self.target, "foo"), "a") as fp_:
-            fp_.write("More local changes!\n")
-        ret = self.run_state("git.latest", name=self.repo, target=self.target)
-        self.assertSaltTrueReturn(ret)
-        ret = ret[next(iter(ret))]
-        self.assertIn("up-to-date, but with uncommitted changes", ret["comment"])
-        self.assertIn(
-            "Set 'force_reset' to True to purge uncommitted changes", ret["comment"]
-        )
-        self.assertEqual(ret["changes"], {})
-        ret = self.run_state(
-            "git.latest", name=TEST_REPO, target=self.target, force_reset=True
-        )
-        self.assertSaltTrueReturn(ret)
-        ret = ret[next(iter(ret))]
-        assert "Uncommitted changes were discarded" in ret["comment"]
-        assert "Repository was hard-reset" in ret["comment"]
-        assert "forced update" in ret["changes"]
-    @pytest.mark.slow_test
-    def test_latest_force_reset_true_non_fast_forward(self):
-        self._test_latest_force_reset_setup()
-        ret = self.run_state(
-            "git.latest", name=self.repo, target=self.target, force_reset=True
-        )
-        self.assertSaltTrueReturn(ret)
-        ret = ret[next(iter(ret))]
-        self.assertIn("Uncommitted changes were discarded", ret["comment"])
-        self.assertIn("Repository was fast-forwarded", ret["comment"])
-        self._commit(self.admin, content="New line\n", message="added another line")
-        self._push(self.admin)
-        self._commit(
-            self.target,
-            content="Different new line\n",
-            message="added a different line",
-        )
-        ret = self.run_state("git.latest", name=self.repo, target=self.target)
-        self.assertSaltFalseReturn(ret)
-        ret = ret[next(iter(ret))]
-        self.assertIn("this is not a fast-forward merge", ret["comment"])
-        self.assertIn("Set 'force_reset' to True to force this update", ret["comment"])
-        self.assertEqual(ret["changes"], {})
-        ret = self.run_state(
-            "git.latest", name=self.repo, target=self.target, force_reset=True
-        )
-        self.assertSaltTrueReturn(ret)
-        ret = ret[next(iter(ret))]
-        self.assertIn("Repository was hard-reset", ret["comment"])
-        self.assertIn("forced update", ret["changes"])
-        self.assertIn("revision", ret["changes"])
-    @pytest.mark.slow_test
-    def test_renamed_default_branch(self):
-        os.rename(
-            os.path.join(self.repo, "refs", "heads", "master"),
-            os.path.join(self.repo, "refs", "heads", "develop"),
-        )
-        ret = self.run_state(
-            "git.latest",
-            name=self.repo,
-            target=self.target,
-            rev="develop",
-        )
-        self.assertSaltFalseReturn(ret)
-        self.assertEqual(
-            ret[next(iter(ret))]["comment"],
-            "Remote HEAD refers to a ref that does not exist. "
-            "This can happen when the default branch on the "
-            "remote repository is renamed or deleted. If you "
-            "are unable to fix the remote repository, you can "
-            "work around this by setting the 'branch' argument "
-            "(which will ensure that the named branch is created "
-            "if it does not already exist).\n\n"
-            "Changes already made: {} cloned to {}".format(self.repo, self.target),
-        )
-        self.assertEqual(
-            ret[next(iter(ret))]["changes"],
-            {"new": "{} =&gt; {}".format(self.repo, self.target)},
-        )
-        ret = self.run_state(
-            "git.latest",
-            name=self.repo,
-            target=self.target,
-            rev="develop",
-        )
-        self.assertSaltFalseReturn(ret)
-        self.assertEqual(
-            ret[next(iter(ret))]["comment"],
-            "Cannot set/unset upstream tracking branch, local "
-            "HEAD refers to nonexistent branch. This may have "
-            "been caused by cloning a remote repository for which "
-            "the default branch was renamed or deleted. If you "
-            "are unable to fix the remote repository, you can "
-            "work around this by setting the 'branch' argument "
-            "(which will ensure that the named branch is created "
-            "if it does not already exist).",
-        )
-        self.assertEqual(ret[next(iter(ret))]["changes"], {})
-        ret = self.run_state(
-            "git.latest",
-            name=self.repo,
-            target=self.target,
-            rev="develop",
-            branch="develop",
-        )
-        self.assertSaltTrueReturn(ret)
-        self.assertSaltCommentRegexpMatches(
-            ret,
-            "New branch 'develop' was checked out, with origin/develop "
-            r"\([0-9a-f]{7}\) as a starting point",
-        )
-        self.assertEqual(list(ret[next(iter(ret))]["changes"].keys()), ["revision"])
-        self.assertEqual(ret[next(iter(ret))]["changes"]["revision"]["old"], None)
-        self.assertTrue(len(ret[next(iter(ret))]["changes"]["revision"]["new"]) == 40)
-        self.assertTrue(
-            all(
-                [
-                    x in string.hexdigits
-                    for x in ret[next(iter(ret))]["changes"]["revision"]["new"]
-                ]
-            )
-        )
+1 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>import functools
+2 import inspect
+3 import logging
+4 import os
+5 import shutil
+6 import socket
+7 import string
+8 import tempfile
+9 import urllib.parse
+10 import pytest
+11 import salt.utils.files
+12 import salt.utils.path
+13 from salt.utils.versions import LooseVersion as _LooseVersion
+14 from tests.support.case import ModuleCase
+15 from tests.support.helpers import TstSuiteLoggingHandler, with_tempdir
+16 from tests.support.mixins import SaltReturnAssertsMixin
+17 from tests.support.runtests import RUNTIME_VARS
+18 TEST_REPO =</b></font> "https://github.com/saltstack/salt-test-repo.git"
+19 def __check_git_version(caller, min_version, skip_msg):
+20     if inspect.isclass(caller):
+21         actual_setup = getattr(caller, "setUp", None)
+22         def setUp(self, *args, **kwargs):
+23             if not salt.utils.path.which("git"):
+24                 self.skipTest("git is not installed")
+25             git_version = self.run_function("git.version")
+26             if _LooseVersion(git_version) &lt; _LooseVersion(min_version):
+27                 self.skipTest(skip_msg.format(min_version, git_version))
+28             if actual_setup is not None:
+29                 actual_setup(self, *args, **kwargs)
+30         caller.setUp = setUp
+31         return caller
+32     @functools.wraps(caller)
+33     def wrapper(self, *args, **kwargs):
+34         if not salt.utils.path.which("git"):
+35             self.skipTest("git is not installed")
+36         git_version = self.run_function("git.version")
+37         if _LooseVersion(git_version) &lt; _LooseVersion(min_version):
+38             self.skipTest(skip_msg.format(min_version, git_version))
+39         return caller(self, *args, **kwargs)
+40     return wrapper
+41 def ensure_min_git(caller=None, min_version="1.6.5"):
+42     if caller is None:
+43         return functools.partial(ensure_min_git, min_version=min_version)
+44     return __check_git_version(
+45         caller, min_version, "git {0} or newer required to run this test (detected {1})"
+46     )
+47 def uses_git_opts(caller):
+48     min_version = "1.7.2"
+49     return __check_git_version(
+50         caller,
+51         min_version,
+52         "git_opts only supported in git {0} and newer (detected {1})",
+53     )
+54 class WithGitMirror:
+55     def __init__(self, repo_url, **kwargs):
+56         self.repo_url = repo_url
+57         if "dir" not in kwargs:
+58             kwargs["dir"] = RUNTIME_VARS.TMP
+59         self.kwargs = kwargs
+60     def __call__(self, func):
+61         self.func = func
+62         return functools.wraps(func)(
+63             lambda testcase, *args, **kwargs: self.wrap(testcase, *args, **kwargs)
+64         )
+65     def wrap(self, testcase, *args, **kwargs):
+66         mirror_dir = tempfile.mkdtemp(**self.kwargs)
+67         admin_dir = tempfile.mkdtemp(**self.kwargs)
+68         clone_dir = tempfile.mkdtemp(**self.kwargs)
+69         os.rmdir(mirror_dir)
+70         os.rmdir(admin_dir)
+71         os.rmdir(clone_dir)
+72         mirror_url = "file://" + mirror_dir
+73         testcase.run_function("git.clone", [mirror_dir], url=TEST_REPO, opts="--mirror")
+74         assert os.path.exists(mirror_dir)
+75         ret = testcase.run_state("git.latest", name=mirror_url, target=admin_dir)
+76         ret = ret[next(iter(ret))]
+77         assert os.path.exists(admin_dir)
+78         try:
+79             return self.func(
+80                 testcase, mirror_url, admin_dir, clone_dir, *args, **kwargs
+81             )
+82         finally:
+83             shutil.rmtree(mirror_dir, ignore_errors=True)
+84             shutil.rmtree(admin_dir, ignore_errors=True)
+85             shutil.rmtree(clone_dir, ignore_errors=True)
+86 with_git_mirror = WithGitMirror
+87 @ensure_min_git
+88 class GitTest(ModuleCase, SaltReturnAssertsMixin):
+89     def setUp(self):
+90         domain = urllib.parse.urlparse(TEST_REPO).netloc
+91         try:
+92             if hasattr(socket, "setdefaulttimeout"):
+93                 socket.setdefaulttimeout(10)
+94             socket.gethostbyname(domain)
+95         except OSError:
+96             msg = "error resolving {0}, possible network issue?"
+97             self.skipTest(msg.format(domain))
+98     def tearDown(self):
+99         socket.setdefaulttimeout(None)
+100     def _head(self, cwd):
+101         return self.run_function("git.rev_parse", [cwd, "HEAD"])
+102     @with_tempdir(create=False)
+103     @pytest.mark.slow_test
+104     def test_latest(self, target):
+105         ret = self.run_state("git.latest", name=TEST_REPO, target=target)
+106         self.assertSaltTrueReturn(ret)
+107         self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
+108     @with_tempdir(create=False)
+109     @pytest.mark.slow_test
+110     def test_latest_config_get_regexp_retcode(self, target):
+111         log_format = "[%(levelname)-8s] %(jid)s %(message)s"
+112         self.handler = TstSuiteLoggingHandler(format=log_format, level=logging.DEBUG)
+113         ret_code_err = "failed with return code: 1"
+114         with self.handler:
+115             ret = self.run_state("git.latest", name=TEST_REPO, target=target)
+116             self.assertSaltTrueReturn(ret)
+117             self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
+118             assert any(ret_code_err in s for s in self.handler.messages) is False, False
+119     @with_tempdir(create=False)
+120     @pytest.mark.slow_test
+121     def test_latest_with_rev_and_submodules(self, target):
+122         ret = self.run_state(
+123             "git.latest", name=TEST_REPO, rev="develop", target=target, submodules=True
+124         )
+125         self.assertSaltTrueReturn(ret)
+126         self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
+127     @with_tempdir(create=False)
+128     @pytest.mark.slow_test
+129     def test_latest_failure(self, target):
+130         ret = self.run_state(
+131             "git.latest",
+132             name="https://youSpelledGitHubWrong.com/saltstack/salt-test-repo.git",
+133             rev="develop",
+134             target=target,
+135             submodules=True,
+136         )
+137         self.assertSaltFalseReturn(ret)
+138         self.assertFalse(os.path.isdir(os.path.join(target, ".git")))
+139     @with_tempdir()
+140     @pytest.mark.slow_test
+141     def test_latest_empty_dir(self, target):
+142         ret = self.run_state(
+143             "git.latest", name=TEST_REPO, rev="develop", target=target, submodules=True
+144         )
+145         self.assertSaltTrueReturn(ret)
+146         self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
+147     @with_tempdir(create=False)
+148     @pytest.mark.slow_test
+149     def test_latest_unless_no_cwd_issue_6800(self, target):
+150         ret = self.run_state(
+151             "git.latest",
+152             name=TEST_REPO,
+153             rev="develop",
+154             target=target,
+155             unless="test -e {}".format(target),
+156             submodules=True,
+157         )
+158         self.assertSaltTrueReturn(ret)
+159         self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
+160     @with_tempdir(create=False)
+161     @pytest.mark.slow_test
+162     def test_numeric_rev(self, target):
+163         ret = self.run_state(
+164             "git.latest",
+165             name=TEST_REPO,
+166             rev=0.11,
+167             target=target,
+168             submodules=True,
+169             timeout=120,
+170         )
+171         self.assertSaltTrueReturn(ret)
+172         self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
+173     @with_tempdir(create=False)
+174     @pytest.mark.slow_test
+175     def test_latest_with_local_changes(self, target):
+176         ret = self.run_state("git.latest", name=TEST_REPO, target=target)
+177         self.assertSaltTrueReturn(ret)
+178         self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
+179         with salt.utils.files.fopen(os.path.join(target, "LICENSE"), "a") as fp_:
+180             fp_.write("Lorem ipsum dolor blah blah blah....\n")
+181         self.assertTrue(self.run_function("git.diff", [target, "HEAD"]))
+182         ret = self.run_state(
+183             "git.latest", name=TEST_REPO, target=target, force_reset=False
+184         )
+185         self.assertSaltTrueReturn(ret)
+186         self.assertEqual(
+187             ret[next(iter(ret))]["comment"],
+188             "Repository {} is up-to-date, but with uncommitted changes. "
+189             "Set 'force_reset' to True to purge uncommitted changes.".format(target),
+190         )
+191         ret = self.run_state(
+192             "git.latest", name=TEST_REPO, target=target, force_reset=True
+193         )
+194         self.assertSaltTrueReturn(ret)
+195         self.assertFalse(self.run_function("git.diff", [target, "HEAD"]))
+196     @with_git_mirror(TEST_REPO)
+197     @uses_git_opts
+198     @pytest.mark.slow_test
+199     def test_latest_fast_forward(self, mirror_url, admin_dir, clone_dir):
+200         ret = self.run_state("git.latest", name=mirror_url, target=clone_dir)
+201         ret = ret[next(iter(ret))]
+202         assert ret["result"]
+203         head_pre = self._head(admin_dir)
+204         with salt.utils.files.fopen(os.path.join(admin_dir, "LICENSE"), "a") as fp_:
+205             fp_.write("Hello world!")
+206         self.run_function(
+207             "git.commit",
+208             [admin_dir, "added a line"],
+209             git_opts='-c user.name="Foo Bar" -c user.email=foo@bar.com',
+210             opts="-a",
+211         )
+212         head_post = self._head(admin_dir)
+213         assert head_pre != head_post
+214         self.run_function("git.push", [admin_dir, "origin", "develop"])
+215         ret = self.run_state("git.latest", name=mirror_url, target=clone_dir)
+216         ret = ret[next(iter(ret))]
+217         assert ret["result"]
+218         assert head_post == self._head(clone_dir)
+219     @with_tempdir(create=False)
+220     def _changed_local_branch_helper(self, target, rev, hint):
+221         ret = self.run_state("git.latest", name=TEST_REPO, rev=rev, target=target)
+222         self.assertSaltTrueReturn(ret)
+223         self.run_function("git.checkout", [target, "new_branch"], opts="-b")
+224         with salt.utils.files.fopen(os.path.join(target, "foo"), "w"):
+225             pass
+226         self.run_function("git.add", [target, "."])
+227         self.run_function(
+228             "git.commit",
+229             [target, "add file"],
+230             git_opts='-c user.name="Foo Bar" -c user.email=foo@bar.com',
+231         )
+232         ret = self.run_state("git.latest", name=TEST_REPO, rev=rev, target=target)
+233         self.assertSaltFalseReturn(ret)
+234         comment = ret[next(iter(ret))]["comment"]
+235         self.assertTrue(hint in comment)
+236     @uses_git_opts
+237     @pytest.mark.slow_test
+238     def test_latest_changed_local_branch_rev_head(self):
+239         self._changed_local_branch_helper(  # pylint: disable=no-value-for-parameter
+240             "HEAD",
+241             "The default remote branch (develop) differs from the local "
+242             "branch (new_branch)",
+243         )
+244     @uses_git_opts
+245     @pytest.mark.slow_test
+246     def test_latest_changed_local_branch_rev_develop(self):
+247         self._changed_local_branch_helper(  # pylint: disable=no-value-for-parameter
+248             "develop",
+249             "The desired rev (develop) differs from the name of the local "
+250             "branch (new_branch)",
+251         )
+252     @uses_git_opts
+253     @with_tempdir(create=False)
+254     @with_tempdir()
+255     @pytest.mark.slow_test
+256     def test_latest_updated_remote_rev(self, name, target):
+257         self.run_function("git.init", [name])
+258         with salt.utils.files.fopen(os.path.join(name, "foo.txt"), "w") as fp_:
+259             fp_.write("Hello world\n")
+260         self.run_function("git.add", [name, "."])
+261         self.run_function(
+262             "git.commit",
+263             [name, "initial commit"],
+264             git_opts='-c user.name="Foo Bar" -c user.email=foo@bar.com',
+265         )
+266         ret = self.run_state(
+267             "git.latest",
+268             name=name,
+269             target=target,
+270         )
+271         self.assertSaltTrueReturn(ret)
+272         with salt.utils.files.fopen(os.path.join(name, "foo.txt"), "w") as fp_:
+273             fp_.write("Added a line\n")
+274         self.run_function(
+275             "git.commit",
+276             [name, "added a line"],
+277             git_opts='-c user.name="Foo Bar" -c user.email=foo@bar.com',
+278             opts="-a",
+279         )
+280         ret = self.run_state(
+281             "git.latest",
+282             name=name,
+283             target=target,
+284         )
+285         self.assertSaltTrueReturn(ret)
+286     @with_tempdir(create=False)
+287     @pytest.mark.slow_test
+288     def test_latest_depth(self, target):
+289         ret = self.run_state(
+290             "git.latest", name=TEST_REPO, rev="HEAD", target=target, depth=1
+291         )
+292         self.assertSaltFalseReturn(ret)
+293         self.assertIn(
+294             "must be set to the name of a branch", ret[next(iter(ret))]["comment"]
+295         )
+296         ret = self.run_state(
+297             "git.latest",
+298             name=TEST_REPO,
+299             rev="non-default-branch",
+300             target=target,
+301             depth=1,
+302         )
+303         self.assertSaltTrueReturn(ret)
+304         self.assertTrue(os.path.isdir(os.path.join(target, ".git")))
+305     @with_git_mirror(TEST_REPO)
+306     @uses_git_opts
+307     @pytest.mark.slow_test
+308     def test_latest_sync_tags(self, mirror_url, admin_dir, clone_dir):
+309         tag1 = "mytag1"
+310         tag2 = "mytag2"
+311         self.run_function("git.tag", [admin_dir, tag1])
+312         self.run_function("git.push", [admin_dir, "origin", tag1])
+313         ret = self.run_state("git.latest", name=mirror_url, target=clone_dir)
+314         ret = ret[next(iter(ret))]
+315         assert ret["result"]
+316         self.run_function("git.push", [admin_dir, "origin", ":{}".format(tag1)])
+317         self.run_function("git.tag", [admin_dir, tag2])
+318         self.run_function("git.push", [admin_dir, "origin", tag2])
+319         ret = self.run_state(
+320             "git.latest", name=mirror_url, target=clone_dir, sync_tags=False
+321         )
+322         ret = ret[next(iter(ret))]
+323         assert ret["result"]
+324         all_tags = self.run_function("git.list_tags", [clone_dir])
+325         assert tag1 in all_tags
+326         assert tag2 in all_tags
+327         expected_changes = {"new_tags": [tag2]}
+328         assert ret["changes"] == expected_changes, ret["changes"]
+329         ret = self.run_state(
+330             "git.latest", name=mirror_url, target=clone_dir, sync_tags=True
+331         )
+332         ret = ret[next(iter(ret))]
+333         assert ret["result"]
+334         all_tags = self.run_function("git.list_tags", [clone_dir])
+335         assert tag1 not in all_tags
+336         assert tag2 in all_tags
+337         expected_changes = {"deleted_tags": [tag1]}
+338         assert ret["changes"] == expected_changes, ret["changes"]
+339     @with_tempdir(create=False)
+340     @pytest.mark.slow_test
+341     def test_cloned(self, target):
+342         ret = self.run_state("git.cloned", name=TEST_REPO, target=target, test=True)
+343         ret = ret[next(iter(ret))]
+344         assert ret["result"] is None
+345         assert ret["changes"] == {"new": "{} =&gt; {}".format(TEST_REPO, target)}
+346         assert ret["comment"] == "{} would be cloned to {}".format(TEST_REPO, target)
+347         ret = self.run_state("git.cloned", name=TEST_REPO, target=target)
+348         ret = ret[next(iter(ret))]
+349         assert ret["result"] is True
+350         assert ret["changes"] == {"new": "{} =&gt; {}".format(TEST_REPO, target)}
+351         assert ret["comment"] == "{} cloned to {}".format(TEST_REPO, target)
+352         ret = self.run_state("git.cloned", name=TEST_REPO, target=target)
+353         ret = ret[next(iter(ret))]
+354         assert ret["result"] is True
+355         assert not ret["changes"]
+356         assert ret["comment"] == "Repository already exists at {}".format(target)
+357         ret = self.run_state("git.cloned", name=TEST_REPO, target=target, test=True)
+358         ret = ret[next(iter(ret))]
+359         assert not ret["changes"]
+360         assert ret["result"] is True
+361         assert ret["comment"] == "Repository already exists at {}".format(target)
+362     @with_tempdir(create=False)
+363     @pytest.mark.slow_test
+364     def test_cloned_with_branch(self, target):
+365         old_branch = "master"
+366         new_branch = "develop"
+367         bad_branch = "thisbranchdoesnotexist"
+368         ret = self.run_state(
+369             "git.cloned", name=TEST_REPO, target=target, branch=old_branch, test=True
+370         )
+371         ret = ret[next(iter(ret))]
+372         assert ret["result"] is None
+373         assert ret["changes"] == {"new": "{} =&gt; {}".format(TEST_REPO, target)}
+374         assert ret["comment"] == "{} would be cloned to {} with branch '{}'".format(
+375             TEST_REPO, target, old_branch
+376         )
+377         ret = self.run_state(
+378             "git.cloned", name=TEST_REPO, target=target, branch=old_branch
+379         )
+380         ret = ret[next(iter(ret))]
+381         assert ret["result"] is True
+382         assert ret["changes"] == {"new": "{} =&gt; {}".format(TEST_REPO, target)}
+383         assert ret["comment"] == "{} cloned to {} with branch '{}'".format(
+384             TEST_REPO, target, old_branch
+385         )
+386         ret = self.run_state(
+387             "git.cloned", name=TEST_REPO, target=target, branch=old_branch
+388         )
+389         ret = ret[next(iter(ret))]
+390         assert ret["result"] is True
+391         assert not ret["changes"]
+392         assert ret[
+393             "comment"
+394         ] == "Repository already exists at {} and is checked out to branch '{}'".format(
+395             target, old_branch
+396         )
+397         ret = self.run_state(
+398             "git.cloned", name=TEST_REPO, target=target, test=True, branch=old_branch
+399         )
+400         ret = ret[next(iter(ret))]
+401         assert ret["result"] is True
+402         assert not ret["changes"]
+403         assert ret[
+404             "comment"
+405         ] == "Repository already exists at {} and is checked out to branch '{}'".format(
+406             target, old_branch
+407         )
+408         ret = self.run_state(
+409             "git.cloned", name=TEST_REPO, target=target, branch=new_branch, test=True
+410         )
+411         ret = ret[next(iter(ret))]
+412         assert ret["result"] is None
+413         assert ret["changes"] == {"branch": {"old": old_branch, "new": new_branch}}
+414         assert ret["comment"] == "Branch would be changed to '{}'".format(new_branch)
+415         ret = self.run_state(
+416             "git.cloned", name=TEST_REPO, target=target, branch=new_branch
+417         )
+418         ret = ret[next(iter(ret))]
+419         assert ret["result"] is True
+420         assert ret["changes"] == {"branch": {"old": old_branch, "new": new_branch}}
+421         assert ret["comment"] == "Branch changed to '{}'".format(new_branch)
+422         ret = self.run_state(
+423             "git.cloned", name=TEST_REPO, target=target, branch=old_branch
+424         )
+425         ret = ret[next(iter(ret))]
+426         assert ret["result"] is True
+427         assert ret["changes"] == {"branch": {"old": new_branch, "new": old_branch}}
+428         assert ret["comment"] == "Branch changed to '{}'".format(old_branch)
+429         ret = self.run_state(
+430             "git.cloned", name=TEST_REPO, target=target, branch=bad_branch
+431         )
+432         ret = ret[next(iter(ret))]
+433         assert ret["result"] is False
+434         assert not ret["changes"]
+435         assert ret["comment"].startswith(
+436             "Failed to change branch to '{}':".format(bad_branch)
+437         )
+438     @with_tempdir(create=False)
+439     @ensure_min_git(min_version="1.7.10")
+440     @pytest.mark.slow_test
+441     def test_cloned_with_nonexistant_branch(self, target):
+442         branch = "thisbranchdoesnotexist"
+443         ret = self.run_state(
+444             "git.cloned", name=TEST_REPO, target=target, branch=branch, test=True
+445         )
+446         ret = ret[next(iter(ret))]
+447         assert ret["result"] is None
+448         assert ret["changes"]
+449         assert ret["comment"] == "{} would be cloned to {} with branch '{}'".format(
+450             TEST_REPO, target, branch
+451         )
+452         ret = self.run_state("git.cloned", name=TEST_REPO, target=target, branch=branch)
+453         ret = ret[next(iter(ret))]
+454         assert ret["result"] is False
+455         assert not ret["changes"]
+456         assert ret["comment"].startswith("Clone failed:")
+457         assert "not found in upstream origin" in ret["comment"]
+458     @with_tempdir(create=False)
+459     @pytest.mark.slow_test
+460     def test_present(self, name):
+461         ret = self.run_state("git.present", name=name, bare=True)
+462         self.assertSaltTrueReturn(ret)
+463         self.assertTrue(os.path.isfile(os.path.join(name, "HEAD")))
+464     @with_tempdir()
+465     @pytest.mark.slow_test
+466     def test_present_failure(self, name):
+467         fname = os.path.join(name, "stoptheprocess")
+468         with salt.utils.files.fopen(fname, "a"):
+469             pass
+470         ret = self.run_state("git.present", name=name, bare=True)
+471         self.assertSaltFalseReturn(ret)
+472         self.assertFalse(os.path.isfile(os.path.join(name, "HEAD")))
+473     @with_tempdir()
+474     @pytest.mark.slow_test
+475     def test_present_empty_dir(self, name):
+476         ret = self.run_state("git.present", name=name, bare=True)
+477         self.assertSaltTrueReturn(ret)
+478         self.assertTrue(os.path.isfile(os.path.join(name, "HEAD")))
+479     @with_tempdir()
+480     @pytest.mark.slow_test
+481     def test_config_set_value_with_space_character(self, name):
+482         self.run_function("git.init", [name])
+483         ret = self.run_state(
+484             "git.config_set",
+485             name="user.name",
+486             value="foo bar",
+487             repo=name,
+488             **{"global": False}
+489         )
+490         self.assertSaltTrueReturn(ret)
+491 @ensure_min_git
+492 @uses_git_opts
+493 class LocalRepoGitTest(ModuleCase, SaltReturnAssertsMixin):
+494     def setUp(self):
+495         self.repo = tempfile.mkdtemp(dir=RUNTIME_VARS.TMP)
+496         self.admin = tempfile.mkdtemp(dir=RUNTIME_VARS.TMP)
+497         self.target = tempfile.mkdtemp(dir=RUNTIME_VARS.TMP)
+498         for dirname in (self.repo, self.admin, self.target):
+499 <a name="1"></a>            self.addCleanup(shutil.rmtree, dirname, ignore_errors=True)
+500         self<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.run_function("git.init", [self.repo], bare=True)
+501         self.run_function("git.clone", [self.admin], url=self.repo)
+502         self._commit(self.admin, "", message="initial commit")
+503         self.</b></font>_push(self.admin)
+504     def _commit(self, repo_path, content, message):
+505         with salt.utils.files.fopen(os.path.join(repo_path, "foo"), "a") as fp_:
+506             fp_.write(content)
+507         self.run_function("git.add", [repo_path, "."])
+508         self.run_function(
+509             "git.commit",
+510             [repo_path, message],
+511             git_opts='-c user.name="Foo Bar" -c user.email=foo@bar.com',
+512         )
+513     def _push(self, repo_path, remote="origin", ref="master"):
+514         self.run_function("git.push", [repo_path], remote=remote, ref=ref)
+515     def _test_latest_force_reset_setup(self):
+516         ret = self.run_state("git.latest", name=self.repo, target=self.target)
+517         self.assertSaltTrueReturn(ret)
+518         self._commit(self.admin, content="Hello world!\n", message="added a line")
+519         self._push(self.admin)
+520         with salt.utils.files.fopen(os.path.join(self.target, "foo"), "a") as fp_:
+521             fp_.write("Local changes!\n")
+522     @pytest.mark.slow_test
+523     def test_latest_force_reset_remote_changes(self):
+524         self._test_latest_force_reset_setup()
+525         ret = self.run_state("git.latest", name=self.repo, target=self.target)
+526         self.assertSaltFalseReturn(ret)
+527         ret = ret[next(iter(ret))]
+528         self.assertIn("there are uncommitted changes", ret["comment"])
+529         self.assertIn("Set 'force_reset' to True (or 'remote-changes')", ret["comment"])
+530         self.assertEqual(ret["changes"], {})
+531         ret = self.run_state(
+532             "git.latest",
+533             name=self.repo,
+534             target=self.target,
+535             force_reset="remote-changes",
+536 <a name="2"></a>        )
+537         self.assertSaltTrueReturn(ret)
+538         ret = ret[next(iter(ret))]
+539         self<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.assertIn("Uncommitted changes were discarded", ret["comment"])
+540         self.assertIn("Repository was fast-forwarded", ret["comment"])
+541         self.assertNotIn("forced update", ret["changes"])
+542         self.assertIn("revision", ret[</b></font>"changes"])
+543         with salt.utils.files.fopen(os.path.join(self.target, "foo"), "a") as fp_:
+544             fp_.write("More local changes!\n")
+545         ret = self.run_state(
+546             "git.latest",
+547             name=self.repo,
+548             target=self.target,
+549             force_reset="remote-changes",
+550         )
+551         self.assertSaltTrueReturn(ret)
+552         ret = ret[next(iter(ret))]
+553         self.assertIn("up-to-date, but with uncommitted changes", ret["comment"])
+554         self.assertIn(
+555             "Set 'force_reset' to True to purge uncommitted changes", ret["comment"]
+556         )
+557         self.assertEqual(ret["changes"], {})
+558     @pytest.mark.slow_test
+559     def test_latest_force_reset_true_fast_forward(self):
+560         self._test_latest_force_reset_setup()
+561         ret = self.run_state(
+562             "git.latest", name=self.repo, target=self.target, force_reset=True
+563         )
+564         self.assertSaltTrueReturn(ret)
+565         ret = ret[next(iter(ret))]
+566         self.assertIn("Uncommitted changes were discarded", ret["comment"])
+567         self.assertIn("Repository was fast-forwarded", ret["comment"])
+568         with salt.utils.files.fopen(os.path.join(self.target, "foo"), "a") as fp_:
+569             fp_.write("More local changes!\n")
+570         ret = self.run_state("git.latest", name=self.repo, target=self.target)
+571         self.assertSaltTrueReturn(ret)
+572         ret = ret[next(iter(ret))]
+573         self.assertIn("up-to-date, but with uncommitted changes", ret["comment"])
+574         self.assertIn(
+575             "Set 'force_reset' to True to purge uncommitted changes", ret["comment"]
+576         )
+577         self.assertEqual(ret["changes"], {})
+578         ret = self.run_state(
+579             "git.latest", name=TEST_REPO, target=self.target, force_reset=True
+580         )
+581         self.assertSaltTrueReturn(ret)
+582         ret = ret[next(iter(ret))]
+583         assert "Uncommitted changes were discarded" in ret["comment"]
+584         assert "Repository was hard-reset" in ret["comment"]
+585         assert "forced update" in ret["changes"]
+586     @pytest.mark.slow_test
+587     def test_latest_force_reset_true_non_fast_forward(self):
+588         self._test_latest_force_reset_setup()
+589         ret = self.run_state(
+590             "git.latest", name=self.repo, target=self.target, force_reset=True
+591         )
+592         self.assertSaltTrueReturn(ret)
+593         ret = ret[next(iter(ret))]
+594         self.assertIn("Uncommitted changes were discarded", ret["comment"])
+595         self.assertIn("Repository was fast-forwarded", ret["comment"])
+596         self._commit(self.admin, content="New line\n", message="added another line")
+597         self._push(self.admin)
+598         self._commit(
+599             self.target,
+600             content="Different new line\n",
+601             message="added a different line",
+602         )
+603         ret = self.run_state("git.latest", name=self.repo, target=self.target)
+604         self.assertSaltFalseReturn(ret)
+605         ret = ret[next(iter(ret))]
+606         self.assertIn("this is not a fast-forward merge", ret["comment"])
+607         self.assertIn("Set 'force_reset' to True to force this update", ret["comment"])
+608         self.assertEqual(ret["changes"], {})
+609         ret = self.run_state(
+610             "git.latest", name=self.repo, target=self.target, force_reset=True
+611         )
+612         self.assertSaltTrueReturn(ret)
+613         ret = ret[next(iter(ret))]
+614         self.assertIn("Repository was hard-reset", ret["comment"])
+615         self.assertIn("forced update", ret["changes"])
+616         self.assertIn("revision", ret["changes"])
+617     @pytest.mark.slow_test
+618     def test_renamed_default_branch(self):
+619         os.rename(
+620             os.path.join(self.repo, "refs", "heads", "master"),
+621             os.path.join(self.repo, "refs", "heads", "develop"),
+622         )
+623         ret = self.run_state(
+624             "git.latest",
+625             name=self.repo,
+626             target=self.target,
+627             rev="develop",
+628         )
+629         self.assertSaltFalseReturn(ret)
+630         self.assertEqual(
+631             ret[next(iter(ret))]["comment"],
+632             "Remote HEAD refers to a ref that does not exist. "
+633             "This can happen when the default branch on the "
+634             "remote repository is renamed or deleted. If you "
+635             "are unable to fix the remote repository, you can "
+636             "work around this by setting the 'branch' argument "
+637             "(which will ensure that the named branch is created "
+638             "if it does not already exist).\n\n"
+639             "Changes already made: {} cloned to {}".format(self.repo, self.target),
+640         )
+641         self.assertEqual(
+642             ret[next(iter(ret))]["changes"],
+643             {"new": "{} =&gt; {}".format(self.repo, self.target)},
+644         )
+645         ret = self.run_state(
+646             "git.latest",
+647             name=self.repo,
+648             target=self.target,
+649             rev="develop",
+650         )
+651         self.assertSaltFalseReturn(ret)
+652         self.assertEqual(
+653             ret[next(iter(ret))]["comment"],
+654             "Cannot set/unset upstream tracking branch, local "
+655             "HEAD refers to nonexistent branch. This may have "
+656             "been caused by cloning a remote repository for which "
+657             "the default branch was renamed or deleted. If you "
+658             "are unable to fix the remote repository, you can "
+659             "work around this by setting the 'branch' argument "
+660             "(which will ensure that the named branch is created "
+661             "if it does not already exist).",
+662         )
+663         self.assertEqual(ret[next(iter(ret))]["changes"], {})
+664         ret = self.run_state(
+665             "git.latest",
+666             name=self.repo,
+667             target=self.target,
+668             rev="develop",
+669             branch="develop",
+670         )
+671         self.assertSaltTrueReturn(ret)
+672         self.assertSaltCommentRegexpMatches(
+673             ret,
+674             "New branch 'develop' was checked out, with origin/develop "
+675             r"\([0-9a-f]{7}\) as a starting point",
+676         )
+677         self.assertEqual(list(ret[next(iter(ret))]["changes"].keys()), ["revision"])
+678         self.assertEqual(ret[next(iter(ret))]["changes"]["revision"]["old"], None)
+679         self.assertTrue(len(ret[next(iter(ret))]["changes"]["revision"]["new"]) == 40)
+680         self.assertTrue(
+681             all(
+682                 [
+683                     x in string.hexdigits
+684                     for x in ret[next(iter(ret))]["changes"]["revision"]["new"]
+685                 ]
+686             )
+687         )
 </pre>
 </div>
 </div>

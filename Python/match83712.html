@@ -42,481 +42,481 @@ Matches for s3fs.py &amp; boto_secgroup.py
 </h3>
 <hr/>
 <pre>
-import datetime
-import logging
-import os
-import pickle
-import time
-import urllib.parse
-import salt.fileserver as fs
-import salt.modules
-import salt.utils.files
-import salt.utils.gzip_util
-import salt.utils.hashutils
-import salt.utils.versions
-log = logging.getLogger(__name__)
-S3_CACHE_EXPIRE = 30  # cache for 30 seconds
-S3_SYNC_ON_UPDATE = True  # sync cache on update rather than jit
-def envs():
-    metadata = _init()
-    return list(metadata.keys())
-def update():
-    metadata = _init()
-    if S3_SYNC_ON_UPDATE:
-        log.info("Syncing local cache from S3...")
-        for saltenv, env_meta in metadata.items():
-            for bucket_files in _find_files(env_meta):
-                for bucket, files in bucket_files.items():
-                    for file_path in files:
-                        cached_file_path = _get_cached_file_name(
-                            bucket, saltenv, file_path
-                        )
-                        log.info("%s - %s : %s", bucket, saltenv, file_path)
-                        _get_file_from_s3(
-                            metadata, saltenv, bucket, file_path, cached_file_path
-                        )
-        log.info("Sync local cache from S3 completed.")
-def find_file(path, saltenv="base", **kwargs):
-    if "env" in kwargs:
-        kwargs.pop("env")
-    fnd = {"bucket": None, "path": None}
-    metadata = _init()
-    if not metadata or saltenv not in metadata:
-        return fnd
-    env_files = _find_files(metadata[saltenv])
-    if not _is_env_per_bucket():
-        path = os.path.join(saltenv, path)
-    for bucket in env_files:
-        for bucket_name, files in bucket.items():
-            if path in files and not fs.is_file_ignored(__opts__, path):
-                fnd["bucket"] = bucket_name
-                fnd["path"] = path
-                break
-        else:
-            continue  # only executes if we didn't break
-        break
-    if not fnd["path"] or not fnd["bucket"]:
-        return fnd
-    cached_file_path = _get_cached_file_name(fnd["bucket"], saltenv, path)
-    _get_file_from_s3(metadata, saltenv, fnd["bucket"], path, cached_file_path)
-    return fnd
-def file_hash(load, fnd):
-    if "env" in load:
-        load.pop("env")
-    ret = {}
-    if "saltenv" not in load:
-        return ret
-    if "path" not in fnd or "bucket" not in fnd or not fnd["path"]:
-        return ret
-    cached_file_path = _get_cached_file_name(
-        fnd["bucket"], load["saltenv"], fnd["path"]
-    )
-    if os.path.isfile(cached_file_path):
-        ret["hsum"] = salt.utils.hashutils.get_hash(cached_file_path)
-        ret["hash_type"] = "md5"
-    return ret
-def serve_file(load, fnd):
-    if "env" in load:
-        load.pop("env")
-    ret = {"data": "", "dest": ""}
-    if "path" not in load or "loc" not in load or "saltenv" not in load:
-        return ret
-    if "path" not in fnd or "bucket" not in fnd:
-        return ret
-    gzip = load.get("gzip", None)
-    cached_file_path = _get_cached_file_name(
-        fnd["bucket"], load["saltenv"], fnd["path"]
-    )
-    ret["dest"] = _trim_env_off_path([fnd["path"]], load["saltenv"])[0]
-    with salt.utils.files.fopen(cached_file_path, "rb") as fp_:
-        fp_.seek(load["loc"])
-        data = fp_.read(__opts__["file_buffer_size"])
-        if data and not salt.utils.files.is_binary(cached_file_path):
-            data = data.decode(__salt_system_encoding__)
-        if gzip and data:
-            data = salt.utils.gzip_util.compress(data, gzip)
-            ret["gzip"] = gzip
-        ret["data"] = data
-    return ret
-def file_list(load):
-    if "env" in load:
-        load.pop("env")
-    ret = []
-    if "saltenv" not in load:
-        return ret
-    saltenv = load["saltenv"]
-    metadata = _init()
-    if not metadata or saltenv not in metadata:
-        return ret
-    for bucket in _find_files(metadata[saltenv]):
-        for buckets in bucket.values():
-            files = [f for f in buckets if not fs.is_file_ignored(__opts__, f)]
-            ret += _trim_env_off_path(files, saltenv)
-    return ret
-def file_list_emptydirs(load):
-    _init()
-    return []
-def dir_list(load):
-    if "env" in load:
-        load.pop("env")
-    ret = []
-    if "saltenv" not in load:
-        return ret
-    saltenv = load["saltenv"]
-    metadata = _init()
-    if not metadata or saltenv not in metadata:
-        return ret
-    for bucket in _find_dirs(metadata[saltenv]):
-        for dirs in bucket.values():
-            dirs = _trim_env_off_path(dirs, saltenv, trim_slash=True)
-            ret += [_f for _f in dirs if _f]
-    return ret
-def _get_s3_key():
-    key = __opts__["s3.key"] if "s3.key" in __opts__ else None
-    keyid = __opts__["s3.keyid"] if "s3.keyid" in __opts__ else None
-    service_url = __opts__["s3.service_url"] if "s3.service_url" in __opts__ else None
-    verify_ssl = __opts__["s3.verify_ssl"] if "s3.verify_ssl" in __opts__ else None
-    kms_keyid = __opts__["aws.kmw.keyid"] if "aws.kms.keyid" in __opts__ else None
-    location = __opts__["s3.location"] if "s3.location" in __opts__ else None
-    path_style = __opts__["s3.path_style"] if "s3.path_style" in __opts__ else None
-    https_enable = (
-        __opts__["s3.https_enable"] if "s3.https_enable" in __opts__ else None
-    )
-    return (
-        key,
-        keyid,
-        service_url,
-        verify_ssl,
-        kms_keyid,
-        location,
-        path_style,
-        https_enable,
-    )
-def _init():
-    cache_file = _get_buckets_cache_filename()
-    exp = time.time() - S3_CACHE_EXPIRE
-    metadata = None
-    try:
-        if os.path.getmtime(cache_file) &gt; exp:
-            metadata = _read_buckets_cache_file(cache_file)
-    except OSError:
-        pass
-    if metadata is None:
-        metadata = _refresh_buckets_cache_file(cache_file)
-    return metadata
-def _get_cache_dir():
-    return os.path.join(__opts__["cachedir"], "s3cache")
-def _get_cached_file_name(bucket_name, saltenv, path):
-    file_path = os.path.join(_get_cache_dir(), saltenv, bucket_name, path)
-    if not os.path.exists(os.path.dirname(file_path)):
-        os.makedirs(os.path.dirname(file_path))
-    return file_path
-def _get_buckets_cache_filename():
-    cache_dir = _get_cache_dir()
-    if not os.path.exists(cache_dir):
-        os.makedirs(cache_dir)
-    return os.path.join(cache_dir, "buckets_files.cache")
-def _refresh_buckets_cache_file(cache_file):
-    log.debug("Refreshing buckets cache file")
-    (
-        key,
-        keyid,
-        service_url,
-        verify_ssl,
-        kms_keyid,
-        location,
-        path_style,
-        https_enable,
-    ) = _get_s3_key()
-    metadata = {}
-    def __get_s3_meta(bucket, key=key, keyid=keyid):
-<a name="1"></a>        ret, marker = [], ""
-        while True:
-            tmp = __utils__["s3.query"](
-                key<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>=key,
-                keyid=keyid,
-                kms_keyid=keyid,
-                bucket=bucket,
-                service_url=service_url,
-                verify_ssl=verify_ssl,
-                location=location,
-                return_bin=False,
-                path_style=path_style,
-                https_enable=https_enable,
-                params={"marker": marker},
-            )
-            headers =</b></font> []
-            for header in tmp:
-                if "Key" in header:
-                    break
-                headers.append(header)
-            ret.extend(tmp)
-            if all(
-                [header.get("IsTruncated", "false") == "false" for header in headers]
-            ):
-                break
-            marker = tmp[-1]["Key"]
-        return ret
-    if _is_env_per_bucket():
-        for saltenv, buckets in _get_buckets().items():
-            bucket_files_list = []
-            for bucket_name in buckets:
-                bucket_files = {}
-                s3_meta = __get_s3_meta(bucket_name)
-                if not s3_meta:
-                    continue
-                bucket_files[bucket_name] = [k for k in s3_meta if "Key" in k]
-                bucket_files_list.append(bucket_files)
-                if not bucket_files[bucket_name]:
-                    meta_response = {}
-                    for k in s3_meta:
-                        if "Code" in k or "Message" in k:
-                            meta_response.update(k)
-                    try:
-                        log.warning(
-                            "'%s' response for bucket '%s'",
-                            meta_response["Message"],
-                            bucket_name,
-                        )
-                        continue
-                    except KeyError:
-                        if "Code" in meta_response:
-                            log.warning(
-                                "'%s' response for bucket '%s'",
-                                meta_response["Code"],
-                                bucket_name,
-                            )
-                            continue
-                        else:
-                            log.warning(
-                                "S3 Error! Do you have any files in your S3 bucket?"
-                            )
-                            return {}
-            metadata[saltenv] = bucket_files_list
-    else:
-        for bucket_name in _get_buckets():
-            s3_meta = __get_s3_meta(bucket_name)
-            if not s3_meta:
-                continue
-            files = [k for k in s3_meta if "Key" in k]
-            if not files:
-                meta_response = {}
-                for k in s3_meta:
-                    if "Code" in k or "Message" in k:
-                        meta_response.update(k)
-                try:
-                    log.warning(
-                        "'%s' response for bucket '%s'",
-                        meta_response["Message"],
-                        bucket_name,
-                    )
-                    continue
-                except KeyError:
-                    if "Code" in meta_response:
-                        log.warning(
-                            "'%s' response for bucket '%s'",
-                            meta_response["Code"],
-                            bucket_name,
-                        )
-                        continue
-                    else:
-                        log.warning(
-                            "S3 Error! Do you have any files in your S3 bucket?"
-                        )
-                        return {}
-            environments = [(os.path.dirname(k["Key"]).split("/", 1))[0] for k in files]
-            environments = set(environments)
-            for saltenv in environments:
-                env_files = [k for k in files if k["Key"].startswith(saltenv)]
-                if saltenv not in metadata:
-                    metadata[saltenv] = []
-                found = False
-                for bucket_files in metadata[saltenv]:
-                    if bucket_name in bucket_files:
-                        bucket_files[bucket_name] += env_files
-                        found = True
-                        break
-                if not found:
-                    metadata[saltenv].append({bucket_name: env_files})
-    _write_buckets_cache_file(metadata, cache_file)
-    return metadata
-def _write_buckets_cache_file(metadata, cache_file):
-    if os.path.isfile(cache_file):
-        os.remove(cache_file)
-    log.debug("Writing buckets cache file")
-    with salt.utils.files.fopen(cache_file, "wb") as fp_:
-        pickle.dump(metadata, fp_)
-def _read_buckets_cache_file(cache_file):
-    log.debug("Reading buckets cache file")
-    with salt.utils.files.fopen(cache_file, "rb") as fp_:
-        try:
-            data = pickle.load(fp_)
-        except (
-            pickle.UnpicklingError,
-            AttributeError,
-            EOFError,
-            ImportError,
-            IndexError,
-            KeyError,
-            ValueError,
-        ) as exc:
-            log.debug("Exception reading buckets cache file: '%s'", exc)
-            data = None
-    return data
-def _find_files(metadata):
-    ret = []
-    found = {}
-    for bucket_dict in metadata:
-        for bucket_name, data in bucket_dict.items():
-            filepaths = [k["Key"] for k in data]
-            filepaths = [k for k in filepaths if not k.endswith("/")]
-            if bucket_name not in found:
-                found[bucket_name] = True
-                ret.append({bucket_name: filepaths})
-            else:
-                for bucket in ret:
-                    if bucket_name in bucket:
-                        bucket[bucket_name] += filepaths
-                        break
-    return ret
-def _find_dirs(metadata):
-    ret = []
-    found = {}
-    for bucket_dict in metadata:
-        for bucket_name, data in bucket_dict.items():
-            dirpaths = set()
-            for path in [k["Key"] for k in data]:
-                prefix = ""
-                for part in path.split("/")[:-1]:
-                    directory = prefix + part + "/"
-                    dirpaths.add(directory)
-                    prefix = directory
-            if bucket_name not in found:
-                found[bucket_name] = True
-                ret.append({bucket_name: list(dirpaths)})
-            else:
-                for bucket in ret:
-                    if bucket_name in bucket:
-                        bucket[bucket_name] += list(dirpaths)
-                        bucket[bucket_name] = list(set(bucket[bucket_name]))
-                        break
-    return ret
-def _find_file_meta(metadata, bucket_name, saltenv, path):
-    env_meta = metadata[saltenv] if saltenv in metadata else {}
-    bucket_meta = {}
-    for bucket in env_meta:
-        if bucket_name in bucket:
-            bucket_meta = bucket[bucket_name]
-    files_meta = list(list(filter((lambda k: "Key" in k), bucket_meta)))
-    for item_meta in files_meta:
-        if "Key" in item_meta and item_meta["Key"] == path:
-            try:
-                item_meta["ETag"] = item_meta["ETag"].strip('"')
-            except KeyError:
-                pass
-            return item_meta
-def _get_buckets():
-    return __opts__["s3.buckets"] if "s3.buckets" in __opts__ else {}
-def _get_file_from_s3(metadata, saltenv, bucket_name, path, cached_file_path):
-    (
-        key,
-        keyid,
-        service_url,
-        verify_ssl,
-        kms_keyid,
-        location,
-        path_style,
-        https_enable,
-    ) = _get_s3_key()
-    if os.path.isfile(cached_file_path):
-        file_meta = _find_file_meta(metadata, bucket_name, saltenv, path)
-        if file_meta:
-            file_etag = file_meta["ETag"]
-            if file_etag.find("-") == -1:
-                file_md5 = file_etag
-                cached_md5 = salt.utils.hashutils.get_hash(cached_file_path, "md5")
-                if cached_md5 == file_md5:
-                    return
-            else:
-                cached_file_stat = os.stat(cached_file_path)
-                cached_file_size = cached_file_stat.st_size
-                cached_file_mtime = datetime.datetime.fromtimestamp(
-                    cached_file_stat.st_mtime
-                )
-                cached_file_lastmod = datetime.datetime.strptime(
-                    file_meta["LastModified"], "%Y-%m-%dT%H:%M:%S.%fZ"
-                )
-                if (
-<a name="0"></a>                    cached_file_size == int(file_meta["Size"])
-                    and cached_file_mtime &gt; cached_file_lastmod
-                ):
-                    log<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.debug(
-                        "cached file size equal to metadata size and "
-                        "cached file mtime later than metadata last "
-                        "modification time."
-                    )
-                    ret = __utils__["s3.query"](
-                        key=key,
-                        keyid=keyid,
-                        kms_keyid=keyid,
-                        method="HEAD",
-                        bucket=bucket_name,
-                        service_url=service_url,
-                        verify_ssl=verify_ssl,
-                        location=</b></font>location,
-                        path=urllib.parse.quote(path),
-                        local_file=cached_file_path,
-                        full_headers=True,
-                        path_style=path_style,
-                        https_enable=https_enable,
-                    )
-                    if ret is not None:
-                        for header_name, header_value in ret["headers"].items():
-                            name = header_name.strip()
-                            value = header_value.strip()
-                            if str(name).lower() == "last-modified":
-                                s3_file_mtime = datetime.datetime.strptime(
-                                    value, "%a, %d %b %Y %H:%M:%S %Z"
-                                )
-                            elif str(name).lower() == "content-length":
-                                s3_file_size = int(value)
-                        if (
-                            cached_file_size == s3_file_size
-                            and cached_file_mtime &gt; s3_file_mtime
-                        ):
-                            log.info(
-                                "%s - %s : %s skipped download since cached file size "
-                                "equal to and mtime after s3 values",
-                                bucket_name,
-                                saltenv,
-                                path,
-                            )
-<a name="2"></a>                            return
-    __utils__<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>["s3.query"](
-        key=key,
-        keyid=keyid,
-        kms_keyid=keyid,
-        bucket=bucket_name,
-        service_url=service_url,
-        verify_ssl=verify_ssl,
-        location=location,
-        path=urllib.parse.</b></font>quote(path),
-        local_file=cached_file_path,
-        path_style=path_style,
-        https_enable=https_enable,
-    )
-def _trim_env_off_path(paths, saltenv, trim_slash=False):
-    env_len = None if _is_env_per_bucket() else len(saltenv) + 1
-    slash_len = -1 if trim_slash else None
-    return [d[env_len:slash_len] for d in paths]
-def _is_env_per_bucket():
-    buckets = _get_buckets()
-    if isinstance(buckets, dict):
-        return True
-    elif isinstance(buckets, list):
-        return False
-    else:
-        raise ValueError("Incorrect s3.buckets type given in config")
+1 import datetime
+2 import logging
+3 import os
+4 import pickle
+5 import time
+6 import urllib.parse
+7 import salt.fileserver as fs
+8 import salt.modules
+9 import salt.utils.files
+10 import salt.utils.gzip_util
+11 import salt.utils.hashutils
+12 import salt.utils.versions
+13 log = logging.getLogger(__name__)
+14 S3_CACHE_EXPIRE = 30  # cache for 30 seconds
+15 S3_SYNC_ON_UPDATE = True  # sync cache on update rather than jit
+16 def envs():
+17     metadata = _init()
+18     return list(metadata.keys())
+19 def update():
+20     metadata = _init()
+21     if S3_SYNC_ON_UPDATE:
+22         log.info("Syncing local cache from S3...")
+23         for saltenv, env_meta in metadata.items():
+24             for bucket_files in _find_files(env_meta):
+25                 for bucket, files in bucket_files.items():
+26                     for file_path in files:
+27                         cached_file_path = _get_cached_file_name(
+28                             bucket, saltenv, file_path
+29                         )
+30                         log.info("%s - %s : %s", bucket, saltenv, file_path)
+31                         _get_file_from_s3(
+32                             metadata, saltenv, bucket, file_path, cached_file_path
+33                         )
+34         log.info("Sync local cache from S3 completed.")
+35 def find_file(path, saltenv="base", **kwargs):
+36     if "env" in kwargs:
+37         kwargs.pop("env")
+38     fnd = {"bucket": None, "path": None}
+39     metadata = _init()
+40     if not metadata or saltenv not in metadata:
+41         return fnd
+42     env_files = _find_files(metadata[saltenv])
+43     if not _is_env_per_bucket():
+44         path = os.path.join(saltenv, path)
+45     for bucket in env_files:
+46         for bucket_name, files in bucket.items():
+47             if path in files and not fs.is_file_ignored(__opts__, path):
+48                 fnd["bucket"] = bucket_name
+49                 fnd["path"] = path
+50                 break
+51         else:
+52             continue  # only executes if we didn't break
+53         break
+54     if not fnd["path"] or not fnd["bucket"]:
+55         return fnd
+56     cached_file_path = _get_cached_file_name(fnd["bucket"], saltenv, path)
+57     _get_file_from_s3(metadata, saltenv, fnd["bucket"], path, cached_file_path)
+58     return fnd
+59 def file_hash(load, fnd):
+60     if "env" in load:
+61         load.pop("env")
+62     ret = {}
+63     if "saltenv" not in load:
+64         return ret
+65     if "path" not in fnd or "bucket" not in fnd or not fnd["path"]:
+66         return ret
+67     cached_file_path = _get_cached_file_name(
+68         fnd["bucket"], load["saltenv"], fnd["path"]
+69     )
+70     if os.path.isfile(cached_file_path):
+71         ret["hsum"] = salt.utils.hashutils.get_hash(cached_file_path)
+72         ret["hash_type"] = "md5"
+73     return ret
+74 def serve_file(load, fnd):
+75     if "env" in load:
+76         load.pop("env")
+77     ret = {"data": "", "dest": ""}
+78     if "path" not in load or "loc" not in load or "saltenv" not in load:
+79         return ret
+80     if "path" not in fnd or "bucket" not in fnd:
+81         return ret
+82     gzip = load.get("gzip", None)
+83     cached_file_path = _get_cached_file_name(
+84         fnd["bucket"], load["saltenv"], fnd["path"]
+85     )
+86     ret["dest"] = _trim_env_off_path([fnd["path"]], load["saltenv"])[0]
+87     with salt.utils.files.fopen(cached_file_path, "rb") as fp_:
+88         fp_.seek(load["loc"])
+89         data = fp_.read(__opts__["file_buffer_size"])
+90         if data and not salt.utils.files.is_binary(cached_file_path):
+91             data = data.decode(__salt_system_encoding__)
+92         if gzip and data:
+93             data = salt.utils.gzip_util.compress(data, gzip)
+94             ret["gzip"] = gzip
+95         ret["data"] = data
+96     return ret
+97 def file_list(load):
+98     if "env" in load:
+99         load.pop("env")
+100     ret = []
+101     if "saltenv" not in load:
+102         return ret
+103     saltenv = load["saltenv"]
+104     metadata = _init()
+105     if not metadata or saltenv not in metadata:
+106         return ret
+107     for bucket in _find_files(metadata[saltenv]):
+108         for buckets in bucket.values():
+109             files = [f for f in buckets if not fs.is_file_ignored(__opts__, f)]
+110             ret += _trim_env_off_path(files, saltenv)
+111     return ret
+112 def file_list_emptydirs(load):
+113     _init()
+114     return []
+115 def dir_list(load):
+116     if "env" in load:
+117         load.pop("env")
+118     ret = []
+119     if "saltenv" not in load:
+120         return ret
+121     saltenv = load["saltenv"]
+122     metadata = _init()
+123     if not metadata or saltenv not in metadata:
+124         return ret
+125     for bucket in _find_dirs(metadata[saltenv]):
+126         for dirs in bucket.values():
+127             dirs = _trim_env_off_path(dirs, saltenv, trim_slash=True)
+128             ret += [_f for _f in dirs if _f]
+129     return ret
+130 def _get_s3_key():
+131     key = __opts__["s3.key"] if "s3.key" in __opts__ else None
+132     keyid = __opts__["s3.keyid"] if "s3.keyid" in __opts__ else None
+133     service_url = __opts__["s3.service_url"] if "s3.service_url" in __opts__ else None
+134     verify_ssl = __opts__["s3.verify_ssl"] if "s3.verify_ssl" in __opts__ else None
+135     kms_keyid = __opts__["aws.kmw.keyid"] if "aws.kms.keyid" in __opts__ else None
+136     location = __opts__["s3.location"] if "s3.location" in __opts__ else None
+137     path_style = __opts__["s3.path_style"] if "s3.path_style" in __opts__ else None
+138     https_enable = (
+139         __opts__["s3.https_enable"] if "s3.https_enable" in __opts__ else None
+140     )
+141     return (
+142         key,
+143         keyid,
+144         service_url,
+145         verify_ssl,
+146         kms_keyid,
+147         location,
+148         path_style,
+149         https_enable,
+150     )
+151 def _init():
+152     cache_file = _get_buckets_cache_filename()
+153     exp = time.time() - S3_CACHE_EXPIRE
+154     metadata = None
+155     try:
+156         if os.path.getmtime(cache_file) &gt; exp:
+157             metadata = _read_buckets_cache_file(cache_file)
+158     except OSError:
+159         pass
+160     if metadata is None:
+161         metadata = _refresh_buckets_cache_file(cache_file)
+162     return metadata
+163 def _get_cache_dir():
+164     return os.path.join(__opts__["cachedir"], "s3cache")
+165 def _get_cached_file_name(bucket_name, saltenv, path):
+166     file_path = os.path.join(_get_cache_dir(), saltenv, bucket_name, path)
+167     if not os.path.exists(os.path.dirname(file_path)):
+168         os.makedirs(os.path.dirname(file_path))
+169     return file_path
+170 def _get_buckets_cache_filename():
+171     cache_dir = _get_cache_dir()
+172     if not os.path.exists(cache_dir):
+173         os.makedirs(cache_dir)
+174     return os.path.join(cache_dir, "buckets_files.cache")
+175 def _refresh_buckets_cache_file(cache_file):
+176     log.debug("Refreshing buckets cache file")
+177     (
+178         key,
+179         keyid,
+180         service_url,
+181         verify_ssl,
+182         kms_keyid,
+183         location,
+184         path_style,
+185         https_enable,
+186     ) = _get_s3_key()
+187     metadata = {}
+188     def __get_s3_meta(bucket, key=key, keyid=keyid):
+189 <a name="1"></a>        ret, marker = [], ""
+190         while True:
+191             tmp = __utils__["s3.query"](
+192                 key<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>=key,
+193                 keyid=keyid,
+194                 kms_keyid=keyid,
+195                 bucket=bucket,
+196                 service_url=service_url,
+197                 verify_ssl=verify_ssl,
+198                 location=location,
+199                 return_bin=False,
+200                 path_style=path_style,
+201                 https_enable=https_enable,
+202                 params={"marker": marker},
+203             )
+204             headers =</b></font> []
+205             for header in tmp:
+206                 if "Key" in header:
+207                     break
+208                 headers.append(header)
+209             ret.extend(tmp)
+210             if all(
+211                 [header.get("IsTruncated", "false") == "false" for header in headers]
+212             ):
+213                 break
+214             marker = tmp[-1]["Key"]
+215         return ret
+216     if _is_env_per_bucket():
+217         for saltenv, buckets in _get_buckets().items():
+218             bucket_files_list = []
+219             for bucket_name in buckets:
+220                 bucket_files = {}
+221                 s3_meta = __get_s3_meta(bucket_name)
+222                 if not s3_meta:
+223                     continue
+224                 bucket_files[bucket_name] = [k for k in s3_meta if "Key" in k]
+225                 bucket_files_list.append(bucket_files)
+226                 if not bucket_files[bucket_name]:
+227                     meta_response = {}
+228                     for k in s3_meta:
+229                         if "Code" in k or "Message" in k:
+230                             meta_response.update(k)
+231                     try:
+232                         log.warning(
+233                             "'%s' response for bucket '%s'",
+234                             meta_response["Message"],
+235                             bucket_name,
+236                         )
+237                         continue
+238                     except KeyError:
+239                         if "Code" in meta_response:
+240                             log.warning(
+241                                 "'%s' response for bucket '%s'",
+242                                 meta_response["Code"],
+243                                 bucket_name,
+244                             )
+245                             continue
+246                         else:
+247                             log.warning(
+248                                 "S3 Error! Do you have any files in your S3 bucket?"
+249                             )
+250                             return {}
+251             metadata[saltenv] = bucket_files_list
+252     else:
+253         for bucket_name in _get_buckets():
+254             s3_meta = __get_s3_meta(bucket_name)
+255             if not s3_meta:
+256                 continue
+257             files = [k for k in s3_meta if "Key" in k]
+258             if not files:
+259                 meta_response = {}
+260                 for k in s3_meta:
+261                     if "Code" in k or "Message" in k:
+262                         meta_response.update(k)
+263                 try:
+264                     log.warning(
+265                         "'%s' response for bucket '%s'",
+266                         meta_response["Message"],
+267                         bucket_name,
+268                     )
+269                     continue
+270                 except KeyError:
+271                     if "Code" in meta_response:
+272                         log.warning(
+273                             "'%s' response for bucket '%s'",
+274                             meta_response["Code"],
+275                             bucket_name,
+276                         )
+277                         continue
+278                     else:
+279                         log.warning(
+280                             "S3 Error! Do you have any files in your S3 bucket?"
+281                         )
+282                         return {}
+283             environments = [(os.path.dirname(k["Key"]).split("/", 1))[0] for k in files]
+284             environments = set(environments)
+285             for saltenv in environments:
+286                 env_files = [k for k in files if k["Key"].startswith(saltenv)]
+287                 if saltenv not in metadata:
+288                     metadata[saltenv] = []
+289                 found = False
+290                 for bucket_files in metadata[saltenv]:
+291                     if bucket_name in bucket_files:
+292                         bucket_files[bucket_name] += env_files
+293                         found = True
+294                         break
+295                 if not found:
+296                     metadata[saltenv].append({bucket_name: env_files})
+297     _write_buckets_cache_file(metadata, cache_file)
+298     return metadata
+299 def _write_buckets_cache_file(metadata, cache_file):
+300     if os.path.isfile(cache_file):
+301         os.remove(cache_file)
+302     log.debug("Writing buckets cache file")
+303     with salt.utils.files.fopen(cache_file, "wb") as fp_:
+304         pickle.dump(metadata, fp_)
+305 def _read_buckets_cache_file(cache_file):
+306     log.debug("Reading buckets cache file")
+307     with salt.utils.files.fopen(cache_file, "rb") as fp_:
+308         try:
+309             data = pickle.load(fp_)
+310         except (
+311             pickle.UnpicklingError,
+312             AttributeError,
+313             EOFError,
+314             ImportError,
+315             IndexError,
+316             KeyError,
+317             ValueError,
+318         ) as exc:
+319             log.debug("Exception reading buckets cache file: '%s'", exc)
+320             data = None
+321     return data
+322 def _find_files(metadata):
+323     ret = []
+324     found = {}
+325     for bucket_dict in metadata:
+326         for bucket_name, data in bucket_dict.items():
+327             filepaths = [k["Key"] for k in data]
+328             filepaths = [k for k in filepaths if not k.endswith("/")]
+329             if bucket_name not in found:
+330                 found[bucket_name] = True
+331                 ret.append({bucket_name: filepaths})
+332             else:
+333                 for bucket in ret:
+334                     if bucket_name in bucket:
+335                         bucket[bucket_name] += filepaths
+336                         break
+337     return ret
+338 def _find_dirs(metadata):
+339     ret = []
+340     found = {}
+341     for bucket_dict in metadata:
+342         for bucket_name, data in bucket_dict.items():
+343             dirpaths = set()
+344             for path in [k["Key"] for k in data]:
+345                 prefix = ""
+346                 for part in path.split("/")[:-1]:
+347                     directory = prefix + part + "/"
+348                     dirpaths.add(directory)
+349                     prefix = directory
+350             if bucket_name not in found:
+351                 found[bucket_name] = True
+352                 ret.append({bucket_name: list(dirpaths)})
+353             else:
+354                 for bucket in ret:
+355                     if bucket_name in bucket:
+356                         bucket[bucket_name] += list(dirpaths)
+357                         bucket[bucket_name] = list(set(bucket[bucket_name]))
+358                         break
+359     return ret
+360 def _find_file_meta(metadata, bucket_name, saltenv, path):
+361     env_meta = metadata[saltenv] if saltenv in metadata else {}
+362     bucket_meta = {}
+363     for bucket in env_meta:
+364         if bucket_name in bucket:
+365             bucket_meta = bucket[bucket_name]
+366     files_meta = list(list(filter((lambda k: "Key" in k), bucket_meta)))
+367     for item_meta in files_meta:
+368         if "Key" in item_meta and item_meta["Key"] == path:
+369             try:
+370                 item_meta["ETag"] = item_meta["ETag"].strip('"')
+371             except KeyError:
+372                 pass
+373             return item_meta
+374 def _get_buckets():
+375     return __opts__["s3.buckets"] if "s3.buckets" in __opts__ else {}
+376 def _get_file_from_s3(metadata, saltenv, bucket_name, path, cached_file_path):
+377     (
+378         key,
+379         keyid,
+380         service_url,
+381         verify_ssl,
+382         kms_keyid,
+383         location,
+384         path_style,
+385         https_enable,
+386     ) = _get_s3_key()
+387     if os.path.isfile(cached_file_path):
+388         file_meta = _find_file_meta(metadata, bucket_name, saltenv, path)
+389         if file_meta:
+390             file_etag = file_meta["ETag"]
+391             if file_etag.find("-") == -1:
+392                 file_md5 = file_etag
+393                 cached_md5 = salt.utils.hashutils.get_hash(cached_file_path, "md5")
+394                 if cached_md5 == file_md5:
+395                     return
+396             else:
+397                 cached_file_stat = os.stat(cached_file_path)
+398                 cached_file_size = cached_file_stat.st_size
+399                 cached_file_mtime = datetime.datetime.fromtimestamp(
+400                     cached_file_stat.st_mtime
+401                 )
+402                 cached_file_lastmod = datetime.datetime.strptime(
+403                     file_meta["LastModified"], "%Y-%m-%dT%H:%M:%S.%fZ"
+404                 )
+405                 if (
+406 <a name="0"></a>                    cached_file_size == int(file_meta["Size"])
+407                     and cached_file_mtime &gt; cached_file_lastmod
+408                 ):
+409                     log<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.debug(
+410                         "cached file size equal to metadata size and "
+411                         "cached file mtime later than metadata last "
+412                         "modification time."
+413                     )
+414                     ret = __utils__["s3.query"](
+415                         key=key,
+416                         keyid=keyid,
+417                         kms_keyid=keyid,
+418                         method="HEAD",
+419                         bucket=bucket_name,
+420                         service_url=service_url,
+421                         verify_ssl=verify_ssl,
+422                         location=</b></font>location,
+423                         path=urllib.parse.quote(path),
+424                         local_file=cached_file_path,
+425                         full_headers=True,
+426                         path_style=path_style,
+427                         https_enable=https_enable,
+428                     )
+429                     if ret is not None:
+430                         for header_name, header_value in ret["headers"].items():
+431                             name = header_name.strip()
+432                             value = header_value.strip()
+433                             if str(name).lower() == "last-modified":
+434                                 s3_file_mtime = datetime.datetime.strptime(
+435                                     value, "%a, %d %b %Y %H:%M:%S %Z"
+436                                 )
+437                             elif str(name).lower() == "content-length":
+438                                 s3_file_size = int(value)
+439                         if (
+440                             cached_file_size == s3_file_size
+441                             and cached_file_mtime &gt; s3_file_mtime
+442                         ):
+443                             log.info(
+444                                 "%s - %s : %s skipped download since cached file size "
+445                                 "equal to and mtime after s3 values",
+446                                 bucket_name,
+447                                 saltenv,
+448                                 path,
+449                             )
+450 <a name="2"></a>                            return
+451     __utils__<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>["s3.query"](
+452         key=key,
+453         keyid=keyid,
+454         kms_keyid=keyid,
+455         bucket=bucket_name,
+456         service_url=service_url,
+457         verify_ssl=verify_ssl,
+458         location=location,
+459         path=urllib.parse.</b></font>quote(path),
+460         local_file=cached_file_path,
+461         path_style=path_style,
+462         https_enable=https_enable,
+463     )
+464 def _trim_env_off_path(paths, saltenv, trim_slash=False):
+465     env_len = None if _is_env_per_bucket() else len(saltenv) + 1
+466     slash_len = -1 if trim_slash else None
+467     return [d[env_len:slash_len] for d in paths]
+468 def _is_env_per_bucket():
+469     buckets = _get_buckets()
+470     if isinstance(buckets, dict):
+471         return True
+472     elif isinstance(buckets, list):
+473         return False
+474     else:
+475         raise ValueError("Incorrect s3.buckets type given in config")
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -529,720 +529,720 @@ def _is_env_per_bucket():
 </h3>
 <hr/>
 <pre>
-import logging
-import pprint
-import salt.utils.dictupdate as dictupdate
-from salt.exceptions import SaltInvocationError
-log = logging.getLogger(__name__)
-def __virtual__():
-    if "boto_secgroup.exists" in __salt__:
-        return "boto_secgroup"
-    return (False, "boto_secgroup module could not be loaded")
-def present(
-<a name="1"></a>    name,
-    description,
-    vpc_id=None,
-    vpc_name<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>=None,
-    rules=None,
-    rules_egress=None,
-    delete_ingress_rules=True,
-    delete_egress_rules=True,
-    region=None,
-    key=None,
-    keyid=None,
-    profile=None,
-    tags=None,
-):
-    ret = {"name": name, "result": True, "comment": "", "changes": {}}
-    _ret =</b></font> _security_group_present(
-        name,
-        description,
-        vpc_id=vpc_id,
-        vpc_name=vpc_name,
-        region=region,
-        key=key,
-        keyid=keyid,
-        profile=profile,
-    )
-    ret["changes"] = _ret["changes"]
-    ret["comment"] = " ".join([ret["comment"], _ret["comment"]])
-    if not _ret["result"]:
-        ret["result"] = _ret["result"]
-        if ret["result"] is False:
-            return ret
-        elif ret["result"] is None:
-            return ret
-    if rules is not None:
-        _ret = _rules_present(
-            name,
-            rules,
-            delete_ingress_rules,
-            vpc_id=vpc_id,
-            vpc_name=vpc_name,
-            region=region,
-            key=key,
-            keyid=keyid,
-            profile=profile,
-        )
-        ret["changes"] = dictupdate.update(ret["changes"], _ret["changes"])
-        ret["comment"] = " ".join([ret["comment"], _ret["comment"]])
-        if not _ret["result"]:
-            ret["result"] = _ret["result"]
-    if rules_egress is not None:
-        _ret = _rules_egress_present(
-            name,
-            rules_egress,
-            delete_egress_rules,
-            vpc_id=vpc_id,
-            vpc_name=vpc_name,
-            region=region,
-            key=key,
-            keyid=keyid,
-            profile=profile,
-        )
-        ret["changes"] = dictupdate.update(ret["changes"], _ret["changes"])
-        ret["comment"] = " ".join([ret["comment"], _ret["comment"]])
-        if not _ret["result"]:
-            ret["result"] = _ret["result"]
-    _ret = _tags_present(
-        name=name,
-        tags=tags,
-        vpc_id=vpc_id,
-        vpc_name=vpc_name,
-        region=region,
-        key=key,
-        keyid=keyid,
-        profile=profile,
-    )
-    ret["changes"] = dictupdate.update(ret["changes"], _ret["changes"])
-    ret["comment"] = " ".join([ret["comment"], _ret["comment"]])
-    if not _ret["result"]:
-        ret["result"] = _ret["result"]
-    return ret
-def _security_group_present(
-    name,
-    description,
-    vpc_id=None,
-    vpc_name=None,
-    region=None,
-    key=None,
-    keyid=None,
-    profile=None,
-):
-    ret = {"result": True, "comment": "", "changes": {}}
-    exists = __salt__["boto_secgroup.exists"](
-        name, region, key, keyid, profile, vpc_id, vpc_name
-    )
-    if not exists:
-        if __opts__["test"]:
-            ret["comment"] = "Security group {} is set to be created.".format(name)
-            ret["result"] = None
-            return ret
-        created = __salt__["boto_secgroup.create"](
-            name=name,
-            description=description,
-            vpc_id=vpc_id,
-            vpc_name=vpc_name,
-            region=region,
-            key=key,
-            keyid=keyid,
-            profile=profile,
-<a name="2"></a>        )
-        if created:
-            ret["changes"]["old"] = {"secgroup": None}
-            sg = __salt__<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>["boto_secgroup.get_config"](
-                name=name,
-                group_id=None,
-                region=region,
-                key=key,
-                keyid=keyid,
-                profile=profile,
-                vpc_id=vpc_id,
-                vpc_name=vpc_name,
-            )
-            ret["changes"][</b></font>"new"] = {"secgroup": sg}
-            ret["comment"] = "Security group {} created.".format(name)
-        else:
-            ret["result"] = False
-            ret["comment"] = "Failed to create {} security group.".format(name)
-    else:
-        ret["comment"] = "Security group {} present.".format(name)
-    return ret
-def _split_rules(rules):
-    split = []
-    for rule in rules:
-        cidr_ip = rule.get("cidr_ip")
-        group_name = rule.get("source_group_name")
-        group_id = rule.get("source_group_group_id")
-        if cidr_ip and not isinstance(cidr_ip, str):
-            for ip in cidr_ip:
-                _rule = rule.copy()
-                _rule["cidr_ip"] = ip
-                split.append(_rule)
-        elif group_name and not isinstance(group_name, str):
-            for name in group_name:
-                _rule = rule.copy()
-                _rule["source_group_name"] = name
-                split.append(_rule)
-        elif group_id and not isinstance(group_id, str):
-            for _id in group_id:
-                _rule = rule.copy()
-                _rule["source_group_group_id"] = _id
-                split.append(_rule)
-        else:
-            split.append(rule)
-    return split
-def _check_rule(rule, _rule):
-    if _rule.get("from_port") is None:
-        _rule["from_port"] = -1
-    if _rule.get("to_port") is None:
-        _rule["to_port"] = -1
-    if (
-        rule["ip_protocol"] == _rule["ip_protocol"]
-        and str(rule["from_port"]) == str(_rule["from_port"])
-        and str(rule["to_port"]) == str(_rule["to_port"])
-    ):
-        _cidr_ip = _rule.get("cidr_ip")
-        if _cidr_ip and _cidr_ip == rule.get("cidr_ip"):
-            return True
-        _owner_id = _rule.get("source_group_owner_id")
-        if _owner_id and _owner_id == rule.get("source_group_owner_id"):
-            return True
-        _group_id = _rule.get("source_group_group_id")
-        if _group_id and _group_id == rule.get("source_group_group_id"):
-            return True
-        _group_name = _rule.get("source_group_name")
-        if _group_name and _group_id == rule.get("source_group_name"):
-            return True
-    return False
-def _get_rule_changes(rules, _rules):
-    to_delete = []
-    to_create = []
-    for rule in rules:
-        try:
-            ip_protocol = str(rule.get("ip_protocol"))
-        except KeyError:
-            raise SaltInvocationError(
-                "ip_protocol, to_port, and from_port are"
-                " required arguments for security group"
-                " rules."
-            )
-        supported_protocols = [
-            "tcp",
-            "6",
-            6,
-            "udp",
-            "17",
-            17,
-            "icmp",
-            "1",
-            1,
-            "all",
-            "-1",
-            -1,
-        ]
-        if ip_protocol not in supported_protocols and (
-            not "{}".format(ip_protocol).isdigit() or int(ip_protocol) &gt; 255
-        ):
-            raise SaltInvocationError(
-                "Invalid ip_protocol {} specified in security group rule.".format(
-                    ip_protocol
-                )
-            )
-        if ip_protocol == "all":
-            rule["ip_protocol"] = "-1"
-        cidr_ip = rule.get("cidr_ip", None)
-        group_name = rule.get("source_group_name", None)
-        group_id = rule.get("source_group_group_id", None)
-        if cidr_ip and (group_id or group_name):
-            raise SaltInvocationError(
-                "cidr_ip and source groups can not both"
-                " be specified in security group rules."
-            )
-        if group_id and group_name:
-            raise SaltInvocationError(
-                "Either source_group_group_id or"
-                " source_group_name can be specified in"
-                " security group rules, but not both."
-            )
-        if not (cidr_ip or group_id or group_name):
-            raise SaltInvocationError(
-                "cidr_ip, source_group_group_id, or"
-                " source_group_name must be provided for"
-                " security group rules."
-            )
-        rule_found = False
-        for _rule in _rules:
-            if _check_rule(rule, _rule):
-                rule_found = True
-                break
-        if not rule_found:
-            to_create.append(rule)
-    for _rule in _rules:
-        rule_found = False
-        for rule in rules:
-            if _check_rule(rule, _rule):
-                rule_found = True
-                break
-        if not rule_found:
-            _rule.pop("source_group_name", None)
-            to_delete.append(_rule)
-    log.debug("Rules to be deleted: %s", to_delete)
-    log.debug("Rules to be created: %s", to_create)
-    return (to_delete, to_create)
-def _rules_present(
-    name,
-    rules,
-    delete_ingress_rules=True,
-    vpc_id=None,
-    vpc_name=None,
-    region=None,
-    key=None,
-    keyid=None,
-    profile=None,
-):
-    ret = {"result": True, "comment": "", "changes": {}}
-    sg = __salt__["boto_secgroup.get_config"](
-        name=name,
-        group_id=None,
-        region=region,
-        key=key,
-        keyid=keyid,
-        profile=profile,
-        vpc_id=vpc_id,
-        vpc_name=vpc_name,
-    )
-    if not sg:
-        ret[
-            "comment"
-        ] = "{} security group configuration could not be retrieved.".format(name)
-        ret["result"] = False
-        return ret
-    rules = _split_rules(rules)
-    if vpc_id or vpc_name:
-        for rule in rules:
-            _source_group_name = rule.get("source_group_name", None)
-            if _source_group_name:
-                _group_vpc_name = vpc_name
-                _group_vpc_id = vpc_id
-                _source_group_name_vpc = rule.get("source_group_name_vpc", None)
-                if _source_group_name_vpc:
-                    _group_vpc_name = _source_group_name_vpc
-                    _group_vpc_id = None
-                _group_id = __salt__["boto_secgroup.get_group_id"](
-                    name=_source_group_name,
-                    vpc_id=_group_vpc_id,
-                    vpc_name=_group_vpc_name,
-                    region=region,
-                    key=key,
-                    keyid=keyid,
-                    profile=profile,
-                )
-                if not _group_id:
-                    raise SaltInvocationError(
-                        "source_group_name {} does not map to a valid "
-                        "source group id.".format(_source_group_name)
-                    )
-                rule["source_group_name"] = None
-                if _source_group_name_vpc:
-                    rule.pop("source_group_name_vpc")
-                rule["source_group_group_id"] = _group_id
-    to_delete, to_create = _get_rule_changes(rules, sg["rules"])
-    to_delete = to_delete if delete_ingress_rules else []
-    if to_create or to_delete:
-        if __opts__["test"]:
-            msg = """Security group {} set to have rules modified.
-            To be created: {}
-            To be deleted: {}""".format(
-                name, pprint.pformat(to_create), pprint.pformat(to_delete)
-            )
-            ret["comment"] = msg
-            ret["result"] = None
-            return ret
-        if to_delete:
-            deleted = True
-            for rule in to_delete:
-                _deleted = __salt__["boto_secgroup.revoke"](
-                    name,
-                    vpc_id=vpc_id,
-                    vpc_name=vpc_name,
-                    region=region,
-                    key=key,
-                    keyid=keyid,
-                    profile=profile,
-                    **rule
-                )
-                if not _deleted:
-                    deleted = False
-            if deleted:
-                ret["comment"] = "Removed rules on {} security group.".format(name)
-            else:
-                ret["comment"] = "Failed to remove rules on {} security group.".format(
-                    name
-                )
-                ret["result"] = False
-        if to_create:
-            created = True
-            for rule in to_create:
-                _created = __salt__["boto_secgroup.authorize"](
-                    name,
-                    vpc_id=vpc_id,
-                    vpc_name=vpc_name,
-                    region=region,
-                    key=key,
-                    keyid=keyid,
-                    profile=profile,
-                    **rule
-                )
-                if not _created:
-                    created = False
-            if created:
-                ret["comment"] = " ".join(
-                    [
-                        ret["comment"],
-                        "Created rules on {} security group.".format(name),
-                    ]
-                )
-            else:
-                ret["comment"] = " ".join(
-                    [
-                        ret["comment"],
-                        "Failed to create rules on {} security group.".format(name),
-                    ]
-                )
-                ret["result"] = False
-        ret["changes"]["old"] = {"rules": sg["rules"]}
-        sg = __salt__["boto_secgroup.get_config"](
-            name=name,
-            group_id=None,
-            region=region,
-            key=key,
-            keyid=keyid,
-            profile=profile,
-            vpc_id=vpc_id,
-            vpc_name=vpc_name,
-        )
-        ret["changes"]["new"] = {"rules": sg["rules"]}
-    return ret
-def _rules_egress_present(
-    name,
-    rules_egress,
-    delete_egress_rules=True,
-    vpc_id=None,
-    vpc_name=None,
-    region=None,
-    key=None,
-    keyid=None,
-    profile=None,
-):
-    ret = {"result": True, "comment": "", "changes": {}}
-    sg = __salt__["boto_secgroup.get_config"](
-        name=name,
-        group_id=None,
-        region=region,
-        key=key,
-        keyid=keyid,
-        profile=profile,
-        vpc_id=vpc_id,
-        vpc_name=vpc_name,
-    )
-    if not sg:
-        ret[
-            "comment"
-        ] = "{} security group configuration could not be retrieved.".format(name)
-        ret["result"] = False
-        return ret
-    rules_egress = _split_rules(rules_egress)
-    if vpc_id or vpc_name:
-        for rule in rules_egress:
-            _source_group_name = rule.get("source_group_name", None)
-            if _source_group_name:
-                _group_vpc_name = vpc_name
-                _group_vpc_id = vpc_id
-                _source_group_name_vpc = rule.get("source_group_name_vpc", None)
-                if _source_group_name_vpc:
-                    _group_vpc_name = _source_group_name_vpc
-                    _group_vpc_id = None
-                _group_id = __salt__["boto_secgroup.get_group_id"](
-                    name=_source_group_name,
-                    vpc_id=_group_vpc_id,
-                    vpc_name=_group_vpc_name,
-                    region=region,
-                    key=key,
-                    keyid=keyid,
-                    profile=profile,
-                )
-                if not _group_id:
-                    raise SaltInvocationError(
-                        "source_group_name {} does not map to a valid "
-                        "source group id.".format(_source_group_name)
-                    )
-                rule["source_group_name"] = None
-                if _source_group_name_vpc:
-                    rule.pop("source_group_name_vpc")
-                rule["source_group_group_id"] = _group_id
-    to_delete, to_create = _get_rule_changes(rules_egress, sg["rules_egress"])
-    to_delete = to_delete if delete_egress_rules else []
-    if to_create or to_delete:
-        if __opts__["test"]:
-            msg = """Security group {} set to have rules modified.
-            To be created: {}
-            To be deleted: {}""".format(
-                name, pprint.pformat(to_create), pprint.pformat(to_delete)
-            )
-            ret["comment"] = msg
-            ret["result"] = None
-            return ret
-        if to_delete:
-            deleted = True
-            for rule in to_delete:
-                _deleted = __salt__["boto_secgroup.revoke"](
-                    name,
-                    vpc_id=vpc_id,
-                    vpc_name=vpc_name,
-                    region=region,
-                    key=key,
-                    keyid=keyid,
-                    profile=profile,
-                    egress=True,
-                    **rule
-                )
-                if not _deleted:
-                    deleted = False
-            if deleted:
-                ret["comment"] = " ".join(
-                    [
-                        ret["comment"],
-                        "Removed egress rule on {} security group.".format(name),
-                    ]
-                )
-            else:
-                ret["comment"] = " ".join(
-                    [
-                        ret["comment"],
-                        "Failed to remove egress rule on {} security group.".format(
-                            name
-                        ),
-                    ]
-                )
-                ret["result"] = False
-        if to_create:
-            created = True
-            for rule in to_create:
-                _created = __salt__["boto_secgroup.authorize"](
-                    name,
-                    vpc_id=vpc_id,
-                    vpc_name=vpc_name,
-                    region=region,
-                    key=key,
-                    keyid=keyid,
-                    profile=profile,
-                    egress=True,
-                    **rule
-                )
-                if not _created:
-                    created = False
-            if created:
-                ret["comment"] = " ".join(
-                    [
-                        ret["comment"],
-                        "Created egress rules on {} security group.".format(name),
-                    ]
-                )
-            else:
-                ret["comment"] = " ".join(
-                    [
-                        ret["comment"],
-                        "Failed to create egress rules on {} security group.".format(
-                            name
-                        ),
-                    ]
-                )
-                ret["result"] = False
-        ret["changes"]["old"] = {"rules_egress": sg["rules_egress"]}
-        sg = __salt__["boto_secgroup.get_config"](
-            name=name,
-            group_id=None,
-            region=region,
-            key=key,
-            keyid=keyid,
-            profile=profile,
-            vpc_id=vpc_id,
-            vpc_name=vpc_name,
-        )
-        ret["changes"]["new"] = {"rules_egress": sg["rules_egress"]}
-    return ret
-def absent(
-    name, vpc_id=None, vpc_name=None, region=None, key=None, keyid=None, profile=None
-):
-    ret = {"name": name, "result": True, "comment": "", "changes": {}}
-    sg = __salt__["boto_secgroup.get_config"](
-        name=name,
-        group_id=None,
-        region=region,
-        key=key,
-        keyid=keyid,
-        profile=profile,
-        vpc_id=vpc_id,
-        vpc_name=vpc_name,
-    )
-    if sg:
-        if __opts__["test"]:
-            ret["comment"] = "Security group {} is set to be removed.".format(name)
-            ret["result"] = None
-            return ret
-        deleted = __salt__["boto_secgroup.delete"](
-            name=name,
-            group_id=None,
-            region=region,
-            key=key,
-            keyid=keyid,
-            profile=profile,
-            vpc_id=vpc_id,
-            vpc_name=vpc_name,
-        )
-        if deleted:
-            ret["changes"]["old"] = {"secgroup": sg}
-            ret["changes"]["new"] = {"secgroup": None}
-            ret["comment"] = "Security group {} deleted.".format(name)
-        else:
-            ret["result"] = False
-            ret["comment"] = "Failed to delete {} security group.".format(name)
-    else:
-        ret["comment"] = "{} security group does not exist.".format(name)
-    return ret
-def _tags_present(
-    name,
-    tags,
-    vpc_id=None,
-    vpc_name=None,
-    region=None,
-    key=None,
-    keyid=None,
-    profile=None,
-):
-    ret = {"result": True, "comment": "", "changes": {}}
-    if tags:
-        sg = __salt__["boto_secgroup.get_config"](
-            name=name,
-            group_id=None,
-            region=region,
-            key=key,
-            keyid=keyid,
-            profile=profile,
-            vpc_id=vpc_id,
-            vpc_name=vpc_name,
-        )
-        if not sg:
-            ret[
-                "comment"
-            ] = "{} security group configuration could not be retrieved.".format(name)
-            ret["result"] = False
-            return ret
-        tags_to_add = tags
-        tags_to_update = {}
-        tags_to_remove = []
-        if sg.get("tags"):
-            for existing_tag in sg["tags"]:
-                if existing_tag not in tags:
-                    if existing_tag not in tags_to_remove:
-                        tags_to_remove.append(existing_tag)
-                else:
-                    if tags[existing_tag] != sg["tags"][existing_tag]:
-                        tags_to_update[existing_tag] = tags[existing_tag]
-                    tags_to_add.pop(existing_tag)
-        if tags_to_remove:
-            if __opts__["test"]:
-                msg = "The following tag{} set to be removed: {}.".format(
-                    ("s are" if len(tags_to_remove) &gt; 1 else " is"),
-                    ", ".join(tags_to_remove),
-                )
-                ret["comment"] = " ".join([ret["comment"], msg])
-                ret["result"] = None
-            else:
-                temp_ret = __salt__["boto_secgroup.delete_tags"](
-                    tags_to_remove,
-                    name=name,
-                    group_id=None,
-                    vpc_name=vpc_name,
-                    vpc_id=vpc_id,
-                    region=region,
-                    key=key,
-                    keyid=keyid,
-                    profile=profile,
-                )
-                if not temp_ret:
-                    ret["result"] = False
-                    ret["comment"] = " ".join(
-                        [
-                            ret["comment"],
-                            "Error attempting to delete tags {}.".format(
-                                tags_to_remove
-                            ),
-                        ]
-                    )
-                    return ret
-                if "old" not in ret["changes"]:
-                    ret["changes"] = dictupdate.update(
-                        ret["changes"], {"old": {"tags": {}}}
-                    )
-                for rem_tag in tags_to_remove:
-                    ret["changes"]["old"]["tags"][rem_tag] = sg["tags"][rem_tag]
-        if tags_to_add or tags_to_update:
-            if __opts__["test"]:
-                if tags_to_add:
-                    msg = "The following tag{} set to be added: {}.".format(
-                        ("s are" if len(tags_to_add.keys()) &gt; 1 else " is"),
-                        ", ".join(tags_to_add.keys()),
-                    )
-                    ret["comment"] = " ".join([ret["comment"], msg])
-                    ret["result"] = None
-                if tags_to_update:
-                    msg = "The following tag {} set to be updated: {}.".format(
-                        (
-                            "values are"
-                            if len(tags_to_update.keys()) &gt; 1
-                            else "value is"
-                        ),
-                        ", ".join(tags_to_update.keys()),
-                    )
-<a name="0"></a>                    ret["comment"] = " ".join([ret["comment"], msg])
-                    ret["result"] = None
-            else:
-                all_tag_changes = dictupdate<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.update(tags_to_add, tags_to_update)
-                temp_ret = __salt__["boto_secgroup.set_tags"](
-                    all_tag_changes,
-                    name=name,
-                    group_id=None,
-                    vpc_name=vpc_name,
-                    vpc_id=vpc_id,
-                    region=region,
-                    key=key,
-                    keyid=keyid,
-                    profile=</b></font>profile,
-                )
-                if not temp_ret:
-                    ret["result"] = False
-                    msg = "Error attempting to set tags."
-                    ret["comment"] = " ".join([ret["comment"], msg])
-                    return ret
-                if "old" not in ret["changes"]:
-                    ret["changes"] = dictupdate.update(
-                        ret["changes"], {"old": {"tags": {}}}
-                    )
-                if "new" not in ret["changes"]:
-                    ret["changes"] = dictupdate.update(
-                        ret["changes"], {"new": {"tags": {}}}
-                    )
-                for tag in all_tag_changes:
-                    ret["changes"]["new"]["tags"][tag] = tags[tag]
-                    if "tags" in sg:
-                        if sg["tags"]:
-                            if tag in sg["tags"]:
-                                ret["changes"]["old"]["tags"][tag] = sg["tags"][tag]
-        if not tags_to_update and not tags_to_remove and not tags_to_add:
-            ret["comment"] = " ".join([ret["comment"], "Tags are already set."])
-    return ret
+1 import logging
+2 import pprint
+3 import salt.utils.dictupdate as dictupdate
+4 from salt.exceptions import SaltInvocationError
+5 log = logging.getLogger(__name__)
+6 def __virtual__():
+7     if "boto_secgroup.exists" in __salt__:
+8         return "boto_secgroup"
+9     return (False, "boto_secgroup module could not be loaded")
+10 def present(
+11 <a name="1"></a>    name,
+12     description,
+13     vpc_id=None,
+14     vpc_name<font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>=None,
+15     rules=None,
+16     rules_egress=None,
+17     delete_ingress_rules=True,
+18     delete_egress_rules=True,
+19     region=None,
+20     key=None,
+21     keyid=None,
+22     profile=None,
+23     tags=None,
+24 ):
+25     ret = {"name": name, "result": True, "comment": "", "changes": {}}
+26     _ret =</b></font> _security_group_present(
+27         name,
+28         description,
+29         vpc_id=vpc_id,
+30         vpc_name=vpc_name,
+31         region=region,
+32         key=key,
+33         keyid=keyid,
+34         profile=profile,
+35     )
+36     ret["changes"] = _ret["changes"]
+37     ret["comment"] = " ".join([ret["comment"], _ret["comment"]])
+38     if not _ret["result"]:
+39         ret["result"] = _ret["result"]
+40         if ret["result"] is False:
+41             return ret
+42         elif ret["result"] is None:
+43             return ret
+44     if rules is not None:
+45         _ret = _rules_present(
+46             name,
+47             rules,
+48             delete_ingress_rules,
+49             vpc_id=vpc_id,
+50             vpc_name=vpc_name,
+51             region=region,
+52             key=key,
+53             keyid=keyid,
+54             profile=profile,
+55         )
+56         ret["changes"] = dictupdate.update(ret["changes"], _ret["changes"])
+57         ret["comment"] = " ".join([ret["comment"], _ret["comment"]])
+58         if not _ret["result"]:
+59             ret["result"] = _ret["result"]
+60     if rules_egress is not None:
+61         _ret = _rules_egress_present(
+62             name,
+63             rules_egress,
+64             delete_egress_rules,
+65             vpc_id=vpc_id,
+66             vpc_name=vpc_name,
+67             region=region,
+68             key=key,
+69             keyid=keyid,
+70             profile=profile,
+71         )
+72         ret["changes"] = dictupdate.update(ret["changes"], _ret["changes"])
+73         ret["comment"] = " ".join([ret["comment"], _ret["comment"]])
+74         if not _ret["result"]:
+75             ret["result"] = _ret["result"]
+76     _ret = _tags_present(
+77         name=name,
+78         tags=tags,
+79         vpc_id=vpc_id,
+80         vpc_name=vpc_name,
+81         region=region,
+82         key=key,
+83         keyid=keyid,
+84         profile=profile,
+85     )
+86     ret["changes"] = dictupdate.update(ret["changes"], _ret["changes"])
+87     ret["comment"] = " ".join([ret["comment"], _ret["comment"]])
+88     if not _ret["result"]:
+89         ret["result"] = _ret["result"]
+90     return ret
+91 def _security_group_present(
+92     name,
+93     description,
+94     vpc_id=None,
+95     vpc_name=None,
+96     region=None,
+97     key=None,
+98     keyid=None,
+99     profile=None,
+100 ):
+101     ret = {"result": True, "comment": "", "changes": {}}
+102     exists = __salt__["boto_secgroup.exists"](
+103         name, region, key, keyid, profile, vpc_id, vpc_name
+104     )
+105     if not exists:
+106         if __opts__["test"]:
+107             ret["comment"] = "Security group {} is set to be created.".format(name)
+108             ret["result"] = None
+109             return ret
+110         created = __salt__["boto_secgroup.create"](
+111             name=name,
+112             description=description,
+113             vpc_id=vpc_id,
+114             vpc_name=vpc_name,
+115             region=region,
+116             key=key,
+117             keyid=keyid,
+118             profile=profile,
+119 <a name="2"></a>        )
+120         if created:
+121             ret["changes"]["old"] = {"secgroup": None}
+122             sg = __salt__<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>["boto_secgroup.get_config"](
+123                 name=name,
+124                 group_id=None,
+125                 region=region,
+126                 key=key,
+127                 keyid=keyid,
+128                 profile=profile,
+129                 vpc_id=vpc_id,
+130                 vpc_name=vpc_name,
+131             )
+132             ret["changes"][</b></font>"new"] = {"secgroup": sg}
+133             ret["comment"] = "Security group {} created.".format(name)
+134         else:
+135             ret["result"] = False
+136             ret["comment"] = "Failed to create {} security group.".format(name)
+137     else:
+138         ret["comment"] = "Security group {} present.".format(name)
+139     return ret
+140 def _split_rules(rules):
+141     split = []
+142     for rule in rules:
+143         cidr_ip = rule.get("cidr_ip")
+144         group_name = rule.get("source_group_name")
+145         group_id = rule.get("source_group_group_id")
+146         if cidr_ip and not isinstance(cidr_ip, str):
+147             for ip in cidr_ip:
+148                 _rule = rule.copy()
+149                 _rule["cidr_ip"] = ip
+150                 split.append(_rule)
+151         elif group_name and not isinstance(group_name, str):
+152             for name in group_name:
+153                 _rule = rule.copy()
+154                 _rule["source_group_name"] = name
+155                 split.append(_rule)
+156         elif group_id and not isinstance(group_id, str):
+157             for _id in group_id:
+158                 _rule = rule.copy()
+159                 _rule["source_group_group_id"] = _id
+160                 split.append(_rule)
+161         else:
+162             split.append(rule)
+163     return split
+164 def _check_rule(rule, _rule):
+165     if _rule.get("from_port") is None:
+166         _rule["from_port"] = -1
+167     if _rule.get("to_port") is None:
+168         _rule["to_port"] = -1
+169     if (
+170         rule["ip_protocol"] == _rule["ip_protocol"]
+171         and str(rule["from_port"]) == str(_rule["from_port"])
+172         and str(rule["to_port"]) == str(_rule["to_port"])
+173     ):
+174         _cidr_ip = _rule.get("cidr_ip")
+175         if _cidr_ip and _cidr_ip == rule.get("cidr_ip"):
+176             return True
+177         _owner_id = _rule.get("source_group_owner_id")
+178         if _owner_id and _owner_id == rule.get("source_group_owner_id"):
+179             return True
+180         _group_id = _rule.get("source_group_group_id")
+181         if _group_id and _group_id == rule.get("source_group_group_id"):
+182             return True
+183         _group_name = _rule.get("source_group_name")
+184         if _group_name and _group_id == rule.get("source_group_name"):
+185             return True
+186     return False
+187 def _get_rule_changes(rules, _rules):
+188     to_delete = []
+189     to_create = []
+190     for rule in rules:
+191         try:
+192             ip_protocol = str(rule.get("ip_protocol"))
+193         except KeyError:
+194             raise SaltInvocationError(
+195                 "ip_protocol, to_port, and from_port are"
+196                 " required arguments for security group"
+197                 " rules."
+198             )
+199         supported_protocols = [
+200             "tcp",
+201             "6",
+202             6,
+203             "udp",
+204             "17",
+205             17,
+206             "icmp",
+207             "1",
+208             1,
+209             "all",
+210             "-1",
+211             -1,
+212         ]
+213         if ip_protocol not in supported_protocols and (
+214             not "{}".format(ip_protocol).isdigit() or int(ip_protocol) &gt; 255
+215         ):
+216             raise SaltInvocationError(
+217                 "Invalid ip_protocol {} specified in security group rule.".format(
+218                     ip_protocol
+219                 )
+220             )
+221         if ip_protocol == "all":
+222             rule["ip_protocol"] = "-1"
+223         cidr_ip = rule.get("cidr_ip", None)
+224         group_name = rule.get("source_group_name", None)
+225         group_id = rule.get("source_group_group_id", None)
+226         if cidr_ip and (group_id or group_name):
+227             raise SaltInvocationError(
+228                 "cidr_ip and source groups can not both"
+229                 " be specified in security group rules."
+230             )
+231         if group_id and group_name:
+232             raise SaltInvocationError(
+233                 "Either source_group_group_id or"
+234                 " source_group_name can be specified in"
+235                 " security group rules, but not both."
+236             )
+237         if not (cidr_ip or group_id or group_name):
+238             raise SaltInvocationError(
+239                 "cidr_ip, source_group_group_id, or"
+240                 " source_group_name must be provided for"
+241                 " security group rules."
+242             )
+243         rule_found = False
+244         for _rule in _rules:
+245             if _check_rule(rule, _rule):
+246                 rule_found = True
+247                 break
+248         if not rule_found:
+249             to_create.append(rule)
+250     for _rule in _rules:
+251         rule_found = False
+252         for rule in rules:
+253             if _check_rule(rule, _rule):
+254                 rule_found = True
+255                 break
+256         if not rule_found:
+257             _rule.pop("source_group_name", None)
+258             to_delete.append(_rule)
+259     log.debug("Rules to be deleted: %s", to_delete)
+260     log.debug("Rules to be created: %s", to_create)
+261     return (to_delete, to_create)
+262 def _rules_present(
+263     name,
+264     rules,
+265     delete_ingress_rules=True,
+266     vpc_id=None,
+267     vpc_name=None,
+268     region=None,
+269     key=None,
+270     keyid=None,
+271     profile=None,
+272 ):
+273     ret = {"result": True, "comment": "", "changes": {}}
+274     sg = __salt__["boto_secgroup.get_config"](
+275         name=name,
+276         group_id=None,
+277         region=region,
+278         key=key,
+279         keyid=keyid,
+280         profile=profile,
+281         vpc_id=vpc_id,
+282         vpc_name=vpc_name,
+283     )
+284     if not sg:
+285         ret[
+286             "comment"
+287         ] = "{} security group configuration could not be retrieved.".format(name)
+288         ret["result"] = False
+289         return ret
+290     rules = _split_rules(rules)
+291     if vpc_id or vpc_name:
+292         for rule in rules:
+293             _source_group_name = rule.get("source_group_name", None)
+294             if _source_group_name:
+295                 _group_vpc_name = vpc_name
+296                 _group_vpc_id = vpc_id
+297                 _source_group_name_vpc = rule.get("source_group_name_vpc", None)
+298                 if _source_group_name_vpc:
+299                     _group_vpc_name = _source_group_name_vpc
+300                     _group_vpc_id = None
+301                 _group_id = __salt__["boto_secgroup.get_group_id"](
+302                     name=_source_group_name,
+303                     vpc_id=_group_vpc_id,
+304                     vpc_name=_group_vpc_name,
+305                     region=region,
+306                     key=key,
+307                     keyid=keyid,
+308                     profile=profile,
+309                 )
+310                 if not _group_id:
+311                     raise SaltInvocationError(
+312                         "source_group_name {} does not map to a valid "
+313                         "source group id.".format(_source_group_name)
+314                     )
+315                 rule["source_group_name"] = None
+316                 if _source_group_name_vpc:
+317                     rule.pop("source_group_name_vpc")
+318                 rule["source_group_group_id"] = _group_id
+319     to_delete, to_create = _get_rule_changes(rules, sg["rules"])
+320     to_delete = to_delete if delete_ingress_rules else []
+321     if to_create or to_delete:
+322         if __opts__["test"]:
+323             msg = """Security group {} set to have rules modified.
+324             To be created: {}
+325             To be deleted: {}""".format(
+326                 name, pprint.pformat(to_create), pprint.pformat(to_delete)
+327             )
+328             ret["comment"] = msg
+329             ret["result"] = None
+330             return ret
+331         if to_delete:
+332             deleted = True
+333             for rule in to_delete:
+334                 _deleted = __salt__["boto_secgroup.revoke"](
+335                     name,
+336                     vpc_id=vpc_id,
+337                     vpc_name=vpc_name,
+338                     region=region,
+339                     key=key,
+340                     keyid=keyid,
+341                     profile=profile,
+342                     **rule
+343                 )
+344                 if not _deleted:
+345                     deleted = False
+346             if deleted:
+347                 ret["comment"] = "Removed rules on {} security group.".format(name)
+348             else:
+349                 ret["comment"] = "Failed to remove rules on {} security group.".format(
+350                     name
+351                 )
+352                 ret["result"] = False
+353         if to_create:
+354             created = True
+355             for rule in to_create:
+356                 _created = __salt__["boto_secgroup.authorize"](
+357                     name,
+358                     vpc_id=vpc_id,
+359                     vpc_name=vpc_name,
+360                     region=region,
+361                     key=key,
+362                     keyid=keyid,
+363                     profile=profile,
+364                     **rule
+365                 )
+366                 if not _created:
+367                     created = False
+368             if created:
+369                 ret["comment"] = " ".join(
+370                     [
+371                         ret["comment"],
+372                         "Created rules on {} security group.".format(name),
+373                     ]
+374                 )
+375             else:
+376                 ret["comment"] = " ".join(
+377                     [
+378                         ret["comment"],
+379                         "Failed to create rules on {} security group.".format(name),
+380                     ]
+381                 )
+382                 ret["result"] = False
+383         ret["changes"]["old"] = {"rules": sg["rules"]}
+384         sg = __salt__["boto_secgroup.get_config"](
+385             name=name,
+386             group_id=None,
+387             region=region,
+388             key=key,
+389             keyid=keyid,
+390             profile=profile,
+391             vpc_id=vpc_id,
+392             vpc_name=vpc_name,
+393         )
+394         ret["changes"]["new"] = {"rules": sg["rules"]}
+395     return ret
+396 def _rules_egress_present(
+397     name,
+398     rules_egress,
+399     delete_egress_rules=True,
+400     vpc_id=None,
+401     vpc_name=None,
+402     region=None,
+403     key=None,
+404     keyid=None,
+405     profile=None,
+406 ):
+407     ret = {"result": True, "comment": "", "changes": {}}
+408     sg = __salt__["boto_secgroup.get_config"](
+409         name=name,
+410         group_id=None,
+411         region=region,
+412         key=key,
+413         keyid=keyid,
+414         profile=profile,
+415         vpc_id=vpc_id,
+416         vpc_name=vpc_name,
+417     )
+418     if not sg:
+419         ret[
+420             "comment"
+421         ] = "{} security group configuration could not be retrieved.".format(name)
+422         ret["result"] = False
+423         return ret
+424     rules_egress = _split_rules(rules_egress)
+425     if vpc_id or vpc_name:
+426         for rule in rules_egress:
+427             _source_group_name = rule.get("source_group_name", None)
+428             if _source_group_name:
+429                 _group_vpc_name = vpc_name
+430                 _group_vpc_id = vpc_id
+431                 _source_group_name_vpc = rule.get("source_group_name_vpc", None)
+432                 if _source_group_name_vpc:
+433                     _group_vpc_name = _source_group_name_vpc
+434                     _group_vpc_id = None
+435                 _group_id = __salt__["boto_secgroup.get_group_id"](
+436                     name=_source_group_name,
+437                     vpc_id=_group_vpc_id,
+438                     vpc_name=_group_vpc_name,
+439                     region=region,
+440                     key=key,
+441                     keyid=keyid,
+442                     profile=profile,
+443                 )
+444                 if not _group_id:
+445                     raise SaltInvocationError(
+446                         "source_group_name {} does not map to a valid "
+447                         "source group id.".format(_source_group_name)
+448                     )
+449                 rule["source_group_name"] = None
+450                 if _source_group_name_vpc:
+451                     rule.pop("source_group_name_vpc")
+452                 rule["source_group_group_id"] = _group_id
+453     to_delete, to_create = _get_rule_changes(rules_egress, sg["rules_egress"])
+454     to_delete = to_delete if delete_egress_rules else []
+455     if to_create or to_delete:
+456         if __opts__["test"]:
+457             msg = """Security group {} set to have rules modified.
+458             To be created: {}
+459             To be deleted: {}""".format(
+460                 name, pprint.pformat(to_create), pprint.pformat(to_delete)
+461             )
+462             ret["comment"] = msg
+463             ret["result"] = None
+464             return ret
+465         if to_delete:
+466             deleted = True
+467             for rule in to_delete:
+468                 _deleted = __salt__["boto_secgroup.revoke"](
+469                     name,
+470                     vpc_id=vpc_id,
+471                     vpc_name=vpc_name,
+472                     region=region,
+473                     key=key,
+474                     keyid=keyid,
+475                     profile=profile,
+476                     egress=True,
+477                     **rule
+478                 )
+479                 if not _deleted:
+480                     deleted = False
+481             if deleted:
+482                 ret["comment"] = " ".join(
+483                     [
+484                         ret["comment"],
+485                         "Removed egress rule on {} security group.".format(name),
+486                     ]
+487                 )
+488             else:
+489                 ret["comment"] = " ".join(
+490                     [
+491                         ret["comment"],
+492                         "Failed to remove egress rule on {} security group.".format(
+493                             name
+494                         ),
+495                     ]
+496                 )
+497                 ret["result"] = False
+498         if to_create:
+499             created = True
+500             for rule in to_create:
+501                 _created = __salt__["boto_secgroup.authorize"](
+502                     name,
+503                     vpc_id=vpc_id,
+504                     vpc_name=vpc_name,
+505                     region=region,
+506                     key=key,
+507                     keyid=keyid,
+508                     profile=profile,
+509                     egress=True,
+510                     **rule
+511                 )
+512                 if not _created:
+513                     created = False
+514             if created:
+515                 ret["comment"] = " ".join(
+516                     [
+517                         ret["comment"],
+518                         "Created egress rules on {} security group.".format(name),
+519                     ]
+520                 )
+521             else:
+522                 ret["comment"] = " ".join(
+523                     [
+524                         ret["comment"],
+525                         "Failed to create egress rules on {} security group.".format(
+526                             name
+527                         ),
+528                     ]
+529                 )
+530                 ret["result"] = False
+531         ret["changes"]["old"] = {"rules_egress": sg["rules_egress"]}
+532         sg = __salt__["boto_secgroup.get_config"](
+533             name=name,
+534             group_id=None,
+535             region=region,
+536             key=key,
+537             keyid=keyid,
+538             profile=profile,
+539             vpc_id=vpc_id,
+540             vpc_name=vpc_name,
+541         )
+542         ret["changes"]["new"] = {"rules_egress": sg["rules_egress"]}
+543     return ret
+544 def absent(
+545     name, vpc_id=None, vpc_name=None, region=None, key=None, keyid=None, profile=None
+546 ):
+547     ret = {"name": name, "result": True, "comment": "", "changes": {}}
+548     sg = __salt__["boto_secgroup.get_config"](
+549         name=name,
+550         group_id=None,
+551         region=region,
+552         key=key,
+553         keyid=keyid,
+554         profile=profile,
+555         vpc_id=vpc_id,
+556         vpc_name=vpc_name,
+557     )
+558     if sg:
+559         if __opts__["test"]:
+560             ret["comment"] = "Security group {} is set to be removed.".format(name)
+561             ret["result"] = None
+562             return ret
+563         deleted = __salt__["boto_secgroup.delete"](
+564             name=name,
+565             group_id=None,
+566             region=region,
+567             key=key,
+568             keyid=keyid,
+569             profile=profile,
+570             vpc_id=vpc_id,
+571             vpc_name=vpc_name,
+572         )
+573         if deleted:
+574             ret["changes"]["old"] = {"secgroup": sg}
+575             ret["changes"]["new"] = {"secgroup": None}
+576             ret["comment"] = "Security group {} deleted.".format(name)
+577         else:
+578             ret["result"] = False
+579             ret["comment"] = "Failed to delete {} security group.".format(name)
+580     else:
+581         ret["comment"] = "{} security group does not exist.".format(name)
+582     return ret
+583 def _tags_present(
+584     name,
+585     tags,
+586     vpc_id=None,
+587     vpc_name=None,
+588     region=None,
+589     key=None,
+590     keyid=None,
+591     profile=None,
+592 ):
+593     ret = {"result": True, "comment": "", "changes": {}}
+594     if tags:
+595         sg = __salt__["boto_secgroup.get_config"](
+596             name=name,
+597             group_id=None,
+598             region=region,
+599             key=key,
+600             keyid=keyid,
+601             profile=profile,
+602             vpc_id=vpc_id,
+603             vpc_name=vpc_name,
+604         )
+605         if not sg:
+606             ret[
+607                 "comment"
+608             ] = "{} security group configuration could not be retrieved.".format(name)
+609             ret["result"] = False
+610             return ret
+611         tags_to_add = tags
+612         tags_to_update = {}
+613         tags_to_remove = []
+614         if sg.get("tags"):
+615             for existing_tag in sg["tags"]:
+616                 if existing_tag not in tags:
+617                     if existing_tag not in tags_to_remove:
+618                         tags_to_remove.append(existing_tag)
+619                 else:
+620                     if tags[existing_tag] != sg["tags"][existing_tag]:
+621                         tags_to_update[existing_tag] = tags[existing_tag]
+622                     tags_to_add.pop(existing_tag)
+623         if tags_to_remove:
+624             if __opts__["test"]:
+625                 msg = "The following tag{} set to be removed: {}.".format(
+626                     ("s are" if len(tags_to_remove) &gt; 1 else " is"),
+627                     ", ".join(tags_to_remove),
+628                 )
+629                 ret["comment"] = " ".join([ret["comment"], msg])
+630                 ret["result"] = None
+631             else:
+632                 temp_ret = __salt__["boto_secgroup.delete_tags"](
+633                     tags_to_remove,
+634                     name=name,
+635                     group_id=None,
+636                     vpc_name=vpc_name,
+637                     vpc_id=vpc_id,
+638                     region=region,
+639                     key=key,
+640                     keyid=keyid,
+641                     profile=profile,
+642                 )
+643                 if not temp_ret:
+644                     ret["result"] = False
+645                     ret["comment"] = " ".join(
+646                         [
+647                             ret["comment"],
+648                             "Error attempting to delete tags {}.".format(
+649                                 tags_to_remove
+650                             ),
+651                         ]
+652                     )
+653                     return ret
+654                 if "old" not in ret["changes"]:
+655                     ret["changes"] = dictupdate.update(
+656                         ret["changes"], {"old": {"tags": {}}}
+657                     )
+658                 for rem_tag in tags_to_remove:
+659                     ret["changes"]["old"]["tags"][rem_tag] = sg["tags"][rem_tag]
+660         if tags_to_add or tags_to_update:
+661             if __opts__["test"]:
+662                 if tags_to_add:
+663                     msg = "The following tag{} set to be added: {}.".format(
+664                         ("s are" if len(tags_to_add.keys()) &gt; 1 else " is"),
+665                         ", ".join(tags_to_add.keys()),
+666                     )
+667                     ret["comment"] = " ".join([ret["comment"], msg])
+668                     ret["result"] = None
+669                 if tags_to_update:
+670                     msg = "The following tag {} set to be updated: {}.".format(
+671                         (
+672                             "values are"
+673                             if len(tags_to_update.keys()) &gt; 1
+674                             else "value is"
+675                         ),
+676                         ", ".join(tags_to_update.keys()),
+677                     )
+678 <a name="0"></a>                    ret["comment"] = " ".join([ret["comment"], msg])
+679                     ret["result"] = None
+680             else:
+681                 all_tag_changes = dictupdate<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.update(tags_to_add, tags_to_update)
+682                 temp_ret = __salt__["boto_secgroup.set_tags"](
+683                     all_tag_changes,
+684                     name=name,
+685                     group_id=None,
+686                     vpc_name=vpc_name,
+687                     vpc_id=vpc_id,
+688                     region=region,
+689                     key=key,
+690                     keyid=keyid,
+691                     profile=</b></font>profile,
+692                 )
+693                 if not temp_ret:
+694                     ret["result"] = False
+695                     msg = "Error attempting to set tags."
+696                     ret["comment"] = " ".join([ret["comment"], msg])
+697                     return ret
+698                 if "old" not in ret["changes"]:
+699                     ret["changes"] = dictupdate.update(
+700                         ret["changes"], {"old": {"tags": {}}}
+701                     )
+702                 if "new" not in ret["changes"]:
+703                     ret["changes"] = dictupdate.update(
+704                         ret["changes"], {"new": {"tags": {}}}
+705                     )
+706                 for tag in all_tag_changes:
+707                     ret["changes"]["new"]["tags"][tag] = tags[tag]
+708                     if "tags" in sg:
+709                         if sg["tags"]:
+710                             if tag in sg["tags"]:
+711                                 ret["changes"]["old"]["tags"][tag] = sg["tags"][tag]
+712         if not tags_to_update and not tags_to_remove and not tags_to_add:
+713             ret["comment"] = " ".join([ret["comment"], "Tags are already set."])
+714     return ret
 </pre>
 </div>
 </div>
