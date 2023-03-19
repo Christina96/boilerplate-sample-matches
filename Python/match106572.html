@@ -42,558 +42,1049 @@ Matches for capirca_acl.py &amp; test_network_4.py
 </h3>
 <hr/>
 <pre>
-1 import datetime
-2 import inspect
-3 import logging
-4 import re
-5 import salt.utils.files
-6 log = logging.getLogger(__file__)
-7 try:
-8     import capirca
-9     import capirca.aclgen
-10     import capirca.lib.policy
-11     import capirca.lib.aclgenerator
-12     HAS_CAPIRCA = True
-13 except ImportError:
-14     HAS_CAPIRCA = False
-15 __virtualname__ = "capirca"
-16 __proxyenabled__ = ["*"]
-17 def __virtual__():
-18     if HAS_CAPIRCA:
-19         return __virtualname__
-20     else:
-21         return (False, "The capirca module (capirca_acl) cannot be loaded.")
-22 _TERM_FIELDS = {
-23     "action": [],
-24     "address": [],
-25     "address_exclude": [],
-26     "comment": [],
-27     "counter": None,
-28     "expiration": None,
-29     "destination_address": [],
-30     "destination_address_exclude": [],
-31     "destination_port": [],
-32     "destination_prefix": [],
-33     "forwarding_class": [],
-34     "forwarding_class_except": [],
-35     "logging": [],
-36     "log_name": None,
-37     "loss_priority": None,
-38     "option": [],
-39     "owner": None,
-40     "policer": None,
-41     "port": [],
-42     "precedence": [],
-43     "principals": [],
-44     "protocol": [],
-45     "protocol_except": [],
-46     "qos": None,
-47     "pan_application": [],
-48     "routing_instance": None,
-49     "source_address": [],
-50     "source_address_exclude": [],
-51     "source_port": [],
-52     "source_prefix": [],
-53     "verbatim": [],
-54     "packet_length": None,
-55     "fragment_offset": None,
-56     "hop_limit": None,
-57     "icmp_type": [],
-58     "icmp_code": None,
-59     "ether_type": [],
-60     "traffic_class_count": None,
-61     "traffic_type": [],
-62     "translated": False,
-63     "dscp_set": None,
-64     "dscp_match": [],
-65     "dscp_except": [],
-66     "next_ip": None,
-67     "flexible_match_range": [],
-68     "source_prefix_except": [],
-69     "destination_prefix_except": [],
-70     "vpn": None,
-71     "source_tag": [],
-72     "destination_tag": [],
-73     "source_interface": None,
-74     "destination_interface": None,
-75     "platform": [],
-76     "platform_exclude": [],
-77     "timeout": None,
-78     "flattened": False,
-79     "flattened_addr": None,
-80     "flattened_saddr": None,
-81     "flattened_daddr": None,
-82     "priority": None,
-83     "ttl": None,
-84 }
-85 _IP_FILEDS = [
-86     "source_address",
-87     "source_address_exclude",
-88     "destination_address",
-89     "address",
-90     "address_exclude",
-91     "flattened_addr",
-92     "flattened_saddr",
-93     "flattened_daddr",
-94     "next_ip",
-95 ]
-96 _SERVICES = {}
-97 if HAS_CAPIRCA:
-98     _TempTerm = capirca.lib.policy.Term
-99     def _add_object(self, obj):
-100         return
-101     setattr(_TempTerm, "AddObject", _add_object)
-102     dumy_term = _TempTerm(None)
-103     for item in dir(dumy_term):
-104         if hasattr(item, "__func__") or item.startswith("_") or item != item.lower():
-105             continue
-106         _TERM_FIELDS[item] = getattr(dumy_term, item)
-107     class _Policy(capirca.lib.policy.Policy):
-108         def __init__(self):
-109             self.filters = []
-110             self.filename = ""
-111     class _Term(capirca.lib.policy.Term):
-112         def __init__(self):
-113             for field, default in _TERM_FIELDS.items():
-114                 setattr(self, field, default)
-115 def _import_platform_generator(platform):
-116     log.debug("Using platform: %s", platform)
-117     for mod_name, mod_obj in inspect.getmembers(capirca.aclgen):
-118         if mod_name == platform and inspect.ismodule(mod_obj):
-119             for plat_obj_name, plat_obj in inspect.getmembers(
-120                 mod_obj
-121             ):  # pylint: disable=unused-variable
-122                 if inspect.isclass(plat_obj) and issubclass(
-123                     plat_obj, capirca.lib.aclgenerator.ACLGenerator
-124                 ):
-125                     log.debug("Identified Capirca class %s for %s", plat_obj, platform)
-126                     return plat_obj
-127     log.error("Unable to identify any Capirca plaform class for %s", platform)
-128 def _get_services_mapping():
-129     if _SERVICES:
-130         return _SERVICES
-131     services_txt = ""
-132     try:
-133         with salt.utils.files.fopen("/etc/services", "r") as srv_f:
-134             services_txt = salt.utils.stringutils.to_unicode(srv_f.read())
-135     except OSError as ioe:
-136         log.error("Unable to read from /etc/services:")
-137         log.error(ioe)
-138         return _SERVICES  # no mapping possible, sorry
-139     service_rgx = re.compile(r"^([a-zA-Z0-9-]+)\s+(\d+)\/(tcp|udp)(.*)$")
-140     for line in services_txt.splitlines():
-141         service_rgx_s = service_rgx.search(line)
-142         if service_rgx_s and len(service_rgx_s.groups()) == 4:
-143             srv_name, port, protocol, _ = service_rgx_s.groups()
-144             if srv_name not in _SERVICES:
-145                 _SERVICES[srv_name] = {"port": [], "protocol": []}
-146             try:
-147                 _SERVICES[srv_name]["port"].append(int(port))
-148             except ValueError as verr:
-149                 log.error(verr)
-150                 log.error("Did not read that properly:")
-151                 log.error(line)
-152                 log.error(
-153                     "Please report the above error: %s does not seem a valid port"
-154                     " value!",
-155                     port,
-156                 )
-157             _SERVICES[srv_name]["protocol"].append(protocol)
-158     return _SERVICES
-159 def _translate_port(port):
-160     services = _get_services_mapping()
-161     if port in services and services[port]["port"]:
-162         return services[port]["port"][0]
-163     return port
-164 def _make_it_list(dict_, field_name, value):
-165     prev_value = []
-166     if field_name in dict_:
-167         prev_value = dict_[field_name]
-168     if value is None:
-169         return prev_value
-170     elif isinstance(value, (tuple, list)):
-171         if field_name in ("source_port", "destination_port"):
-172             portval = []
-173             for port in value:
-174                 if not isinstance(port, (tuple, list)):
-175                     portval.append((port, port))
-176                 else:
-177                     portval.append(port)
-178             translated_portval = []
-179             for port_start, port_end in portval:
-180                 if not isinstance(port_start, int):
-181                     port_start = _translate_port(port_start)
-182                 if not isinstance(port_end, int):
-183                     port_end = _translate_port(port_end)
-184                 translated_portval.append((port_start, port_end))
-185             return list(set(prev_value + translated_portval))
-186         return list(set(prev_value + list(value)))
-187     if field_name in ("source_port", "destination_port"):
-188         if not isinstance(value, int):
-189             value = _translate_port(value)
-190         return list(set(prev_value + [(value, value)]))  # a list of tuples
-191     return list(set(prev_value + [value]))
-192 def _clean_term_opts(term_opts):
-193     clean_opts = {}
-194     _services = _get_services_mapping()
-195     for field, value in term_opts.items():
-196         if field == "source_service" and value:
-197             if isinstance(value, str):
-198                 value = _make_it_list(clean_opts, field, value)
-199             log.debug("Processing special source services:")
-200             log.debug(value)
-201             for service in value:
-202                 if service and service in _services:
-203                     clean_opts["source_port"] = _make_it_list(
-204                         clean_opts, "source_port", _services[service]["port"]
-205                     )
-206                         clean_opts, "protocol", _services[service]["protocol"]
-207                     )
-208             log<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.debug(
-209                 "Built source_port field, after processing special source services:"
-210             )
-211             log.debug(clean_opts.get("source_port"))
-212             log.debug("Built protocol field, after processing special source services:")
-213             log.debug(clean_opts.get(</b></font>"protocol"))
-214         elif field == "destination_service" and value:
-215             if isinstance(value, str):
-216                 value = _make_it_list(clean_opts, field, value)
-217             log.debug("Processing special destination services:")
-218             log.debug(value)
-219             for service in value:
-220                 if service and service in _services:
-221                     clean_opts["destination_port"] = _make_it_list(
-222                         clean_opts, "destination_port", _services[service]["port"]
-223                     )
-224                         clean_opts, "protocol", _services[service]["protocol"]
-225                     )
-226             log<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.debug(
-227                 "Built source_port field, after processing special destination"
-228                 " services:"
-229             )
-230             log.debug(clean_opts.get("destination_service"))
-231             log.debug(
-232                 "Built protocol field, after processing special destination services:"
-233             )
-234             log.debug(clean_opts.get("protocol"))
-235         elif field in _TERM_FIELDS and value and value != _TERM_FIELDS[</b></font>field]:
-236             if isinstance(_TERM_FIELDS[field], list):
-237                 value = _make_it_list(clean_opts, field, value)
-238             if field in _IP_FILEDS:
-239                 ip_values = []
-240                 for addr in value:
-241                     ip_values.append(capirca.lib.policy.nacaddr.IP(addr))
-242                 value = ip_values[:]
-243             clean_opts[field] = value
-244     return clean_opts
-245 def _lookup_element(lst, key):
-246     if not lst:
-247         return {}
-248     for ele in lst:
-249         if not ele or not isinstance(ele, dict):
-250             continue
-251         if key in ele:
-252             return ele[key]
-253     return {}
-254 def _get_pillar_cfg(pillar_key, pillarenv=None, saltenv=None):
-255     pillar_cfg = __salt__["pillar.get"](
-256         pillar_key, pillarenv=pillarenv, saltenv=saltenv
-257     )
-258     return pillar_cfg
-259 def _cleanup(lst):
-260     clean = []
-261     for ele in lst:
-262         if ele and isinstance(ele, dict):
-263             clean.append(ele)
-264     return clean
-265 def _merge_list_of_dict(first, second, prepend=True):
-266     first = _cleanup(first)
-267     second = _cleanup(second)
-268     if not first and not second:
-269         return []
-270     if not first and second:
-271         return second
-272     if first and not second:
-273         return first
-274     overlaps = []
-275     merged = []
-276     appended = []
-277     for ele in first:
-278         if _lookup_element(second, next(iter(ele))):
-279             overlaps.append(ele)
-280         elif prepend:
-281             merged.append(ele)
-282         elif not prepend:
-283             appended.append(ele)
-284     for ele in second:
-285         ele_key = next(iter(ele))
-286         if _lookup_element(overlaps, ele_key):
-287             ele_val_first = _lookup_element(first, ele_key)
-288             merged.append({ele_key: ele_val_first})
-289         else:
-290             merged.append(ele)
-291     if not prepend:
-292         merged.extend(appended)
-293     return merged
-294 def _get_term_object(
-295     filter_name,
-296     term_name,
-297     pillar_key="acl",
-298     pillarenv=None,
-299     saltenv=None,
-300     merge_pillar=True,
-301     **term_fields
-302 ):
-303     log.debug("Generating config for term %s under filter %s", term_name, filter_name)
-304     term = _Term()
-305     term.name = term_name
-306     term_opts = {}
-307     if merge_pillar:
-308         term_opts = get_term_pillar(
-309             filter_name,
-310             term_name,
-311             pillar_key=pillar_key,
-312             saltenv=saltenv,
-313             pillarenv=pillarenv,
-314         )
-315         log.debug("Merging with pillar data:")
-316         log.debug(term_opts)
-317         term_opts = _clean_term_opts(term_opts)
-318         log.debug("Cleaning up pillar data:")
-319         log.debug(term_opts)
-320     log.debug("Received processing opts:")
-321     log.debug(term_fields)
-322     log.debug("Cleaning up processing opts:")
-323     term_fields = _clean_term_opts(term_fields)
-324     log.debug(term_fields)
-325     log.debug("Final term opts:")
-326     term_opts.update(term_fields)
-327     log.debug(term_fields)
-328     for field, value in term_opts.items():
-329         setattr(term, field, value)
-330     log.debug("Term config:")
-331     log.debug(str(term))
-332     return term
-333 def _get_policy_object(
-334     platform,
-335     filters=None,
-336     pillar_key="acl",
-337     pillarenv=None,
-338     saltenv=None,
-339     merge_pillar=True,
-340 ):
-341     policy = _Policy()
-342     policy_filters = []
-343     if not filters:
-344         filters = []
-345     for filter_ in filters:
-346         if not filter_ or not isinstance(filter_, dict):
-347             continue  # go to the next filter
-348         filter_name, filter_config = next(iter(filter_.items()))
-349         header = capirca.lib.policy.Header()  # same header everywhere
-350         target_opts = [platform, filter_name]
-351         filter_options = filter_config.pop("options", None)
-352         if filter_options:
-353             filter_options = _make_it_list({}, filter_name, filter_options)
-354             target_opts.extend(filter_options)
-355         target = capirca.lib.policy.Target(target_opts)
-356         header.AddObject(target)
-357         filter_terms = []
-358         for term_ in filter_config.get("terms", []):
-359             if term_ and isinstance(term_, dict):
-360                 term_name, term_fields = next(iter(term_.items()))
-361                 term = _get_term_object(
-362                     filter_name,
-363                     term_name,
-364                     pillar_key=pillar_key,
-365                     pillarenv=pillarenv,
-366                     saltenv=saltenv,
-367                     merge_pillar=merge_pillar,
-368                     **term_fields
-369                 )
-370             filter_terms.append(term)
-371         policy_filters.append((header, filter_terms))
-372     policy.filters = policy_filters
-373     log.debug("Policy config:")
-374     log.debug(str(policy))
-375     platform_generator = _import_platform_generator(platform)
-376     policy_config = platform_generator(policy, 2)
-377     log.debug("Generating policy config for %s:", platform)
-378     log.debug(str(policy_config))
-379     return policy_config
-380 def _revision_tag(
-381     text,
-382     revision_id=None,
-383     revision_no=None,
-384     revision_date=True,
-385     revision_date_format="%Y/%m/%d",
-386 ):
-387     timestamp = datetime.datetime.now().strftime(revision_date_format)
-388     new_text = []
-389     for line in text.splitlines():
-390         if "$Id:$" in line:
-391             if not revision_id:  # if no explicit revision ID required
-392                 continue  # jump to next line, ignore this one
-393             line = line.replace("$Id:$", "$Id: {rev_id} $".format(rev_id=revision_id))
-394         if "$Revision:$" in line:
-395             if not revision_no:  # if no explicit revision number required
-396                 continue  # jump to next line, ignore this one
-397             line = line.replace(
-398                 "$Revision:$", "$Revision: {rev_no} $".format(rev_no=revision_no)
-399             )
-400         if "$Date:$" in line:
-401             if not revision_date:
-402                 continue  # jump
-403             line = line.replace("$Date:$", "$Date: {ts} $".format(ts=timestamp))
-404         new_text.append(line)
-405     return "\n".join(new_text)
-406 def get_term_config(
-407     platform,
-408     filter_name,
-409     term_name,
-410     filter_options=None,
-411     pillarenv=None,
-412     saltenv=None,
-413     merge_pillar<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>=True,
-414     revision_id=None,
-415     revision_no=None,
-416     revision_date=True,
-417     revision_date_format="%Y/%m/%d",
-418     source_service=None,
-419     destination_service=None,
-420     **term_fields
-421 ):
-422     terms = []
-423     term = {term_name: {}}
-424     term[term_name].</b></font>update(term_fields)
-425     term[term_name].update(
-426         {
-427             "source_service": _make_it_list({}, "source_service", source_service),
-428             "destination_service": _make_it_list(
-429                 {}, "destination_service", destination_service
-430             ),
-431         }
-432     )
-433     terms.append(term)
-434     if not filter_options:
-435         filter_options = []
-436     return get_filter_config(
-437         platform,
-438         filter_name,
-439         filter_options=filter_options,
-440         terms=terms,
-441         pillar_key=pillar_key,
-442         pillarenv=pillarenv,
-443         saltenv=saltenv,
-444         merge_pillar=merge_pillar,
-445         only_lower_merge=True,
-446         revision_id=revision_id,
-447         revision_no=revision_no,
-448         revision_date=revision_date,
-449         revision_date_format=revision_date_format,
-450     )
-451 def get_filter_config(
-452     platform,
-453     filter_name,
-454     filter_options=None,
-455     terms=None,
-456     prepend=True,
-457     pillar_key="acl",
-458     pillarenv=None,
-459     saltenv=None,
-460     merge_pillar=True,
-461     only_lower_merge=False,
-462     revision_id=None,
-463     revision_no=None,
-464     revision_date=True,
-465     revision_date_format="%Y/%m/%d",
-466 ):
-467     if not filter_options:
-468         filter_options = []
-469     if not terms:
-470         terms = []
-471     if merge_pillar and not only_lower_merge:
-472         acl_pillar_cfg = _get_pillar_cfg(
-473             pillar_key, saltenv=saltenv, pillarenv=pillarenv
-474         )
-475         filter_pillar_cfg = _lookup_element(acl_pillar_cfg, filter_name)
-476         filter_options = filter_options or filter_pillar_cfg.pop("options", None)
-477         if filter_pillar_cfg:
-478             pillar_terms = filter_pillar_cfg.get(
-479                 "terms", []
-480             )  # No problem if empty in the pillar
-481             terms = _merge_list_of_dict(terms, pillar_terms, prepend=prepend)
-482     filters = []
-483     filters.append(
-484         {
-485             filter_name: {
-486                 "options": _make_it_list({}, filter_name, filter_options),
-487                 "terms": terms,
-488             }
-489         }
-490     )
-491     return get_policy_config(
-492         platform,
-493         filters=filters,
-494         pillar_key=pillar_key,
-495         pillarenv=pillarenv,
-496         saltenv=saltenv,
-497         merge_pillar=merge_pillar,
-498         only_lower_merge=True,
-499         revision_id=revision_id,
-500         revision_no=revision_no,
-501         revision_date=revision_date,
-502         revision_date_format=revision_date_format,
-503     )
-504 def get_policy_config(
-505     platform,
-506     filters=None,
-507     prepend=True,
-508     pillar_key="acl",
-509     pillarenv=None,
-510     saltenv=None,
-511     merge_pillar=True,
-512     only_lower_merge=False,
-513     revision_id=None,
-514     revision_no=None,
-515     revision_date=True,
-516     revision_date_format="%Y/%m/%d",
-517 ):
-518     if not filters:
-519         filters = []
-520     if merge_pillar and not only_lower_merge:
-521         policy_pillar_cfg = _get_pillar_cfg(
-522             pillar_key, saltenv=saltenv, pillarenv=pillarenv
-523         )
-524         filters = _merge_list_of_dict(filters, policy_pillar_cfg, prepend=prepend)
-525     policy_object = _get_policy_object(
-526         platform,
-527         filters=filters,
-528         pillar_key=pillar_key,
-529         pillarenv=pillarenv,
-530         saltenv=saltenv,
-531         merge_pillar=merge_pillar,
-532     )
-533     policy_text = str(policy_object)
-534     return _revision_tag(
-535         policy_text,
-536         revision_id=revision_id,
-537         revision_no=revision_no,
-538         revision_date=revision_date,
-539         revision_date_format=revision_date_format,
-540     )
-541 def get_filter_pillar(filter_name, pillar_key="acl", pillarenv=None, saltenv=None):
-542     pillar_cfg = _get_pillar_cfg(pillar_key, pillarenv=pillarenv, saltenv=saltenv)
-543     return _lookup_element(pillar_cfg, filter_name)
-544 def get_term_pillar(
-545     filter_name, term_name, pillar_key="acl", pillarenv=None, saltenv=None
-546 ):
-547     filter_pillar_cfg = get_filter_pillar(
-548         filter_name, pillar_key=pillar_key, pillarenv=pillarenv, saltenv=saltenv
-549     )
-550     term_pillar_cfg = filter_pillar_cfg.get("terms", [])
-551     term_opts = _lookup_element(term_pillar_cfg, term_name)
-552     return term_opts
+"""
+Capirca ACL
+===========
+Generate ACL (firewall) configuration for network devices.
+.. versionadded:: 2017.7.0
+:codeauthor: Mircea Ulinic &lt;ping@mirceaulinic.net&gt; &amp; Robert Ankeny &lt;robankeny@google.com&gt;
+:maturity:   new
+:depends:    capirca
+:platform:   unix
+Dependencies
+------------
+The firewall configuration is generated by Capirca_.
+.. _Capirca: https://github.com/google/capirca
+To install Capirca, execute: ``pip install capirca``.
+"""
+import datetime
+import inspect
+import logging
+import re
+import salt.utils.files
+log = logging.getLogger(__file__)
+try:
+    import capirca
+    import capirca.aclgen
+    import capirca.lib.policy
+    import capirca.lib.aclgenerator
+    HAS_CAPIRCA = True
+except ImportError:
+    HAS_CAPIRCA = False
+__virtualname__ = "capirca"
+__proxyenabled__ = ["*"]
+def __virtual__():
+    """
+    This module requires at least Capirca to work.
+    """
+    if HAS_CAPIRCA:
+        return __virtualname__
+    else:
+        return (False, "The capirca module (capirca_acl) cannot be loaded.")
+_TERM_FIELDS = {
+    "action": [],
+    "address": [],
+    "address_exclude": [],
+    "comment": [],
+    "counter": None,
+    "expiration": None,
+    "destination_address": [],
+    "destination_address_exclude": [],
+    "destination_port": [],
+    "destination_prefix": [],
+    "forwarding_class": [],
+    "forwarding_class_except": [],
+    "logging": [],
+    "log_name": None,
+    "loss_priority": None,
+    "option": [],
+    "owner": None,
+    "policer": None,
+    "port": [],
+    "precedence": [],
+    "principals": [],
+    "protocol": [],
+    "protocol_except": [],
+    "qos": None,
+    "pan_application": [],
+    "routing_instance": None,
+    "source_address": [],
+    "source_address_exclude": [],
+    "source_port": [],
+    "source_prefix": [],
+    "verbatim": [],
+    "packet_length": None,
+    "fragment_offset": None,
+    "hop_limit": None,
+    "icmp_type": [],
+    "icmp_code": None,
+    "ether_type": [],
+    "traffic_class_count": None,
+    "traffic_type": [],
+    "translated": False,
+    "dscp_set": None,
+    "dscp_match": [],
+    "dscp_except": [],
+    "next_ip": None,
+    "flexible_match_range": [],
+    "source_prefix_except": [],
+    "destination_prefix_except": [],
+    "vpn": None,
+    "source_tag": [],
+    "destination_tag": [],
+    "source_interface": None,
+    "destination_interface": None,
+    "platform": [],
+    "platform_exclude": [],
+    "timeout": None,
+    "flattened": False,
+    "flattened_addr": None,
+    "flattened_saddr": None,
+    "flattened_daddr": None,
+    "priority": None,
+    "ttl": None,
+}
+_IP_FILEDS = [
+    "source_address",
+    "source_address_exclude",
+    "destination_address",
+    "address",
+    "address_exclude",
+    "flattened_addr",
+    "flattened_saddr",
+    "flattened_daddr",
+    "next_ip",
+]
+_SERVICES = {}
+if HAS_CAPIRCA:
+    _TempTerm = capirca.lib.policy.Term
+    def _add_object(self, obj):
+        return
+    setattr(_TempTerm, "AddObject", _add_object)
+    dumy_term = _TempTerm(None)
+    for item in dir(dumy_term):
+        if hasattr(item, "__func__") or item.startswith("_") or item != item.lower():
+            continue
+        _TERM_FIELDS[item] = getattr(dumy_term, item)
+    class _Policy(capirca.lib.policy.Policy):
+        """
+        Extending the Capirca Policy class to allow inserting custom filters.
+        """
+        def __init__(self):
+            self.filters = []
+            self.filename = ""
+    class _Term(capirca.lib.policy.Term):
+        """
+        Extending the Capirca Term class to allow setting field valued on the fly.
+        """
+        def __init__(self):
+            for field, default in _TERM_FIELDS.items():
+                setattr(self, field, default)
+def _import_platform_generator(platform):
+    """
+    Given a specific platform (under the Capirca conventions),
+    return the generator class.
+    The generator class is identified looking under the &lt;platform&gt; module
+    for a class inheriting the `ACLGenerator` class.
+    """
+    log.debug("Using platform: %s", platform)
+    for mod_name, mod_obj in inspect.getmembers(capirca.aclgen):
+        if mod_name == platform and inspect.ismodule(mod_obj):
+            for plat_obj_name, plat_obj in inspect.getmembers(
+                mod_obj
+            ):  # pylint: disable=unused-variable
+                if inspect.isclass(plat_obj) and issubclass(
+                    plat_obj, capirca.lib.aclgenerator.ACLGenerator
+                ):
+                    log.debug("Identified Capirca class %s for %s", plat_obj, platform)
+                    return plat_obj
+    log.error("Unable to identify any Capirca plaform class for %s", platform)
+def _get_services_mapping():
+    """
+    Build a map of services based on the IANA assignment list:
+    http://www.iana.org/assignments/port-numbers
+    It will load the /etc/services file and will build the mapping on the fly,
+    similar to the Capirca's SERVICES file:
+    https://github.com/google/capirca/blob/master/def/SERVICES.svc
+    As this module is be available on Unix systems only,
+    we'll read the services from /etc/services.
+    In the worst case, the user will not be able to specify the
+    services shortcut and they will need to specify the protocol / port combination
+    using the source_port / destination_port &amp; protocol fields.
+    """
+    if _SERVICES:
+        return _SERVICES
+    services_txt = ""
+    try:
+        with salt.utils.files.fopen("/etc/services", "r") as srv_f:
+            services_txt = salt.utils.stringutils.to_unicode(srv_f.read())
+    except OSError as ioe:
+        log.error("Unable to read from /etc/services:")
+        log.error(ioe)
+        return _SERVICES  # no mapping possible, sorry
+    service_rgx = re.compile(r"^([a-zA-Z0-9-]+)\s+(\d+)\/(tcp|udp)(.*)$")
+    for line in services_txt.splitlines():
+        service_rgx_s = service_rgx.search(line)
+        if service_rgx_s and len(service_rgx_s.groups()) == 4:
+            srv_name, port, protocol, _ = service_rgx_s.groups()
+            if srv_name not in _SERVICES:
+                _SERVICES[srv_name] = {"port": [], "protocol": []}
+            try:
+                _SERVICES[srv_name]["port"].append(int(port))
+            except ValueError as verr:
+                log.error(verr)
+                log.error("Did not read that properly:")
+                log.error(line)
+                log.error(
+                    "Please report the above error: %s does not seem a valid port"
+                    " value!",
+                    port,
+                )
+            _SERVICES[srv_name]["protocol"].append(protocol)
+    return _SERVICES
+def _translate_port(port):
+    """
+    Look into services and return the port value using the
+    service name as lookup value.
+    """
+    services = _get_services_mapping()
+    if port in services and services[port]["port"]:
+        return services[port]["port"][0]
+    return port
+def _make_it_list(dict_, field_name, value):
+    """
+    Return the object list.
+    """
+    prev_value = []
+    if field_name in dict_:
+        prev_value = dict_[field_name]
+    if value is None:
+        return prev_value
+    elif isinstance(value, (tuple, list)):
+        if field_name in ("source_port", "destination_port"):
+            portval = []
+            for port in value:
+                if not isinstance(port, (tuple, list)):
+                    portval.append((port, port))
+                else:
+                    portval.append(port)
+            translated_portval = []
+            for port_start, port_end in portval:
+                if not isinstance(port_start, int):
+                    port_start = _translate_port(port_start)
+                if not isinstance(port_end, int):
+                    port_end = _translate_port(port_end)
+                translated_portval.append((port_start, port_end))
+            return list(set(prev_value + translated_portval))
+        return list(set(prev_value + list(value)))
+    if field_name in ("source_port", "destination_port"):
+        if not isinstance(value, int):
+            value = _translate_port(value)
+        return list(set(prev_value + [(value, value)]))  # a list of tuples
+    return list(set(prev_value + [value]))
+def _clean_term_opts(term_opts):
+    """
+    Cleanup the term opts:
+    - strip Null and empty valuee, defaulting their value to their base definition from _TERM_FIELDS
+    - convert to `nacaddr.IP` fields from `_IP_FILEDS`
+    - create lists for those fields requiring it
+    """
+    clean_opts = {}
+    _services = _get_services_mapping()
+    for field, value in term_opts.items():
+        if field == "source_service" and value:
+            if isinstance(value, str):
+                value = _make_it_list(clean_opts, field, value)
+            log.debug("Processing special source services:")
+            log.debug(value)
+            for service in value:
+                if service and service in _services:
+                    clean_opts["source_port"] = _make_it_list(
+                        clean_opts, "source_port", _services[service]["port"]
+                    )
+                        clean_opts, "protocol", _services[service]["protocol"]
+                    )
+            log<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.debug(
+                "Built source_port field, after processing special source services:"
+            )
+            log.debug(clean_opts.get("source_port"))
+            log.debug("Built protocol field, after processing special source services:")
+            log.debug(clean_opts.get(</b></font>"protocol"))
+        elif field == "destination_service" and value:
+            if isinstance(value, str):
+                value = _make_it_list(clean_opts, field, value)
+            log.debug("Processing special destination services:")
+            log.debug(value)
+            for service in value:
+                if service and service in _services:
+                    clean_opts["destination_port"] = _make_it_list(
+                        clean_opts, "destination_port", _services[service]["port"]
+                    )
+                        clean_opts, "protocol", _services[service]["protocol"]
+                    )
+            log<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>.debug(
+                "Built source_port field, after processing special destination"
+                " services:"
+            )
+            log.debug(clean_opts.get("destination_service"))
+            log.debug(
+                "Built protocol field, after processing special destination services:"
+            )
+            log.debug(clean_opts.get("protocol"))
+        elif field in _TERM_FIELDS and value and value != _TERM_FIELDS[</b></font>field]:
+            if isinstance(_TERM_FIELDS[field], list):
+                value = _make_it_list(clean_opts, field, value)
+            if field in _IP_FILEDS:
+                ip_values = []
+                for addr in value:
+                    ip_values.append(capirca.lib.policy.nacaddr.IP(addr))
+                value = ip_values[:]
+            clean_opts[field] = value
+    return clean_opts
+def _lookup_element(lst, key):
+    """
+    Find an dictionary in a list of dictionaries, given its main key.
+    """
+    if not lst:
+        return {}
+    for ele in lst:
+        if not ele or not isinstance(ele, dict):
+            continue
+        if key in ele:
+            return ele[key]
+    return {}
+def _get_pillar_cfg(pillar_key, pillarenv=None, saltenv=None):
+    """
+    Retrieve the pillar data from the right environment.
+    """
+    pillar_cfg = __salt__["pillar.get"](
+        pillar_key, pillarenv=pillarenv, saltenv=saltenv
+    )
+    return pillar_cfg
+def _cleanup(lst):
+    """
+    Return a list of non-empty dictionaries.
+    """
+    clean = []
+    for ele in lst:
+        if ele and isinstance(ele, dict):
+            clean.append(ele)
+    return clean
+def _merge_list_of_dict(first, second, prepend=True):
+    """
+    Merge lists of dictionaries.
+    Each element of the list is a dictionary having one single key.
+    That key is then used as unique lookup.
+    The first element list has higher priority than the second.
+    When there's an overlap between the two lists,
+    it won't change the position, but the content.
+    """
+    first = _cleanup(first)
+    second = _cleanup(second)
+    if not first and not second:
+        return []
+    if not first and second:
+        return second
+    if first and not second:
+        return first
+    overlaps = []
+    merged = []
+    appended = []
+    for ele in first:
+        if _lookup_element(second, next(iter(ele))):
+            overlaps.append(ele)
+        elif prepend:
+            merged.append(ele)
+        elif not prepend:
+            appended.append(ele)
+    for ele in second:
+        ele_key = next(iter(ele))
+        if _lookup_element(overlaps, ele_key):
+            ele_val_first = _lookup_element(first, ele_key)
+            merged.append({ele_key: ele_val_first})
+        else:
+            merged.append(ele)
+    if not prepend:
+        merged.extend(appended)
+    return merged
+def _get_term_object(
+    filter_name,
+    term_name,
+    pillar_key="acl",
+    pillarenv=None,
+    saltenv=None,
+    merge_pillar=True,
+    **term_fields
+):
+    """
+    Return an instance of the ``_Term`` class given the term options.
+    """
+    log.debug("Generating config for term %s under filter %s", term_name, filter_name)
+    term = _Term()
+    term.name = term_name
+    term_opts = {}
+    if merge_pillar:
+        term_opts = get_term_pillar(
+            filter_name,
+            term_name,
+            pillar_key=pillar_key,
+            saltenv=saltenv,
+            pillarenv=pillarenv,
+        )
+        log.debug("Merging with pillar data:")
+        log.debug(term_opts)
+        term_opts = _clean_term_opts(term_opts)
+        log.debug("Cleaning up pillar data:")
+        log.debug(term_opts)
+    log.debug("Received processing opts:")
+    log.debug(term_fields)
+    log.debug("Cleaning up processing opts:")
+    term_fields = _clean_term_opts(term_fields)
+    log.debug(term_fields)
+    log.debug("Final term opts:")
+    term_opts.update(term_fields)
+    log.debug(term_fields)
+    for field, value in term_opts.items():
+        setattr(term, field, value)
+    log.debug("Term config:")
+    log.debug(str(term))
+    return term
+def _get_policy_object(
+    platform,
+    filters=None,
+    pillar_key="acl",
+    pillarenv=None,
+    saltenv=None,
+    merge_pillar=True,
+):
+    """
+    Return an instance of the ``_Policy`` class given the filters config.
+    """
+    policy = _Policy()
+    policy_filters = []
+    if not filters:
+        filters = []
+    for filter_ in filters:
+        if not filter_ or not isinstance(filter_, dict):
+            continue  # go to the next filter
+        filter_name, filter_config = next(iter(filter_.items()))
+        header = capirca.lib.policy.Header()  # same header everywhere
+        target_opts = [platform, filter_name]
+        filter_options = filter_config.pop("options", None)
+        if filter_options:
+            filter_options = _make_it_list({}, filter_name, filter_options)
+            target_opts.extend(filter_options)
+        target = capirca.lib.policy.Target(target_opts)
+        header.AddObject(target)
+        filter_terms = []
+        for term_ in filter_config.get("terms", []):
+            if term_ and isinstance(term_, dict):
+                term_name, term_fields = next(iter(term_.items()))
+                term = _get_term_object(
+                    filter_name,
+                    term_name,
+                    pillar_key=pillar_key,
+                    pillarenv=pillarenv,
+                    saltenv=saltenv,
+                    merge_pillar=merge_pillar,
+                    **term_fields
+                )
+            filter_terms.append(term)
+        policy_filters.append((header, filter_terms))
+    policy.filters = policy_filters
+    log.debug("Policy config:")
+    log.debug(str(policy))
+    platform_generator = _import_platform_generator(platform)
+    policy_config = platform_generator(policy, 2)
+    log.debug("Generating policy config for %s:", platform)
+    log.debug(str(policy_config))
+    return policy_config
+def _revision_tag(
+    text,
+    revision_id=None,
+    revision_no=None,
+    revision_date=True,
+    revision_date_format="%Y/%m/%d",
+):
+    """
+    Refactor revision tag comments.
+    Capirca generates the filter text having the following tag keys:
+    - $Id:$
+    - $Revision:$
+    - $Date:$
+    This function goes through all the config lines and replaces
+    those tags with the content requested by the user.
+    If a certain value is not provided, the corresponding tag will be stripped.
+    """
+    timestamp = datetime.datetime.now().strftime(revision_date_format)
+    new_text = []
+    for line in text.splitlines():
+        if "$Id:$" in line:
+            if not revision_id:  # if no explicit revision ID required
+                continue  # jump to next line, ignore this one
+            line = line.replace("$Id:$", "$Id: {rev_id} $".format(rev_id=revision_id))
+        if "$Revision:$" in line:
+            if not revision_no:  # if no explicit revision number required
+                continue  # jump to next line, ignore this one
+            line = line.replace(
+                "$Revision:$", "$Revision: {rev_no} $".format(rev_no=revision_no)
+            )
+        if "$Date:$" in line:
+            if not revision_date:
+                continue  # jump
+            line = line.replace("$Date:$", "$Date: {ts} $".format(ts=timestamp))
+        new_text.append(line)
+    return "\n".join(new_text)
+def get_term_config(
+    platform,
+    filter_name,
+    term_name,
+    filter_options=None,
+    pillarenv=None,
+    saltenv=None,
+    merge_pillar<font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>=True,
+    revision_id=None,
+    revision_no=None,
+    revision_date=True,
+    revision_date_format="%Y/%m/%d",
+    source_service=None,
+    destination_service=None,
+    **term_fields
+):
+    """
+    Return the configuration of a single policy term.
+    platform
+        The name of the Capirca platform.
+    filter_name
+        The name of the policy filter.
+    term_name
+        The name of the term.
+    filter_options
+        Additional filter options. These options are platform-specific.
+        E.g.: ``inet6``, ``bridge``, ``object-group``,
+        See the complete list of options_.
+        .. _options: https://github.com/google/capirca/wiki/Policy-format#header-section
+    pillar_key: ``acl``
+        The key in the pillar containing the default attributes values. Default: ``acl``.
+        If the pillar contains the following structure:
+        .. code-block:: yaml
+            firewall:
+              - my-filter:
+                  terms:
+                    - my-term:
+                        source_port: 1234
+                        source_address:
+                            - 1.2.3.4/32
+                            - 5.6.7.8/32
+        The ``pillar_key`` field would be specified as ``firewall``.
+    pillarenv
+        Query the master to generate fresh pillar data on the fly,
+        specifically from the requested pillar environment.
+    saltenv
+        Included only for compatibility with
+        :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
+    merge_pillar: ``True``
+        Merge the CLI variables with the pillar. Default: ``True``.
+    revision_id
+        Add a comment in the term config having the description for the changes applied.
+    revision_no
+        The revision count.
+    revision_date: ``True``
+        Boolean flag: display the date when the term configuration was generated. Default: ``True``.
+    revision_date_format: ``%Y/%m/%d``
+        The date format to be used when generating the perforce data. Default: ``%Y/%m/%d`` (&lt;year&gt;/&lt;month&gt;/&lt;day&gt;).
+    source_service
+        A special service to choose from. This is a helper so the user is able to
+        select a source just using the name, instead of specifying a source_port and protocol.
+        As this module is available on Unix platforms only,
+        it reads the IANA_ port assignment from ``/etc/services``.
+        If the user requires additional shortcuts to be referenced, they can add entries under ``/etc/services``,
+        which can be managed using the :mod:`file state &lt;salt.states.file&gt;`.
+        .. _IANA: http://www.iana.org/assignments/port-numbers
+    destination_service
+        A special service to choose from. This is a helper so the user is able to
+        select a source just using the name, instead of specifying a destination_port and protocol.
+        Allows the same options as ``source_service``.
+    term_fields
+        Term attributes.
+        To see what fields are supported, please consult the list of supported keywords_.
+        Some platforms have few other optional_ keywords.
+        .. _keywords: https://github.com/google/capirca/wiki/Policy-format#keywords
+        .. _optional: https://github.com/google/capirca/wiki/Policy-format#optionally-supported-keywords
+    .. note::
+        The following fields are accepted:
+        - action
+        - address
+        - address_exclude
+        - comment
+        - counter
+        - expiration
+        - destination_address
+        - destination_address_exclude
+        - destination_port
+        - destination_prefix
+        - forwarding_class
+        - forwarding_class_except
+        - logging
+        - log_name
+        - loss_priority
+        - option
+        - policer
+        - port
+        - precedence
+        - principals
+        - protocol
+        - protocol_except
+        - qos
+        - pan_application
+        - routing_instance
+        - source_address
+        - source_address_exclude
+        - source_port
+        - source_prefix
+        - verbatim
+        - packet_length
+        - fragment_offset
+        - hop_limit
+        - icmp_type
+        - ether_type
+        - traffic_class_count
+        - traffic_type
+        - translated
+        - dscp_set
+        - dscp_match
+        - dscp_except
+        - next_ip
+        - flexible_match_range
+        - source_prefix_except
+        - destination_prefix_except
+        - vpn
+        - source_tag
+        - destination_tag
+        - source_interface
+        - destination_interface
+        - flattened
+        - flattened_addr
+        - flattened_saddr
+        - flattened_daddr
+        - priority
+    .. note::
+        The following fields can be also a single value and a list of values:
+        - action
+        - address
+        - address_exclude
+        - comment
+        - destination_address
+        - destination_address_exclude
+        - destination_port
+        - destination_prefix
+        - forwarding_class
+        - forwarding_class_except
+        - logging
+        - option
+        - port
+        - precedence
+        - principals
+        - protocol
+        - protocol_except
+        - pan_application
+        - source_address
+        - source_address_exclude
+        - source_port
+        - source_prefix
+        - verbatim
+        - icmp_type
+        - ether_type
+        - traffic_type
+        - dscp_match
+        - dscp_except
+        - flexible_match_range
+        - source_prefix_except
+        - destination_prefix_except
+        - source_tag
+        - destination_tag
+        - source_service
+        - destination_service
+        Example: ``destination_address`` can be either defined as:
+        .. code-block:: yaml
+            destination_address: 172.17.17.1/24
+        or as a list of destination IP addresses:
+        .. code-block:: yaml
+            destination_address:
+                - 172.17.17.1/24
+                - 172.17.19.1/24
+        or a list of services to be matched:
+        .. code-block:: yaml
+            source_service:
+                - ntp
+                - snmp
+                - ldap
+                - bgpd
+    .. note::
+        The port fields ``source_port`` and ``destination_port`` can be used as above to select either
+        a single value, either a list of values, but also they can select port ranges. Example:
+        .. code-block:: yaml
+            source_port:
+                - [1000, 2000]
+                - [3000, 4000]
+        With the configuration above, the user is able to select the 1000-2000 and 3000-4000 source port ranges.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' capirca.get_term_config arista filter-name term-name source_address=1.2.3.4 destination_address=5.6.7.8 action=accept
+    Output Example:
+    .. code-block:: text
+        ! $Date: 2017/03/22 $
+        no ip access-list filter-name
+        ip access-list filter-name
+         remark term-name
+         permit ip host 1.2.3.4 host 5.6.7.8
+        exit
+    """
+    terms = []
+    term = {term_name: {}}
+    term[term_name].</b></font>update(term_fields)
+    term[term_name].update(
+        {
+            "source_service": _make_it_list({}, "source_service", source_service),
+            "destination_service": _make_it_list(
+                {}, "destination_service", destination_service
+            ),
+        }
+    )
+    terms.append(term)
+    if not filter_options:
+        filter_options = []
+    return get_filter_config(
+        platform,
+        filter_name,
+        filter_options=filter_options,
+        terms=terms,
+        pillar_key=pillar_key,
+        pillarenv=pillarenv,
+        saltenv=saltenv,
+        merge_pillar=merge_pillar,
+        only_lower_merge=True,
+        revision_id=revision_id,
+        revision_no=revision_no,
+        revision_date=revision_date,
+        revision_date_format=revision_date_format,
+    )
+def get_filter_config(
+    platform,
+    filter_name,
+    filter_options=None,
+    terms=None,
+    prepend=True,
+    pillar_key="acl",
+    pillarenv=None,
+    saltenv=None,
+    merge_pillar=True,
+    only_lower_merge=False,
+    revision_id=None,
+    revision_no=None,
+    revision_date=True,
+    revision_date_format="%Y/%m/%d",
+):
+    """
+    Return the configuration of a policy filter.
+    platform
+        The name of the Capirca platform.
+    filter_name
+        The name of the policy filter.
+    filter_options
+        Additional filter options. These options are platform-specific.
+        See the complete list of options_.
+        .. _options: https://github.com/google/capirca/wiki/Policy-format#header-section
+    terms
+        List of terms for this policy filter.
+        If not specified or empty, will try to load the configuration from the pillar,
+        unless ``merge_pillar`` is set as ``False``.
+    prepend: ``True``
+        When ``merge_pillar`` is set as ``True``, the final list of terms generated by merging
+        the terms from ``terms`` with those defined in the pillar (if any): new terms are prepended
+        at the beginning, while existing ones will preserve the position. To add the new terms
+        at the end of the list, set this argument to ``False``.
+    pillar_key: ``acl``
+        The key in the pillar containing the default attributes values. Default: ``acl``.
+    pillarenv
+        Query the master to generate fresh pillar data on the fly,
+        specifically from the requested pillar environment.
+    saltenv
+        Included only for compatibility with
+        :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
+    merge_pillar: ``True``
+        Merge the CLI variables with the pillar. Default: ``True``.
+    only_lower_merge: ``False``
+        Specify if it should merge only the terms fields. Otherwise it will try
+        to merge also filters fields. Default: ``False``.
+    revision_id
+        Add a comment in the filter config having the description for the changes applied.
+    revision_no
+        The revision count.
+    revision_date: ``True``
+        Boolean flag: display the date when the filter configuration was generated. Default: ``True``.
+    revision_date_format: ``%Y/%m/%d``
+        The date format to be used when generating the perforce data. Default: ``%Y/%m/%d`` (&lt;year&gt;/&lt;month&gt;/&lt;day&gt;).
+    CLI Example:
+    .. code-block:: bash
+        salt '*' capirca.get_filter_config ciscoxr my-filter pillar_key=netacl
+    Output Example:
+    .. code-block:: text
+        ! $Id:$
+        ! $Date:$
+        ! $Revision:$
+        no ipv4 access-list my-filter
+        ipv4 access-list my-filter
+         remark $Id:$
+         remark my-term
+         deny ipv4 any eq 1234 any
+         deny ipv4 any eq 1235 any
+         remark my-other-term
+         permit tcp any range 5678 5680 any
+        exit
+    The filter configuration has been loaded from the pillar, having the following structure:
+    .. code-block:: yaml
+        netacl:
+          - my-filter:
+              terms:
+                - my-term:
+                    source_port: [1234, 1235]
+                    action: reject
+                - my-other-term:
+                    source_port:
+                      - [5678, 5680]
+                    protocol: tcp
+                    action: accept
+    """
+    if not filter_options:
+        filter_options = []
+    if not terms:
+        terms = []
+    if merge_pillar and not only_lower_merge:
+        acl_pillar_cfg = _get_pillar_cfg(
+            pillar_key, saltenv=saltenv, pillarenv=pillarenv
+        )
+        filter_pillar_cfg = _lookup_element(acl_pillar_cfg, filter_name)
+        filter_options = filter_options or filter_pillar_cfg.pop("options", None)
+        if filter_pillar_cfg:
+            pillar_terms = filter_pillar_cfg.get(
+                "terms", []
+            )  # No problem if empty in the pillar
+            terms = _merge_list_of_dict(terms, pillar_terms, prepend=prepend)
+    filters = []
+    filters.append(
+        {
+            filter_name: {
+                "options": _make_it_list({}, filter_name, filter_options),
+                "terms": terms,
+            }
+        }
+    )
+    return get_policy_config(
+        platform,
+        filters=filters,
+        pillar_key=pillar_key,
+        pillarenv=pillarenv,
+        saltenv=saltenv,
+        merge_pillar=merge_pillar,
+        only_lower_merge=True,
+        revision_id=revision_id,
+        revision_no=revision_no,
+        revision_date=revision_date,
+        revision_date_format=revision_date_format,
+    )
+def get_policy_config(
+    platform,
+    filters=None,
+    prepend=True,
+    pillar_key="acl",
+    pillarenv=None,
+    saltenv=None,
+    merge_pillar=True,
+    only_lower_merge=False,
+    revision_id=None,
+    revision_no=None,
+    revision_date=True,
+    revision_date_format="%Y/%m/%d",
+):
+    """
+    Return the configuration of the whole policy.
+    platform
+        The name of the Capirca platform.
+    filters
+        List of filters for this policy.
+        If not specified or empty, will try to load the configuration from the pillar,
+        unless ``merge_pillar`` is set as ``False``.
+    prepend: ``True``
+        When ``merge_pillar`` is set as ``True``, the final list of filters generated by merging
+        the filters from ``filters`` with those defined in the pillar (if any): new filters are prepended
+        at the beginning, while existing ones will preserve the position. To add the new filters
+        at the end of the list, set this argument to ``False``.
+    pillar_key: ``acl``
+        The key in the pillar containing the default attributes values. Default: ``acl``.
+    pillarenv
+        Query the master to generate fresh pillar data on the fly,
+        specifically from the requested pillar environment.
+    saltenv
+        Included only for compatibility with
+        :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
+    merge_pillar: ``True``
+        Merge the CLI variables with the pillar. Default: ``True``.
+    only_lower_merge: ``False``
+        Specify if it should merge only the filters and terms fields. Otherwise it will try
+        to merge everything at the policy level. Default: ``False``.
+    revision_id
+        Add a comment in the policy config having the description for the changes applied.
+    revision_no
+        The revision count.
+    revision_date: ``True``
+        Boolean flag: display the date when the policy configuration was generated. Default: ``True``.
+    revision_date_format: ``%Y/%m/%d``
+        The date format to be used when generating the perforce data. Default: ``%Y/%m/%d`` (&lt;year&gt;/&lt;month&gt;/&lt;day&gt;).
+    CLI Example:
+    .. code-block:: bash
+        salt '*' capirca.get_policy_config juniper pillar_key=netacl
+    Output Example:
+    .. code-block:: text
+        firewall {
+            family inet {
+                replace:
+                /*
+                ** $Id:$
+                ** $Date:$
+                ** $Revision:$
+                **
+                */
+                filter my-filter {
+                    term my-term {
+                        from {
+                            source-port [ 1234 1235 ];
+                        }
+                        then {
+                            reject;
+                        }
+                    }
+                    term my-other-term {
+                        from {
+                            protocol tcp;
+                            source-port 5678-5680;
+                        }
+                        then accept;
+                    }
+                }
+            }
+        }
+        firewall {
+            family inet {
+                replace:
+                /*
+                ** $Id:$
+                ** $Date:$
+                ** $Revision:$
+                **
+                */
+                filter my-other-filter {
+                    interface-specific;
+                    term dummy-term {
+                        from {
+                            protocol [ tcp udp ];
+                        }
+                        then {
+                            reject;
+                        }
+                    }
+                }
+            }
+        }
+    The policy configuration has been loaded from the pillar, having the following structure:
+    .. code-block:: yaml
+        netacl:
+          - my-filter:
+              options:
+                - not-interface-specific
+              terms:
+                - my-term:
+                    source_port: [1234, 1235]
+                    action: reject
+                - my-other-term:
+                    source_port:
+                      - [5678, 5680]
+                    protocol: tcp
+                    action: accept
+          - my-other-filter:
+              terms:
+                - dummy-term:
+                    protocol:
+                      - tcp
+                      - udp
+                    action: reject
+    """
+    if not filters:
+        filters = []
+    if merge_pillar and not only_lower_merge:
+        policy_pillar_cfg = _get_pillar_cfg(
+            pillar_key, saltenv=saltenv, pillarenv=pillarenv
+        )
+        filters = _merge_list_of_dict(filters, policy_pillar_cfg, prepend=prepend)
+    policy_object = _get_policy_object(
+        platform,
+        filters=filters,
+        pillar_key=pillar_key,
+        pillarenv=pillarenv,
+        saltenv=saltenv,
+        merge_pillar=merge_pillar,
+    )
+    policy_text = str(policy_object)
+    return _revision_tag(
+        policy_text,
+        revision_id=revision_id,
+        revision_no=revision_no,
+        revision_date=revision_date,
+        revision_date_format=revision_date_format,
+    )
+def get_filter_pillar(filter_name, pillar_key="acl", pillarenv=None, saltenv=None):
+    """
+    Helper that can be used inside a state SLS,
+    in order to get the filter configuration given its name.
+    filter_name
+        The name of the filter.
+    pillar_key
+        The root key of the whole policy config.
+    pillarenv
+        Query the master to generate fresh pillar data on the fly,
+        specifically from the requested pillar environment.
+    saltenv
+        Included only for compatibility with
+        :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
+    """
+    pillar_cfg = _get_pillar_cfg(pillar_key, pillarenv=pillarenv, saltenv=saltenv)
+    return _lookup_element(pillar_cfg, filter_name)
+def get_term_pillar(
+    filter_name, term_name, pillar_key="acl", pillarenv=None, saltenv=None
+):
+    """
+    Helper that can be used inside a state SLS,
+    in order to get the term configuration given its name,
+    under a certain filter uniquely identified by its name.
+    filter_name
+        The name of the filter.
+    term_name
+        The name of the term.
+    pillar_key: ``acl``
+        The root key of the whole policy config. Default: ``acl``.
+    pillarenv
+        Query the master to generate fresh pillar data on the fly,
+        specifically from the requested pillar environment.
+    saltenv
+        Included only for compatibility with
+        :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
+    """
+    filter_pillar_cfg = get_filter_pillar(
+        filter_name, pillar_key=pillar_key, pillarenv=pillarenv, saltenv=saltenv
+    )
+    term_pillar_cfg = filter_pillar_cfg.get("terms", [])
+    term_opts = _lookup_element(term_pillar_cfg, term_name)
+    return term_opts
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -606,1096 +1097,1135 @@ Matches for capirca_acl.py &amp; test_network_4.py
 </h3>
 <hr/>
 <pre>
-1 import logging
-2 import socket
-3 import textwrap
-4 import time
-5 import pytest
-6 import salt.exceptions
-7 import salt.utils.network as network
-8 from salt._compat import ipaddress
-9 from tests.support.mock import MagicMock, create_autospec, mock_open, patch
-10 from tests.support.unit import TestCase
-11 log = logging.getLogger(__name__)
-12 LINUX <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>= """\
-13 eth0      Link encap:Ethernet  HWaddr e0:3f:49:85:6a:af
-14           inet addr:10.10.10.56  Bcast:10.10.10.255  Mask:255.255.252.0
-15           inet6 addr: fe80::e23f:49ff:fe85:6aaf/64 Scope:Link
-16           UP BROADCAST RUNNING MULTICAST  MTU:1500  Metric:1
-17           RX packets:643363 errors:0 dropped:0 overruns:0 frame:0
-18           TX packets:196539 errors:0 dropped:0 overruns:0 carrier:0
-19           collisions:0 txqueuelen:1000
-20           RX bytes:386388355 (368.4 MiB)  TX bytes:25600939 (24.4 MiB)
-21 lo        Link encap:Local Loopback
-22           inet addr:127.0.0.1  Mask:255.0.0.0
-23           inet6 addr: ::1/128 Scope:Host
-24           UP LOOPBACK RUNNING  MTU:65536  Metric:1
-25           RX packets:548901 errors:0 dropped:0 overruns:0 frame:0
-26           TX packets:548901 errors:0 dropped:0 overruns:0 carrier:0
-27           collisions:0 txqueuelen:0
-28           RX bytes:613479895 (585.0 MiB)  TX bytes:613479895 (585.0 MiB)
-29 SOLARIS = """\
-30 lo0: flags=2001000849&lt;UP,LOOPBACK,RUNNING,MULTICAST,IPv4,VIRTUAL&gt; mtu 8232 index 1
-31         inet 127.0.0.1 netmask ff000000
-32 net0: flags=100001100943&lt;UP,BROADCAST,RUNNING,PROMISC,MULTICAST,ROUTER,IPv4,PHYSRUNNING&gt; mtu 1500 index 2
-33         inet 10.10.10.38 netmask ffffffe0 broadcast 10.10.10.63
-34 ilbint0: flags=110001100843&lt;UP,BROADCAST,RUNNING,MULTICAST,ROUTER,IPv4,VRRP,PHYSRUNNING&gt; mtu 1500 index 3
-35         inet 10.6.0.11 netmask ffffff00 broadcast 10.6.0.255
-36 ilbext0: flags=110001100843&lt;UP,BROADCAST,RUNNING,MULTICAST,ROUTER,IPv4,VRRP,PHYSRUNNING&gt; mtu 1500 index 4
-37         inet 10.10.11.11 netmask ffffffe0 broadcast 10.10.11.31
-38 ilbext0:1: flags=110001100843&lt;UP,BROADCAST,RUNNING,MULTICAST,ROUTER,IPv4,VRRP,PHYSRUNNING&gt; mtu 1500 index 4
-39         inet 10.10.11.12 netmask ffffffe0 broadcast 10.10.11.31
-40 vpn0: flags=1000011008d1&lt;UP,POINTOPOINT,RUNNING,NOARP,MULTICAST,ROUTER,IPv4,PHYSRUNNING&gt; mtu 1480 index 5
-41         inet tunnel src 10.10.11.12 tunnel dst 10.10.5.5
-42         tunnel hop limit 64
-43         inet 10.6.0.14 --&gt; 10.6.0.15 netmask ff000000
-44 lo0: flags=2002000849&lt;UP,LOOPBACK,RUNNING,MULTICAST,IPv6,VIRTUAL&gt; mtu 8252 index 1
-45         inet6 ::1/128
-46 net0: flags=120002004941&lt;UP,RUNNING,PROMISC,MULTICAST,DHCP,IPv6,PHYSRUNNING&gt; mtu 1500 index 2
-47         inet6 fe80::221:9bff:fefd:2a22/10
-48 ilbint0: flags=120002000840&lt;RUNNING,MULTICAST,IPv6,PHYSRUNNING&gt; mtu 1500 index 3
-49         inet6 ::/0
-50 ilbext0: flags=120002000840&lt;RUNNING,MULTICAST,IPv6,PHYSRUNNING&gt; mtu 1500 index 4
-51         inet6 ::/0
-52 vpn0: flags=120002200850&lt;POINTOPOINT,RUNNING,MULTICAST,NONUD,IPv6,PHYSRUNNING&gt; mtu 1480 index 5
-53         inet tunnel src 10.10.11.12 tunnel dst 10.10.5.5
-54         tunnel hop limit 64
-55         inet6 ::/0 --&gt; fe80::b2d6:7c10
-56 """
-57 NETBSD = """\
-58 vioif0: flags=0x8943&lt;UP,BROADCAST,RUNNING,PROMISC,SIMPLEX,MULTICAST&gt; mtu 1500
-59         ec_capabilities=1&lt;VLAN_MTU&gt;
-60         ec_enabled=0
-61         address: 00:a0:98:e6:83:18
-62         inet 192.168.1.80/24 broadcast 192.168.1.255 flags 0x0
-63         inet6 fe80::2a0:98ff:fee6:8318%vioif0/64 flags 0x0 scopeid 0x1
-64 lo0: flags=0x8049&lt;UP,LOOPBACK,RUNNING,MULTICAST&gt; mtu 33624
-65         inet 127.0.0.1/8 flags 0x0
-66         inet6 ::1/128 flags 0x20&lt;NODAD&gt;
-67         inet6 fe80::1%lo0/64 flags 0x0 scopeid 0x2
-68 FREEBSD_SOCKSTAT_WITH_FAT_PID = """\
-69 USER     COMMAND    PID   FD PROTO  LOCAL ADDRESS    FOREIGN ADDRESS
-70 salt-master python2.781106 35 tcp4  127.0.0.1:61115  127.0.0.1:4506
-71 LINUX_NETLINK_SS_OUTPUT = """\
-72 State       Recv-Q Send-Q                                                            Local Address:Port                                                                           Peer Address:Port
-73 TIME-WAIT   0      0                                                                         [::1]:8009                                                                                  [::1]:40368
-74 LISTEN      0      128                                                                   127.0.0.1:5903                                                                                0.0.0.0:*
-75 ESTAB       0      0                                                            [::ffff:127.0.0.1]:4506                                                                    [::ffff:127.0.0.1]:32315
-76 ESTAB       0      0                                                                 192.168.122.1:4506                                                                       192.168.122.177:24545
-77 """
-78     False: ("10.10.0.0"</b></font>, "10.10.0.0/33", "FOO", 9, "0.9.800.1000/24"),
-79 }
-80 IPV6_SUBNETS = {
-81     True: ("::1/128",),
-82     False: ("::1", "::1/129", "FOO", 9, "aj01::feac/64"),
-83 }
-84 class NetworkTestCase(TestCase):
-85     def test_sanitize_host_ip(self):
-86         ret = network.sanitize_host("10.1./2.$3")
-87         self.assertEqual(ret, "10.1.2.3")
-88     def test_sanitize_host_name(self):
-89         """
-90         Should not remove the underscore
-91         """
-92         ret = network.sanitize_host("foo_bar")
-93         self.assertEqual(ret, "foo_bar")
-94     def test_host_to_ips(self):
-95         """
-96         NOTE: When this test fails it's usually because the IP address has
-97         changed. In these cases, we just need to update the IP address in the
-98         assertion.
-99         """
-100         def _side_effect(host, *args):
-101             try:
-102                 return {
-103                     "github.com": [
-104                         (2, 1, 6, "", ("192.30.255.112", 0)),
-105                         (2, 1, 6, "", ("192.30.255.113", 0)),
-106                     ],
-107                     "ipv6host.foo": [
-108                         (socket.AF_INET6, 1, 6, "", ("2001:a71::1", 0, 0, 0)),
-109                     ],
-110                 }[host]
-111             except KeyError:
-112                 raise socket.gaierror(-2, "Name or service not known")
-113         getaddrinfo_mock = MagicMock(side_effect=_side_effect)
-114         with patch.object(socket, "getaddrinfo", getaddrinfo_mock):
-115             ret = network.host_to_ips("github.com")
-116             self.assertEqual(ret, ["192.30.255.112", "192.30.255.113"])
-117             ret = network.host_to_ips("ipv6host.foo")
-118             self.assertEqual(ret, ["2001:a71::1"])
-119             ret = network.host_to_ips("someothersite.com")
-120             self.assertEqual(ret, None)
-121     def test_generate_minion_id(self):
-122         self.assertTrue(network.generate_minion_id())
-123     def test__generate_minion_id_with_unicode_in_etc_hosts(self):
-124         """
-125         Test that unicode in /etc/hosts doesn't raise an error when
-126         _generate_minion_id() helper is called to gather the hosts.
-127         """
-128         content = textwrap.dedent(
-129             """\
-130         127.0.0.1       localhost thisismyhostname     # 本机
-131         """
-132         )
-133         fopen_mock = mock_open(read_data={"/etc/hosts": content})
-134         with patch("salt.utils.files.fopen", fopen_mock):
-135     def test_is_ip(self):
-136         self<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.assertTrue(network.is_ip("10.10.0.3"))
-137         self.assertFalse(network.is_ip("0.9.800.1000"))
-138     def test_is_ipv4(self):
-139         self<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.assertTrue(network.is_ipv4("10.10.0.3"))
-140         self.assertFalse(network.is_ipv4("10.100.1"))
-141         self.assertFalse(network.is_ipv4("2001:db8:0:1:1:1:1:1"))
-142         self.</b></font>assertFalse(network.is_ipv4("sixteen-char-str"))
-143     def test_is_ipv6(self):
-144         self.assertTrue(network.is_ipv6("2001:db8:0:1:1:1:1:1"))
-145         self.assertTrue(network.is_ipv6("0:0:0:0:0:0:0:1"))
-146         self.assertTrue(network.is_ipv6("::1"))
-147         self.assertTrue(network.is_ipv6("::"))
-148         self.assertTrue(network.is_ipv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334"))
-149         self.assertTrue(network.is_ipv6("2001:0db8:85a3::8a2e:0370:7334"))
-150         self.assertFalse(network.is_ipv6("2001:0db8:0370:7334"))
-151         self.assertFalse(network.is_ipv6("2001:0db8:::0370:7334"))
-152         self.assertFalse(network.is_ipv6("10.0.1.2"))
-153         self.assertFalse(network.is_ipv6("2001.0db8.85a3.0000.0000.8a2e.0370.7334"))
-154         self.assertFalse(network.is_ipv6("sixteen-char-str"))
-155     def test_ipv6(self):
-156         self.assertTrue(network.ipv6("2001:db8:0:1:1:1:1:1"))
-157         self.assertTrue(network.ipv6("0:0:0:0:0:0:0:1"))
-158         self.assertTrue(network.ipv6("::1"))
-159         self.assertTrue(network.ipv6("::"))
-160         self.assertTrue(network.ipv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334"))
-161         self.assertTrue(network.ipv6("2001:0db8:85a3::8a2e:0370:7334"))
-162         self.assertTrue(network.ipv6("2001:67c:2e8::/48"))
-163     def test_parse_host_port(self):
-164         _ip = ipaddress.ip_address
-165         good_host_ports = {
-166             "10.10.0.3": (_ip("10.10.0.3").compressed, None),
-167             "10.10.0.3:1234": (_ip("10.10.0.3").compressed, 1234),
-168             "2001:0db8:85a3::8a2e:0370:7334": (
-169                 _ip("2001:0db8:85a3::8a2e:0370:7334").compressed,
-170                 None,
-171             ),
-172             "[2001:0db8:85a3::8a2e:0370:7334]:1234": (
-173                 _ip("2001:0db8:85a3::8a2e:0370:7334").compressed,
-174                 1234,
-175             ),
-176             "2001:0db8:85a3::7334": (_ip("2001:0db8:85a3::7334").compressed, None),
-177             "[2001:0db8:85a3::7334]:1234": (
-178                 _ip("2001:0db8:85a3::7334").compressed,
-179                 1234,
-180             ),
-181         }
-182         bad_host_ports = [
-183             "10.10.0.3/24",
-184             "10.10.0.3::1234",
-185             "2001:0db8:0370:7334",
-186             "2001:0db8:0370::7334]:1234",
-187             "2001:0db8:0370:0:a:b:c:d:1234",
-188             "host name",
-189             "host name:1234",
-190             "10.10.0.3:abcd",
-191         ]
-192         for host_port, assertion_value in good_host_ports.items():
-193             host = port = None
-194             host, port = network.parse_host_port(host_port)
-195             self.assertEqual((host, port), assertion_value)
-196         for host_port in bad_host_ports:
-197             try:
-198                 self.assertRaises(ValueError, network.parse_host_port, host_port)
-199             except AssertionError as _e_:
-200                 log.error(
-201                     'bad host_port value: "%s" failed to trigger ValueError exception',
-202                     host_port,
-203                 )
-204                 raise _e_
-205     def test_dns_check(self):
-206         hosts = [
-207             {
-208                 "host": "10.10.0.3",
-209                 "port": "",
-210                 "mocked": [(2, 1, 6, "", ("10.10.0.3", 0))],
-211                 "ret": "10.10.0.3",
-212             },
-213             {
-214                 "host": "10.10.0.3",
-215                 "port": "1234",
-216                 "mocked": [(2, 1, 6, "", ("10.10.0.3", 0))],
-217                 "ret": "10.10.0.3",
-218             },
-219             {
-220                 "host": "2001:0db8:85a3::8a2e:0370:7334",
-221                 "port": "",
-222                 "mocked": [(10, 1, 6, "", ("2001:db8:85a3::8a2e:370:7334", 0, 0, 0))],
-223                 "ret": "[2001:db8:85a3::8a2e:370:7334]",
-224             },
-225             {
-226                 "host": "2001:0db8:85a3::8a2e:370:7334",
-227                 "port": "1234",
-228                 "mocked": [(10, 1, 6, "", ("2001:db8:85a3::8a2e:370:7334", 0, 0, 0))],
-229                 "ret": "[2001:db8:85a3::8a2e:370:7334]",
-230             },
-231             {
-232                 "host": "salt-master",
-233                 "port": "1234",
-234                 "mocked": [(2, 1, 6, "", ("127.0.0.1", 0))],
-235                 "ret": "127.0.0.1",
-236             },
-237         ]
-238         for host in hosts:
-239             with patch.object(
-240                 socket,
-241                 "getaddrinfo",
-242                 create_autospec(socket.getaddrinfo, return_value=host["mocked"]),
-243             ):
-244                 with patch("socket.socket", create_autospec(socket.socket)):
-245                     ret = network.dns_check(host["host"], host["port"])
-246                     self.assertEqual(ret, host["ret"])
-247     def test_dns_check_ipv6_filter(self):
-248         with patch.object(
-249             socket,
-250             "getaddrinfo",
-251             create_autospec(socket.getaddrinfo, side_effect=Exception),
-252         ) as getaddrinfo:
-253             for ipv6, param in [
-254                 (None, socket.AF_UNSPEC),
-255                 (True, socket.AF_INET6),
-256                 (False, socket.AF_INET),
-257             ]:
-258                 with self.assertRaises(Exception):
-259                     network.dns_check("foo", "1", ipv6=ipv6)
-260                 getaddrinfo.assert_called_with("foo", "1", param, socket.SOCK_STREAM)
-261     def test_dns_check_errors(self):
-262         with patch.object(
-263             socket, "getaddrinfo", create_autospec(socket.getaddrinfo, return_value=[])
-264         ):
-265             with self.assertRaisesRegex(
-266                 salt.exceptions.SaltSystemExit,
-267                 "DNS lookup or connection check of 'foo' failed",
-268             ):
-269                 network.dns_check("foo", "1")
-270         with patch.object(
-271             socket,
-272             "getaddrinfo",
-273             create_autospec(socket.getaddrinfo, side_effect=TypeError),
-274         ):
-275             with self.assertRaisesRegex(
-276                 salt.exceptions.SaltSystemExit, "Invalid or unresolveable address"
-277             ):
-278                 network.dns_check("foo", "1")
-279     def test_test_addrs(self):
-280         addrinfo = [
-281             (30, 2, 17, "", ("2600:9000:21eb:a800:8:1031:abc0:93a1", 0, 0, 0)),
-282             (30, 1, 6, "", ("2600:9000:21eb:a800:8:1031:abc0:93a1", 0, 0, 0)),
-283             (30, 2, 17, "", ("2600:9000:21eb:b400:8:1031:abc0:93a1", 0, 0, 0)),
-284             (30, 1, 6, "", ("2600:9000:21eb:b400:8:1031:abc0:93a1", 0, 0, 0)),
-285             (2, 1, 6, "", ("13.35.99.52", 0)),
-286             (2, 2, 17, "", ("13.35.99.85", 0)),
-287             (2, 1, 6, "", ("13.35.99.85", 0)),
-288             (2, 2, 17, "", ("13.35.99.122", 0)),
-289         ]
-290         with patch("socket.socket", create_autospec(socket.socket)) as s:
-291             addrs = network._test_addrs(addrinfo, 80)
-292             self.assertTrue(len(addrs) == 1)
-293             self.assertTrue(addrs[0] == addrinfo[0][4][0])
-294             s.side_effect = [socket.error, MagicMock()]
-295             addrs = network._test_addrs(addrinfo, 80)
-296             self.assertTrue(len(addrs) == 1)
-297             self.assertTrue(addrs[0] == addrinfo[2][4][0])
-298             s.side_effect = socket.error
-299             addrs = network._test_addrs(addrinfo, 80)
-300             time.sleep(2)
-301             self.assertFalse(len(addrs) == 0)
-302             s.side_effect = socket.error
-303             addrs = network._test_addrs(addrinfo, 80)
-304             self.assertTrue(len(addrs) == 5)
-305     def test_is_subnet(self):
-306         for subnet_data in (IPV4_SUBNETS, IPV6_SUBNETS):
-307             for item in subnet_data[True]:
-308                 log.debug("Testing that %s is a valid subnet", item)
-309                 self.assertTrue(network.is_subnet(item))
-310             for item in subnet_data[False]:
-311                 log.debug("Testing that %s is not a valid subnet", item)
-312                 self.assertFalse(network.is_subnet(item))
-313     def test_is_ipv4_subnet(self):
-314         for item in IPV4_SUBNETS[True]:
-315             log.debug("Testing that %s is a valid subnet", item)
-316             self.assertTrue(network.is_ipv4_subnet(item))
-317         for item in IPV4_SUBNETS[False]:
-318             log.debug("Testing that %s is not a valid subnet", item)
-319             self.assertFalse(network.is_ipv4_subnet(item))
-320     def test_is_ipv6_subnet(self):
-321         for item in IPV6_SUBNETS[True]:
-322             log.debug("Testing that %s is a valid subnet", item)
-323             self.assertTrue(network.is_ipv6_subnet(item))
-324         for item in IPV6_SUBNETS[False]:
-325             log.debug("Testing that %s is not a valid subnet", item)
-326             self.assertFalse(network.is_ipv6_subnet(item))
-327     def test_cidr_to_ipv4_netmask(self):
-328         self.assertEqual(network.cidr_to_ipv4_netmask(24), "255.255.255.0")
-329         self.assertEqual(network.cidr_to_ipv4_netmask(21), "255.255.248.0")
-330         self.assertEqual(network.cidr_to_ipv4_netmask(17), "255.255.128.0")
-331         self.assertEqual(network.cidr_to_ipv4_netmask(9), "255.128.0.0")
-332         self.assertEqual(network.cidr_to_ipv4_netmask(36), "")
-333         self.assertEqual(network.cidr_to_ipv4_netmask("lol"), "")
-334     def test_number_of_set_bits_to_ipv4_netmask(self):
-335         set_bits_to_netmask = network._number_of_set_bits_to_ipv4_netmask(0xFFFFFF00)
-336         self.assertEqual(set_bits_to_netmask, "255.255.255.0")
-337         set_bits_to_netmask = network._number_of_set_bits_to_ipv4_netmask(0xFFFF6400)
-338     def test_hex2ip(self):
-339         self.assertEqual(network.hex2ip("0x4A7D2B63"), "74.125.43.99")
-340         self.assertEqual(network.hex2ip("0x4A7D2B63", invert=True), "99.43.125.74")
-341         self.assertEqual(
-342             network.hex2ip("00000000000000000000FFFF7F000001"), "127.0.0.1"
-343         )
-344         self.assertEqual(
-345             network.hex2ip("0000000000000000FFFF00000100007F", invert=True), "127.0.0.1"
-346         )
-347         self.assertEqual(
-348             network.hex2ip("20010DB8000000000000000000000000"), "2001:db8::"
-349         )
-350         self.assertEqual(
-351             network.hex2ip("B80D0120000000000000000000000000", invert=True),
-352             "2001:db8::",
-353         )
-354     def test_interfaces_ifconfig_linux(self):
-355         interfaces = network._interfaces_ifconfig(LINUX)
-356         self.assertEqual(
-357             interfaces,
-358             {
-359                 "eth0": {
-360                     "hwaddr": "e0:3f:49:85:6a:af",
-361                     "inet": [
-362                         {
-363                             "address": "10.10.10.56",
-364                             "broadcast": "10.10.10.255",
-365                             "netmask": "255.255.252.0",
-366                         }
-367                     ],
-368                     "inet6": [
-369                         {
-370                             "address": "fe80::e23f:49ff:fe85:6aaf",
-371                             "prefixlen": "64",
-372                             "scope": "link",
-373                         }
-374                     ],
-375                     "up": True,
-376                 },
-377                 "lo": {
-378                     "inet": [{"address": "127.0.0.1", "netmask": "255.0.0.0"}],
-379                     "inet6": [{"address": "::1", "prefixlen": "128", "scope": "host"}],
-380                     "up": True,
-381                 },
-382             },
-383         )
-384     def test_interfaces_ifconfig_freebsd(self):
-385         interfaces = network._interfaces_ifconfig(FREEBSD)
-386         self.assertEqual(
-387             interfaces,
-388             {
-389                 "": {"up": False},
-390                 "em0": {
-391                     "hwaddr": "00:30:48:ff:ff:ff",
-392                     "inet": [
-393                         {
-394                             "address": "10.10.10.250",
-395                             "broadcast": "10.10.10.255",
-396                             "netmask": "255.255.255.224",
-397                         },
-398                         {
-399                             "address": "10.10.10.56",
-400                             "broadcast": "10.10.10.63",
-401                             "netmask": "255.255.255.192",
-402                         },
-403                     ],
-404                     "up": True,
-405                 },
-406                 "em1": {"hwaddr": "00:30:48:aa:aa:aa", "up": False},
-407                 "lo0": {
-408                     "inet": [{"address": "127.0.0.1", "netmask": "255.0.0.0"}],
-409                     "inet6": [
-410                         {"address": "fe80::1", "prefixlen": "64", "scope": "0x8"},
-411                         {"address": "::1", "prefixlen": "128", "scope": None},
-412                     ],
-413                     "up": True,
-414                 },
-415                 "plip0": {"up": False},
-416                 "tun0": {
-417                     "inet": [{"address": "10.12.0.1", "netmask": "255.255.255.255"}],
-418                     "up": True,
-419                 },
-420             },
-421         )
-422     def test_interfaces_ifconfig_solaris(self):
-423         with patch("salt.utils.platform.is_sunos", lambda: True):
-424             interfaces = network._interfaces_ifconfig(SOLARIS)
-425             expected_interfaces = {
-426                 "ilbint0": {
-427                     "inet6": [],
-428                     "inet": [
-429                         {
-430                             "broadcast": "10.6.0.255",
-431                             "netmask": "255.255.255.0",
-432                             "address": "10.6.0.11",
-433                         }
-434                     ],
-435                     "up": True,
-436                 },
-437                 "lo0": {
-438                     "inet6": [{"prefixlen": "128", "address": "::1"}],
-439                     "inet": [{"netmask": "255.0.0.0", "address": "127.0.0.1"}],
-440                     "up": True,
-441                 },
-442                 "ilbext0": {
-443                     "inet6": [],
-444                     "inet": [
-445                         {
-446                             "broadcast": "10.10.11.31",
-447                             "netmask": "255.255.255.224",
-448                             "address": "10.10.11.11",
-449                         },
-450                         {
-451                             "broadcast": "10.10.11.31",
-452                             "netmask": "255.255.255.224",
-453                             "address": "10.10.11.12",
-454                         },
-455                     ],
-456                     "up": True,
-457                 },
-458                 "vpn0": {
-459                     "inet6": [],
-460                     "inet": [{"netmask": "255.0.0.0", "address": "10.6.0.14"}],
-461                     "up": True,
-462                 },
-463                 "net0": {
-464                     "inet6": [
-465                         {"prefixlen": "10", "address": "fe80::221:9bff:fefd:2a22"}
-466                     ],
-467                     "inet": [
-468                         {
-469                             "broadcast": "10.10.10.63",
-470                             "netmask": "255.255.255.224",
-471                             "address": "10.10.10.38",
-472                         }
-473                     ],
-474                     "up": True,
-475                 },
-476             }
-477             self.assertEqual(interfaces, expected_interfaces)
-478     def test_interfaces_ifconfig_netbsd(self):
-479         interfaces = network._netbsd_interfaces_ifconfig(NETBSD)
-480         self.assertEqual(
-481             interfaces,
-482             {
-483                 "lo0": {
-484                     "inet": [{"address": "127.0.0.1", "netmask": "255.0.0.0"}],
-485                     "inet6": [
-486                         {"address": "fe80::1", "prefixlen": "64", "scope": "lo0"}
-487                     ],
-488                     "up": True,
-489                 },
-490                 "vioif0": {
-491                     "hwaddr": "00:a0:98:e6:83:18",
-492                     "inet": [
-493                         {
-494                             "address": "192.168.1.80",
-495                             "broadcast": "192.168.1.255",
-496                             "netmask": "255.255.255.0",
-497                         }
-498                     ],
-499                     "inet6": [
-500                         {
-501                             "address": "fe80::2a0:98ff:fee6:8318",
-502                             "prefixlen": "64",
-503                             "scope": "vioif0",
-504                         }
-505                     ],
-506                     "up": True,
-507                 },
-508             },
-509         )
-510     def test_freebsd_remotes_on(self):
-511         with patch("salt.utils.platform.is_sunos", lambda: False):
-512             with patch("salt.utils.platform.is_freebsd", lambda: True):
-513                 with patch("subprocess.check_output", return_value=FREEBSD_SOCKSTAT):
-514                     remotes = network._freebsd_remotes_on("4506", "remote")
-515                     self.assertEqual(remotes, {"127.0.0.1"})
-516     def test_freebsd_remotes_on_with_fat_pid(self):
-517         with patch("salt.utils.platform.is_sunos", lambda: False):
-518             with patch("salt.utils.platform.is_freebsd", lambda: True):
-519                 with patch(
-520                     "subprocess.check_output",
-521                     return_value=FREEBSD_SOCKSTAT_WITH_FAT_PID,
-522                 ):
-523                     remotes = network._freebsd_remotes_on("4506", "remote")
-524                     self.assertEqual(remotes, {"127.0.0.1"})
-525     def test_netlink_tool_remote_on_a(self):
-526         with patch("salt.utils.platform.is_sunos", lambda: False):
-527             with patch("salt.utils.platform.is_linux", lambda: True):
-528                 with patch(
-529                     "subprocess.check_output", return_value=LINUX_NETLINK_SS_OUTPUT
-530                 ):
-531                     remotes = network._netlink_tool_remote_on("4506", "local")
-532                     self.assertEqual(remotes, {"192.168.122.177", "::ffff:127.0.0.1"})
-533     def test_netlink_tool_remote_on_b(self):
-534         with patch("subprocess.check_output", return_value=NETLINK_SS):
-535             remotes = network._netlink_tool_remote_on("4505", "remote_port")
-536             self.assertEqual(remotes, {"127.0.0.1", "::ffff:1.2.3.4"})
-537     def test_generate_minion_id_distinct(self):
-538         """
-539         Test if minion IDs are distinct in the pool.
-540         :return:
-541         """
-542         with patch("platform.node", MagicMock(return_value="nodename")), patch(
-543             "socket.gethostname", MagicMock(return_value="hostname")
-544         ), patch(
-545             "socket.getfqdn", MagicMock(return_value="hostname.domainname.blank")
-546         ), patch(
-547             "socket.getaddrinfo",
-548             MagicMock(return_value=[(2, 3, 0, "attrname", ("127.0.1.1", 0))]),
-549         ), patch(
-550             "salt.utils.files.fopen", mock_open()
-551         ), patch(
-552             "salt.utils.network.ip_addrs",
-553             MagicMock(return_value=["1.2.3.4", "5.6.7.8"]),
-554         ):
-555             self.assertEqual(
-556                 network._generate_minion_id(),
-557                 [
-558                     "hostname.domainname.blank",
-559                     "nodename",
-560                     "hostname",
-561                     "1.2.3.4",
-562                     "5.6.7.8",
-563                 ],
-564             )
-565     def test_generate_minion_id_127_name(self):
-566         """
-567         Test if minion IDs can be named 127.foo
-568         :return:
-569         """
-570         with patch("platform.node", MagicMock(return_value="127")), patch(
-571             "socket.gethostname", MagicMock(return_value="127")
-572         ), patch(
-573             "socket.getfqdn", MagicMock(return_value="127.domainname.blank")
-574         ), patch(
-575             "socket.getaddrinfo",
-576             MagicMock(return_value=[(2, 3, 0, "attrname", ("127.0.1.1", 0))]),
-577         ), patch(
-578             "salt.utils.files.fopen", mock_open()
-579         ), patch(
-580             "salt.utils.network.ip_addrs",
-581             MagicMock(return_value=["1.2.3.4", "5.6.7.8"]),
-582         ):
-583             self.assertEqual(
-584                 network._generate_minion_id(),
-585                 ["127.domainname.blank", "127", "1.2.3.4", "5.6.7.8"],
-586             )
-587     def test_generate_minion_id_127_name_startswith(self):
-588         """
-589         Test if minion IDs can be named starting from "127"
-590         :return:
-591         """
-592         with patch("platform.node", MagicMock(return_value="127890")), patch(
-593             "socket.gethostname", MagicMock(return_value="127890")
-594         ), patch(
-595             "socket.getfqdn", MagicMock(return_value="127890.domainname.blank")
-596         ), patch(
-597             "socket.getaddrinfo",
-598             MagicMock(return_value=[(2, 3, 0, "attrname", ("127.0.1.1", 0))]),
-599         ), patch(
-600             "salt.utils.files.fopen", mock_open()
-601         ), patch(
-602             "salt.utils.network.ip_addrs",
-603             MagicMock(return_value=["1.2.3.4", "5.6.7.8"]),
-604         ):
-605             self.assertEqual(
-606                 network._generate_minion_id(),
-607                 ["127890.domainname.blank", "127890", "1.2.3.4", "5.6.7.8"],
-608             )
-609     def test_generate_minion_id_duplicate(self):
-610         """
-611         Test if IP addresses in the minion IDs are distinct in the pool
-612         :return:
-613         """
-614         with patch("platform.node", MagicMock(return_value="hostname")), patch(
-615             "socket.gethostname", MagicMock(return_value="hostname")
-616         ), patch("socket.getfqdn", MagicMock(return_value="hostname")), patch(
-617             "socket.getaddrinfo",
-618             MagicMock(return_value=[(2, 3, 0, "hostname", ("127.0.1.1", 0))]),
-619         ), patch(
-620             "salt.utils.files.fopen", mock_open()
-621         ), patch(
-622             "salt.utils.network.ip_addrs",
-623             MagicMock(return_value=["1.2.3.4", "1.2.3.4", "1.2.3.4"]),
-624         ):
-625             self.assertEqual(network._generate_minion_id(), ["hostname", "1.2.3.4"])
-626     def test_generate_minion_id_platform_used(self):
-627         """
-628         Test if platform.node is used for the first occurrence.
-629         The platform.node is most common hostname resolver before anything else.
-630         :return:
-631         """
-632         with patch(
-633             "platform.node", MagicMock(return_value="very.long.and.complex.domain.name")
-634         ), patch("socket.gethostname", MagicMock(return_value="hostname")), patch(
-635             "socket.getfqdn", MagicMock(return_value="")
-636         ), patch(
-637             "socket.getaddrinfo",
-638             MagicMock(return_value=[(2, 3, 0, "hostname", ("127.0.1.1", 0))]),
-639         ), patch(
-640             "salt.utils.files.fopen", mock_open()
-641         ), patch(
-642             "salt.utils.network.ip_addrs",
-643             MagicMock(return_value=["1.2.3.4", "1.2.3.4", "1.2.3.4"]),
-644         ):
-645             self.assertEqual(
-646                 network.generate_minion_id(), "very.long.and.complex.domain.name"
-647             )
-648     def test_generate_minion_id_platform_localhost_filtered(self):
-649         """
-650         Test if localhost is filtered from the first occurrence.
-651         :return:
-652         """
-653         with patch("platform.node", MagicMock(return_value="localhost")), patch(
-654             "socket.gethostname", MagicMock(return_value="pick.me")
-655         ), patch(
-656             "socket.getfqdn", MagicMock(return_value="hostname.domainname.blank")
-657         ), patch(
-658             "socket.getaddrinfo",
-659             MagicMock(return_value=[(2, 3, 0, "hostname", ("127.0.1.1", 0))]),
-660         ), patch(
-661             "salt.utils.files.fopen", mock_open()
-662         ), patch(
-663             "salt.utils.network.ip_addrs",
-664             MagicMock(return_value=["1.2.3.4", "1.2.3.4", "1.2.3.4"]),
-665         ):
-666             self.assertEqual(network.generate_minion_id(), "hostname.domainname.blank")
-667     def test_generate_minion_id_platform_localhost_filtered_all(self):
-668         """
-669         Test if any of the localhost is filtered from everywhere.
-670         :return:
-671         """
-672         with patch("platform.node", MagicMock(return_value="localhost")), patch(
-673             "socket.gethostname", MagicMock(return_value="ip6-loopback")
-674         ), patch("socket.getfqdn", MagicMock(return_value="ip6-localhost")), patch(
-675             "socket.getaddrinfo",
-676             MagicMock(return_value=[(2, 3, 0, "localhost", ("127.0.1.1", 0))]),
-677         ), patch(
-678             "salt.utils.files.fopen", mock_open()
-679         ), patch(
-680             "salt.utils.network.ip_addrs",
-681             MagicMock(
-682                 return_value=["127.0.0.1", "::1", "fe00::0", "fe02::1", "1.2.3.4"]
-683             ),
-684         ):
-685             self.assertEqual(network.generate_minion_id(), "1.2.3.4")
-686     def test_generate_minion_id_platform_localhost_only(self):
-687         """
-688         Test if there is no other choice but localhost.
-689         :return:
-690         """
-691         with patch("platform.node", MagicMock(return_value="localhost")), patch(
-692             "socket.gethostname", MagicMock(return_value="ip6-loopback")
-693         ), patch("socket.getfqdn", MagicMock(return_value="ip6-localhost")), patch(
-694             "socket.getaddrinfo",
-695             MagicMock(return_value=[(2, 3, 0, "localhost", ("127.0.1.1", 0))]),
-696         ), patch(
-697             "salt.utils.files.fopen", mock_open()
-698         ), patch(
-699             "salt.utils.network.ip_addrs",
-700             MagicMock(return_value=["127.0.0.1", "::1", "fe00::0", "fe02::1"]),
-701         ):
-702             self.assertEqual(network.generate_minion_id(), "localhost")
-703     def test_generate_minion_id_platform_fqdn(self):
-704         """
-705         Test if fqdn is picked up.
-706         :return:
-707         """
-708         with patch("platform.node", MagicMock(return_value="localhost")), patch(
-709             "socket.gethostname", MagicMock(return_value="ip6-loopback")
-710         ), patch("socket.getfqdn", MagicMock(return_value="pick.me")), patch(
-711             "socket.getaddrinfo",
-712             MagicMock(return_value=[(2, 3, 0, "localhost", ("127.0.1.1", 0))]),
-713         ), patch(
-714             "salt.utils.files.fopen", mock_open()
-715         ), patch(
-716             "salt.utils.network.ip_addrs",
-717             MagicMock(return_value=["127.0.0.1", "::1", "fe00::0", "fe02::1"]),
-718         ):
-719             self.assertEqual(network.generate_minion_id(), "pick.me")
-720     def test_generate_minion_id_platform_localhost_addrinfo(self):
-721         """
-722         Test if addinfo is picked up.
-723         :return:
-724         """
-725         with patch("platform.node", MagicMock(return_value="localhost")), patch(
-726             "socket.gethostname", MagicMock(return_value="ip6-loopback")
-727         ), patch("socket.getfqdn", MagicMock(return_value="ip6-localhost")), patch(
-728             "socket.getaddrinfo",
-729             MagicMock(return_value=[(2, 3, 0, "pick.me", ("127.0.1.1", 0))]),
-730         ), patch(
-731             "salt.utils.files.fopen", mock_open()
-732         ), patch(
-733             "salt.utils.network.ip_addrs",
-734             MagicMock(return_value=["127.0.0.1", "::1", "fe00::0", "fe02::1"]),
-735         ):
-736             self.assertEqual(network.generate_minion_id(), "pick.me")
-737     def test_generate_minion_id_platform_ip_addr_only(self):
-738         """
-739         Test if IP address is the only what is used as a Minion ID in case no DNS name.
-740         :return:
-741         """
-742         with patch("platform.node", MagicMock(return_value="localhost")), patch(
-743             "socket.gethostname", MagicMock(return_value="ip6-loopback")
-744         ), patch("socket.getfqdn", MagicMock(return_value="ip6-localhost")), patch(
-745             "socket.getaddrinfo",
-746             MagicMock(return_value=[(2, 3, 0, "localhost", ("127.0.1.1", 0))]),
-747         ), patch(
-748             "salt.utils.files.fopen", mock_open()
-749         ), patch(
-750             "salt.utils.network.ip_addrs",
-751             MagicMock(
-752                 return_value=["127.0.0.1", "::1", "fe00::0", "fe02::1", "1.2.3.4"]
-753             ),
-754         ):
-755             self.assertEqual(network.generate_minion_id(), "1.2.3.4")
-756     def test_gen_mac(self):
-757         with patch("random.randint", return_value=1) as random_mock:
-758             self.assertEqual(random_mock.return_value, 1)
-759             ret = network.gen_mac("00:16:3E")
-760             expected_mac = "00:16:3E:01:01:01"
-761             self.assertEqual(ret, expected_mac)
-762     def test_mac_str_to_bytes(self):
-763         self.assertRaises(ValueError, network.mac_str_to_bytes, "31337")
-764         self.assertRaises(ValueError, network.mac_str_to_bytes, "0001020304056")
-765         self.assertRaises(ValueError, network.mac_str_to_bytes, "00:01:02:03:04:056")
-766         self.assertRaises(ValueError, network.mac_str_to_bytes, "a0:b0:c0:d0:e0:fg")
-767         self.assertEqual(
-768             b"\x10\x08\x06\x04\x02\x00", network.mac_str_to_bytes("100806040200")
-769         )
-770         self.assertEqual(
-771             b"\xf8\xe7\xd6\xc5\xb4\xa3", network.mac_str_to_bytes("f8e7d6c5b4a3")
-772         )
-773     @pytest.mark.slow_test
-774     def test_generate_minion_id_with_long_hostname(self):
-775         """
-776         Validate the fix for:
-777         https://github.com/saltstack/salt/issues/51160
-778         """
-779         long_name = "localhost-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz"
-780         with patch("socket.gethostname", MagicMock(return_value=long_name)):
-781             minion_id = network.generate_minion_id()
-782         assert minion_id != "", minion_id
-783     def test_filter_by_networks_with_no_filter(self):
-784         ips = ["10.0.123.200", "10.10.10.10"]
-785         with pytest.raises(TypeError):
-786             network.filter_by_networks(ips)  # pylint: disable=no-value-for-parameter
-787     def test_filter_by_networks_empty_filter(self):
-788         ips = ["10.0.123.200", "10.10.10.10"]
-789         assert network.filter_by_networks(ips, []) == []
-790     def test_filter_by_networks_ips_list(self):
-791         ips = [
-792             "10.0.123.200",
-793             "10.10.10.10",
-794             "193.124.233.5",
-795             "fe80::d210:cf3f:64e7:5423",
-796         ]
-797         networks = ["10.0.0.0/8", "fe80::/64"]
-798         assert network.filter_by_networks(ips, networks) == [
-799             "10.0.123.200",
-800             "10.10.10.10",
-801             "fe80::d210:cf3f:64e7:5423",
-802         ]
-803     def test_filter_by_networks_interfaces_dict(self):
-804         interfaces = {
-805             "wlan0": ["192.168.1.100", "217.5.140.67", "2001:db8::ff00:42:8329"],
-806             "eth0": [
-807                 "2001:0DB8:0:CD30:123:4567:89AB:CDEF",
-808                 "192.168.1.101",
-809                 "10.0.123.201",
-810             ],
-811         }
-812         assert network.filter_by_networks(
-813             interfaces, ["192.168.1.0/24", "2001:db8::/48"]
-814         ) == {
-815             "wlan0": ["192.168.1.100", "2001:db8::ff00:42:8329"],
-816             "eth0": ["2001:0DB8:0:CD30:123:4567:89AB:CDEF", "192.168.1.101"],
-817         }
-818     def test_filter_by_networks_catch_all(self):
-819         ips = [
-820             "10.0.123.200",
-821             "10.10.10.10",
-822             "193.124.233.5",
-823             "fe80::d210:cf3f:64e7:5423",
-824         ]
-825         assert ips == network.filter_by_networks(ips, ["0.0.0.0/0", "::/0"])
-826     def test_ip_networks(self):
-827         interface_data = network._interfaces_ifconfig(LINUX)
-828         ret = network.ip_networks(interface_data=interface_data)
-829         assert ret == ["10.10.8.0/22"], ret
-830         ret = network.ip_networks(interface="eth0", interface_data=interface_data)
-831         assert ret == ["10.10.8.0/22"], ret
-832         ret = network.ip_networks(interface="eth0,lo", interface_data=interface_data)
-833         assert ret == ["10.10.8.0/22"], ret
-834         ret = network.ip_networks(interface="eth1", interface_data=interface_data)
-835         assert ret == [], ret
-836         ret = network.ip_networks(include_loopback=True, interface_data=interface_data)
-837         assert ret == ["10.10.8.0/22", "127.0.0.0/8"], ret
-838         ret = network.ip_networks(
-839             interface="eth0", include_loopback=True, interface_data=interface_data
-840         )
-841         assert ret == ["10.10.8.0/22"], ret
-842         ret = network.ip_networks(
-843             interface="eth0,lo", include_loopback=True, interface_data=interface_data
-844         )
-845         assert ret == ["10.10.8.0/22", "127.0.0.0/8"], ret
-846         ret = network.ip_networks(
-847             interface="eth1", include_loopback=True, interface_data=interface_data
-848         )
-849         assert ret == [], ret
-850         ret = network.ip_networks(verbose=True, interface_data=interface_data)
-851         assert ret == {
-852             "10.10.8.0/22": {
-853                 "prefixlen": 22,
-854                 "netmask": "255.255.252.0",
-855                 "num_addresses": 1024,
-856                 "address": "10.10.8.0",
-857             },
-858         }, ret
-859         ret = network.ip_networks(
-860             interface="eth0", verbose=True, interface_data=interface_data
-861         )
-862         assert ret == {
-863             "10.10.8.0/22": {
-864                 "prefixlen": 22,
-865                 "netmask": "255.255.252.0",
-866                 "num_addresses": 1024,
-867                 "address": "10.10.8.0",
-868             },
-869         }, ret
-870         ret = network.ip_networks(
-871             interface="eth0,lo", verbose=True, interface_data=interface_data
-872         )
-873         assert ret == {
-874             "10.10.8.0/22": {
-875                 "prefixlen": 22,
-876                 "netmask": "255.255.252.0",
-877                 "num_addresses": 1024,
-878                 "address": "10.10.8.0",
-879             },
-880         }, ret
-881         ret = network.ip_networks(
-882             interface="eth1", verbose=True, interface_data=interface_data
-883         )
-884         assert ret == {}, ret
-885         ret = network.ip_networks(
-886             include_loopback=True, verbose=True, interface_data=interface_data
-887         )
-888         assert ret == {
-889             "10.10.8.0/22": {
-890                 "prefixlen": 22,
-891                 "netmask": "255.255.252.0",
-892                 "num_addresses": 1024,
-893                 "address": "10.10.8.0",
-894             },
-895             "127.0.0.0/8": {
-896                 "prefixlen": 8,
-897                 "netmask": "255.0.0.0",
-898                 "num_addresses": 16777216,
-899                 "address": "127.0.0.0",
-900             },
-901         }, ret
-902         ret = network.ip_networks(
-903             interface="eth0",
-904             include_loopback=True,
-905             verbose=True,
-906             interface_data=interface_data,
-907         )
-908         assert ret == {
-909             "10.10.8.0/22": {
-910                 "prefixlen": 22,
-911                 "netmask": "255.255.252.0",
-912                 "num_addresses": 1024,
-913                 "address": "10.10.8.0",
-914             },
-915         }, ret
-916         ret = network.ip_networks(
-917             interface="eth0,lo",
-918             include_loopback=True,
-919             verbose=True,
-920             interface_data=interface_data,
-921         )
-922         assert ret == {
-923             "10.10.8.0/22": {
-924                 "prefixlen": 22,
-925                 "netmask": "255.255.252.0",
-926                 "num_addresses": 1024,
-927                 "address": "10.10.8.0",
-928             },
-929             "127.0.0.0/8": {
-930                 "prefixlen": 8,
-931                 "netmask": "255.0.0.0",
-932                 "num_addresses": 16777216,
-933                 "address": "127.0.0.0",
-934             },
-935         }, ret
-936         ret = network.ip_networks(
-937             interface="eth1",
-938             include_loopback=True,
-939             verbose=True,
-940             interface_data=interface_data,
-941         )
-942         assert ret == {}, ret
-943     def test_ip_networks6(self):
-944         interface_data = network._interfaces_ifconfig(LINUX)
-945         ret = network.ip_networks6(interface_data=interface_data)
-946         assert ret == ["fe80::/64"], ret
-947         ret = network.ip_networks6(interface="eth0", interface_data=interface_data)
-948         assert ret == ["fe80::/64"], ret
-949         ret = network.ip_networks6(interface="eth0,lo", interface_data=interface_data)
-950         assert ret == ["fe80::/64"], ret
-951         ret = network.ip_networks6(interface="eth1", interface_data=interface_data)
-952         assert ret == [], ret
-953         ret = network.ip_networks6(include_loopback=True, interface_data=interface_data)
-954         assert ret == ["::1/128", "fe80::/64"], ret
-955         ret = network.ip_networks6(
-956             interface="eth0", include_loopback=True, interface_data=interface_data
-957         )
-958         assert ret == ["fe80::/64"], ret
-959         ret = network.ip_networks6(
-960             interface="eth0,lo", include_loopback=True, interface_data=interface_data
-961         )
-962         assert ret == ["::1/128", "fe80::/64"], ret
-963         ret = network.ip_networks6(
-964             interface="eth1", include_loopback=True, interface_data=interface_data
-965         )
-966         assert ret == [], ret
-967         ret = network.ip_networks6(verbose=True, interface_data=interface_data)
-968         assert ret == {
-969             "fe80::/64": {
-970                 "prefixlen": 64,
-971                 "netmask": "ffff:ffff:ffff:ffff::",
-972                 "num_addresses": 18446744073709551616,
-973                 "address": "fe80::",
-974             },
-975         }, ret
-976         ret = network.ip_networks6(
-977             interface="eth0", verbose=True, interface_data=interface_data
-978         )
-979         assert ret == {
-980             "fe80::/64": {
-981                 "prefixlen": 64,
-982                 "netmask": "ffff:ffff:ffff:ffff::",
-983                 "num_addresses": 18446744073709551616,
-984                 "address": "fe80::",
-985             },
-986         }, ret
-987         ret = network.ip_networks6(
-988             interface="eth0,lo", verbose=True, interface_data=interface_data
-989         )
-990         assert ret == {
-991             "fe80::/64": {
-992                 "prefixlen": 64,
-993                 "netmask": "ffff:ffff:ffff:ffff::",
-994                 "num_addresses": 18446744073709551616,
-995                 "address": "fe80::",
-996             },
-997         }, ret
-998         ret = network.ip_networks6(
-999             interface="eth1", verbose=True, interface_data=interface_data
-1000         )
-1001         assert ret == {}, ret
-1002         ret = network.ip_networks6(
-1003             include_loopback=True, verbose=True, interface_data=interface_data
-1004         )
-1005         assert ret == {
-1006             "fe80::/64": {
-1007                 "prefixlen": 64,
-1008                 "netmask": "ffff:ffff:ffff:ffff::",
-1009                 "num_addresses": 18446744073709551616,
-1010                 "address": "fe80::",
-1011             },
-1012             "::1/128": {
-1013                 "prefixlen": 128,
-1014                 "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-1015                 "num_addresses": 1,
-1016                 "address": "::1",
-1017             },
-1018         }, ret
-1019         ret = network.ip_networks6(
-1020             interface="eth0",
-1021             include_loopback=True,
-1022             verbose=True,
-1023             interface_data=interface_data,
-1024         )
-1025         assert ret == {
-1026             "fe80::/64": {
-1027                 "prefixlen": 64,
-1028                 "netmask": "ffff:ffff:ffff:ffff::",
-1029                 "num_addresses": 18446744073709551616,
-1030                 "address": "fe80::",
-1031             },
-1032         }, ret
-1033         ret = network.ip_networks6(
-1034             interface="eth0,lo",
-1035             include_loopback=True,
-1036             verbose=True,
-1037             interface_data=interface_data,
-1038         )
-1039         assert ret == {
-1040             "fe80::/64": {
-1041                 "prefixlen": 64,
-1042                 "netmask": "ffff:ffff:ffff:ffff::",
-1043                 "num_addresses": 18446744073709551616,
-1044                 "address": "fe80::",
-1045             },
-1046             "::1/128": {
-1047                 "prefixlen": 128,
-1048                 "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-1049                 "num_addresses": 1,
-1050                 "address": "::1",
-1051             },
-1052         }, ret
-1053         ret = network.ip_networks6(
-1054             interface="eth1",
-1055             include_loopback=True,
-1056             verbose=True,
-1057             interface_data=interface_data,
-1058         )
-1059         assert ret == {}, ret
-1060     def test_get_fqhostname_return(self):
-1061         """
-1062         Test if proper hostname is used when RevDNS differ from hostname
-1063         :return:
-1064         """
-1065         with patch("socket.gethostname", MagicMock(return_value="hostname")), patch(
-1066             "socket.getfqdn",
-1067             MagicMock(return_value="very.long.and.complex.domain.name"),
-1068         ), patch(
-1069             "socket.getaddrinfo",
-1070             MagicMock(return_value=[(2, 3, 0, "hostname", ("127.0.1.1", 0))]),
-1071         ):
-1072             self.assertEqual(network.get_fqhostname(), "hostname")
-1073     def test_get_fqhostname_return_empty_hostname(self):
-1074         """
-1075         Test if proper hostname is used when hostname returns empty string
-1076         """
-1077         host = "hostname"
-1078         with patch("socket.gethostname", MagicMock(return_value=host)), patch(
-1079             "socket.getfqdn",
-1080             MagicMock(return_value="very.long.and.complex.domain.name"),
-1081         ), patch(
-1082             "socket.getaddrinfo",
-1083             MagicMock(
-1084                 return_value=[
-1085                     (2, 3, 0, host, ("127.0.1.1", 0)),
-1086                     (2, 3, 0, "", ("127.0.1.1", 0)),
-1087                 ]
-1088             ),
-1089         ):
-1090             self.assertEqual(network.get_fqhostname(), host)
+import logging
+import socket
+import textwrap
+import time
+import pytest
+import salt.exceptions
+import salt.utils.network as network
+from salt._compat import ipaddress
+from tests.support.mock import MagicMock, create_autospec, mock_open, patch
+from tests.support.unit import TestCase
+log = logging.getLogger(__name__)
+LINUX <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>= """\
+eth0      Link encap:Ethernet  HWaddr e0:3f:49:85:6a:af
+          inet addr:10.10.10.56  Bcast:10.10.10.255  Mask:255.255.252.0
+          inet6 addr: fe80::e23f:49ff:fe85:6aaf/64 Scope:Link
+          UP BROADCAST RUNNING MULTICAST  MTU:1500  Metric:1
+          RX packets:643363 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:196539 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 txqueuelen:1000
+          RX bytes:386388355 (368.4 MiB)  TX bytes:25600939 (24.4 MiB)
+lo        Link encap:Local Loopback
+          inet addr:127.0.0.1  Mask:255.0.0.0
+          inet6 addr: ::1/128 Scope:Host
+          UP LOOPBACK RUNNING  MTU:65536  Metric:1
+          RX packets:548901 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:548901 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 txqueuelen:0
+          RX bytes:613479895 (585.0 MiB)  TX bytes:613479895 (585.0 MiB)
+"""
+FREEBSD = """
+em0: flags=8843&lt;UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST&gt; metric 0 mtu 1500
+        options=4219b&lt;RXCSUM,TXCSUM,VLAN_MTU,VLAN_HWTAGGING,VLAN_HWCSUM,TSO4,WOL_MAGIC,VLAN_HWTSO&gt;
+        ether 00:30:48:ff:ff:ff
+        inet 10.10.10.250 netmask 0xffffffe0 broadcast 10.10.10.255
+        inet 10.10.10.56 netmask 0xffffffc0 broadcast 10.10.10.63
+        media: Ethernet autoselect (1000baseT &lt;full-duplex&gt;)
+        status: active
+em1: flags=8c02&lt;BROADCAST,OACTIVE,SIMPLEX,MULTICAST&gt; metric 0 mtu 1500
+        options=4219b&lt;RXCSUM,TXCSUM,VLAN_MTU,VLAN_HWTAGGING,VLAN_HWCSUM,TSO4,WOL_MAGIC,VLAN_HWTSO&gt;
+        ether 00:30:48:aa:aa:aa
+        media: Ethernet autoselect
+        status: no carrier
+plip0: flags=8810&lt;POINTOPOINT,SIMPLEX,MULTICAST&gt; metric 0 mtu 1500
+lo0: flags=8049&lt;UP,LOOPBACK,RUNNING,MULTICAST&gt; metric 0 mtu 16384
+        options=3&lt;RXCSUM,TXCSUM&gt;
+        inet6 fe80::1%lo0 prefixlen 64 scopeid 0x8
+        inet6 ::1 prefixlen 128
+        inet 127.0.0.1 netmask 0xff000000
+        nd6 options=3&lt;PERFORMNUD,ACCEPT_RTADV&gt;
+tun0: flags=8051&lt;UP,POINTOPOINT,RUNNING,MULTICAST&gt; metric 0 mtu 1500
+        options=80000&lt;LINKSTATE&gt;
+        inet 10.12.0.1 --&gt; 10.12.0.2 netmask 0xffffffff
+        Opened by PID 1964
+"""
+SOLARIS = """\
+lo0: flags=2001000849&lt;UP,LOOPBACK,RUNNING,MULTICAST,IPv4,VIRTUAL&gt; mtu 8232 index 1
+        inet 127.0.0.1 netmask ff000000
+net0: flags=100001100943&lt;UP,BROADCAST,RUNNING,PROMISC,MULTICAST,ROUTER,IPv4,PHYSRUNNING&gt; mtu 1500 index 2
+        inet 10.10.10.38 netmask ffffffe0 broadcast 10.10.10.63
+ilbint0: flags=110001100843&lt;UP,BROADCAST,RUNNING,MULTICAST,ROUTER,IPv4,VRRP,PHYSRUNNING&gt; mtu 1500 index 3
+        inet 10.6.0.11 netmask ffffff00 broadcast 10.6.0.255
+ilbext0: flags=110001100843&lt;UP,BROADCAST,RUNNING,MULTICAST,ROUTER,IPv4,VRRP,PHYSRUNNING&gt; mtu 1500 index 4
+        inet 10.10.11.11 netmask ffffffe0 broadcast 10.10.11.31
+ilbext0:1: flags=110001100843&lt;UP,BROADCAST,RUNNING,MULTICAST,ROUTER,IPv4,VRRP,PHYSRUNNING&gt; mtu 1500 index 4
+        inet 10.10.11.12 netmask ffffffe0 broadcast 10.10.11.31
+vpn0: flags=1000011008d1&lt;UP,POINTOPOINT,RUNNING,NOARP,MULTICAST,ROUTER,IPv4,PHYSRUNNING&gt; mtu 1480 index 5
+        inet tunnel src 10.10.11.12 tunnel dst 10.10.5.5
+        tunnel hop limit 64
+        inet 10.6.0.14 --&gt; 10.6.0.15 netmask ff000000
+lo0: flags=2002000849&lt;UP,LOOPBACK,RUNNING,MULTICAST,IPv6,VIRTUAL&gt; mtu 8252 index 1
+        inet6 ::1/128
+net0: flags=120002004941&lt;UP,RUNNING,PROMISC,MULTICAST,DHCP,IPv6,PHYSRUNNING&gt; mtu 1500 index 2
+        inet6 fe80::221:9bff:fefd:2a22/10
+ilbint0: flags=120002000840&lt;RUNNING,MULTICAST,IPv6,PHYSRUNNING&gt; mtu 1500 index 3
+        inet6 ::/0
+ilbext0: flags=120002000840&lt;RUNNING,MULTICAST,IPv6,PHYSRUNNING&gt; mtu 1500 index 4
+        inet6 ::/0
+vpn0: flags=120002200850&lt;POINTOPOINT,RUNNING,MULTICAST,NONUD,IPv6,PHYSRUNNING&gt; mtu 1480 index 5
+        inet tunnel src 10.10.11.12 tunnel dst 10.10.5.5
+        tunnel hop limit 64
+        inet6 ::/0 --&gt; fe80::b2d6:7c10
+"""
+NETBSD = """\
+vioif0: flags=0x8943&lt;UP,BROADCAST,RUNNING,PROMISC,SIMPLEX,MULTICAST&gt; mtu 1500
+        ec_capabilities=1&lt;VLAN_MTU&gt;
+        ec_enabled=0
+        address: 00:a0:98:e6:83:18
+        inet 192.168.1.80/24 broadcast 192.168.1.255 flags 0x0
+        inet6 fe80::2a0:98ff:fee6:8318%vioif0/64 flags 0x0 scopeid 0x1
+lo0: flags=0x8049&lt;UP,LOOPBACK,RUNNING,MULTICAST&gt; mtu 33624
+        inet 127.0.0.1/8 flags 0x0
+        inet6 ::1/128 flags 0x20&lt;NODAD&gt;
+        inet6 fe80::1%lo0/64 flags 0x0 scopeid 0x2
+"""
+FREEBSD_SOCKSTAT = """\
+USER    COMMAND     PID     FD  PROTO  LOCAL ADDRESS    FOREIGN ADDRESS
+root    python2.7   1294    41  tcp4   127.0.0.1:61115  127.0.0.1:4506
+"""
+FREEBSD_SOCKSTAT_WITH_FAT_PID = """\
+USER     COMMAND    PID   FD PROTO  LOCAL ADDRESS    FOREIGN ADDRESS
+salt-master python2.781106 35 tcp4  127.0.0.1:61115  127.0.0.1:4506
+"""
+NETLINK_SS = """
+State      Recv-Q Send-Q               Local Address:Port                 Peer Address:Port
+ESTAB      0      0                    127.0.0.1:56726                    127.0.0.1:4505
+ESTAB      0      0                    ::ffff:1.2.3.4:5678                ::ffff:1.2.3.4:4505
+"""
+LINUX_NETLINK_SS_OUTPUT = """\
+State       Recv-Q Send-Q                                                            Local Address:Port                                                                           Peer Address:Port
+TIME-WAIT   0      0                                                                         [::1]:8009                                                                                  [::1]:40368
+LISTEN      0      128                                                                   127.0.0.1:5903                                                                                0.0.0.0:*
+ESTAB       0      0                                                            [::ffff:127.0.0.1]:4506                                                                    [::ffff:127.0.0.1]:32315
+ESTAB       0      0                                                                 192.168.122.1:4506                                                                       192.168.122.177:24545
+"""
+IPV4_SUBNETS = {
+    True: ("10.10.0.0/24",),
+    False: ("10.10.0.0"</b></font>, "10.10.0.0/33", "FOO", 9, "0.9.800.1000/24"),
+}
+IPV6_SUBNETS = {
+    True: ("::1/128",),
+    False: ("::1", "::1/129", "FOO", 9, "aj01::feac/64"),
+}
+class NetworkTestCase(TestCase):
+    def test_sanitize_host_ip(self):
+        ret = network.sanitize_host("10.1./2.$3")
+        self.assertEqual(ret, "10.1.2.3")
+    def test_sanitize_host_name(self):
+        """
+        Should not remove the underscore
+        """
+        ret = network.sanitize_host("foo_bar")
+        self.assertEqual(ret, "foo_bar")
+    def test_host_to_ips(self):
+        """
+        NOTE: When this test fails it's usually because the IP address has
+        changed. In these cases, we just need to update the IP address in the
+        assertion.
+        """
+        def _side_effect(host, *args):
+            try:
+                return {
+                    "github.com": [
+                        (2, 1, 6, "", ("192.30.255.112", 0)),
+                        (2, 1, 6, "", ("192.30.255.113", 0)),
+                    ],
+                    "ipv6host.foo": [
+                        (socket.AF_INET6, 1, 6, "", ("2001:a71::1", 0, 0, 0)),
+                    ],
+                }[host]
+            except KeyError:
+                raise socket.gaierror(-2, "Name or service not known")
+        getaddrinfo_mock = MagicMock(side_effect=_side_effect)
+        with patch.object(socket, "getaddrinfo", getaddrinfo_mock):
+            ret = network.host_to_ips("github.com")
+            self.assertEqual(ret, ["192.30.255.112", "192.30.255.113"])
+            ret = network.host_to_ips("ipv6host.foo")
+            self.assertEqual(ret, ["2001:a71::1"])
+            ret = network.host_to_ips("someothersite.com")
+            self.assertEqual(ret, None)
+    def test_generate_minion_id(self):
+        self.assertTrue(network.generate_minion_id())
+    def test__generate_minion_id_with_unicode_in_etc_hosts(self):
+        """
+        Test that unicode in /etc/hosts doesn't raise an error when
+        _generate_minion_id() helper is called to gather the hosts.
+        """
+        content = textwrap.dedent(
+            """\
+        127.0.0.1       localhost thisismyhostname     # 本机
+        """
+        )
+        fopen_mock = mock_open(read_data={"/etc/hosts": content})
+        with patch("salt.utils.files.fopen", fopen_mock):
+    def test_is_ip(self):
+        self<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.assertTrue(network.is_ip("10.10.0.3"))
+        self.assertFalse(network.is_ip("0.9.800.1000"))
+    def test_is_ipv4(self):
+        self<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>.assertTrue(network.is_ipv4("10.10.0.3"))
+        self.assertFalse(network.is_ipv4("10.100.1"))
+        self.assertFalse(network.is_ipv4("2001:db8:0:1:1:1:1:1"))
+        self.</b></font>assertFalse(network.is_ipv4("sixteen-char-str"))
+    def test_is_ipv6(self):
+        self.assertTrue(network.is_ipv6("2001:db8:0:1:1:1:1:1"))
+        self.assertTrue(network.is_ipv6("0:0:0:0:0:0:0:1"))
+        self.assertTrue(network.is_ipv6("::1"))
+        self.assertTrue(network.is_ipv6("::"))
+        self.assertTrue(network.is_ipv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334"))
+        self.assertTrue(network.is_ipv6("2001:0db8:85a3::8a2e:0370:7334"))
+        self.assertFalse(network.is_ipv6("2001:0db8:0370:7334"))
+        self.assertFalse(network.is_ipv6("2001:0db8:::0370:7334"))
+        self.assertFalse(network.is_ipv6("10.0.1.2"))
+        self.assertFalse(network.is_ipv6("2001.0db8.85a3.0000.0000.8a2e.0370.7334"))
+        self.assertFalse(network.is_ipv6("sixteen-char-str"))
+    def test_ipv6(self):
+        self.assertTrue(network.ipv6("2001:db8:0:1:1:1:1:1"))
+        self.assertTrue(network.ipv6("0:0:0:0:0:0:0:1"))
+        self.assertTrue(network.ipv6("::1"))
+        self.assertTrue(network.ipv6("::"))
+        self.assertTrue(network.ipv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334"))
+        self.assertTrue(network.ipv6("2001:0db8:85a3::8a2e:0370:7334"))
+        self.assertTrue(network.ipv6("2001:67c:2e8::/48"))
+    def test_parse_host_port(self):
+        _ip = ipaddress.ip_address
+        good_host_ports = {
+            "10.10.0.3": (_ip("10.10.0.3").compressed, None),
+            "10.10.0.3:1234": (_ip("10.10.0.3").compressed, 1234),
+            "2001:0db8:85a3::8a2e:0370:7334": (
+                _ip("2001:0db8:85a3::8a2e:0370:7334").compressed,
+                None,
+            ),
+            "[2001:0db8:85a3::8a2e:0370:7334]:1234": (
+                _ip("2001:0db8:85a3::8a2e:0370:7334").compressed,
+                1234,
+            ),
+            "2001:0db8:85a3::7334": (_ip("2001:0db8:85a3::7334").compressed, None),
+            "[2001:0db8:85a3::7334]:1234": (
+                _ip("2001:0db8:85a3::7334").compressed,
+                1234,
+            ),
+        }
+        bad_host_ports = [
+            "10.10.0.3/24",
+            "10.10.0.3::1234",
+            "2001:0db8:0370:7334",
+            "2001:0db8:0370::7334]:1234",
+            "2001:0db8:0370:0:a:b:c:d:1234",
+            "host name",
+            "host name:1234",
+            "10.10.0.3:abcd",
+        ]
+        for host_port, assertion_value in good_host_ports.items():
+            host = port = None
+            host, port = network.parse_host_port(host_port)
+            self.assertEqual((host, port), assertion_value)
+        for host_port in bad_host_ports:
+            try:
+                self.assertRaises(ValueError, network.parse_host_port, host_port)
+            except AssertionError as _e_:
+                log.error(
+                    'bad host_port value: "%s" failed to trigger ValueError exception',
+                    host_port,
+                )
+                raise _e_
+    def test_dns_check(self):
+        hosts = [
+            {
+                "host": "10.10.0.3",
+                "port": "",
+                "mocked": [(2, 1, 6, "", ("10.10.0.3", 0))],
+                "ret": "10.10.0.3",
+            },
+            {
+                "host": "10.10.0.3",
+                "port": "1234",
+                "mocked": [(2, 1, 6, "", ("10.10.0.3", 0))],
+                "ret": "10.10.0.3",
+            },
+            {
+                "host": "2001:0db8:85a3::8a2e:0370:7334",
+                "port": "",
+                "mocked": [(10, 1, 6, "", ("2001:db8:85a3::8a2e:370:7334", 0, 0, 0))],
+                "ret": "[2001:db8:85a3::8a2e:370:7334]",
+            },
+            {
+                "host": "2001:0db8:85a3::8a2e:370:7334",
+                "port": "1234",
+                "mocked": [(10, 1, 6, "", ("2001:db8:85a3::8a2e:370:7334", 0, 0, 0))],
+                "ret": "[2001:db8:85a3::8a2e:370:7334]",
+            },
+            {
+                "host": "salt-master",
+                "port": "1234",
+                "mocked": [(2, 1, 6, "", ("127.0.0.1", 0))],
+                "ret": "127.0.0.1",
+            },
+        ]
+        for host in hosts:
+            with patch.object(
+                socket,
+                "getaddrinfo",
+                create_autospec(socket.getaddrinfo, return_value=host["mocked"]),
+            ):
+                with patch("socket.socket", create_autospec(socket.socket)):
+                    ret = network.dns_check(host["host"], host["port"])
+                    self.assertEqual(ret, host["ret"])
+    def test_dns_check_ipv6_filter(self):
+        with patch.object(
+            socket,
+            "getaddrinfo",
+            create_autospec(socket.getaddrinfo, side_effect=Exception),
+        ) as getaddrinfo:
+            for ipv6, param in [
+                (None, socket.AF_UNSPEC),
+                (True, socket.AF_INET6),
+                (False, socket.AF_INET),
+            ]:
+                with self.assertRaises(Exception):
+                    network.dns_check("foo", "1", ipv6=ipv6)
+                getaddrinfo.assert_called_with("foo", "1", param, socket.SOCK_STREAM)
+    def test_dns_check_errors(self):
+        with patch.object(
+            socket, "getaddrinfo", create_autospec(socket.getaddrinfo, return_value=[])
+        ):
+            with self.assertRaisesRegex(
+                salt.exceptions.SaltSystemExit,
+                "DNS lookup or connection check of 'foo' failed",
+            ):
+                network.dns_check("foo", "1")
+        with patch.object(
+            socket,
+            "getaddrinfo",
+            create_autospec(socket.getaddrinfo, side_effect=TypeError),
+        ):
+            with self.assertRaisesRegex(
+                salt.exceptions.SaltSystemExit, "Invalid or unresolveable address"
+            ):
+                network.dns_check("foo", "1")
+    def test_test_addrs(self):
+        addrinfo = [
+            (30, 2, 17, "", ("2600:9000:21eb:a800:8:1031:abc0:93a1", 0, 0, 0)),
+            (30, 1, 6, "", ("2600:9000:21eb:a800:8:1031:abc0:93a1", 0, 0, 0)),
+            (30, 2, 17, "", ("2600:9000:21eb:b400:8:1031:abc0:93a1", 0, 0, 0)),
+            (30, 1, 6, "", ("2600:9000:21eb:b400:8:1031:abc0:93a1", 0, 0, 0)),
+            (2, 1, 6, "", ("13.35.99.52", 0)),
+            (2, 2, 17, "", ("13.35.99.85", 0)),
+            (2, 1, 6, "", ("13.35.99.85", 0)),
+            (2, 2, 17, "", ("13.35.99.122", 0)),
+        ]
+        with patch("socket.socket", create_autospec(socket.socket)) as s:
+            addrs = network._test_addrs(addrinfo, 80)
+            self.assertTrue(len(addrs) == 1)
+            self.assertTrue(addrs[0] == addrinfo[0][4][0])
+            s.side_effect = [socket.error, MagicMock()]
+            addrs = network._test_addrs(addrinfo, 80)
+            self.assertTrue(len(addrs) == 1)
+            self.assertTrue(addrs[0] == addrinfo[2][4][0])
+            s.side_effect = socket.error
+            addrs = network._test_addrs(addrinfo, 80)
+            time.sleep(2)
+            self.assertFalse(len(addrs) == 0)
+            s.side_effect = socket.error
+            addrs = network._test_addrs(addrinfo, 80)
+            self.assertTrue(len(addrs) == 5)
+    def test_is_subnet(self):
+        for subnet_data in (IPV4_SUBNETS, IPV6_SUBNETS):
+            for item in subnet_data[True]:
+                log.debug("Testing that %s is a valid subnet", item)
+                self.assertTrue(network.is_subnet(item))
+            for item in subnet_data[False]:
+                log.debug("Testing that %s is not a valid subnet", item)
+                self.assertFalse(network.is_subnet(item))
+    def test_is_ipv4_subnet(self):
+        for item in IPV4_SUBNETS[True]:
+            log.debug("Testing that %s is a valid subnet", item)
+            self.assertTrue(network.is_ipv4_subnet(item))
+        for item in IPV4_SUBNETS[False]:
+            log.debug("Testing that %s is not a valid subnet", item)
+            self.assertFalse(network.is_ipv4_subnet(item))
+    def test_is_ipv6_subnet(self):
+        for item in IPV6_SUBNETS[True]:
+            log.debug("Testing that %s is a valid subnet", item)
+            self.assertTrue(network.is_ipv6_subnet(item))
+        for item in IPV6_SUBNETS[False]:
+            log.debug("Testing that %s is not a valid subnet", item)
+            self.assertFalse(network.is_ipv6_subnet(item))
+    def test_cidr_to_ipv4_netmask(self):
+        self.assertEqual(network.cidr_to_ipv4_netmask(24), "255.255.255.0")
+        self.assertEqual(network.cidr_to_ipv4_netmask(21), "255.255.248.0")
+        self.assertEqual(network.cidr_to_ipv4_netmask(17), "255.255.128.0")
+        self.assertEqual(network.cidr_to_ipv4_netmask(9), "255.128.0.0")
+        self.assertEqual(network.cidr_to_ipv4_netmask(36), "")
+        self.assertEqual(network.cidr_to_ipv4_netmask("lol"), "")
+    def test_number_of_set_bits_to_ipv4_netmask(self):
+        set_bits_to_netmask = network._number_of_set_bits_to_ipv4_netmask(0xFFFFFF00)
+        self.assertEqual(set_bits_to_netmask, "255.255.255.0")
+        set_bits_to_netmask = network._number_of_set_bits_to_ipv4_netmask(0xFFFF6400)
+    def test_hex2ip(self):
+        self.assertEqual(network.hex2ip("0x4A7D2B63"), "74.125.43.99")
+        self.assertEqual(network.hex2ip("0x4A7D2B63", invert=True), "99.43.125.74")
+        self.assertEqual(
+            network.hex2ip("00000000000000000000FFFF7F000001"), "127.0.0.1"
+        )
+        self.assertEqual(
+            network.hex2ip("0000000000000000FFFF00000100007F", invert=True), "127.0.0.1"
+        )
+        self.assertEqual(
+            network.hex2ip("20010DB8000000000000000000000000"), "2001:db8::"
+        )
+        self.assertEqual(
+            network.hex2ip("B80D0120000000000000000000000000", invert=True),
+            "2001:db8::",
+        )
+    def test_interfaces_ifconfig_linux(self):
+        interfaces = network._interfaces_ifconfig(LINUX)
+        self.assertEqual(
+            interfaces,
+            {
+                "eth0": {
+                    "hwaddr": "e0:3f:49:85:6a:af",
+                    "inet": [
+                        {
+                            "address": "10.10.10.56",
+                            "broadcast": "10.10.10.255",
+                            "netmask": "255.255.252.0",
+                        }
+                    ],
+                    "inet6": [
+                        {
+                            "address": "fe80::e23f:49ff:fe85:6aaf",
+                            "prefixlen": "64",
+                            "scope": "link",
+                        }
+                    ],
+                    "up": True,
+                },
+                "lo": {
+                    "inet": [{"address": "127.0.0.1", "netmask": "255.0.0.0"}],
+                    "inet6": [{"address": "::1", "prefixlen": "128", "scope": "host"}],
+                    "up": True,
+                },
+            },
+        )
+    def test_interfaces_ifconfig_freebsd(self):
+        interfaces = network._interfaces_ifconfig(FREEBSD)
+        self.assertEqual(
+            interfaces,
+            {
+                "": {"up": False},
+                "em0": {
+                    "hwaddr": "00:30:48:ff:ff:ff",
+                    "inet": [
+                        {
+                            "address": "10.10.10.250",
+                            "broadcast": "10.10.10.255",
+                            "netmask": "255.255.255.224",
+                        },
+                        {
+                            "address": "10.10.10.56",
+                            "broadcast": "10.10.10.63",
+                            "netmask": "255.255.255.192",
+                        },
+                    ],
+                    "up": True,
+                },
+                "em1": {"hwaddr": "00:30:48:aa:aa:aa", "up": False},
+                "lo0": {
+                    "inet": [{"address": "127.0.0.1", "netmask": "255.0.0.0"}],
+                    "inet6": [
+                        {"address": "fe80::1", "prefixlen": "64", "scope": "0x8"},
+                        {"address": "::1", "prefixlen": "128", "scope": None},
+                    ],
+                    "up": True,
+                },
+                "plip0": {"up": False},
+                "tun0": {
+                    "inet": [{"address": "10.12.0.1", "netmask": "255.255.255.255"}],
+                    "up": True,
+                },
+            },
+        )
+    def test_interfaces_ifconfig_solaris(self):
+        with patch("salt.utils.platform.is_sunos", lambda: True):
+            interfaces = network._interfaces_ifconfig(SOLARIS)
+            expected_interfaces = {
+                "ilbint0": {
+                    "inet6": [],
+                    "inet": [
+                        {
+                            "broadcast": "10.6.0.255",
+                            "netmask": "255.255.255.0",
+                            "address": "10.6.0.11",
+                        }
+                    ],
+                    "up": True,
+                },
+                "lo0": {
+                    "inet6": [{"prefixlen": "128", "address": "::1"}],
+                    "inet": [{"netmask": "255.0.0.0", "address": "127.0.0.1"}],
+                    "up": True,
+                },
+                "ilbext0": {
+                    "inet6": [],
+                    "inet": [
+                        {
+                            "broadcast": "10.10.11.31",
+                            "netmask": "255.255.255.224",
+                            "address": "10.10.11.11",
+                        },
+                        {
+                            "broadcast": "10.10.11.31",
+                            "netmask": "255.255.255.224",
+                            "address": "10.10.11.12",
+                        },
+                    ],
+                    "up": True,
+                },
+                "vpn0": {
+                    "inet6": [],
+                    "inet": [{"netmask": "255.0.0.0", "address": "10.6.0.14"}],
+                    "up": True,
+                },
+                "net0": {
+                    "inet6": [
+                        {"prefixlen": "10", "address": "fe80::221:9bff:fefd:2a22"}
+                    ],
+                    "inet": [
+                        {
+                            "broadcast": "10.10.10.63",
+                            "netmask": "255.255.255.224",
+                            "address": "10.10.10.38",
+                        }
+                    ],
+                    "up": True,
+                },
+            }
+            self.assertEqual(interfaces, expected_interfaces)
+    def test_interfaces_ifconfig_netbsd(self):
+        interfaces = network._netbsd_interfaces_ifconfig(NETBSD)
+        self.assertEqual(
+            interfaces,
+            {
+                "lo0": {
+                    "inet": [{"address": "127.0.0.1", "netmask": "255.0.0.0"}],
+                    "inet6": [
+                        {"address": "fe80::1", "prefixlen": "64", "scope": "lo0"}
+                    ],
+                    "up": True,
+                },
+                "vioif0": {
+                    "hwaddr": "00:a0:98:e6:83:18",
+                    "inet": [
+                        {
+                            "address": "192.168.1.80",
+                            "broadcast": "192.168.1.255",
+                            "netmask": "255.255.255.0",
+                        }
+                    ],
+                    "inet6": [
+                        {
+                            "address": "fe80::2a0:98ff:fee6:8318",
+                            "prefixlen": "64",
+                            "scope": "vioif0",
+                        }
+                    ],
+                    "up": True,
+                },
+            },
+        )
+    def test_freebsd_remotes_on(self):
+        with patch("salt.utils.platform.is_sunos", lambda: False):
+            with patch("salt.utils.platform.is_freebsd", lambda: True):
+                with patch("subprocess.check_output", return_value=FREEBSD_SOCKSTAT):
+                    remotes = network._freebsd_remotes_on("4506", "remote")
+                    self.assertEqual(remotes, {"127.0.0.1"})
+    def test_freebsd_remotes_on_with_fat_pid(self):
+        with patch("salt.utils.platform.is_sunos", lambda: False):
+            with patch("salt.utils.platform.is_freebsd", lambda: True):
+                with patch(
+                    "subprocess.check_output",
+                    return_value=FREEBSD_SOCKSTAT_WITH_FAT_PID,
+                ):
+                    remotes = network._freebsd_remotes_on("4506", "remote")
+                    self.assertEqual(remotes, {"127.0.0.1"})
+    def test_netlink_tool_remote_on_a(self):
+        with patch("salt.utils.platform.is_sunos", lambda: False):
+            with patch("salt.utils.platform.is_linux", lambda: True):
+                with patch(
+                    "subprocess.check_output", return_value=LINUX_NETLINK_SS_OUTPUT
+                ):
+                    remotes = network._netlink_tool_remote_on("4506", "local")
+                    self.assertEqual(remotes, {"192.168.122.177", "::ffff:127.0.0.1"})
+    def test_netlink_tool_remote_on_b(self):
+        with patch("subprocess.check_output", return_value=NETLINK_SS):
+            remotes = network._netlink_tool_remote_on("4505", "remote_port")
+            self.assertEqual(remotes, {"127.0.0.1", "::ffff:1.2.3.4"})
+    def test_generate_minion_id_distinct(self):
+        """
+        Test if minion IDs are distinct in the pool.
+        :return:
+        """
+        with patch("platform.node", MagicMock(return_value="nodename")), patch(
+            "socket.gethostname", MagicMock(return_value="hostname")
+        ), patch(
+            "socket.getfqdn", MagicMock(return_value="hostname.domainname.blank")
+        ), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "attrname", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(return_value=["1.2.3.4", "5.6.7.8"]),
+        ):
+            self.assertEqual(
+                network._generate_minion_id(),
+                [
+                    "hostname.domainname.blank",
+                    "nodename",
+                    "hostname",
+                    "1.2.3.4",
+                    "5.6.7.8",
+                ],
+            )
+    def test_generate_minion_id_127_name(self):
+        """
+        Test if minion IDs can be named 127.foo
+        :return:
+        """
+        with patch("platform.node", MagicMock(return_value="127")), patch(
+            "socket.gethostname", MagicMock(return_value="127")
+        ), patch(
+            "socket.getfqdn", MagicMock(return_value="127.domainname.blank")
+        ), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "attrname", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(return_value=["1.2.3.4", "5.6.7.8"]),
+        ):
+            self.assertEqual(
+                network._generate_minion_id(),
+                ["127.domainname.blank", "127", "1.2.3.4", "5.6.7.8"],
+            )
+    def test_generate_minion_id_127_name_startswith(self):
+        """
+        Test if minion IDs can be named starting from "127"
+        :return:
+        """
+        with patch("platform.node", MagicMock(return_value="127890")), patch(
+            "socket.gethostname", MagicMock(return_value="127890")
+        ), patch(
+            "socket.getfqdn", MagicMock(return_value="127890.domainname.blank")
+        ), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "attrname", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(return_value=["1.2.3.4", "5.6.7.8"]),
+        ):
+            self.assertEqual(
+                network._generate_minion_id(),
+                ["127890.domainname.blank", "127890", "1.2.3.4", "5.6.7.8"],
+            )
+    def test_generate_minion_id_duplicate(self):
+        """
+        Test if IP addresses in the minion IDs are distinct in the pool
+        :return:
+        """
+        with patch("platform.node", MagicMock(return_value="hostname")), patch(
+            "socket.gethostname", MagicMock(return_value="hostname")
+        ), patch("socket.getfqdn", MagicMock(return_value="hostname")), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "hostname", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(return_value=["1.2.3.4", "1.2.3.4", "1.2.3.4"]),
+        ):
+            self.assertEqual(network._generate_minion_id(), ["hostname", "1.2.3.4"])
+    def test_generate_minion_id_platform_used(self):
+        """
+        Test if platform.node is used for the first occurrence.
+        The platform.node is most common hostname resolver before anything else.
+        :return:
+        """
+        with patch(
+            "platform.node", MagicMock(return_value="very.long.and.complex.domain.name")
+        ), patch("socket.gethostname", MagicMock(return_value="hostname")), patch(
+            "socket.getfqdn", MagicMock(return_value="")
+        ), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "hostname", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(return_value=["1.2.3.4", "1.2.3.4", "1.2.3.4"]),
+        ):
+            self.assertEqual(
+                network.generate_minion_id(), "very.long.and.complex.domain.name"
+            )
+    def test_generate_minion_id_platform_localhost_filtered(self):
+        """
+        Test if localhost is filtered from the first occurrence.
+        :return:
+        """
+        with patch("platform.node", MagicMock(return_value="localhost")), patch(
+            "socket.gethostname", MagicMock(return_value="pick.me")
+        ), patch(
+            "socket.getfqdn", MagicMock(return_value="hostname.domainname.blank")
+        ), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "hostname", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(return_value=["1.2.3.4", "1.2.3.4", "1.2.3.4"]),
+        ):
+            self.assertEqual(network.generate_minion_id(), "hostname.domainname.blank")
+    def test_generate_minion_id_platform_localhost_filtered_all(self):
+        """
+        Test if any of the localhost is filtered from everywhere.
+        :return:
+        """
+        with patch("platform.node", MagicMock(return_value="localhost")), patch(
+            "socket.gethostname", MagicMock(return_value="ip6-loopback")
+        ), patch("socket.getfqdn", MagicMock(return_value="ip6-localhost")), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "localhost", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(
+                return_value=["127.0.0.1", "::1", "fe00::0", "fe02::1", "1.2.3.4"]
+            ),
+        ):
+            self.assertEqual(network.generate_minion_id(), "1.2.3.4")
+    def test_generate_minion_id_platform_localhost_only(self):
+        """
+        Test if there is no other choice but localhost.
+        :return:
+        """
+        with patch("platform.node", MagicMock(return_value="localhost")), patch(
+            "socket.gethostname", MagicMock(return_value="ip6-loopback")
+        ), patch("socket.getfqdn", MagicMock(return_value="ip6-localhost")), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "localhost", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(return_value=["127.0.0.1", "::1", "fe00::0", "fe02::1"]),
+        ):
+            self.assertEqual(network.generate_minion_id(), "localhost")
+    def test_generate_minion_id_platform_fqdn(self):
+        """
+        Test if fqdn is picked up.
+        :return:
+        """
+        with patch("platform.node", MagicMock(return_value="localhost")), patch(
+            "socket.gethostname", MagicMock(return_value="ip6-loopback")
+        ), patch("socket.getfqdn", MagicMock(return_value="pick.me")), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "localhost", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(return_value=["127.0.0.1", "::1", "fe00::0", "fe02::1"]),
+        ):
+            self.assertEqual(network.generate_minion_id(), "pick.me")
+    def test_generate_minion_id_platform_localhost_addrinfo(self):
+        """
+        Test if addinfo is picked up.
+        :return:
+        """
+        with patch("platform.node", MagicMock(return_value="localhost")), patch(
+            "socket.gethostname", MagicMock(return_value="ip6-loopback")
+        ), patch("socket.getfqdn", MagicMock(return_value="ip6-localhost")), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "pick.me", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(return_value=["127.0.0.1", "::1", "fe00::0", "fe02::1"]),
+        ):
+            self.assertEqual(network.generate_minion_id(), "pick.me")
+    def test_generate_minion_id_platform_ip_addr_only(self):
+        """
+        Test if IP address is the only what is used as a Minion ID in case no DNS name.
+        :return:
+        """
+        with patch("platform.node", MagicMock(return_value="localhost")), patch(
+            "socket.gethostname", MagicMock(return_value="ip6-loopback")
+        ), patch("socket.getfqdn", MagicMock(return_value="ip6-localhost")), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "localhost", ("127.0.1.1", 0))]),
+        ), patch(
+            "salt.utils.files.fopen", mock_open()
+        ), patch(
+            "salt.utils.network.ip_addrs",
+            MagicMock(
+                return_value=["127.0.0.1", "::1", "fe00::0", "fe02::1", "1.2.3.4"]
+            ),
+        ):
+            self.assertEqual(network.generate_minion_id(), "1.2.3.4")
+    def test_gen_mac(self):
+        with patch("random.randint", return_value=1) as random_mock:
+            self.assertEqual(random_mock.return_value, 1)
+            ret = network.gen_mac("00:16:3E")
+            expected_mac = "00:16:3E:01:01:01"
+            self.assertEqual(ret, expected_mac)
+    def test_mac_str_to_bytes(self):
+        self.assertRaises(ValueError, network.mac_str_to_bytes, "31337")
+        self.assertRaises(ValueError, network.mac_str_to_bytes, "0001020304056")
+        self.assertRaises(ValueError, network.mac_str_to_bytes, "00:01:02:03:04:056")
+        self.assertRaises(ValueError, network.mac_str_to_bytes, "a0:b0:c0:d0:e0:fg")
+        self.assertEqual(
+            b"\x10\x08\x06\x04\x02\x00", network.mac_str_to_bytes("100806040200")
+        )
+        self.assertEqual(
+            b"\xf8\xe7\xd6\xc5\xb4\xa3", network.mac_str_to_bytes("f8e7d6c5b4a3")
+        )
+    @pytest.mark.slow_test
+    def test_generate_minion_id_with_long_hostname(self):
+        """
+        Validate the fix for:
+        https://github.com/saltstack/salt/issues/51160
+        """
+        long_name = "localhost-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz"
+        with patch("socket.gethostname", MagicMock(return_value=long_name)):
+            minion_id = network.generate_minion_id()
+        assert minion_id != "", minion_id
+    def test_filter_by_networks_with_no_filter(self):
+        ips = ["10.0.123.200", "10.10.10.10"]
+        with pytest.raises(TypeError):
+            network.filter_by_networks(ips)  # pylint: disable=no-value-for-parameter
+    def test_filter_by_networks_empty_filter(self):
+        ips = ["10.0.123.200", "10.10.10.10"]
+        assert network.filter_by_networks(ips, []) == []
+    def test_filter_by_networks_ips_list(self):
+        ips = [
+            "10.0.123.200",
+            "10.10.10.10",
+            "193.124.233.5",
+            "fe80::d210:cf3f:64e7:5423",
+        ]
+        networks = ["10.0.0.0/8", "fe80::/64"]
+        assert network.filter_by_networks(ips, networks) == [
+            "10.0.123.200",
+            "10.10.10.10",
+            "fe80::d210:cf3f:64e7:5423",
+        ]
+    def test_filter_by_networks_interfaces_dict(self):
+        interfaces = {
+            "wlan0": ["192.168.1.100", "217.5.140.67", "2001:db8::ff00:42:8329"],
+            "eth0": [
+                "2001:0DB8:0:CD30:123:4567:89AB:CDEF",
+                "192.168.1.101",
+                "10.0.123.201",
+            ],
+        }
+        assert network.filter_by_networks(
+            interfaces, ["192.168.1.0/24", "2001:db8::/48"]
+        ) == {
+            "wlan0": ["192.168.1.100", "2001:db8::ff00:42:8329"],
+            "eth0": ["2001:0DB8:0:CD30:123:4567:89AB:CDEF", "192.168.1.101"],
+        }
+    def test_filter_by_networks_catch_all(self):
+        ips = [
+            "10.0.123.200",
+            "10.10.10.10",
+            "193.124.233.5",
+            "fe80::d210:cf3f:64e7:5423",
+        ]
+        assert ips == network.filter_by_networks(ips, ["0.0.0.0/0", "::/0"])
+    def test_ip_networks(self):
+        interface_data = network._interfaces_ifconfig(LINUX)
+        ret = network.ip_networks(interface_data=interface_data)
+        assert ret == ["10.10.8.0/22"], ret
+        ret = network.ip_networks(interface="eth0", interface_data=interface_data)
+        assert ret == ["10.10.8.0/22"], ret
+        ret = network.ip_networks(interface="eth0,lo", interface_data=interface_data)
+        assert ret == ["10.10.8.0/22"], ret
+        ret = network.ip_networks(interface="eth1", interface_data=interface_data)
+        assert ret == [], ret
+        ret = network.ip_networks(include_loopback=True, interface_data=interface_data)
+        assert ret == ["10.10.8.0/22", "127.0.0.0/8"], ret
+        ret = network.ip_networks(
+            interface="eth0", include_loopback=True, interface_data=interface_data
+        )
+        assert ret == ["10.10.8.0/22"], ret
+        ret = network.ip_networks(
+            interface="eth0,lo", include_loopback=True, interface_data=interface_data
+        )
+        assert ret == ["10.10.8.0/22", "127.0.0.0/8"], ret
+        ret = network.ip_networks(
+            interface="eth1", include_loopback=True, interface_data=interface_data
+        )
+        assert ret == [], ret
+        ret = network.ip_networks(verbose=True, interface_data=interface_data)
+        assert ret == {
+            "10.10.8.0/22": {
+                "prefixlen": 22,
+                "netmask": "255.255.252.0",
+                "num_addresses": 1024,
+                "address": "10.10.8.0",
+            },
+        }, ret
+        ret = network.ip_networks(
+            interface="eth0", verbose=True, interface_data=interface_data
+        )
+        assert ret == {
+            "10.10.8.0/22": {
+                "prefixlen": 22,
+                "netmask": "255.255.252.0",
+                "num_addresses": 1024,
+                "address": "10.10.8.0",
+            },
+        }, ret
+        ret = network.ip_networks(
+            interface="eth0,lo", verbose=True, interface_data=interface_data
+        )
+        assert ret == {
+            "10.10.8.0/22": {
+                "prefixlen": 22,
+                "netmask": "255.255.252.0",
+                "num_addresses": 1024,
+                "address": "10.10.8.0",
+            },
+        }, ret
+        ret = network.ip_networks(
+            interface="eth1", verbose=True, interface_data=interface_data
+        )
+        assert ret == {}, ret
+        ret = network.ip_networks(
+            include_loopback=True, verbose=True, interface_data=interface_data
+        )
+        assert ret == {
+            "10.10.8.0/22": {
+                "prefixlen": 22,
+                "netmask": "255.255.252.0",
+                "num_addresses": 1024,
+                "address": "10.10.8.0",
+            },
+            "127.0.0.0/8": {
+                "prefixlen": 8,
+                "netmask": "255.0.0.0",
+                "num_addresses": 16777216,
+                "address": "127.0.0.0",
+            },
+        }, ret
+        ret = network.ip_networks(
+            interface="eth0",
+            include_loopback=True,
+            verbose=True,
+            interface_data=interface_data,
+        )
+        assert ret == {
+            "10.10.8.0/22": {
+                "prefixlen": 22,
+                "netmask": "255.255.252.0",
+                "num_addresses": 1024,
+                "address": "10.10.8.0",
+            },
+        }, ret
+        ret = network.ip_networks(
+            interface="eth0,lo",
+            include_loopback=True,
+            verbose=True,
+            interface_data=interface_data,
+        )
+        assert ret == {
+            "10.10.8.0/22": {
+                "prefixlen": 22,
+                "netmask": "255.255.252.0",
+                "num_addresses": 1024,
+                "address": "10.10.8.0",
+            },
+            "127.0.0.0/8": {
+                "prefixlen": 8,
+                "netmask": "255.0.0.0",
+                "num_addresses": 16777216,
+                "address": "127.0.0.0",
+            },
+        }, ret
+        ret = network.ip_networks(
+            interface="eth1",
+            include_loopback=True,
+            verbose=True,
+            interface_data=interface_data,
+        )
+        assert ret == {}, ret
+    def test_ip_networks6(self):
+        interface_data = network._interfaces_ifconfig(LINUX)
+        ret = network.ip_networks6(interface_data=interface_data)
+        assert ret == ["fe80::/64"], ret
+        ret = network.ip_networks6(interface="eth0", interface_data=interface_data)
+        assert ret == ["fe80::/64"], ret
+        ret = network.ip_networks6(interface="eth0,lo", interface_data=interface_data)
+        assert ret == ["fe80::/64"], ret
+        ret = network.ip_networks6(interface="eth1", interface_data=interface_data)
+        assert ret == [], ret
+        ret = network.ip_networks6(include_loopback=True, interface_data=interface_data)
+        assert ret == ["::1/128", "fe80::/64"], ret
+        ret = network.ip_networks6(
+            interface="eth0", include_loopback=True, interface_data=interface_data
+        )
+        assert ret == ["fe80::/64"], ret
+        ret = network.ip_networks6(
+            interface="eth0,lo", include_loopback=True, interface_data=interface_data
+        )
+        assert ret == ["::1/128", "fe80::/64"], ret
+        ret = network.ip_networks6(
+            interface="eth1", include_loopback=True, interface_data=interface_data
+        )
+        assert ret == [], ret
+        ret = network.ip_networks6(verbose=True, interface_data=interface_data)
+        assert ret == {
+            "fe80::/64": {
+                "prefixlen": 64,
+                "netmask": "ffff:ffff:ffff:ffff::",
+                "num_addresses": 18446744073709551616,
+                "address": "fe80::",
+            },
+        }, ret
+        ret = network.ip_networks6(
+            interface="eth0", verbose=True, interface_data=interface_data
+        )
+        assert ret == {
+            "fe80::/64": {
+                "prefixlen": 64,
+                "netmask": "ffff:ffff:ffff:ffff::",
+                "num_addresses": 18446744073709551616,
+                "address": "fe80::",
+            },
+        }, ret
+        ret = network.ip_networks6(
+            interface="eth0,lo", verbose=True, interface_data=interface_data
+        )
+        assert ret == {
+            "fe80::/64": {
+                "prefixlen": 64,
+                "netmask": "ffff:ffff:ffff:ffff::",
+                "num_addresses": 18446744073709551616,
+                "address": "fe80::",
+            },
+        }, ret
+        ret = network.ip_networks6(
+            interface="eth1", verbose=True, interface_data=interface_data
+        )
+        assert ret == {}, ret
+        ret = network.ip_networks6(
+            include_loopback=True, verbose=True, interface_data=interface_data
+        )
+        assert ret == {
+            "fe80::/64": {
+                "prefixlen": 64,
+                "netmask": "ffff:ffff:ffff:ffff::",
+                "num_addresses": 18446744073709551616,
+                "address": "fe80::",
+            },
+            "::1/128": {
+                "prefixlen": 128,
+                "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                "num_addresses": 1,
+                "address": "::1",
+            },
+        }, ret
+        ret = network.ip_networks6(
+            interface="eth0",
+            include_loopback=True,
+            verbose=True,
+            interface_data=interface_data,
+        )
+        assert ret == {
+            "fe80::/64": {
+                "prefixlen": 64,
+                "netmask": "ffff:ffff:ffff:ffff::",
+                "num_addresses": 18446744073709551616,
+                "address": "fe80::",
+            },
+        }, ret
+        ret = network.ip_networks6(
+            interface="eth0,lo",
+            include_loopback=True,
+            verbose=True,
+            interface_data=interface_data,
+        )
+        assert ret == {
+            "fe80::/64": {
+                "prefixlen": 64,
+                "netmask": "ffff:ffff:ffff:ffff::",
+                "num_addresses": 18446744073709551616,
+                "address": "fe80::",
+            },
+            "::1/128": {
+                "prefixlen": 128,
+                "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                "num_addresses": 1,
+                "address": "::1",
+            },
+        }, ret
+        ret = network.ip_networks6(
+            interface="eth1",
+            include_loopback=True,
+            verbose=True,
+            interface_data=interface_data,
+        )
+        assert ret == {}, ret
+    def test_get_fqhostname_return(self):
+        """
+        Test if proper hostname is used when RevDNS differ from hostname
+        :return:
+        """
+        with patch("socket.gethostname", MagicMock(return_value="hostname")), patch(
+            "socket.getfqdn",
+            MagicMock(return_value="very.long.and.complex.domain.name"),
+        ), patch(
+            "socket.getaddrinfo",
+            MagicMock(return_value=[(2, 3, 0, "hostname", ("127.0.1.1", 0))]),
+        ):
+            self.assertEqual(network.get_fqhostname(), "hostname")
+    def test_get_fqhostname_return_empty_hostname(self):
+        """
+        Test if proper hostname is used when hostname returns empty string
+        """
+        host = "hostname"
+        with patch("socket.gethostname", MagicMock(return_value=host)), patch(
+            "socket.getfqdn",
+            MagicMock(return_value="very.long.and.complex.domain.name"),
+        ), patch(
+            "socket.getaddrinfo",
+            MagicMock(
+                return_value=[
+                    (2, 3, 0, host, ("127.0.1.1", 0)),
+                    (2, 3, 0, "", ("127.0.1.1", 0)),
+                ]
+            ),
+        ):
+            self.assertEqual(network.get_fqhostname(), host)
 </pre>
 </div>
 </div>

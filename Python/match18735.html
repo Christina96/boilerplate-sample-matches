@@ -45,923 +45,2084 @@ Matches for napalm_network.py &amp; netacl.py
 </h3>
 <hr/>
 <pre>
-1 import datetime
-2 import logging
-3 import time
-4 import salt.utils.files
-5 import salt.utils.napalm
-6 import salt.utils.templates
-7 import salt.utils.versions
-8 log = logging.getLogger(__name__)
-9 try:
-10     import jxmlease  # pylint: disable=unused-import
-11     HAS_JXMLEASE = True
-12 except ImportError:
-13     HAS_JXMLEASE = False
-14 __virtualname__ = "net"
-15 __proxyenabled__ = ["*"]
-16 __virtual_aliases__ = ("napalm_net",)
-17 def __virtual__():
-18     return salt.utils.napalm.virtual(__opts__, __virtualname__, __file__)
-19 def _filter_list(input_list, search_key, search_value):
-20     output_list = list()
-21     for dictionary in input_list:
-22         if dictionary.get(search_key) == search_value:
-23             output_list.append(dictionary)
-24     return output_list
-25 def _filter_dict(input_dict, search_key, search_value):
-26     output_dict = dict()
-27     for key, key_list in input_dict.items():
-28         key_list_filtered = _filter_list(key_list, search_key, search_value)
-29         if key_list_filtered:
-30             output_dict[key] = key_list_filtered
-31     return output_dict
-32 def _safe_commit_config(loaded_result, napalm_device):
-33     _commit = commit(
-34         inherit_napalm_device=napalm_device
-35     )  # calls the function commit, defined below
-36     if not _commit.get("result", False):
-37         loaded_result["comment"] += (
-38             _commit["comment"] if _commit.get("comment") else "Unable to commit."
-39         )
-40         loaded_result["result"] = False
-41         discarded = _safe_dicard_config(loaded_result, napalm_device)
-42         if not discarded["result"]:
-43             return loaded_result
-44     return _commit
-45 def _safe_dicard_config(loaded_result, napalm_device):
-46     log.debug("Discarding the config")
-47     log.debug(loaded_result)
-48     _discarded = discard_config(inherit_napalm_device=napalm_device)
-49     if not _discarded.get("result", False):
-50         loaded_result["comment"] += (
-51             _discarded["comment"]
-52             if _discarded.get("comment")
-53             else "Unable to discard config."
-54         )
-55         loaded_result["result"] = False
-56         _explicit_close(napalm_device)
-57         __context__["retcode"] = 1
-58         return loaded_result
-59     return _discarded
-60 def _explicit_close(napalm_device):
-61     if salt.utils.napalm.not_always_alive(__opts__):
-62         try:
-63             napalm_device["DRIVER"].close()
-64         except Exception as err:  # pylint: disable=broad-except
-65             log.error("Unable to close the temp connection with the device:")
-66             log.error(err)
-67             log.error("Please report.")
-68 def _config_logic(
-69     napalm_device,
-70     loaded_result,
-71     test=False,
-72     debug=False,
-73     replace=False,
-74     commit_config=True,
-75     loaded_config=None,
-76     commit_in=None,
-77     commit_at=None,
-78     revert_in=None,
-79     revert_at=None,
-80     commit_jid=None,
-81     **kwargs
-82 ):
-83     current_jid = kwargs.get("__pub_jid")
-84     if not current_jid:
-85         current_jid = "{:%Y%m%d%H%M%S%f}".format(datetime.datetime.now())
-86     loaded_result["already_configured"] = False
-87     loaded_result["loaded_config"] = ""
-88     if debug:
-89         loaded_result["loaded_config"] = loaded_config
-90     _compare = compare_config(inherit_napalm_device=napalm_device)
-91     if _compare.get("result", False):
-92         loaded_result["diff"] = _compare.get("out")
-93         loaded_result.pop("out", "")  # not needed
-94     else:
-95         loaded_result["diff"] = None
-96         loaded_result["result"] = False
-97         loaded_result["comment"] = _compare.get("comment")
-98         __context__["retcode"] = 1
-99         return loaded_result
-100     _loaded_res = loaded_result.get("result", False)
-101     if not _loaded_res or test:
-102         if loaded_result["comment"]:
-103             loaded_result["comment"] += "\n"
-104         if not len(loaded_result.get("diff", "")) &gt; 0:
-105             loaded_result["already_configured"] = True
-106         discarded = _safe_dicard_config(loaded_result, napalm_device)
-107         if not discarded["result"]:
-108             return loaded_result
-109         loaded_result["comment"] += "Configuration discarded."
-110         _explicit_close(napalm_device)
-111         if not loaded_result["result"]:
-112             __context__["retcode"] = 1
-113         return loaded_result
-114     if not test and commit_config:
-115         if commit_jid:
-116             log.info("Committing the JID: %s", str(commit_jid))
-117             removed = cancel_commit(commit_jid)
-118             log.debug("Cleaned up the commit from the schedule")
-119             log.debug(removed["comment"])
-120         if len(loaded_result.get("diff", "")) &gt; 0:
-121             if commit_in or commit_at:
-122                 commit_time = __utils__["timeutil.get_time_at"](
-123                     time_in=commit_in, time_at=commit_in
-124                 )
-125                 scheduled_job_name = "__napalm_commit_{}".format(current_jid)
-126                 temp_file = salt.utils.files.mkstemp()
-127                 with salt.utils.files.fopen(temp_file, "w") as fp_:
-128                     fp_.write(loaded_config)
-129                 scheduled = __salt__["schedule.add"](
-130                     scheduled_job_name,
-131                     function="net.load_config",
-132                     job_kwargs={
-133                         "filename": temp_file,
-134                         "commit_jid": current_jid,
-135                         "replace": replace,
-136                     },
-137                     once=commit_time,
-138                 )
-139                 log.debug("Scheduling job")
-140                 log.debug(scheduled)
-141                 saved = __salt__["schedule.save"]()  # ensure the schedule is
-142                 discarded = _safe_dicard_config(loaded_result, napalm_device)
-143                 if not discarded["result"]:
-144                     discarded["comment"] += (
-145                         "Scheduled the job to be executed at {schedule_ts}, "
-146                         "but was unable to discard the config: \n".format(
-147                             schedule_ts=commit_time
-148                         )
-149                     )
-150                     return discarded
-151                 loaded_result["comment"] = (
-152                     "Changes discarded for now, and scheduled commit at:"
-153                     " {schedule_ts}.\nThe commit ID is: {current_jid}.\nTo discard this"
-154                     " commit, you can execute: \n\nsalt {min_id} net.cancel_commit"
-155                     " {current_jid}".format(
-156                         schedule_ts=commit_time,
-157                         min_id=__opts__["id"],
-158                         current_jid=current_jid,
-159                     )
-160                 )
-161                 loaded_result["commit_id"] = current_jid
-162                 return loaded_result
-163             log.debug("About to commit:")
-164             log.debug(loaded_result["diff"])
-165             if revert_in or revert_at:
-166                 revert_time = __utils__["timeutil.get_time_at"](
-167                     time_in=revert_in, time_at=revert_at
-168                 )
-169                 if __grains__["os"] == "junos":
-170                     if not HAS_JXMLEASE:
-171                         loaded_result["comment"] = (
-172                             "This feature requires the library jxmlease to be"
-173                             " installed.\nTo install, please execute: ``pip install"
-174                             " jxmlease``."
-175                         )
-176                         loaded_result["result"] = False
-177                         return loaded_result
-178                     timestamp_at = __utils__["timeutil.get_timestamp_at"](
-179                         time_in=revert_in, time_at=revert_at
-180                     )
-181                     minutes = int((timestamp_at - time.time()) / 60)
-182                     _comm = __salt__["napalm.junos_commit"](confirm=minutes)
-183                     if not _comm["out"]:
-184                         loaded_result[
-185                             "comment"
-186                         ] = "Unable to commit confirm: {}".format(_comm["message"])
-187                         loaded_result["result"] = False
-188                         discarded = _safe_dicard_config(loaded_result, napalm_device)
-189                         if not discarded["result"]:
-190                             return loaded_result
-191                 else:
-192                     temp_file = salt.utils.files.mkstemp()
-193                     running_config = __salt__["net.config"](source="running")["out"][
-194                         "running"
-195                     ]
-196                     with salt.utils.files.fopen(temp_file, "w") as fp_:
-197                         fp_.write(running_config)
-198                     committed = _safe_commit_config(loaded_result, napalm_device)
-199                     if not committed["result"]:
-200                         return loaded_result
-201                     scheduled_job_name = "__napalm_commit_{}".format(current_jid)
-202                     scheduled = __salt__["schedule.add"](
-203                         scheduled_job_name,
-204                         function="net.load_config",
-205                         job_kwargs={
-206                             "filename": temp_file,
-207                             "commit_jid": current_jid,
-208                             "replace": True,
-209                         },
-210                         once=revert_time,
-211                     )
-212                     log.debug("Scheduling commit confirmed")
-213                     log.debug(scheduled)
-214                     saved = __salt__["schedule.save"]()
-215                 loaded_result["comment"] = (
-216                     "The commit ID is: {current_jid}.\nThis commit will be reverted at:"
-217                     " {schedule_ts}, unless confirmed.\nTo confirm the commit and avoid"
-218                     " reverting, you can execute:\n\nsalt {min_id} net.confirm_commit"
-219                     " {current_jid}".format(
-220                         schedule_ts=revert_time,
-221                         min_id=__opts__["id"],
-222                         current_jid=current_jid,
-223                     )
-224                 )
-225                 loaded_result["commit_id"] = current_jid
-226                 return loaded_result
-227             committed = _safe_commit_config(loaded_result, napalm_device)
-228             if not committed["result"]:
-229                 return loaded_result
-230         else:
-231             discarded = _safe_dicard_config(loaded_result, napalm_device)
-232             if not discarded["result"]:
-233                 return loaded_result
-234             loaded_result["already_configured"] = True
-235             loaded_result["comment"] = "Already configured."
-236     _explicit_close(napalm_device)
-237     if not loaded_result["result"]:
-238         __context__["retcode"] = 1
-239     return loaded_result
-240 @salt.utils.napalm.proxy_napalm_wrap
-241 def connected(**kwargs):  # pylint: disable=unused-argument
-242     return {"out": napalm_device.get("UP", False)}  # pylint: disable=undefined-variable
-243 @salt.utils.napalm.proxy_napalm_wrap
-244 def facts(**kwargs):  # pylint: disable=unused-argument
-245     return salt.utils.napalm.call(
-246         napalm_device, "get_facts", **{}  # pylint: disable=undefined-variable
-247     )
-248 @salt.utils.napalm.proxy_napalm_wrap
-249 def environment(**kwargs):  # pylint: disable=unused-argument
-250     return salt.utils.napalm.call(
-251         napalm_device, "get_environment", **{}  # pylint: disable=undefined-variable
-252     )
-253 @salt.utils.napalm.proxy_napalm_wrap
-254 def cli(*commands, **kwargs):  # pylint: disable=unused-argument
-255     raw_cli_outputs = salt.utils.napalm.call(
-256         napalm_device,  # pylint: disable=undefined-variable
-257         "cli",
-258         **{"commands": list(commands)}
-259     )
-260     if not raw_cli_outputs["result"]:
-261         return raw_cli_outputs
-262     textfsm_parse = (
-263         kwargs.get("textfsm_parse")
-264         or __opts__.get("napalm_cli_textfsm_parse")
-265         or __pillar__.get("napalm_cli_textfsm_parse", False)
-266     )
-267     if not textfsm_parse:
-268         log.debug("No TextFSM parsing requested.")
-269         return raw_cli_outputs
-270     if "textfsm.extract" not in __salt__ or "textfsm.index" not in __salt__:
-271         raw_cli_outputs["comment"] += "Unable to process: is TextFSM installed?"
-272         log.error(raw_cli_outputs["comment"])
-273         return raw_cli_outputs
-274     textfsm_template = kwargs.get("textfsm_template")
-275     log.debug("textfsm_template: %s", textfsm_template)
-276     textfsm_path = (
-277         kwargs.get("textfsm_path")
-278         or __opts__.get("textfsm_path")
-279         or __pillar__.get("textfsm_path")
-280     )
-281     log.debug("textfsm_path: %s", textfsm_path)
-282     textfsm_template_dict = (
-283         kwargs.get("textfsm_template_dict")
-284         or __opts__.get("napalm_cli_textfsm_template_dict")
-285         or __pillar__.get("napalm_cli_textfsm_template_dict", {})
-286     )
-287     log.debug("TextFSM command-template mapping: %s", textfsm_template_dict)
-288     index_file = (
-289         kwargs.get("index_file")
-290         or __opts__.get("textfsm_index_file")
-291         or __pillar__.get("textfsm_index_file")
-292     )
-293     log.debug("index_file: %s", index_file)
-294     platform_grain_name = (
-295         kwargs.get("platform_grain_name")
-296         or __opts__.get("textfsm_platform_grain")
-297         or __pillar__.get("textfsm_platform_grain", "os")
-298     )
-299     log.debug("platform_grain_name: %s", platform_grain_name)
-300     platform_column_name = (
-301         kwargs.get("platform_column_name")
-302         or __opts__.get("textfsm_platform_column_name")
-303         or __pillar__.get("textfsm_platform_column_name", "Platform")
-304     )
-305     log.debug("platform_column_name: %s", platform_column_name)
-306     saltenv = kwargs.get("saltenv", "base")
-307     include_empty = kwargs.get("include_empty", False)
-308     include_pat = kwargs.get("include_pat")
-309     exclude_pat = kwargs.get("exclude_pat")
-310     processed_cli_outputs = {
-311         "comment": raw_cli_outputs.get("comment", ""),
-312         "result": raw_cli_outputs["result"],
-313         "out": {},
-314     }
-315     log.debug("Starting to analyse the raw outputs")
-316     for command in list(commands):
-317         command_output = raw_cli_outputs["out"][command]
-318         log.debug("Output from command: %s", command)
-319         log.debug(command_output)
-320         processed_command_output = None
-321         if textfsm_path:
-322             log.debug("Using the templates under %s", textfsm_path)
-323             processed_cli_output = __salt__["textfsm.index"](
-324                 command,
-325                 platform_grain_name=platform_grain_name,
-326                 platform_column_name=platform_column_name,
-327                 output=command_output.strip(),
-328                 textfsm_path=textfsm_path,
-329                 saltenv=saltenv,
-330                 include_empty=include_empty,
-331                 include_pat=include_pat,
-332                 exclude_pat=exclude_pat,
-333             )
-334             log.debug("Processed CLI output:")
-335             log.debug(processed_cli_output)
-336             if not processed_cli_output["result"]:
-337                 log.debug("Apparently this did not work, returning the raw output")
-338                 processed_command_output = command_output
-339                 processed_cli_outputs[
-340                     "comment"
-341                 ] += "\nUnable to process the output from {}: {}.".format(
-342                     command, processed_cli_output["comment"]
-343                 )
-344                 log.error(processed_cli_outputs["comment"])
-345             elif processed_cli_output["out"]:
-346                 log.debug("All good, %s has a nice output!", command)
-347                 processed_command_output = processed_cli_output["out"]
-348             else:
-349                 comment = """\nProcessing "{}" didn't fail, but didn't return anything either. Dumping raw.""".format(
-350                     command
-351                 )
-352                 processed_cli_outputs["comment"] += comment
-353                 log.error(comment)
-354                 processed_command_output = command_output
-355         elif textfsm_template or command in textfsm_template_dict:
-356             if command in textfsm_template_dict:
-357                 textfsm_template = textfsm_template_dict[command]
-358             log.debug("Using %s to process the command: %s", textfsm_template, command)
-359             processed_cli_output = __salt__["textfsm.extract"](
-360                 textfsm_template, raw_text=command_output, saltenv=saltenv
-361             )
-362             log.debug("Processed CLI output:")
-363             log.debug(processed_cli_output)
-364             if not processed_cli_output["result"]:
-365                 log.debug("Apparently this did not work, returning the raw output")
-366                 processed_command_output = command_output
-367                 processed_cli_outputs[
-368                     "comment"
-369                 ] += "\nUnable to process the output from {}: {}".format(
-370                     command, processed_cli_output["comment"]
-371                 )
-372                 log.error(processed_cli_outputs["comment"])
-373             elif processed_cli_output["out"]:
-374                 log.debug("All good, %s has a nice output!", command)
-375                 processed_command_output = processed_cli_output["out"]
-376             else:
-377                 log.debug(
-378                     "Processing %s did not fail, but did not return"
-379                     " anything either. Dumping raw.",
-380                     command,
-381                 )
-382                 processed_command_output = command_output
-383         else:
-384             log.error("No TextFSM template specified, or no TextFSM path defined")
-385             processed_command_output = command_output
-386             processed_cli_outputs[
-387                 "comment"
-388             ] += "\nUnable to process the output from {}.".format(command)
-389         processed_cli_outputs["out"][command] = processed_command_output
-390     processed_cli_outputs["comment"] = processed_cli_outputs["comment"].strip()
-391     return processed_cli_outputs
-392 @salt.utils.napalm.proxy_napalm_wrap
-393 def traceroute(
-394     destination, source=None, ttl=None, timeout=None, vrf=None, **kwargs
-395 ):  # pylint: disable=unused-argument
-396     return salt.utils.napalm.call(
-397         napalm_device,  # pylint: disable=undefined-variable
-398         "traceroute",
-399         **{
-400             "destination": destination,
-401             "source": source,
-402             "ttl": ttl,
-403             "timeout": timeout,
-404             "vrf": vrf,
-405         }
-406     )
-407 @salt.utils.napalm.proxy_napalm_wrap
-408 def ping(
-409     destination,
-410     source=None,
-411     ttl=None,
-412     timeout=None,
-413     size=None,
-414     count=None,
-415     vrf=None,
-416     **kwargs
-417 ):  # pylint: disable=unused-argument
-418     return salt.utils.napalm.call(
-419         napalm_device,  # pylint: disable=undefined-variable
-420         "ping",
-421         **{
-422             "destination": destination,
-423             "source": source,
-424             "ttl": ttl,
-425             "timeout": timeout,
-426             "size": size,
-427             "count": count,
-428             "vrf": vrf,
-429         }
-430     )
-431 @salt.utils.napalm.proxy_napalm_wrap
-432 def arp(
-433     interface="", ipaddr="", macaddr="", **kwargs
-434 ):  # pylint: disable=unused-argument
-435     proxy_output = salt.utils.napalm.call(
-436         napalm_device, "get_arp_table", **{}  # pylint: disable=undefined-variable
-437     )
-438     if not proxy_output.get("result"):
-439         return proxy_output
-440     arp_table = proxy_output.get("out")
-441     if interface:
-442         arp_table = _filter_list(arp_table, "interface", interface)
-443     if ipaddr:
-444         arp_table = _filter_list(arp_table, "ip", ipaddr)
-445     if macaddr:
-446         arp_table = _filter_list(arp_table, "mac", macaddr)
-447     proxy_output.update({"out": arp_table})
-448     return proxy_output
-449 @salt.utils.napalm.proxy_napalm_wrap
-450 def ipaddrs(**kwargs):  # pylint: disable=unused-argument
-451     return salt.utils.napalm.call(
-452         napalm_device, "get_interfaces_ip", **{}  # pylint: disable=undefined-variable
-453     )
-454 @salt.utils.napalm.proxy_napalm_wrap
-455 def interfaces(**kwargs):  # pylint: disable=unused-argument
-456     return salt.utils.napalm.call(
-457         napalm_device, "get_interfaces", **{}  # pylint: disable=undefined-variable
-458     )
-459 @salt.utils.napalm.proxy_napalm_wrap
-460 def lldp(interface="", **kwargs):  # pylint: disable=unused-argument
-461     proxy_output = salt.utils.napalm.call(
-462         napalm_device,  # pylint: disable=undefined-variable
-463         "get_lldp_neighbors_detail",
-464         **{}
-465     )
-466     if not proxy_output.get("result"):
-467         return proxy_output
-468     lldp_neighbors = proxy_output.get("out")
-469     if interface:
-470         lldp_neighbors = {interface: lldp_neighbors.get(interface)}
-471     proxy_output.update({"out": lldp_neighbors})
-472     return proxy_output
-473 @salt.utils.napalm.proxy_napalm_wrap
-474 def mac(address="", interface="", vlan=0, **kwargs):  # pylint: disable=unused-argument
-475     proxy_output = salt.utils.napalm.call(
-476         napalm_device,  # pylint: disable=undefined-variable
-477         "get_mac_address_table",
-478         **{}
-479     )
-480     if not proxy_output.get("result"):
-481         return proxy_output
-482     mac_address_table = proxy_output.get("out")
-483     if vlan and isinstance(vlan, int):
-484         mac_address_table = _filter_list(mac_address_table, "vlan", vlan)
-485     if address:
-486         mac_address_table = _filter_list(mac_address_table, "mac", address)
-487     if interface:
-488         mac_address_table = _filter_list(mac_address_table, "interface", interface)
-489     proxy_output.update({"out": mac_address_table})
-490     return proxy_output
-491 @salt.utils.napalm.proxy_napalm_wrap
-492 def config(source=None, **kwargs):  # pylint: disable=unused-argument
-493     return salt.utils.napalm.call(
-494         napalm_device,  # pylint: disable=undefined-variable
-495         "get_config",
-496         **{"retrieve": source}
-497     )
-498 @salt.utils.napalm.proxy_napalm_wrap
-499 def optics(**kwargs):  # pylint: disable=unused-argument
-500     return salt.utils.napalm.call(
-501         napalm_device, "get_optics", **{}  # pylint: disable=undefined-variable
-502     )
-503 @salt.utils.napalm.proxy_napalm_wrap
-504 <font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>def load_config(
-505     filename=None,
-506     text=None,
-507     test=False,
-508     commit=True,
-509     debug=False,
-510     replace=False,
-511     commit_in=None,
-512     commit_at=None,
-513     revert_in=None,
-514     revert_at=None,
-515     commit_jid=None,
-516     inherit_napalm_device=None,
-517     saltenv="base",
-518     **kwargs
-519 ):  # pylint: disable=unused-argument
-520     fun =</b></font> "load_merge_candidate"
-521     if replace:
-522         fun = "load_replace_candidate"
-523     if salt.utils.napalm.not_always_alive(__opts__):
-524         napalm_device["CLOSE"] = False  # pylint: disable=undefined-variable
-525     if filename:
-526         text = __salt__["cp.get_file_str"](filename, saltenv=saltenv)
-527         if text is False:
-528             ret = {"result": False, "out": None}
-529             ret[
-530                 "comment"
-531             ] = "Unable to read from {}. Please specify a valid file or text.".format(
-532                 filename
-533             )
-534             log.error(ret["comment"])
-535             return ret
-536         if commit_jid:
-537             salt.utils.files.safe_rm(filename)
-538     _loaded = salt.utils.napalm.call(
-539         napalm_device, fun, **{"config": text}  # pylint: disable=undefined-variable
-540     )
-541     return _config_logic(
-542         napalm_device,  # pylint: disable=undefined-variable
-543         _loaded,
-544         test=test,
-545         debug=debug,
-546         replace=replace,
-547         commit_config=commit,
-548         loaded_config=text,
-549         commit_at=commit_at,
-550         commit_in=commit_in,
-551         revert_in=revert_in,
-552         revert_at=revert_at,
-553         commit_jid=commit_jid,
-554         **kwargs
-555     )
-556 @salt.utils.napalm.proxy_napalm_wrap
-557 <font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>def load_template(
-558     template_name=None,
-559     template_source=None,
-560     context=None,
-561     defaults=None,
-562     template_engine="jinja",
-563     saltenv="base",
-564     template_hash=None,
-565     template_hash_name=None,
-566     skip_verify=False,
-567     test=False,
-568     commit=True,
-569     debug=False,
-570     replace=False,
-571     commit_in=None,
-572     commit_at=</b></font>None,
-573     revert_in=None,
-574     revert_at=None,
-575     inherit_napalm_device=None,  # pylint: disable=unused-argument
-576     **template_vars
-577 ):
-578     _rendered = ""
-579     _loaded = {"result": True, "comment": "", "out": None}
-580     loaded_config = None
-581     if template_engine not in salt.utils.templates.TEMPLATE_REGISTRY:
-582         _loaded.update(
-583             {
-584                 "result": False,
-585                 "comment": (
-586                     "Invalid templating engine! Choose between: {tpl_eng_opts}".format(
-587                         tpl_eng_opts=", ".join(
-588                             list(salt.utils.templates.TEMPLATE_REGISTRY.keys())
-589                         )
-590                     )
-591                 ),
-592             }
-593         )
-594         return _loaded  # exit
-595     salt_render_prefixes = ("salt://", "http://", "https://", "ftp://")
-596     salt_render = False
-597     file_exists = False
-598     if not isinstance(template_name, (tuple, list)):
-599         for salt_render_prefix in salt_render_prefixes:
-600             if not salt_render:
-601                 salt_render = salt_render or template_name.startswith(
-602                     salt_render_prefix
-603                 )
-604         file_exists = __salt__["file.file_exists"](template_name)
-605     if context is None:
-606         context = {}
-607     context.update(template_vars)
-608     if template_source:
-609         _rendered = __salt__["file.apply_template_on_contents"](
-610             contents=template_source,
-611             template=template_engine,
-612             context=context,
-613             defaults=defaults,
-614             saltenv=saltenv,
-615         )
-616         if not isinstance(_rendered, str):
-617             if "result" in _rendered:
-618                 _loaded["result"] = _rendered["result"]
-619             else:
-620                 _loaded["result"] = False
-621             if "comment" in _rendered:
-622                 _loaded["comment"] = _rendered["comment"]
-623             else:
-624                 _loaded["comment"] = "Error while rendering the template."
-625             return _loaded
-626     else:
-627         if not isinstance(template_name, (list, tuple)):
-628             template_name = [template_name]
-629         if template_hash_name and not isinstance(template_hash_name, (list, tuple)):
-630             template_hash_name = [template_hash_name]
-631         elif not template_hash_name:
-632             template_hash_name = [None] * len(template_name)
-633         if (
-634             template_hash
-635             and isinstance(template_hash, str)
-636             and not (
-637                 template_hash.startswith("salt://")
-638                 or template_hash.startswith("file://")
-639             )
-640         ):
-641             template_hash = [template_hash]
-642         elif (
-643             template_hash
-644             and isinstance(template_hash, str)
-645             and (
-646                 template_hash.startswith("salt://")
-647                 or template_hash.startswith("file://")
-648             )
-649         ):
-650             template_hash = [template_hash] * len(template_name)
-651         elif not template_hash:
-652             template_hash = [None] * len(template_name)
-653         for tpl_index, tpl_name in enumerate(template_name):
-654             tpl_hash = template_hash[tpl_index]
-655             _rand_filename = __salt__["random.hash"](tpl_name, "md5")
-656             _temp_file = __salt__["file.join"]("/tmp", _rand_filename)
-657             _managed <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>= __salt__["file.get_managed"](
-658                 name=_temp_file,
-659                 source=tpl_name,
-660                 source_hash=tpl_hash,
-661                 source_hash_name=tpl_hash_name,
-662                 user=None,
-663                 group=None,
-664                 mode=None,
-665                 attrs=None,
-666                 template=template_engine,
-667                 context=context,
-668                 defaults=defaults,
-669                 saltenv=saltenv,
-670                 skip_verify=</b></font>skip_verify,
-671             )
-672             if not isinstance(_managed, (list, tuple)) and isinstance(_managed, str):
-673                 _loaded["comment"] += _managed
-674                 _loaded["result"] = False
-675             elif isinstance(_managed, (list, tuple)) and not len(_managed) &gt; 0:
-676                 _loaded["result"] = False
-677                 _loaded["comment"] += "Error while rendering the template."
-678             elif isinstance(_managed, (list, tuple)) and not len(_managed[0]) &gt; 0:
-679                 _loaded["result"] = False
-680                 _loaded["comment"] += _managed[-1]  # contains the error message
-681             if _loaded["result"]:  # all good
-682                 _temp_tpl_file = _managed[0]
-683                 _temp_tpl_file_exists = __salt__["file.file_exists"](_temp_tpl_file)
-684                 if not _temp_tpl_file_exists:
-685                     _loaded["result"] = False
-686                     _loaded["comment"] += "Error while rendering the template."
-687                     return _loaded
-688                 _rendered += __salt__["file.read"](_temp_tpl_file)
-689                 __salt__["file.remove"](_temp_tpl_file)
-690             else:
-691                 return _loaded  # exit
-692     loaded_config = _rendered
-693     if _loaded["result"]:  # all good
-694         fun = "load_merge_candidate"
-695         if replace:  # replace requested
-696             fun = "load_replace_candidate"
-697         if salt.utils.napalm.not_always_alive(__opts__):
-698             napalm_device["CLOSE"] = False  # pylint: disable=undefined-variable
-699         _loaded = salt.utils.napalm.call(
-700             napalm_device,  # pylint: disable=undefined-variable
-701             fun,
-702             **{"config": _rendered}
-703         )
-704     return _config_logic(
-705         napalm_device,  # pylint: disable=undefined-variable
-706         _loaded,
-707         test=test,
-708         debug=debug,
-709         replace=replace,
-710         commit_config=commit,
-711         loaded_config=loaded_config,
-712         commit_at=commit_at,
-713         commit_in=commit_in,
-714         revert_in=revert_in,
-715         revert_at=revert_at,
-716         **template_vars
-717     )
-718 @salt.utils.napalm.proxy_napalm_wrap
-719 def commit(inherit_napalm_device=None, **kwargs):  # pylint: disable=unused-argument
-720     return salt.utils.napalm.call(
-721         napalm_device, "commit_config", **{}  # pylint: disable=undefined-variable
-722     )
-723 @salt.utils.napalm.proxy_napalm_wrap
-724 def discard_config(
-725     inherit_napalm_device=None, **kwargs
-726 ):  # pylint: disable=unused-argument
-727     return salt.utils.napalm.call(
-728         napalm_device, "discard_config", **{}  # pylint: disable=undefined-variable
-729     )
-730 @salt.utils.napalm.proxy_napalm_wrap
-731 def compare_config(
-732     inherit_napalm_device=None, **kwargs
-733 ):  # pylint: disable=unused-argument
-734     return salt.utils.napalm.call(
-735         napalm_device, "compare_config", **{}  # pylint: disable=undefined-variable
-736     )
-737 @salt.utils.napalm.proxy_napalm_wrap
-738 def rollback(inherit_napalm_device=None, **kwargs):  # pylint: disable=unused-argument
-739     return salt.utils.napalm.call(
-740         napalm_device, "rollback", **{}  # pylint: disable=undefined-variable
-741     )
-742 @salt.utils.napalm.proxy_napalm_wrap
-743 def config_changed(
-744     inherit_napalm_device=None, **kwargs
-745 ):  # pylint: disable=unused-argument
-746     is_config_changed = False
-747     reason = ""
-748     try_compare = compare_config(inherit_napalm_device=napalm_device)
-749     if try_compare.get("result"):
-750         if try_compare.get("out"):
-751             is_config_changed = True
-752         else:
-753             reason = "Configuration was not changed on the device."
-754     else:
-755         reason = try_compare.get("comment")
-756     return is_config_changed, reason
-757 @salt.utils.napalm.proxy_napalm_wrap
-758 def config_control(
-759     inherit_napalm_device=None, **kwargs
-760 ):  # pylint: disable=unused-argument
-761     result = True
-762     comment = ""
-763     changed, not_changed_rsn = config_changed(inherit_napalm_device=napalm_device)
-764     if not changed:
-765         return (changed, not_changed_rsn)
-766     try_commit = commit()
-767     if not try_commit.get("result"):
-768         result = False
-769         comment = (
-770             "Unable to commit the changes: {reason}.\nWill try to rollback now!".format(
-771                 reason=try_commit.get("comment")
-772             )
-773         )
-774         try_rollback = rollback()
-775         if not try_rollback.get("result"):
-776             comment += "\nCannot rollback! {reason}".format(
-777                 reason=try_rollback.get("comment")
-778             )
-779     return result, comment
-780 def cancel_commit(jid):
-781     job_name = "__napalm_commit_{}".format(jid)
-782     removed = __salt__["schedule.delete"](job_name)
-783     if removed["result"]:
-784         saved = __salt__["schedule.save"]()
-785         removed["comment"] = "Commit #{jid} cancelled.".format(jid=jid)
-786     else:
-787         removed["comment"] = "Unable to find commit #{jid}.".format(jid=jid)
-788     return removed
-789 def confirm_commit(jid):
-790     if __grains__["os"] == "junos":
-791         confirmed = __salt__["napalm.junos_commit"]()
-792         confirmed["result"] = confirmed.pop("out")
-793         confirmed["comment"] = confirmed.pop("message")
-794     else:
-795         confirmed = cancel_commit(jid)
-796     if confirmed["result"]:
-797         confirmed["comment"] = "Commit #{jid} confirmed.".format(jid=jid)
-798     return confirmed
-799 def save_config(source=None, path=None):
-800     if not source:
-801         source = "running"
-802     if not path:
-803         path = salt.utils.files.mkstemp()
-804     running_config = __salt__["net.config"](source=source)
-805     if not running_config or not running_config["result"]:
-806         log.error("Unable to retrieve the config")
-807         return running_config
-808     with salt.utils.files.fopen(path, "w") as fh_:
-809         fh_.write(running_config["out"][source])
-810         "result": True,
-811         "out": path,
-812         "comment": "{source} config saved to {path}".format(source=source, path=<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>path),
-813     }
-814 def replace_pattern(
-815     pattern,
-816     repl,
-817     count=0,
-818     flags=8,
-819     bufsize=1,
-820     append_if_not_found=False,
-821     prepend_if_not_found=False,
-822     not_found_content=None,
-823     search_only=False,
-824     show_changes=True,
-825     backslash_literal=False,
-826     source=None,
-827     path=None,
-828     test=False,
-829     replace=True,
-830     debug=False,
-831     commit=True,
-832 ):
-833     config_saved =</b></font> save_config(source=source, path=path)
-834         return config_saved
-835     path = config_saved["out"]
-836     replace_pattern <font color="#151b8d"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>= __salt__["file.replace"](
-837         path,
-838         pattern,
-839         repl,
-840         count=count,
-841         flags=flags,
-842         bufsize=bufsize,
-843         append_if_not_found=append_if_not_found,
-844         prepend_if_not_found=prepend_if_not_found,
-845         not_found_content=not_found_content,
-846         search_only=search_only,
-847         show_changes=show_changes,
-848         backslash_literal=</b></font>backslash_literal,
-849     )
-850     with salt.utils.files.fopen(path, "r") as fh_:
-851         updated_config = fh_.read()
-852     return __salt__["net.load_config"](
-853         text=updated_config, test=test, debug=debug, replace=replace, commit=commit
-854     )
-855     marker_start,
-856     marker_end,
-857     content<font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>="",
-858     append_if_not_found=False,
-859     prepend_if_not_found=False,
-860     show_changes=True,
-861     append_newline=False,
-862     source="running",
-863     path=None,
-864     test=False,
-865     commit=True,
-866     debug=False,
-867     replace=True,
-868 ):
-869     config_saved =</b></font> save_config(source=source, path=path)
-870     if not config_saved or not config_saved["result"]:
-871         return config_saved
-872     path = config_saved["out"]
-873     replace_pattern = __salt__["file.blockreplace"](
-874         path,
-875         marker_start=marker_start,
-876         marker_end=marker_end,
-877         content=content,
-878         append_if_not_found=append_if_not_found,
-879         prepend_if_not_found=prepend_if_not_found,
-880         show_changes=show_changes,
-881         append_newline=append_newline,
-882     )
-883     with salt.utils.files.fopen(path, "r") as fh_:
-884         updated_config = fh_.read()
-885     return __salt__["net.load_config"](
-886         text=updated_config, test=test, debug=debug, replace=replace, commit=commit
-887     )
-888 def patch(
-889     patchfile,
-890     options="",
-891     saltenv="base",
-892     source_hash=None,
-893     show_changes=True,
-894     source="running",
-895     path=None,
-896     test=False,
-897     commit=True,
-898     debug=False,
-899     replace=True,
-900 ):
-901     config_saved = save_config(source=source, path=path)
-902     if not config_saved or not config_saved["result"]:
-903         return config_saved
-904     path = config_saved["out"]
-905     patchfile_cache = __salt__["cp.cache_file"](patchfile)
-906     if patchfile_cache is False:
-907         return {
-908             "out": None,
-909             "result": False,
-910             "comment": 'The file "{}" does not exist.'.format(patchfile),
-911         }
-912     replace_pattern = __salt__["file.patch"](path, patchfile_cache, options=options)
-913     with salt.utils.files.fopen(path, "r") as fh_:
-914         updated_config = fh_.read()
-915     return __salt__["net.load_config"](
-916         text=updated_config, test=test, debug=debug, replace=replace, commit=commit
-917     )
+"""
+NAPALM Network
+==============
+Basic methods for interaction with the network device through the virtual proxy 'napalm'.
+:codeauthor: Mircea Ulinic &lt;ping@mirceaulinic.net&gt; &amp; Jerome Fleury &lt;jf@cloudflare.com&gt;
+:maturity:   new
+:depends:    napalm
+:platform:   unix
+Dependencies
+------------
+- :mod:`napalm proxy minion &lt;salt.proxy.napalm&gt;`
+.. versionadded:: 2016.11.0
+.. versionchanged:: 2017.7.0
+"""
+import datetime
+import logging
+import time
+import salt.utils.files
+import salt.utils.napalm
+import salt.utils.templates
+import salt.utils.versions
+log = logging.getLogger(__name__)
+try:
+    import jxmlease  # pylint: disable=unused-import
+    HAS_JXMLEASE = True
+except ImportError:
+    HAS_JXMLEASE = False
+__virtualname__ = "net"
+__proxyenabled__ = ["*"]
+__virtual_aliases__ = ("napalm_net",)
+def __virtual__():
+    """
+    NAPALM library must be installed for this module to work and run in a (proxy) minion.
+    """
+    return salt.utils.napalm.virtual(__opts__, __virtualname__, __file__)
+def _filter_list(input_list, search_key, search_value):
+    """
+    Filters a list of dictionary by a set of key-value pair.
+    :param input_list:   is a list of dictionaries
+    :param search_key:   is the key we are looking for
+    :param search_value: is the value we are looking for the key specified in search_key
+    :return:             filered list of dictionaries
+    """
+    output_list = list()
+    for dictionary in input_list:
+        if dictionary.get(search_key) == search_value:
+            output_list.append(dictionary)
+    return output_list
+def _filter_dict(input_dict, search_key, search_value):
+    """
+    Filters a dictionary of dictionaries by a key-value pair.
+    :param input_dict:    is a dictionary whose values are lists of dictionaries
+    :param search_key:    is the key in the leaf dictionaries
+    :param search_values: is the value in the leaf dictionaries
+    :return:              filtered dictionary
+    """
+    output_dict = dict()
+    for key, key_list in input_dict.items():
+        key_list_filtered = _filter_list(key_list, search_key, search_value)
+        if key_list_filtered:
+            output_dict[key] = key_list_filtered
+    return output_dict
+def _safe_commit_config(loaded_result, napalm_device):
+    _commit = commit(
+        inherit_napalm_device=napalm_device
+    )  # calls the function commit, defined below
+    if not _commit.get("result", False):
+        loaded_result["comment"] += (
+            _commit["comment"] if _commit.get("comment") else "Unable to commit."
+        )
+        loaded_result["result"] = False
+        discarded = _safe_dicard_config(loaded_result, napalm_device)
+        if not discarded["result"]:
+            return loaded_result
+    return _commit
+def _safe_dicard_config(loaded_result, napalm_device):
+    log.debug("Discarding the config")
+    log.debug(loaded_result)
+    _discarded = discard_config(inherit_napalm_device=napalm_device)
+    if not _discarded.get("result", False):
+        loaded_result["comment"] += (
+            _discarded["comment"]
+            if _discarded.get("comment")
+            else "Unable to discard config."
+        )
+        loaded_result["result"] = False
+        _explicit_close(napalm_device)
+        __context__["retcode"] = 1
+        return loaded_result
+    return _discarded
+def _explicit_close(napalm_device):
+    """
+    Will explicily close the config session with the network device,
+    when running in a now-always-alive proxy minion or regular minion.
+    This helper must be used in configuration-related functions,
+    as the session is preserved and not closed before making any changes.
+    """
+    if salt.utils.napalm.not_always_alive(__opts__):
+        try:
+            napalm_device["DRIVER"].close()
+        except Exception as err:  # pylint: disable=broad-except
+            log.error("Unable to close the temp connection with the device:")
+            log.error(err)
+            log.error("Please report.")
+def _config_logic(
+    napalm_device,
+    loaded_result,
+    test=False,
+    debug=False,
+    replace=False,
+    commit_config=True,
+    loaded_config=None,
+    commit_in=None,
+    commit_at=None,
+    revert_in=None,
+    revert_at=None,
+    commit_jid=None,
+    **kwargs
+):
+    """
+    Builds the config logic for `load_config` and `load_template` functions.
+    """
+    current_jid = kwargs.get("__pub_jid")
+    if not current_jid:
+        current_jid = "{:%Y%m%d%H%M%S%f}".format(datetime.datetime.now())
+    loaded_result["already_configured"] = False
+    loaded_result["loaded_config"] = ""
+    if debug:
+        loaded_result["loaded_config"] = loaded_config
+    _compare = compare_config(inherit_napalm_device=napalm_device)
+    if _compare.get("result", False):
+        loaded_result["diff"] = _compare.get("out")
+        loaded_result.pop("out", "")  # not needed
+    else:
+        loaded_result["diff"] = None
+        loaded_result["result"] = False
+        loaded_result["comment"] = _compare.get("comment")
+        __context__["retcode"] = 1
+        return loaded_result
+    _loaded_res = loaded_result.get("result", False)
+    if not _loaded_res or test:
+        if loaded_result["comment"]:
+            loaded_result["comment"] += "\n"
+        if not len(loaded_result.get("diff", "")) &gt; 0:
+            loaded_result["already_configured"] = True
+        discarded = _safe_dicard_config(loaded_result, napalm_device)
+        if not discarded["result"]:
+            return loaded_result
+        loaded_result["comment"] += "Configuration discarded."
+        _explicit_close(napalm_device)
+        if not loaded_result["result"]:
+            __context__["retcode"] = 1
+        return loaded_result
+    if not test and commit_config:
+        if commit_jid:
+            log.info("Committing the JID: %s", str(commit_jid))
+            removed = cancel_commit(commit_jid)
+            log.debug("Cleaned up the commit from the schedule")
+            log.debug(removed["comment"])
+        if len(loaded_result.get("diff", "")) &gt; 0:
+            if commit_in or commit_at:
+                commit_time = __utils__["timeutil.get_time_at"](
+                    time_in=commit_in, time_at=commit_in
+                )
+                scheduled_job_name = "__napalm_commit_{}".format(current_jid)
+                temp_file = salt.utils.files.mkstemp()
+                with salt.utils.files.fopen(temp_file, "w") as fp_:
+                    fp_.write(loaded_config)
+                scheduled = __salt__["schedule.add"](
+                    scheduled_job_name,
+                    function="net.load_config",
+                    job_kwargs={
+                        "filename": temp_file,
+                        "commit_jid": current_jid,
+                        "replace": replace,
+                    },
+                    once=commit_time,
+                )
+                log.debug("Scheduling job")
+                log.debug(scheduled)
+                saved = __salt__["schedule.save"]()  # ensure the schedule is
+                discarded = _safe_dicard_config(loaded_result, napalm_device)
+                if not discarded["result"]:
+                    discarded["comment"] += (
+                        "Scheduled the job to be executed at {schedule_ts}, "
+                        "but was unable to discard the config: \n".format(
+                            schedule_ts=commit_time
+                        )
+                    )
+                    return discarded
+                loaded_result["comment"] = (
+                    "Changes discarded for now, and scheduled commit at:"
+                    " {schedule_ts}.\nThe commit ID is: {current_jid}.\nTo discard this"
+                    " commit, you can execute: \n\nsalt {min_id} net.cancel_commit"
+                    " {current_jid}".format(
+                        schedule_ts=commit_time,
+                        min_id=__opts__["id"],
+                        current_jid=current_jid,
+                    )
+                )
+                loaded_result["commit_id"] = current_jid
+                return loaded_result
+            log.debug("About to commit:")
+            log.debug(loaded_result["diff"])
+            if revert_in or revert_at:
+                revert_time = __utils__["timeutil.get_time_at"](
+                    time_in=revert_in, time_at=revert_at
+                )
+                if __grains__["os"] == "junos":
+                    if not HAS_JXMLEASE:
+                        loaded_result["comment"] = (
+                            "This feature requires the library jxmlease to be"
+                            " installed.\nTo install, please execute: ``pip install"
+                            " jxmlease``."
+                        )
+                        loaded_result["result"] = False
+                        return loaded_result
+                    timestamp_at = __utils__["timeutil.get_timestamp_at"](
+                        time_in=revert_in, time_at=revert_at
+                    )
+                    minutes = int((timestamp_at - time.time()) / 60)
+                    _comm = __salt__["napalm.junos_commit"](confirm=minutes)
+                    if not _comm["out"]:
+                        loaded_result[
+                            "comment"
+                        ] = "Unable to commit confirm: {}".format(_comm["message"])
+                        loaded_result["result"] = False
+                        discarded = _safe_dicard_config(loaded_result, napalm_device)
+                        if not discarded["result"]:
+                            return loaded_result
+                else:
+                    temp_file = salt.utils.files.mkstemp()
+                    running_config = __salt__["net.config"](source="running")["out"][
+                        "running"
+                    ]
+                    with salt.utils.files.fopen(temp_file, "w") as fp_:
+                        fp_.write(running_config)
+                    committed = _safe_commit_config(loaded_result, napalm_device)
+                    if not committed["result"]:
+                        return loaded_result
+                    scheduled_job_name = "__napalm_commit_{}".format(current_jid)
+                    scheduled = __salt__["schedule.add"](
+                        scheduled_job_name,
+                        function="net.load_config",
+                        job_kwargs={
+                            "filename": temp_file,
+                            "commit_jid": current_jid,
+                            "replace": True,
+                        },
+                        once=revert_time,
+                    )
+                    log.debug("Scheduling commit confirmed")
+                    log.debug(scheduled)
+                    saved = __salt__["schedule.save"]()
+                loaded_result["comment"] = (
+                    "The commit ID is: {current_jid}.\nThis commit will be reverted at:"
+                    " {schedule_ts}, unless confirmed.\nTo confirm the commit and avoid"
+                    " reverting, you can execute:\n\nsalt {min_id} net.confirm_commit"
+                    " {current_jid}".format(
+                        schedule_ts=revert_time,
+                        min_id=__opts__["id"],
+                        current_jid=current_jid,
+                    )
+                )
+                loaded_result["commit_id"] = current_jid
+                return loaded_result
+            committed = _safe_commit_config(loaded_result, napalm_device)
+            if not committed["result"]:
+                return loaded_result
+        else:
+            discarded = _safe_dicard_config(loaded_result, napalm_device)
+            if not discarded["result"]:
+                return loaded_result
+            loaded_result["already_configured"] = True
+            loaded_result["comment"] = "Already configured."
+    _explicit_close(napalm_device)
+    if not loaded_result["result"]:
+        __context__["retcode"] = 1
+    return loaded_result
+@salt.utils.napalm.proxy_napalm_wrap
+def connected(**kwargs):  # pylint: disable=unused-argument
+    """
+    Specifies if the connection to the device succeeded.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.connected
+    """
+    return {"out": napalm_device.get("UP", False)}  # pylint: disable=undefined-variable
+@salt.utils.napalm.proxy_napalm_wrap
+def facts(**kwargs):  # pylint: disable=unused-argument
+    """
+    Returns characteristics of the network device.
+    :return: a dictionary with the following keys:
+        * uptime - Uptime of the device in seconds.
+        * vendor - Manufacturer of the device.
+        * model - Device model.
+        * hostname - Hostname of the device
+        * fqdn - Fqdn of the device
+        * os_version - String with the OS version running on the device.
+        * serial_number - Serial number of the device
+        * interface_list - List of the interfaces of the device
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.facts
+    Example output:
+    .. code-block:: python
+        {
+            'os_version': '13.3R6.5',
+            'uptime': 10117140,
+            'interface_list': [
+                'lc-0/0/0',
+                'pfe-0/0/0',
+                'pfh-0/0/0',
+                'xe-0/0/0',
+                'xe-0/0/1',
+                'xe-0/0/2',
+                'xe-0/0/3',
+                'gr-0/0/10',
+                'ip-0/0/10'
+            ],
+            'vendor': 'Juniper',
+            'serial_number': 'JN131356FBFA',
+            'model': 'MX480',
+            'hostname': 're0.edge05.syd01',
+            'fqdn': 're0.edge05.syd01'
+        }
+    """
+    return salt.utils.napalm.call(
+        napalm_device, "get_facts", **{}  # pylint: disable=undefined-variable
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def environment(**kwargs):  # pylint: disable=unused-argument
+    """
+    Returns the environment of the device.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.environment
+    Example output:
+    .. code-block:: python
+        {
+            'fans': {
+                'Bottom Rear Fan': {
+                    'status': True
+                },
+                'Bottom Middle Fan': {
+                    'status': True
+                },
+                'Top Middle Fan': {
+                    'status': True
+                },
+                'Bottom Front Fan': {
+                    'status': True
+                },
+                'Top Front Fan': {
+                    'status': True
+                },
+                'Top Rear Fan': {
+                    'status': True
+                }
+            },
+            'memory': {
+                'available_ram': 16349,
+                'used_ram': 4934
+            },
+            'temperature': {
+               'FPC 0 Exhaust A': {
+                    'is_alert': False,
+                    'temperature': 35.0,
+                    'is_critical': False
+                }
+            },
+            'cpu': {
+                '1': {
+                    '%usage': 19.0
+                },
+                '0': {
+                    '%usage': 35.0
+                }
+            }
+        }
+    """
+    return salt.utils.napalm.call(
+        napalm_device, "get_environment", **{}  # pylint: disable=undefined-variable
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def cli(*commands, **kwargs):  # pylint: disable=unused-argument
+    """
+    Returns a dictionary with the raw output of all commands passed as arguments.
+    commands
+        List of commands to be executed on the device.
+    textfsm_parse: ``False``
+        Try parsing the outputs using the TextFSM templates.
+        .. versionadded:: 2018.3.0
+        .. note::
+            This option can be also specified in the minion configuration
+            file or pillar as ``napalm_cli_textfsm_parse``.
+    textfsm_path
+        The path where the TextFSM templates can be found. This option implies
+        the usage of the TextFSM index file.
+        ``textfsm_path`` can be either absolute path on the server,
+        either specified using the following URL mschemes: ``file://``,
+        ``salt://``, ``http://``, ``https://``, ``ftp://``,
+        ``s3://``, ``swift://``.
+        .. versionadded:: 2018.3.0
+        .. note::
+            This needs to be a directory with a flat structure, having an
+            index file (whose name can be specified using the ``index_file`` option)
+            and a number of TextFSM templates.
+        .. note::
+            This option can be also specified in the minion configuration
+            file or pillar as ``textfsm_path``.
+    textfsm_template
+        The path to a certain the TextFSM template.
+        This can be specified using the absolute path
+        to the file, or using one of the following URL schemes:
+        - ``salt://``, to fetch the template from the Salt fileserver.
+        - ``http://`` or ``https://``
+        - ``ftp://``
+        - ``s3://``
+        - ``swift://``
+        .. versionadded:: 2018.3.0
+    textfsm_template_dict
+        A dictionary with the mapping between a command
+        and the corresponding TextFSM path to use to extract the data.
+        The TextFSM paths can be specified as in ``textfsm_template``.
+        .. versionadded:: 2018.3.0
+        .. note::
+            This option can be also specified in the minion configuration
+            file or pillar as ``napalm_cli_textfsm_template_dict``.
+    platform_grain_name: ``os``
+        The name of the grain used to identify the platform name
+        in the TextFSM index file. Default: ``os``.
+        .. versionadded:: 2018.3.0
+        .. note::
+            This option can be also specified in the minion configuration
+            file or pillar as ``textfsm_platform_grain``.
+    platform_column_name: ``Platform``
+        The column name used to identify the platform,
+        exactly as specified in the TextFSM index file.
+        Default: ``Platform``.
+        .. versionadded:: 2018.3.0
+        .. note::
+            This is field is case sensitive, make sure
+            to assign the correct value to this option,
+            exactly as defined in the index file.
+        .. note::
+            This option can be also specified in the minion configuration
+            file or pillar as ``textfsm_platform_column_name``.
+    index_file: ``index``
+        The name of the TextFSM index file, under the ``textfsm_path``. Default: ``index``.
+        .. versionadded:: 2018.3.0
+        .. note::
+            This option can be also specified in the minion configuration
+            file or pillar as ``textfsm_index_file``.
+    saltenv: ``base``
+        Salt fileserver environment from which to retrieve the file.
+        Ignored if ``textfsm_path`` is not a ``salt://`` URL.
+        .. versionadded:: 2018.3.0
+    include_empty: ``False``
+        Include empty files under the ``textfsm_path``.
+        .. versionadded:: 2018.3.0
+    include_pat
+        Glob or regex to narrow down the files cached from the given path.
+        If matching with a regex, the regex must be prefixed with ``E@``,
+        otherwise the expression will be interpreted as a glob.
+        .. versionadded:: 2018.3.0
+    exclude_pat
+        Glob or regex to exclude certain files from being cached from the given path.
+        If matching with a regex, the regex must be prefixed with ``E@``,
+        otherwise the expression will be interpreted as a glob.
+        .. versionadded:: 2018.3.0
+        .. note::
+            If used with ``include_pat``, files matching this pattern will be
+            excluded from the subset of files defined by ``include_pat``.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.cli "show version" "show chassis fan"
+    CLI Example with TextFSM template:
+    .. code-block:: bash
+        salt '*' net.cli textfsm_parse=True textfsm_path=salt://textfsm/
+    Example output:
+    .. code-block:: python
+        {
+            'show version and haiku':  'Hostname: re0.edge01.arn01
+                                          Model: mx480
+                                          Junos: 13.3R6.5
+                                            Help me, Obi-Wan
+                                            I just saw Episode Two
+                                            You're my only hope
+                                         ',
+            'show chassis fan' :   'Item                      Status   RPM     Measurement
+                                      Top Rear Fan              OK       3840    Spinning at intermediate-speed
+                                      Bottom Rear Fan           OK       3840    Spinning at intermediate-speed
+                                      Top Middle Fan            OK       3900    Spinning at intermediate-speed
+                                      Bottom Middle Fan         OK       3840    Spinning at intermediate-speed
+                                      Top Front Fan             OK       3810    Spinning at intermediate-speed
+                                      Bottom Front Fan          OK       3840    Spinning at intermediate-speed
+                                     '
+        }
+    Example output with TextFSM parsing:
+    .. code-block:: json
+        {
+          "comment": "",
+          "result": true,
+          "out": {
+            "sh ver": [
+              {
+                "kernel": "9.1S3.5",
+                "documentation": "9.1S3.5",
+                "boot": "9.1S3.5",
+                "crypto": "9.1S3.5",
+                "chassis": "",
+                "routing": "9.1S3.5",
+                "base": "9.1S3.5",
+                "model": "mx960"
+              }
+            ]
+          }
+        }
+    """
+    raw_cli_outputs = salt.utils.napalm.call(
+        napalm_device,  # pylint: disable=undefined-variable
+        "cli",
+        **{"commands": list(commands)}
+    )
+    if not raw_cli_outputs["result"]:
+        return raw_cli_outputs
+    textfsm_parse = (
+        kwargs.get("textfsm_parse")
+        or __opts__.get("napalm_cli_textfsm_parse")
+        or __pillar__.get("napalm_cli_textfsm_parse", False)
+    )
+    if not textfsm_parse:
+        log.debug("No TextFSM parsing requested.")
+        return raw_cli_outputs
+    if "textfsm.extract" not in __salt__ or "textfsm.index" not in __salt__:
+        raw_cli_outputs["comment"] += "Unable to process: is TextFSM installed?"
+        log.error(raw_cli_outputs["comment"])
+        return raw_cli_outputs
+    textfsm_template = kwargs.get("textfsm_template")
+    log.debug("textfsm_template: %s", textfsm_template)
+    textfsm_path = (
+        kwargs.get("textfsm_path")
+        or __opts__.get("textfsm_path")
+        or __pillar__.get("textfsm_path")
+    )
+    log.debug("textfsm_path: %s", textfsm_path)
+    textfsm_template_dict = (
+        kwargs.get("textfsm_template_dict")
+        or __opts__.get("napalm_cli_textfsm_template_dict")
+        or __pillar__.get("napalm_cli_textfsm_template_dict", {})
+    )
+    log.debug("TextFSM command-template mapping: %s", textfsm_template_dict)
+    index_file = (
+        kwargs.get("index_file")
+        or __opts__.get("textfsm_index_file")
+        or __pillar__.get("textfsm_index_file")
+    )
+    log.debug("index_file: %s", index_file)
+    platform_grain_name = (
+        kwargs.get("platform_grain_name")
+        or __opts__.get("textfsm_platform_grain")
+        or __pillar__.get("textfsm_platform_grain", "os")
+    )
+    log.debug("platform_grain_name: %s", platform_grain_name)
+    platform_column_name = (
+        kwargs.get("platform_column_name")
+        or __opts__.get("textfsm_platform_column_name")
+        or __pillar__.get("textfsm_platform_column_name", "Platform")
+    )
+    log.debug("platform_column_name: %s", platform_column_name)
+    saltenv = kwargs.get("saltenv", "base")
+    include_empty = kwargs.get("include_empty", False)
+    include_pat = kwargs.get("include_pat")
+    exclude_pat = kwargs.get("exclude_pat")
+    processed_cli_outputs = {
+        "comment": raw_cli_outputs.get("comment", ""),
+        "result": raw_cli_outputs["result"],
+        "out": {},
+    }
+    log.debug("Starting to analyse the raw outputs")
+    for command in list(commands):
+        command_output = raw_cli_outputs["out"][command]
+        log.debug("Output from command: %s", command)
+        log.debug(command_output)
+        processed_command_output = None
+        if textfsm_path:
+            log.debug("Using the templates under %s", textfsm_path)
+            processed_cli_output = __salt__["textfsm.index"](
+                command,
+                platform_grain_name=platform_grain_name,
+                platform_column_name=platform_column_name,
+                output=command_output.strip(),
+                textfsm_path=textfsm_path,
+                saltenv=saltenv,
+                include_empty=include_empty,
+                include_pat=include_pat,
+                exclude_pat=exclude_pat,
+            )
+            log.debug("Processed CLI output:")
+            log.debug(processed_cli_output)
+            if not processed_cli_output["result"]:
+                log.debug("Apparently this did not work, returning the raw output")
+                processed_command_output = command_output
+                processed_cli_outputs[
+                    "comment"
+                ] += "\nUnable to process the output from {}: {}.".format(
+                    command, processed_cli_output["comment"]
+                )
+                log.error(processed_cli_outputs["comment"])
+            elif processed_cli_output["out"]:
+                log.debug("All good, %s has a nice output!", command)
+                processed_command_output = processed_cli_output["out"]
+            else:
+                comment = """\nProcessing "{}" didn't fail, but didn't return anything either. Dumping raw.""".format(
+                    command
+                )
+                processed_cli_outputs["comment"] += comment
+                log.error(comment)
+                processed_command_output = command_output
+        elif textfsm_template or command in textfsm_template_dict:
+            if command in textfsm_template_dict:
+                textfsm_template = textfsm_template_dict[command]
+            log.debug("Using %s to process the command: %s", textfsm_template, command)
+            processed_cli_output = __salt__["textfsm.extract"](
+                textfsm_template, raw_text=command_output, saltenv=saltenv
+            )
+            log.debug("Processed CLI output:")
+            log.debug(processed_cli_output)
+            if not processed_cli_output["result"]:
+                log.debug("Apparently this did not work, returning the raw output")
+                processed_command_output = command_output
+                processed_cli_outputs[
+                    "comment"
+                ] += "\nUnable to process the output from {}: {}".format(
+                    command, processed_cli_output["comment"]
+                )
+                log.error(processed_cli_outputs["comment"])
+            elif processed_cli_output["out"]:
+                log.debug("All good, %s has a nice output!", command)
+                processed_command_output = processed_cli_output["out"]
+            else:
+                log.debug(
+                    "Processing %s did not fail, but did not return"
+                    " anything either. Dumping raw.",
+                    command,
+                )
+                processed_command_output = command_output
+        else:
+            log.error("No TextFSM template specified, or no TextFSM path defined")
+            processed_command_output = command_output
+            processed_cli_outputs[
+                "comment"
+            ] += "\nUnable to process the output from {}.".format(command)
+        processed_cli_outputs["out"][command] = processed_command_output
+    processed_cli_outputs["comment"] = processed_cli_outputs["comment"].strip()
+    return processed_cli_outputs
+@salt.utils.napalm.proxy_napalm_wrap
+def traceroute(
+    destination, source=None, ttl=None, timeout=None, vrf=None, **kwargs
+):  # pylint: disable=unused-argument
+    """
+    Calls the method traceroute from the NAPALM driver object and returns a dictionary with the result of the traceroute
+    command executed on the device.
+    destination
+        Hostname or address of remote host
+    source
+        Source address to use in outgoing traceroute packets
+    ttl
+        IP maximum time-to-live value (or IPv6 maximum hop-limit value)
+    timeout
+        Number of seconds to wait for response (seconds)
+    vrf
+        VRF (routing instance) for traceroute attempt
+        .. versionadded:: 2016.11.4
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.traceroute 8.8.8.8
+        salt '*' net.traceroute 8.8.8.8 source=127.0.0.1 ttl=5 timeout=1
+    """
+    return salt.utils.napalm.call(
+        napalm_device,  # pylint: disable=undefined-variable
+        "traceroute",
+        **{
+            "destination": destination,
+            "source": source,
+            "ttl": ttl,
+            "timeout": timeout,
+            "vrf": vrf,
+        }
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def ping(
+    destination,
+    source=None,
+    ttl=None,
+    timeout=None,
+    size=None,
+    count=None,
+    vrf=None,
+    **kwargs
+):  # pylint: disable=unused-argument
+    """
+    Executes a ping on the network device and returns a dictionary as a result.
+    destination
+        Hostname or IP address of remote host
+    source
+        Source address of echo request
+    ttl
+        IP time-to-live value (IPv6 hop-limit value) (1..255 hops)
+    timeout
+        Maximum wait time after sending final packet (seconds)
+    size
+        Size of request packets (0..65468 bytes)
+    count
+        Number of ping requests to send (1..2000000000 packets)
+    vrf
+        VRF (routing instance) for ping attempt
+        .. versionadded:: 2016.11.4
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.ping 8.8.8.8
+        salt '*' net.ping 8.8.8.8 ttl=3 size=65468
+        salt '*' net.ping 8.8.8.8 source=127.0.0.1 timeout=1 count=100
+    """
+    return salt.utils.napalm.call(
+        napalm_device,  # pylint: disable=undefined-variable
+        "ping",
+        **{
+            "destination": destination,
+            "source": source,
+            "ttl": ttl,
+            "timeout": timeout,
+            "size": size,
+            "count": count,
+            "vrf": vrf,
+        }
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def arp(
+    interface="", ipaddr="", macaddr="", **kwargs
+):  # pylint: disable=unused-argument
+    """
+    NAPALM returns a list of dictionaries with details of the ARP entries.
+    :param interface: interface name to filter on
+    :param ipaddr: IP address to filter on
+    :param macaddr: MAC address to filter on
+    :return: List of the entries in the ARP table
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.arp
+        salt '*' net.arp macaddr='5c:5e:ab:da:3c:f0'
+    Example output:
+    .. code-block:: python
+        [
+            {
+                'interface' : 'MgmtEth0/RSP0/CPU0/0',
+                'mac'       : '5c:5e:ab:da:3c:f0',
+                'ip'        : '172.17.17.1',
+                'age'       : 1454496274.84
+            },
+            {
+                'interface': 'MgmtEth0/RSP0/CPU0/0',
+                'mac'       : '66:0e:94:96:e0:ff',
+                'ip'        : '172.17.17.2',
+                'age'       : 1435641582.49
+            }
+        ]
+    """
+    proxy_output = salt.utils.napalm.call(
+        napalm_device, "get_arp_table", **{}  # pylint: disable=undefined-variable
+    )
+    if not proxy_output.get("result"):
+        return proxy_output
+    arp_table = proxy_output.get("out")
+    if interface:
+        arp_table = _filter_list(arp_table, "interface", interface)
+    if ipaddr:
+        arp_table = _filter_list(arp_table, "ip", ipaddr)
+    if macaddr:
+        arp_table = _filter_list(arp_table, "mac", macaddr)
+    proxy_output.update({"out": arp_table})
+    return proxy_output
+@salt.utils.napalm.proxy_napalm_wrap
+def ipaddrs(**kwargs):  # pylint: disable=unused-argument
+    """
+    Returns IP addresses configured on the device.
+    :return:   A dictionary with the IPv4 and IPv6 addresses of the interfaces.
+        Returns all configured IP addresses on all interfaces as a dictionary
+        of dictionaries.  Keys of the main dictionary represent the name of the
+        interface.  Values of the main dictionary represent are dictionaries
+        that may consist of two keys 'ipv4' and 'ipv6' (one, both or none)
+        which are themselvs dictionaries with the IP addresses as keys.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.ipaddrs
+    Example output:
+    .. code-block:: python
+        {
+            'FastEthernet8': {
+                'ipv4': {
+                    '10.66.43.169': {
+                        'prefix_length': 22
+                    }
+                }
+            },
+            'Loopback555': {
+                'ipv4': {
+                    '192.168.1.1': {
+                        'prefix_length': 24
+                    }
+                },
+                'ipv6': {
+                    '1::1': {
+                        'prefix_length': 64
+                    },
+                    '2001:DB8:1::1': {
+                        'prefix_length': 64
+                    },
+                    'FE80::3': {
+                        'prefix_length': 'N/A'
+                    }
+                }
+            }
+        }
+    """
+    return salt.utils.napalm.call(
+        napalm_device, "get_interfaces_ip", **{}  # pylint: disable=undefined-variable
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def interfaces(**kwargs):  # pylint: disable=unused-argument
+    """
+    Returns details of the interfaces on the device.
+    :return: Returns a dictionary of dictionaries. The keys for the first
+        dictionary will be the interfaces in the devices.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.interfaces
+    Example output:
+    .. code-block:: python
+        {
+            'Management1': {
+                'is_up': False,
+                'is_enabled': False,
+                'description': '',
+                'last_flapped': -1,
+                'speed': 1000,
+                'mac_address': 'dead:beef:dead',
+            },
+            'Ethernet1':{
+                'is_up': True,
+                'is_enabled': True,
+                'description': 'foo',
+                'last_flapped': 1429978575.1554043,
+                'speed': 1000,
+                'mac_address': 'beef:dead:beef',
+            }
+        }
+    """
+    return salt.utils.napalm.call(
+        napalm_device, "get_interfaces", **{}  # pylint: disable=undefined-variable
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def lldp(interface="", **kwargs):  # pylint: disable=unused-argument
+    """
+    Returns a detailed view of the LLDP neighbors.
+    :param interface: interface name to filter on
+    :return:          A dictionary with the LLDL neighbors. The keys are the
+        interfaces with LLDP activated on.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.lldp
+        salt '*' net.lldp interface='TenGigE0/0/0/8'
+    Example output:
+    .. code-block:: python
+        {
+            'TenGigE0/0/0/8': [
+                {
+                    'parent_interface': 'Bundle-Ether8',
+                    'interface_description': 'TenGigE0/0/0/8',
+                    'remote_chassis_id': '8c60.4f69.e96c',
+                    'remote_system_name': 'switch',
+                    'remote_port': 'Eth2/2/1',
+                    'remote_port_description': 'Ethernet2/2/1',
+                    'remote_system_description': 'Cisco Nexus Operating System (NX-OS) Software 7.1(0)N1(1a)
+                          TAC support: http://www.cisco.com/tac
+                          Copyright (c) 2002-2015, Cisco Systems, Inc. All rights reserved.',
+                    'remote_system_capab': 'B, R',
+                    'remote_system_enable_capab': 'B'
+                }
+            ]
+        }
+    """
+    proxy_output = salt.utils.napalm.call(
+        napalm_device,  # pylint: disable=undefined-variable
+        "get_lldp_neighbors_detail",
+        **{}
+    )
+    if not proxy_output.get("result"):
+        return proxy_output
+    lldp_neighbors = proxy_output.get("out")
+    if interface:
+        lldp_neighbors = {interface: lldp_neighbors.get(interface)}
+    proxy_output.update({"out": lldp_neighbors})
+    return proxy_output
+@salt.utils.napalm.proxy_napalm_wrap
+def mac(address="", interface="", vlan=0, **kwargs):  # pylint: disable=unused-argument
+    """
+    Returns the MAC Address Table on the device.
+    :param address:   MAC address to filter on
+    :param interface: Interface name to filter on
+    :param vlan:      VLAN identifier
+    :return:          A list of dictionaries representing the entries in the MAC Address Table
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.mac
+        salt '*' net.mac vlan=10
+    Example output:
+    .. code-block:: python
+        [
+            {
+                'mac'       : '00:1c:58:29:4a:71',
+                'interface' : 'xe-3/0/2',
+                'static'    : False,
+                'active'    : True,
+                'moves'     : 1,
+                'vlan'      : 10,
+                'last_move' : 1454417742.58
+            },
+            {
+                'mac'       : '8c:60:4f:58:e1:c1',
+                'interface' : 'xe-1/0/1',
+                'static'    : False,
+                'active'    : True,
+                'moves'     : 2,
+                'vlan'      : 42,
+                'last_move' : 1453191948.11
+            }
+        ]
+    """
+    proxy_output = salt.utils.napalm.call(
+        napalm_device,  # pylint: disable=undefined-variable
+        "get_mac_address_table",
+        **{}
+    )
+    if not proxy_output.get("result"):
+        return proxy_output
+    mac_address_table = proxy_output.get("out")
+    if vlan and isinstance(vlan, int):
+        mac_address_table = _filter_list(mac_address_table, "vlan", vlan)
+    if address:
+        mac_address_table = _filter_list(mac_address_table, "mac", address)
+    if interface:
+        mac_address_table = _filter_list(mac_address_table, "interface", interface)
+    proxy_output.update({"out": mac_address_table})
+    return proxy_output
+@salt.utils.napalm.proxy_napalm_wrap
+def config(source=None, **kwargs):  # pylint: disable=unused-argument
+    """
+    .. versionadded:: 2017.7.0
+    Return the whole configuration of the network device. By default, it will
+    return all possible configuration sources supported by the network device.
+    At most, there will be:
+    - running config
+    - startup config
+    - candidate config
+    To return only one of the configurations, you can use the ``source``
+    argument.
+    source
+        Which configuration type you want to display, default is all of them.
+        Options:
+        - running
+        - candidate
+        - startup
+    :return:
+        The object returned is a dictionary with the following keys:
+        - running (string): Representation of the native running configuration.
+        - candidate (string): Representation of the native candidate configuration.
+            If the device doesn't differentiate between running and startup
+            configuration this will an empty string.
+        - startup (string): Representation of the native startup configuration.
+            If the device doesn't differentiate between running and startup
+            configuration this will an empty string.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.config
+        salt '*' net.config source=candidate
+    """
+    return salt.utils.napalm.call(
+        napalm_device,  # pylint: disable=undefined-variable
+        "get_config",
+        **{"retrieve": source}
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def optics(**kwargs):  # pylint: disable=unused-argument
+    """
+    .. versionadded:: 2017.7.0
+    Fetches the power usage on the various transceivers installed
+    on the network device (in dBm), and returns a view that conforms with the
+    OpenConfig model openconfig-platform-transceiver.yang.
+    :return:
+        Returns a dictionary where the keys are as listed below:
+            * intf_name (unicode)
+                * physical_channels
+                    * channels (list of dicts)
+                        * index (int)
+                        * state
+                            * input_power
+                                * instant (float)
+                                * avg (float)
+                                * min (float)
+                                * max (float)
+                            * output_power
+                                * instant (float)
+                                * avg (float)
+                                * min (float)
+                                * max (float)
+                            * laser_bias_current
+                                * instant (float)
+                                * avg (float)
+                                * min (float)
+                                * max (float)
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.optics
+    """
+    return salt.utils.napalm.call(
+        napalm_device, "get_optics", **{}  # pylint: disable=undefined-variable
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+<font color="#53858b"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>def load_config(
+    filename=None,
+    text=None,
+    test=False,
+    commit=True,
+    debug=False,
+    replace=False,
+    commit_in=None,
+    commit_at=None,
+    revert_in=None,
+    revert_at=None,
+    commit_jid=None,
+    inherit_napalm_device=None,
+    saltenv="base",
+    **kwargs
+):  # pylint: disable=unused-argument
+    """
+    Applies configuration changes on the device. It can be loaded from a file or from inline string.
+    If you send both a filename and a string containing the configuration, the file has higher precedence.
+    By default this function will commit the changes. If there are no changes, it does not commit and
+    the flag ``already_configured`` will be set as ``True`` to point this out.
+    To avoid committing the configuration, set the argument ``test`` to ``True`` and will discard (dry run).
+    To keep the changes but not commit, set ``commit`` to ``False``.
+    To replace the config, set ``replace`` to ``True``.
+    filename
+        Path to the file containing the desired configuration.
+        This can be specified using the absolute path to the file,
+        or using one of the following URL schemes:
+        - ``salt://``, to fetch the template from the Salt fileserver.
+        - ``http://`` or ``https://``
+        - ``ftp://``
+        - ``s3://``
+        - ``swift://``
+        .. versionchanged:: 2018.3.0
+    text
+        String containing the desired configuration.
+        This argument is ignored when ``filename`` is specified.
+    test: False
+        Dry run? If set as ``True``, will apply the config, discard and return the changes. Default: ``False``
+        and will commit the changes on the device.
+    commit: True
+        Commit? Default: ``True``.
+    debug: False
+        Debug mode. Will insert a new key under the output dictionary, as ``loaded_config`` containing the raw
+        configuration loaded on the device.
+        .. versionadded:: 2016.11.2
+    replace: False
+        Load and replace the configuration. Default: ``False``.
+        .. versionadded:: 2016.11.2
+    commit_in: ``None``
+        Commit the changes in a specific number of minutes / hours. Example of
+        accepted formats: ``5`` (commit in 5 minutes), ``2m`` (commit in 2
+        minutes), ``1h`` (commit the changes in 1 hour)`, ``5h30m`` (commit
+        the changes in 5 hours and 30 minutes).
+        .. note::
+            This feature works on any platforms, as it does not rely on the
+            native features of the network operating system.
+        .. note::
+            After the command is executed and the ``diff`` is not satisfactory,
+            or for any other reasons you have to discard the commit, you are
+            able to do so using the
+            :py:func:`net.cancel_commit &lt;salt.modules.napalm_network.cancel_commit&gt;`
+            execution function, using the commit ID returned by this function.
+        .. warning::
+            Using this feature, Salt will load the exact configuration you
+            expect, however the diff may change in time (i.e., if an user
+            applies a manual configuration change, or a different process or
+            command changes the configuration in the meanwhile).
+        .. versionadded:: 2019.2.0
+    commit_at: ``None``
+        Commit the changes at a specific time. Example of accepted formats:
+        ``1am`` (will commit the changes at the next 1AM), ``13:20`` (will
+        commit at 13:20), ``1:20am``, etc.
+        .. note::
+            This feature works on any platforms, as it does not rely on the
+            native features of the network operating system.
+        .. note::
+            After the command is executed and the ``diff`` is not satisfactory,
+            or for any other reasons you have to discard the commit, you are
+            able to do so using the
+            :py:func:`net.cancel_commit &lt;salt.modules.napalm_network.cancel_commit&gt;`
+            execution function, using the commit ID returned by this function.
+        .. warning::
+            Using this feature, Salt will load the exact configuration you
+            expect, however the diff may change in time (i.e., if an user
+            applies a manual configuration change, or a different process or
+            command changes the configuration in the meanwhile).
+        .. versionadded:: 2019.2.0
+    revert_in: ``None``
+        Commit and revert the changes in a specific number of minutes / hours.
+        Example of accepted formats: ``5`` (revert in 5 minutes), ``2m`` (revert
+        in 2 minutes), ``1h`` (revert the changes in 1 hour)`, ``5h30m`` (revert
+        the changes in 5 hours and 30 minutes).
+        .. note::
+            To confirm the commit, and prevent reverting the changes, you will
+            have to execute the
+            :mod:`net.confirm_commit &lt;salt.modules.napalm_network.confirm_commit&gt;`
+            function, using the commit ID returned by this function.
+        .. warning::
+            This works on any platform, regardless if they have or don't have
+            native capabilities to confirming a commit. However, please be
+            *very* cautious when using this feature: on Junos (as it is the only
+            NAPALM core platform supporting this natively) it executes a commit
+            confirmed as you would do from the command line.
+            All the other platforms don't have this capability natively,
+            therefore the revert is done via Salt. That means, your device needs
+            to be reachable at the moment when Salt will attempt to revert your
+            changes. Be cautious when pushing configuration changes that would
+            prevent you reach the device.
+            Similarly, if an user or a different process apply other
+            configuration changes in the meanwhile (between the moment you
+            commit and till the changes are reverted), these changes would be
+            equally reverted, as Salt cannot be aware of them.
+        .. versionadded:: 2019.2.0
+    revert_at: ``None``
+        Commit and revert the changes at a specific time. Example of accepted
+        formats: ``1am`` (will commit and revert the changes at the next 1AM),
+        ``13:20`` (will commit and revert at 13:20), ``1:20am``, etc.
+        .. note::
+            To confirm the commit, and prevent reverting the changes, you will
+            have to execute the
+            :mod:`net.confirm_commit &lt;salt.modules.napalm_network.confirm_commit&gt;`
+            function, using the commit ID returned by this function.
+        .. warning::
+            This works on any platform, regardless if they have or don't have
+            native capabilities to confirming a commit. However, please be
+            *very* cautious when using this feature: on Junos (as it is the only
+            NAPALM core platform supporting this natively) it executes a commit
+            confirmed as you would do from the command line.
+            All the other platforms don't have this capability natively,
+            therefore the revert is done via Salt. That means, your device needs
+            to be reachable at the moment when Salt will attempt to revert your
+            changes. Be cautious when pushing configuration changes that would
+            prevent you reach the device.
+            Similarly, if an user or a different process apply other
+            configuration changes in the meanwhile (between the moment you
+            commit and till the changes are reverted), these changes would be
+            equally reverted, as Salt cannot be aware of them.
+        .. versionadded:: 2019.2.0
+    saltenv: ``base``
+        Specifies the Salt environment name.
+        .. versionadded:: 2018.3.0
+    :return: a dictionary having the following keys:
+    * result (bool): if the config was applied successfully. It is ``False`` only in case of failure. In case \
+    there are no changes to be applied and successfully performs all operations it is still ``True`` and so will be \
+    the ``already_configured`` flag (example below)
+    * comment (str): a message for the user
+    * already_configured (bool): flag to check if there were no changes applied
+    * loaded_config (str): the configuration loaded on the device. Requires ``debug`` to be set as ``True``
+    * diff (str): returns the config changes applied
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.load_config text='ntp peer 192.168.0.1'
+        salt '*' net.load_config filename='/absolute/path/to/your/file'
+        salt '*' net.load_config filename='/absolute/path/to/your/file' test=True
+        salt '*' net.load_config filename='/absolute/path/to/your/file' commit=False
+    Example output:
+    .. code-block:: python
+        {
+            'comment': 'Configuration discarded.',
+            'already_configured': False,
+            'result': True,
+            'diff': '[edit interfaces xe-0/0/5]+   description "Adding a description";'
+        }
+    """
+    fun =</b></font> "load_merge_candidate"
+    if replace:
+        fun = "load_replace_candidate"
+    if salt.utils.napalm.not_always_alive(__opts__):
+        napalm_device["CLOSE"] = False  # pylint: disable=undefined-variable
+    if filename:
+        text = __salt__["cp.get_file_str"](filename, saltenv=saltenv)
+        if text is False:
+            ret = {"result": False, "out": None}
+            ret[
+                "comment"
+            ] = "Unable to read from {}. Please specify a valid file or text.".format(
+                filename
+            )
+            log.error(ret["comment"])
+            return ret
+        if commit_jid:
+            salt.utils.files.safe_rm(filename)
+    _loaded = salt.utils.napalm.call(
+        napalm_device, fun, **{"config": text}  # pylint: disable=undefined-variable
+    )
+    return _config_logic(
+        napalm_device,  # pylint: disable=undefined-variable
+        _loaded,
+        test=test,
+        debug=debug,
+        replace=replace,
+        commit_config=commit,
+        loaded_config=text,
+        commit_at=commit_at,
+        commit_in=commit_in,
+        revert_in=revert_in,
+        revert_at=revert_at,
+        commit_jid=commit_jid,
+        **kwargs
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+<font color="#980517"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>def load_template(
+    template_name=None,
+    template_source=None,
+    context=None,
+    defaults=None,
+    template_engine="jinja",
+    saltenv="base",
+    template_hash=None,
+    template_hash_name=None,
+    skip_verify=False,
+    test=False,
+    commit=True,
+    debug=False,
+    replace=False,
+    commit_in=None,
+    commit_at=</b></font>None,
+    revert_in=None,
+    revert_at=None,
+    inherit_napalm_device=None,  # pylint: disable=unused-argument
+    **template_vars
+):
+    """
+    Renders a configuration template (default: Jinja) and loads the result on the device.
+    By default this function will commit the changes. If there are no changes,
+    it does not commit, discards he config and the flag ``already_configured``
+    will be set as ``True`` to point this out.
+    To avoid committing the configuration, set the argument ``test`` to ``True``
+    and will discard (dry run).
+    To preserve the changes, set ``commit`` to ``False``.
+    However, this is recommended to be used only in exceptional cases
+    when there are applied few consecutive states
+    and/or configuration changes.
+    Otherwise the user might forget that the config DB is locked
+    and the candidate config buffer is not cleared/merged in the running config.
+    To replace the config, set ``replace`` to ``True``.
+    template_name
+        Identifies path to the template source.
+        The template can be either stored on the local machine, either remotely.
+        The recommended location is under the ``file_roots``
+        as specified in the master config file.
+        For example, let's suppose the ``file_roots`` is configured as:
+        .. code-block:: yaml
+            file_roots:
+              base:
+                - /etc/salt/states
+        Placing the template under ``/etc/salt/states/templates/example.jinja``,
+        it can be used as ``salt://templates/example.jinja``.
+        Alternatively, for local files, the user can specify the absolute path.
+        If remotely, the source can be retrieved via ``http``, ``https`` or ``ftp``.
+        Examples:
+        - ``salt://my_template.jinja``
+        - ``/absolute/path/to/my_template.jinja``
+        - ``http://example.com/template.cheetah``
+        - ``https:/example.com/template.mako``
+        - ``ftp://example.com/template.py``
+        .. versionchanged:: 2019.2.0
+            This argument can now support a list of templates to be rendered.
+            The resulting configuration text is loaded at once, as a single
+            configuration chunk.
+    template_source: None
+        Inline config template to be rendered and loaded on the device.
+    template_hash: None
+        Hash of the template file. Format: ``{hash_type: 'md5', 'hsum': &lt;md5sum&gt;}``
+        .. versionadded:: 2016.11.2
+    context: None
+        Overrides default context variables passed to the template.
+        .. versionadded:: 2019.2.0
+    template_hash_name: None
+        When ``template_hash`` refers to a remote file,
+        this specifies the filename to look for in that file.
+        .. versionadded:: 2016.11.2
+    saltenv: ``base``
+        Specifies the template environment.
+        This will influence the relative imports inside the templates.
+        .. versionadded:: 2016.11.2
+    template_engine: jinja
+        The following templates engines are supported:
+        - :mod:`cheetah&lt;salt.renderers.cheetah&gt;`
+        - :mod:`genshi&lt;salt.renderers.genshi&gt;`
+        - :mod:`jinja&lt;salt.renderers.jinja&gt;`
+        - :mod:`mako&lt;salt.renderers.mako&gt;`
+        - :mod:`py&lt;salt.renderers.py&gt;`
+        - :mod:`wempy&lt;salt.renderers.wempy&gt;`
+        .. versionadded:: 2016.11.2
+    skip_verify: True
+        If ``True``, hash verification of remote file sources
+        (``http://``, ``https://``, ``ftp://``) will be skipped,
+        and the ``source_hash`` argument will be ignored.
+        .. versionadded:: 2016.11.2
+    test: False
+        Dry run? If set to ``True``, will apply the config,
+        discard and return the changes.
+        Default: ``False`` and will commit the changes on the device.
+    commit: True
+        Commit? (default: ``True``)
+    debug: False
+        Debug mode. Will insert a new key under the output dictionary,
+        as ``loaded_config`` containing the raw result after the template was rendered.
+        .. versionadded:: 2016.11.2
+    replace: False
+        Load and replace the configuration.
+        .. versionadded:: 2016.11.2
+    commit_in: ``None``
+        Commit the changes in a specific number of minutes / hours. Example of
+        accepted formats: ``5`` (commit in 5 minutes), ``2m`` (commit in 2
+        minutes), ``1h`` (commit the changes in 1 hour)`, ``5h30m`` (commit
+        the changes in 5 hours and 30 minutes).
+        .. note::
+            This feature works on any platforms, as it does not rely on the
+            native features of the network operating system.
+        .. note::
+            After the command is executed and the ``diff`` is not satisfactory,
+            or for any other reasons you have to discard the commit, you are
+            able to do so using the
+            :py:func:`net.cancel_commit &lt;salt.modules.napalm_network.cancel_commit&gt;`
+            execution function, using the commit ID returned by this function.
+        .. warning::
+            Using this feature, Salt will load the exact configuration you
+            expect, however the diff may change in time (i.e., if an user
+            applies a manual configuration change, or a different process or
+            command changes the configuration in the meanwhile).
+        .. versionadded:: 2019.2.0
+    commit_at: ``None``
+        Commit the changes at a specific time. Example of accepted formats:
+        ``1am`` (will commit the changes at the next 1AM), ``13:20`` (will
+        commit at 13:20), ``1:20am``, etc.
+        .. note::
+            This feature works on any platforms, as it does not rely on the
+            native features of the network operating system.
+        .. note::
+            After the command is executed and the ``diff`` is not satisfactory,
+            or for any other reasons you have to discard the commit, you are
+            able to do so using the
+            :py:func:`net.cancel_commit &lt;salt.modules.napalm_network.cancel_commit&gt;`
+            execution function, using the commit ID returned by this function.
+        .. warning::
+            Using this feature, Salt will load the exact configuration you
+            expect, however the diff may change in time (i.e., if an user
+            applies a manual configuration change, or a different process or
+            command changes the configuration in the meanwhile).
+        .. versionadded:: 2019.2.0
+    revert_in: ``None``
+        Commit and revert the changes in a specific number of minutes / hours.
+        Example of accepted formats: ``5`` (revert in 5 minutes), ``2m`` (revert
+        in 2 minutes), ``1h`` (revert the changes in 1 hour)`, ``5h30m`` (revert
+        the changes in 5 hours and 30 minutes).
+        .. note::
+            To confirm the commit, and prevent reverting the changes, you will
+            have to execute the
+            :mod:`net.confirm_commit &lt;salt.modules.napalm_network.confirm_commit&gt;`
+            function, using the commit ID returned by this function.
+        .. warning::
+            This works on any platform, regardless if they have or don't have
+            native capabilities to confirming a commit. However, please be
+            *very* cautious when using this feature: on Junos (as it is the only
+            NAPALM core platform supporting this natively) it executes a commit
+            confirmed as you would do from the command line.
+            All the other platforms don't have this capability natively,
+            therefore the revert is done via Salt. That means, your device needs
+            to be reachable at the moment when Salt will attempt to revert your
+            changes. Be cautious when pushing configuration changes that would
+            prevent you reach the device.
+            Similarly, if an user or a different process apply other
+            configuration changes in the meanwhile (between the moment you
+            commit and till the changes are reverted), these changes would be
+            equally reverted, as Salt cannot be aware of them.
+        .. versionadded:: 2019.2.0
+    revert_at: ``None``
+        Commit and revert the changes at a specific time. Example of accepted
+        formats: ``1am`` (will commit and revert the changes at the next 1AM),
+        ``13:20`` (will commit and revert at 13:20), ``1:20am``, etc.
+        .. note::
+            To confirm the commit, and prevent reverting the changes, you will
+            have to execute the
+            :mod:`net.confirm_commit &lt;salt.modules.napalm_network.confirm_commit&gt;`
+            function, using the commit ID returned by this function.
+        .. warning::
+            This works on any platform, regardless if they have or don't have
+            native capabilities to confirming a commit. However, please be
+            *very* cautious when using this feature: on Junos (as it is the only
+            NAPALM core platform supporting this natively) it executes a commit
+            confirmed as you would do from the command line.
+            All the other platforms don't have this capability natively,
+            therefore the revert is done via Salt. That means, your device needs
+            to be reachable at the moment when Salt will attempt to revert your
+            changes. Be cautious when pushing configuration changes that would
+            prevent you reach the device.
+            Similarly, if an user or a different process apply other
+            configuration changes in the meanwhile (between the moment you
+            commit and till the changes are reverted), these changes would be
+            equally reverted, as Salt cannot be aware of them.
+        .. versionadded:: 2019.2.0
+    defaults: None
+        Default variables/context passed to the template.
+        .. versionadded:: 2016.11.2
+    template_vars
+        Dictionary with the arguments/context to be used when the template is rendered.
+        .. note::
+            Do not explicitly specify this argument. This represents any other
+            variable that will be sent to the template rendering system.
+            Please see the examples below!
+        .. note::
+            It is more recommended to use the ``context`` argument to avoid
+            conflicts between CLI arguments and template variables.
+    :return: a dictionary having the following keys:
+    - result (bool): if the config was applied successfully. It is ``False``
+      only in case of failure. In case there are no changes to be applied and
+      successfully performs all operations it is still ``True`` and so will be
+      the ``already_configured`` flag (example below)
+    - comment (str): a message for the user
+    - already_configured (bool): flag to check if there were no changes applied
+    - loaded_config (str): the configuration loaded on the device, after
+      rendering the template. Requires ``debug`` to be set as ``True``
+    - diff (str): returns the config changes applied
+    The template can use variables from the ``grains``, ``pillar`` or ``opts``, for example:
+    .. code-block:: jinja
+        {% set router_model = grains.get('model') -%}
+        {% set router_vendor = grains.get('vendor') -%}
+        {% set os_version = grains.get('version') -%}
+        {% set hostname = pillar.get('proxy', {}).get('host') -%}
+        {% if router_vendor|lower == 'juniper' %}
+        system {
+            host-name {{hostname}};
+        }
+        {% elif router_vendor|lower == 'cisco' %}
+        hostname {{hostname}}
+        {% endif %}
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' net.load_template set_ntp_peers peers=[192.168.0.1]  # uses NAPALM default templates
+        salt -G 'os:junos' net.load_template template_source='system { host-name {{host_name}}; }' \
+        host_name='MX480.lab'
+        salt -G 'os:junos' net.load_template \
+        template_source='system { host-name {{grains.model}}.lab; }'
+        salt -G 'os:junos' net.load_template template_source='system { host-name {{pillar.proxy.host}}; }'
+        salt '*' net.load_template https://bit.ly/2OhSgqP hostname=example  # will commit
+        salt '*' net.load_template https://bit.ly/2OhSgqP hostname=example test=True  # dry run
+        salt '*' net.load_template salt://templates/example.jinja debug=True  # Using the salt:// URI
+        salt '*' net.load_template salt://templates/example.mako template_engine=mako debug=True
+        salt -G 'os:junos' net.load_template http://bit.ly/2fReJg7 test=True debug=True peers=['192.168.0.1']
+        salt -G 'os:ios' net.load_template http://bit.ly/2gKOj20 test=True debug=True peers=['192.168.0.1']
+        salt '*' net.load_template "['https://bit.ly/2OhSgqP', 'salt://templates/example.jinja']" context="{'hostname': 'example'}"
+    Example output:
+    .. code-block:: python
+        {
+            'comment': '',
+            'already_configured': False,
+            'result': True,
+            'diff': '[edit system]+  host-name edge01.bjm01',
+            'loaded_config': 'system { host-name edge01.bjm01; }''
+        }
+    """
+    _rendered = ""
+    _loaded = {"result": True, "comment": "", "out": None}
+    loaded_config = None
+    if template_engine not in salt.utils.templates.TEMPLATE_REGISTRY:
+        _loaded.update(
+            {
+                "result": False,
+                "comment": (
+                    "Invalid templating engine! Choose between: {tpl_eng_opts}".format(
+                        tpl_eng_opts=", ".join(
+                            list(salt.utils.templates.TEMPLATE_REGISTRY.keys())
+                        )
+                    )
+                ),
+            }
+        )
+        return _loaded  # exit
+    salt_render_prefixes = ("salt://", "http://", "https://", "ftp://")
+    salt_render = False
+    file_exists = False
+    if not isinstance(template_name, (tuple, list)):
+        for salt_render_prefix in salt_render_prefixes:
+            if not salt_render:
+                salt_render = salt_render or template_name.startswith(
+                    salt_render_prefix
+                )
+        file_exists = __salt__["file.file_exists"](template_name)
+    if context is None:
+        context = {}
+    context.update(template_vars)
+    if template_source:
+        _rendered = __salt__["file.apply_template_on_contents"](
+            contents=template_source,
+            template=template_engine,
+            context=context,
+            defaults=defaults,
+            saltenv=saltenv,
+        )
+        if not isinstance(_rendered, str):
+            if "result" in _rendered:
+                _loaded["result"] = _rendered["result"]
+            else:
+                _loaded["result"] = False
+            if "comment" in _rendered:
+                _loaded["comment"] = _rendered["comment"]
+            else:
+                _loaded["comment"] = "Error while rendering the template."
+            return _loaded
+    else:
+        if not isinstance(template_name, (list, tuple)):
+            template_name = [template_name]
+        if template_hash_name and not isinstance(template_hash_name, (list, tuple)):
+            template_hash_name = [template_hash_name]
+        elif not template_hash_name:
+            template_hash_name = [None] * len(template_name)
+        if (
+            template_hash
+            and isinstance(template_hash, str)
+            and not (
+                template_hash.startswith("salt://")
+                or template_hash.startswith("file://")
+            )
+        ):
+            template_hash = [template_hash]
+        elif (
+            template_hash
+            and isinstance(template_hash, str)
+            and (
+                template_hash.startswith("salt://")
+                or template_hash.startswith("file://")
+            )
+        ):
+            template_hash = [template_hash] * len(template_name)
+        elif not template_hash:
+            template_hash = [None] * len(template_name)
+        for tpl_index, tpl_name in enumerate(template_name):
+            tpl_hash = template_hash[tpl_index]
+            _rand_filename = __salt__["random.hash"](tpl_name, "md5")
+            _temp_file = __salt__["file.join"]("/tmp", _rand_filename)
+            _managed <font color="#f63526"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>= __salt__["file.get_managed"](
+                name=_temp_file,
+                source=tpl_name,
+                source_hash=tpl_hash,
+                source_hash_name=tpl_hash_name,
+                user=None,
+                group=None,
+                mode=None,
+                attrs=None,
+                template=template_engine,
+                context=context,
+                defaults=defaults,
+                saltenv=saltenv,
+                skip_verify=</b></font>skip_verify,
+            )
+            if not isinstance(_managed, (list, tuple)) and isinstance(_managed, str):
+                _loaded["comment"] += _managed
+                _loaded["result"] = False
+            elif isinstance(_managed, (list, tuple)) and not len(_managed) &gt; 0:
+                _loaded["result"] = False
+                _loaded["comment"] += "Error while rendering the template."
+            elif isinstance(_managed, (list, tuple)) and not len(_managed[0]) &gt; 0:
+                _loaded["result"] = False
+                _loaded["comment"] += _managed[-1]  # contains the error message
+            if _loaded["result"]:  # all good
+                _temp_tpl_file = _managed[0]
+                _temp_tpl_file_exists = __salt__["file.file_exists"](_temp_tpl_file)
+                if not _temp_tpl_file_exists:
+                    _loaded["result"] = False
+                    _loaded["comment"] += "Error while rendering the template."
+                    return _loaded
+                _rendered += __salt__["file.read"](_temp_tpl_file)
+                __salt__["file.remove"](_temp_tpl_file)
+            else:
+                return _loaded  # exit
+    loaded_config = _rendered
+    if _loaded["result"]:  # all good
+        fun = "load_merge_candidate"
+        if replace:  # replace requested
+            fun = "load_replace_candidate"
+        if salt.utils.napalm.not_always_alive(__opts__):
+            napalm_device["CLOSE"] = False  # pylint: disable=undefined-variable
+        _loaded = salt.utils.napalm.call(
+            napalm_device,  # pylint: disable=undefined-variable
+            fun,
+            **{"config": _rendered}
+        )
+    return _config_logic(
+        napalm_device,  # pylint: disable=undefined-variable
+        _loaded,
+        test=test,
+        debug=debug,
+        replace=replace,
+        commit_config=commit,
+        loaded_config=loaded_config,
+        commit_at=commit_at,
+        commit_in=commit_in,
+        revert_in=revert_in,
+        revert_at=revert_at,
+        **template_vars
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def commit(inherit_napalm_device=None, **kwargs):  # pylint: disable=unused-argument
+    """
+    Commits the configuration changes made on the network device.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.commit
+    """
+    return salt.utils.napalm.call(
+        napalm_device, "commit_config", **{}  # pylint: disable=undefined-variable
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def discard_config(
+    inherit_napalm_device=None, **kwargs
+):  # pylint: disable=unused-argument
+    """
+    Discards the changes applied.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.discard_config
+    """
+    return salt.utils.napalm.call(
+        napalm_device, "discard_config", **{}  # pylint: disable=undefined-variable
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def compare_config(
+    inherit_napalm_device=None, **kwargs
+):  # pylint: disable=unused-argument
+    """
+    Returns the difference between the running config and the candidate config.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.compare_config
+    """
+    return salt.utils.napalm.call(
+        napalm_device, "compare_config", **{}  # pylint: disable=undefined-variable
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def rollback(inherit_napalm_device=None, **kwargs):  # pylint: disable=unused-argument
+    """
+    Rollbacks the configuration.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.rollback
+    """
+    return salt.utils.napalm.call(
+        napalm_device, "rollback", **{}  # pylint: disable=undefined-variable
+    )
+@salt.utils.napalm.proxy_napalm_wrap
+def config_changed(
+    inherit_napalm_device=None, **kwargs
+):  # pylint: disable=unused-argument
+    """
+    Will prompt if the configuration has been changed.
+    :return: A tuple with a boolean that specifies if the config was changed on the device.\
+    And a string that provides more details of the reason why the configuration was not changed.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.config_changed
+    """
+    is_config_changed = False
+    reason = ""
+    try_compare = compare_config(inherit_napalm_device=napalm_device)
+    if try_compare.get("result"):
+        if try_compare.get("out"):
+            is_config_changed = True
+        else:
+            reason = "Configuration was not changed on the device."
+    else:
+        reason = try_compare.get("comment")
+    return is_config_changed, reason
+@salt.utils.napalm.proxy_napalm_wrap
+def config_control(
+    inherit_napalm_device=None, **kwargs
+):  # pylint: disable=unused-argument
+    """
+    Will check if the configuration was changed.
+    If differences found, will try to commit.
+    In case commit unsuccessful, will try to rollback.
+    :return: A tuple with a boolean that specifies if the config was changed/committed/rollbacked on the device.\
+    And a string that provides more details of the reason why the configuration was not committed properly.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.config_control
+    """
+    result = True
+    comment = ""
+    changed, not_changed_rsn = config_changed(inherit_napalm_device=napalm_device)
+    if not changed:
+        return (changed, not_changed_rsn)
+    try_commit = commit()
+    if not try_commit.get("result"):
+        result = False
+        comment = (
+            "Unable to commit the changes: {reason}.\nWill try to rollback now!".format(
+                reason=try_commit.get("comment")
+            )
+        )
+        try_rollback = rollback()
+        if not try_rollback.get("result"):
+            comment += "\nCannot rollback! {reason}".format(
+                reason=try_rollback.get("comment")
+            )
+    return result, comment
+def cancel_commit(jid):
+    """
+    .. versionadded:: 2019.2.0
+    Cancel a commit scheduled to be executed via the ``commit_in`` and
+    ``commit_at`` arguments from the
+    :py:func:`net.load_template &lt;salt.modules.napalm_network.load_template&gt;` or
+    :py:func:`net.load_config &lt;salt.modules.napalm_network.load_config&gt;`
+    execution functions. The commit ID is displayed when the commit is scheduled
+    via the functions named above.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.cancel_commit 20180726083540640360
+    """
+    job_name = "__napalm_commit_{}".format(jid)
+    removed = __salt__["schedule.delete"](job_name)
+    if removed["result"]:
+        saved = __salt__["schedule.save"]()
+        removed["comment"] = "Commit #{jid} cancelled.".format(jid=jid)
+    else:
+        removed["comment"] = "Unable to find commit #{jid}.".format(jid=jid)
+    return removed
+def confirm_commit(jid):
+    """
+    .. versionadded:: 2019.2.0
+    Confirm a commit scheduled to be reverted via the ``revert_in`` and
+    ``revert_at``  arguments from the
+    :mod:`net.load_template &lt;salt.modules.napalm_network.load_template&gt;` or
+    :mod:`net.load_config &lt;salt.modules.napalm_network.load_config&gt;`
+    execution functions. The commit ID is displayed when the commit confirmed
+    is scheduled via the functions named above.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.confirm_commit 20180726083540640360
+    """
+    if __grains__["os"] == "junos":
+        confirmed = __salt__["napalm.junos_commit"]()
+        confirmed["result"] = confirmed.pop("out")
+        confirmed["comment"] = confirmed.pop("message")
+    else:
+        confirmed = cancel_commit(jid)
+    if confirmed["result"]:
+        confirmed["comment"] = "Commit #{jid} confirmed.".format(jid=jid)
+    return confirmed
+def save_config(source=None, path=None):
+    """
+    .. versionadded:: 2019.2.0
+    Save the configuration to a file on the local file system.
+    source: ``running``
+        The configuration source. Choose from: ``running``, ``candidate``,
+        ``startup``. Default: ``running``.
+    path
+        Absolute path to file where to save the configuration.
+        To push the files to the Master, use
+        :mod:`cp.push &lt;salt.modules.cp.push&gt;` Execution function.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.save_config source=running
+    """
+    if not source:
+        source = "running"
+    if not path:
+        path = salt.utils.files.mkstemp()
+    running_config = __salt__["net.config"](source=source)
+    if not running_config or not running_config["result"]:
+        log.error("Unable to retrieve the config")
+        return running_config
+    with salt.utils.files.fopen(path, "w") as fh_:
+        fh_.write(running_config["out"][source])
+        "result": True,
+        "out": path,
+        "comment": "{source} config saved to {path}".format(source=source, path=<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>path),
+    }
+def replace_pattern(
+    pattern,
+    repl,
+    count=0,
+    flags=8,
+    bufsize=1,
+    append_if_not_found=False,
+    prepend_if_not_found=False,
+    not_found_content=None,
+    search_only=False,
+    show_changes=True,
+    backslash_literal=False,
+    source=None,
+    path=None,
+    test=False,
+    replace=True,
+    debug=False,
+    commit=True,
+):
+    """
+    .. versionadded:: 2019.2.0
+    Replace occurrences of a pattern in the configuration source. If
+    ``show_changes`` is ``True``, then a diff of what changed will be returned,
+    otherwise a ``True`` will be returned when changes are made, and ``False``
+    when no changes are made.
+    This is a pure Python implementation that wraps Python's :py:func:`~re.sub`.
+    pattern
+        A regular expression, to be matched using Python's
+        :py:func:`~re.search`.
+    repl
+        The replacement text.
+    count: ``0``
+        Maximum number of pattern occurrences to be replaced. If count is a
+        positive integer ``n``, only ``n`` occurrences will be replaced,
+        otherwise all occurrences will be replaced.
+    flags (list or int): ``8``
+        A list of flags defined in the ``re`` module documentation from the
+        Python standard library. Each list item should be a string that will
+        correlate to the human-friendly flag name. E.g., ``['IGNORECASE',
+        'MULTILINE']``. Optionally, ``flags`` may be an int, with a value
+        corresponding to the XOR (``|``) of all the desired flags. Defaults to
+        8 (which supports 'MULTILINE').
+    bufsize (int or str): ``1``
+        How much of the configuration to buffer into memory at once. The
+        default value ``1`` processes one line at a time. The special value
+        ``file`` may be specified which will read the entire file into memory
+        before processing.
+    append_if_not_found: ``False``
+        If set to ``True``, and pattern is not found, then the content will be
+        appended to the file.
+    prepend_if_not_found: ``False``
+        If set to ``True`` and pattern is not found, then the content will be
+        prepended to the file.
+    not_found_content
+        Content to use for append/prepend if not found. If None (default), uses
+        ``repl``. Useful when ``repl`` uses references to group in pattern.
+    search_only: ``False``
+        If set to true, this no changes will be performed on the file, and this
+        function will simply return ``True`` if the pattern was matched, and
+        ``False`` if not.
+    show_changes: ``True``
+        If ``True``, return a diff of changes made. Otherwise, return ``True``
+        if changes were made, and ``False`` if not.
+    backslash_literal: ``False``
+        Interpret backslashes as literal backslashes for the repl and not
+        escape characters.  This will help when using append/prepend so that
+        the backslashes are not interpreted for the repl on the second run of
+        the state.
+    source: ``running``
+        The configuration source. Choose from: ``running``, ``candidate``, or
+        ``startup``. Default: ``running``.
+    path
+        Save the temporary configuration to a specific path, then read from
+        there.
+    test: ``False``
+        Dry run? If set as ``True``, will apply the config, discard and return
+        the changes. Default: ``False`` and will commit the changes on the
+        device.
+    commit: ``True``
+        Commit the configuration changes? Default: ``True``.
+    debug: ``False``
+        Debug mode. Will insert a new key in the output dictionary, as
+        ``loaded_config`` containing the raw configuration loaded on the device.
+    replace: ``True``
+        Load and replace the configuration. Default: ``True``.
+    If an equal sign (``=``) appears in an argument to a Salt command it is
+    interpreted as a keyword argument in the format ``key=val``. That
+    processing can be bypassed in order to pass an equal sign through to the
+    remote shell command by manually specifying the kwarg:
+    .. code-block:: bash
+        salt '*' net.replace_pattern "bind-address\\s*=" "bind-address:"
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.replace_pattern PREFIX-LIST_NAME new-prefix-list-name
+        salt '*' net.replace_pattern bgp-group-name new-bgp-group-name count=1
+    """
+    config_saved =</b></font> save_config(source=source, path=path)
+        return config_saved
+    path = config_saved["out"]
+    replace_pattern <font color="#151b8d"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>= __salt__["file.replace"](
+        path,
+        pattern,
+        repl,
+        count=count,
+        flags=flags,
+        bufsize=bufsize,
+        append_if_not_found=append_if_not_found,
+        prepend_if_not_found=prepend_if_not_found,
+        not_found_content=not_found_content,
+        search_only=search_only,
+        show_changes=show_changes,
+        backslash_literal=</b></font>backslash_literal,
+    )
+    with salt.utils.files.fopen(path, "r") as fh_:
+        updated_config = fh_.read()
+    return __salt__["net.load_config"](
+        text=updated_config, test=test, debug=debug, replace=replace, commit=commit
+    )
+    marker_start,
+    marker_end,
+    content<font color="#6cc417"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>="",
+    append_if_not_found=False,
+    prepend_if_not_found=False,
+    show_changes=True,
+    append_newline=False,
+    source="running",
+    path=None,
+    test=False,
+    commit=True,
+    debug=False,
+    replace=True,
+):
+    """
+    .. versionadded:: 2019.2.0
+    Replace content of the configuration source, delimited by the line markers.
+    A block of content delimited by comments can help you manage several lines
+    without worrying about old entries removal.
+    marker_start
+        The line content identifying a line as the start of the content block.
+        Note that the whole line containing this marker will be considered,
+        so whitespace or extra content before or after the marker is included
+        in final output.
+    marker_end
+        The line content identifying a line as the end of the content block.
+        Note that the whole line containing this marker will be considered,
+        so whitespace or extra content before or after the marker is included
+        in final output.
+    content
+        The content to be used between the two lines identified by
+        ``marker_start`` and ``marker_stop``.
+    append_if_not_found: ``False``
+        If markers are not found and set to True then, the markers and content
+        will be appended to the file.
+    prepend_if_not_found: ``False``
+        If markers are not found and set to True then, the markers and content
+        will be prepended to the file.
+    append_newline: ``False``
+        Controls whether or not a newline is appended to the content block.
+        If the value of this argument is ``True`` then a newline will be added
+        to the content block. If it is ``False``, then a newline will not be
+        added to the content block. If it is ``None`` then a newline will only
+        be added to the content block if it does not already end in a newline.
+    show_changes: ``True``
+        Controls how changes are presented. If ``True``, this function will
+        return the of the changes made.
+        If ``False``, then it will return a boolean (``True`` if any changes
+        were made, otherwise False).
+    source: ``running``
+        The configuration source. Choose from: ``running``, ``candidate``, or
+        ``startup``. Default: ``running``.
+    path: ``None``
+        Save the temporary configuration to a specific path, then read from
+        there. This argument is optional, can be used when you prefers a
+        particular location of the temporary file.
+    test: ``False``
+        Dry run? If set as ``True``, will apply the config, discard and return
+        the changes. Default: ``False`` and will commit the changes on the
+        device.
+    commit: ``True``
+        Commit the configuration changes? Default: ``True``.
+    debug: ``False``
+        Debug mode. Will insert a new key in the output dictionary, as
+        ``loaded_config`` containing the raw configuration loaded on the device.
+    replace: ``True``
+        Load and replace the configuration. Default: ``True``.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.blockreplace 'ntp' 'interface' ''
+    """
+    config_saved =</b></font> save_config(source=source, path=path)
+    if not config_saved or not config_saved["result"]:
+        return config_saved
+    path = config_saved["out"]
+    replace_pattern = __salt__["file.blockreplace"](
+        path,
+        marker_start=marker_start,
+        marker_end=marker_end,
+        content=content,
+        append_if_not_found=append_if_not_found,
+        prepend_if_not_found=prepend_if_not_found,
+        show_changes=show_changes,
+        append_newline=append_newline,
+    )
+    with salt.utils.files.fopen(path, "r") as fh_:
+        updated_config = fh_.read()
+    return __salt__["net.load_config"](
+        text=updated_config, test=test, debug=debug, replace=replace, commit=commit
+    )
+def patch(
+    patchfile,
+    options="",
+    saltenv="base",
+    source_hash=None,
+    show_changes=True,
+    source="running",
+    path=None,
+    test=False,
+    commit=True,
+    debug=False,
+    replace=True,
+):
+    """
+    .. versionadded:: 2019.2.0
+    Apply a patch to the configuration source, and load the result into the
+    running config of the device.
+    patchfile
+        A patch file to apply to the configuration source.
+    options
+        Options to pass to patch.
+    source_hash
+        If the patch file (specified via the ``patchfile`` argument)  is an
+        HTTP(S) or FTP URL and the file exists in the minion's file cache, this
+        option can be passed to keep the minion from re-downloading the file if
+        the cached copy matches the specified hash.
+    show_changes: ``True``
+        Controls how changes are presented. If ``True``, this function will
+        return the of the changes made.
+        If ``False``, then it will return a boolean (``True`` if any changes
+        were made, otherwise False).
+    source: ``running``
+        The configuration source. Choose from: ``running``, ``candidate``, or
+        ``startup``. Default: ``running``.
+    path: ``None``
+        Save the temporary configuration to a specific path, then read from
+        there. This argument is optional, can the user prefers a particular
+        location of the temporary file.
+    test: ``False``
+        Dry run? If set as ``True``, will apply the config, discard and return
+        the changes. Default: ``False`` and will commit the changes on the
+        device.
+    commit: ``True``
+        Commit the configuration changes? Default: ``True``.
+    debug: ``False``
+        Debug mode. Will insert a new key in the output dictionary, as
+        ``loaded_config`` containing the raw configuration loaded on the device.
+    replace: ``True``
+        Load and replace the configuration. Default: ``True``.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' net.patch https://example.com/running_config.patch
+    """
+    config_saved = save_config(source=source, path=path)
+    if not config_saved or not config_saved["result"]:
+        return config_saved
+    path = config_saved["out"]
+    patchfile_cache = __salt__["cp.cache_file"](patchfile)
+    if patchfile_cache is False:
+        return {
+            "out": None,
+            "result": False,
+            "comment": 'The file "{}" does not exist.'.format(patchfile),
+        }
+    replace_pattern = __salt__["file.patch"](path, patchfile_cache, options=options)
+    with salt.utils.files.fopen(path, "r") as fh_:
+        updated_config = fh_.read()
+    return __salt__["net.load_config"](
+        text=updated_config, test=test, debug=debug, replace=replace, commit=commit
+    )
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -974,147 +2135,800 @@ Matches for napalm_network.py &amp; netacl.py
 </h3>
 <hr/>
 <pre>
-1 import logging
-2 import salt.utils.napalm
-3 log = logging.getLogger(__file__)
-4 try:
-5     import capirca
-6     import capirca.aclgen
-7     import capirca.lib.policy
-8     import capirca.lib.aclgenerator
-9     HAS_CAPIRCA = True
-10 except ImportError:
-11     HAS_CAPIRCA = False
-12 __virtualname__ = "netacl"
-13 def __virtual__():
-14     if HAS_CAPIRCA and salt.utils.napalm.virtual(__opts__, __virtualname__, __file__):
-15         return __virtualname__
-16     else:
-17         return (
-18             False,
-19             "The netacl state cannot be loaded: Please install capirca and napalm.",
-20         )
-21 <font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>def term(
-22     name,
-23     filter_name,
-24     term_name,
-25     filter_options=None,
-26     pillar_key="acl",
-27     pillarenv=None,
-28     saltenv=None,
-29     merge_pillar=False,
-30     revision_id=None,
-31     revision_no=None,
-32     revision_date=True,
-33     revision_date_format="%Y/%m/%d",
-34     test=False,
-35     commit=True,
-36     debug=False,
-37     source_service=None,
-38     destination_service=None,
-39     **term_fields
-40 ):
-41     ret =</b></font> salt.utils.napalm.default_ret(name)
-42     if not filter_options:
-43         filter_options = []
-44     loaded <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>= __salt__["netacl.load_term_config"](
-45         filter_name,
-46         term_name,
-47         filter_options=filter_options,
-48         pillar_key=pillar_key,
-49         pillarenv=pillarenv,
-50         saltenv=saltenv,
-51         merge_pillar=merge_pillar,
-52         revision_id=revision_id if revision_id else name,
-53         revision_no=revision_no,
-54         revision_date=revision_date,
-55         revision_date_format=revision_date_format,
-56         source_service=source_service,
-57         destination_service=destination_service,
-58         test=test,
-59         commit=</b></font>commit,
-60         **term_fields
-61     )
-62     return salt.utils.napalm.loaded_ret(<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>ret, loaded, test, debug)
-63 def filter(
-64     name,  # pylint: disable=redefined-builtin
-65     filter_name,
-66     filter_options=None,
-67     terms=None,
-68     prepend=True,
-69     pillar_key="acl",
-70     pillarenv=None,
-71     saltenv=None,
-72     merge_pillar=False,
-73     only_lower_merge=False,
-74     revision_id=None,
-75     revision_no=None,
-76     revision_date=True,
-77     revision_date_format="%Y/%m/%d",
-78     test=False,
-79     commit=True,
-80     debug=False,
-81 ):
-82     ret =</b></font> salt.utils.napalm.default_ret(name)
-83     test = __opts__["test"] or test
-84     if not filter_options:
-85     if not terms:
-86         terms = []
-87     loaded <font color="#151b8d"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>= __salt__["netacl.load_filter_config"](
-88         filter_name,
-89         filter_options=filter_options,
-90         terms=terms,
-91         prepend=prepend,
-92         pillar_key=pillar_key,
-93         pillarenv=pillarenv,
-94         saltenv=saltenv,
-95         merge_pillar=merge_pillar,
-96         only_lower_merge=only_lower_merge,
-97         revision_id=</b></font>revision_id if revision_id else name,
-98         revision_no=revision_no,
-99         revision_date=revision_date,
-100         revision_date_format=revision_date_format,
-101         test=test,
-102         commit=commit,
-103         debug=debug,
-104     )
-105 <font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>def managed(
-106     name,
-107     filters=None,
-108     prepend=True,
-109     pillar_key="acl",
-110     pillarenv=None,
-111     saltenv=None,
-112     merge_pillar=False,
-113     only_lower_merge=False,
-114     revision_id=None,
-115     revision_no=None,
-116     revision_date=True,
-117     revision_date_format="%Y/%m/%d",
-118     test=False,
-119     commit=True,
-120     debug=</b></font>False,
-121 ):
-122     ret = salt.utils.napalm.default_ret(name)
-123     test = __opts__["test"] or test
-124         filters = []
-125     loaded = __salt__["netacl.load_policy_config"](
-126         filters<font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>=filters,
-127         prepend=prepend,
-128         pillar_key=pillar_key,
-129         pillarenv=pillarenv,
-130         saltenv=saltenv,
-131         merge_pillar=merge_pillar,
-132         only_lower_merge=only_lower_merge,
-133         revision_id=revision_id if revision_id else name,
-134         revision_no=revision_no,
-135         revision_date=revision_date,
-136         revision_date_format=revision_date_format,
-137         test=</b></font>test,
-138         commit=commit,
-139         debug=debug,
-140     )
-141     return salt.utils.napalm.loaded_ret(ret, loaded, test, debug)
+"""
+Network ACL
+===========
+Manage the firewall configuration on the network device managed through NAPALM.
+The firewall configuration is generated by Capirca_.
+.. _Capirca: https://github.com/google/capirca
+.. versionadded:: 2017.7.0
+:codeauthor: Mircea Ulinic &lt;ping@mirceaulinic.net&gt;
+:maturity:   new
+:depends:    capirca, napalm
+:platform:   unix
+Dependencies
+------------
+Capirca
+~~~~~~~
+To install Capirca, execute: ``pip install capirca``.
+NAPALM
+~~~~~~
+To be able to load configuration on network devices,
+it requires NAPALM_ library to be installed:  ``pip install napalm``.
+Please check Installation_ for complete details.
+.. _NAPALM: https://napalm.readthedocs.io
+.. _Installation: https://napalm.readthedocs.io/en/latest/installation/index.html
+"""
+import logging
+import salt.utils.napalm
+log = logging.getLogger(__file__)
+try:
+    import capirca
+    import capirca.aclgen
+    import capirca.lib.policy
+    import capirca.lib.aclgenerator
+    HAS_CAPIRCA = True
+except ImportError:
+    HAS_CAPIRCA = False
+__virtualname__ = "netacl"
+def __virtual__():
+    """
+    This module requires both NAPALM and Capirca.
+    """
+    if HAS_CAPIRCA and salt.utils.napalm.virtual(__opts__, __virtualname__, __file__):
+        return __virtualname__
+    else:
+        return (
+            False,
+            "The netacl state cannot be loaded: Please install capirca and napalm.",
+        )
+<font color="#980517"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>def term(
+    name,
+    filter_name,
+    term_name,
+    filter_options=None,
+    pillar_key="acl",
+    pillarenv=None,
+    saltenv=None,
+    merge_pillar=False,
+    revision_id=None,
+    revision_no=None,
+    revision_date=True,
+    revision_date_format="%Y/%m/%d",
+    test=False,
+    commit=True,
+    debug=False,
+    source_service=None,
+    destination_service=None,
+    **term_fields
+):
+    """
+    Manage the configuration of a specific policy term.
+    filter_name
+        The name of the policy filter.
+    term_name
+        The name of the term.
+    filter_options
+        Additional filter options. These options are platform-specific.
+        See the complete list of options_.
+        .. _options: https://github.com/google/capirca/wiki/Policy-format#header-section
+    pillar_key: ``acl``
+        The key in the pillar containing the default attributes values. Default: ``acl``.
+    pillarenv
+        Query the master to generate fresh pillar data on the fly,
+        specifically from the requested pillar environment.
+    saltenv
+        Included only for compatibility with
+        :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
+    merge_pillar: ``False``
+        Merge the CLI variables with the pillar. Default: ``False``.
+        The properties specified through the state arguments have higher priority than the pillar.
+    revision_id
+        Add a comment in the term config having the description for the changes applied.
+    revision_no
+        The revision count.
+    revision_date: ``True``
+        Boolean flag: display the date when the term configuration was generated. Default: ``True``.
+    revision_date_format: ``%Y/%m/%d``
+        The date format to be used when generating the perforce data. Default: ``%Y/%m/%d`` (&lt;year&gt;/&lt;month&gt;/&lt;day&gt;).
+    test: ``False``
+        Dry run? If set as ``True``, will apply the config, discard and return the changes.
+        Default: ``False`` and will commit the changes on the device.
+    commit: ``True``
+        Commit? Default: ``True``.
+    debug: ``False``
+        Debug mode. Will insert a new key under the output dictionary,
+        as ``loaded_config`` containing the raw configuration loaded on the device.
+    source_service
+        A special service to choose from. This is a helper so the user is able to
+        select a source just using the name, instead of specifying a source_port and protocol.
+        As this module is available on Unix platforms only,
+        it reads the IANA_ port assignment from /etc/services.
+        If the user requires additional shortcuts to be referenced, they can add entries under /etc/services,
+        which can be managed using the :mod:`file state &lt;salt.states.file&gt;`.
+        .. _IANA: http://www.iana.org/assignments/port-numbers
+    destination_service
+        A special service to choose from. This is a helper so the user is able to
+        select a source just using the name, instead of specifying a destination_port and protocol.
+        Allows the same options as ``source_service``.
+    term_fields
+        Term attributes. To see what fields are supported, please consult the
+        list of supported keywords_. Some platforms have few other optional_
+        keywords.
+        .. _keywords: https://github.com/google/capirca/wiki/Policy-format#keywords
+        .. _optional: https://github.com/google/capirca/wiki/Policy-format#optionally-supported-keywords
+    .. note::
+        The following fields are accepted:
+        - action
+        - address
+        - address_exclude
+        - comment
+        - counter
+        - expiration
+        - destination_address
+        - destination_address_exclude
+        - destination_port
+        - destination_prefix
+        - forwarding_class
+        - forwarding_class_except
+        - logging
+        - log_name
+        - loss_priority
+        - option
+        - policer
+        - port
+        - precedence
+        - principals
+        - protocol
+        - protocol_except
+        - qos
+        - pan_application
+        - routing_instance
+        - source_address
+        - source_address_exclude
+        - source_port
+        - source_prefix
+        - verbatim
+        - packet_length
+        - fragment_offset
+        - hop_limit
+        - icmp_type
+        - ether_type
+        - traffic_class_count
+        - traffic_type
+        - translated
+        - dscp_set
+        - dscp_match
+        - dscp_except
+        - next_ip
+        - flexible_match_range
+        - source_prefix_except
+        - destination_prefix_except
+        - vpn
+        - source_tag
+        - destination_tag
+        - source_interface
+        - destination_interface
+        - flattened
+        - flattened_addr
+        - flattened_saddr
+        - flattened_daddr
+        - priority
+    .. note::
+        The following fields can be also a single value and a list of values:
+        - action
+        - address
+        - address_exclude
+        - comment
+        - destination_address
+        - destination_address_exclude
+        - destination_port
+        - destination_prefix
+        - forwarding_class
+        - forwarding_class_except
+        - logging
+        - option
+        - port
+        - precedence
+        - principals
+        - protocol
+        - protocol_except
+        - pan_application
+        - source_address
+        - source_address_exclude
+        - source_port
+        - source_prefix
+        - verbatim
+        - icmp_type
+        - ether_type
+        - traffic_type
+        - dscp_match
+        - dscp_except
+        - flexible_match_range
+        - source_prefix_except
+        - destination_prefix_except
+        - source_tag
+        - destination_tag
+        - source_service
+        - destination_service
+        Example: ``destination_address`` can be either defined as:
+        .. code-block:: yaml
+            destination_address: 172.17.17.1/24
+        or as a list of destination IP addresses:
+        .. code-block:: yaml
+            destination_address:
+                - 172.17.17.1/24
+                - 172.17.19.1/24
+        or a list of services to be matched:
+        .. code-block:: yaml
+            source_service:
+                - ntp
+                - snmp
+                - ldap
+                - bgpd
+    .. note::
+        The port fields ``source_port`` and ``destination_port`` can be used as
+        above to select either a single value, either a list of values, but
+        also they can select port ranges. Example:
+        .. code-block:: yaml
+            source_port:
+                - [1000, 2000]
+                - [3000, 4000]
+        With the configuration above, the user is able to select the 1000-2000 and 3000-4000 source port ranges.
+    CLI Example:
+    .. code-block:: bash
+        salt 'edge01.bjm01' state.sls router.acl
+    Output Example:
+    .. code-block:: text
+        edge01.bjm01:
+        ----------
+                  ID: update_icmp_first_term
+            Function: netacl.term
+              Result: None
+             Comment: Testing mode: Configuration discarded.
+             Started: 12:49:09.174179
+            Duration: 5751.882 ms
+             Changes:
+                      ----------
+                      diff:
+                          [edit firewall]
+                          +    family inet {
+                          +        /*
+                          +         ** $Id: update_icmp_first_term $
+                          +         ** $Date: 2017/02/30 $
+                          +         **
+                          +         */
+                          +        filter block-icmp {
+                          +            term first-term {
+                          +                from {
+                          +                    protocol icmp;
+                          +                }
+                          +                then {
+                          +                    reject;
+                          +                }
+                          +            }
+                          +        }
+                          +    }
+        Summary for edge01.bjm01
+        ------------
+        Succeeded: 1 (unchanged=1, changed=1)
+        Failed:    0
+        ------------
+        Total states run:     1
+        Total run time:   5.752 s
+    Pillar example:
+    .. code-block:: yaml
+        firewall:
+          - block-icmp:
+              terms:
+                - first-term:
+                    protocol:
+                      - icmp
+                    action: reject
+    State SLS example:
+    .. code-block:: jinja
+        {%- set filter_name = 'block-icmp' -%}
+        {%- set term_name = 'first-term' -%}
+        {%- set my_term_cfg = salt.netacl.get_term_pillar(filter_name, term_name) -%}
+        update_icmp_first_term:
+          netacl.term:
+            - filter_name: {{ filter_name }}
+            - filter_options:
+                - not-interface-specific
+            - term_name: {{ term_name }}
+            - {{ my_term_cfg | json }}
+    Or directly referencing the pillar keys:
+    .. code-block:: yaml
+        update_icmp_first_term:
+          netacl.term:
+            - filter_name: block-icmp
+            - filter_options:
+                - not-interface-specific
+            - term_name: first-term
+            - merge_pillar: true
+    .. note::
+        The first method allows the user to eventually apply complex manipulation
+        and / or retrieve the data from external services before passing the
+        data to the state. The second one is more straightforward, for less
+        complex cases when loading the data directly from the pillar is sufficient.
+    .. note::
+        When passing retrieved pillar data into the state file, it is strongly
+        recommended to use the json serializer explicitly (`` | json``),
+        instead of relying on the default Python serializer.
+    """
+    ret =</b></font> salt.utils.napalm.default_ret(name)
+    if not filter_options:
+        filter_options = []
+    loaded <font color="#f63526"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>= __salt__["netacl.load_term_config"](
+        filter_name,
+        term_name,
+        filter_options=filter_options,
+        pillar_key=pillar_key,
+        pillarenv=pillarenv,
+        saltenv=saltenv,
+        merge_pillar=merge_pillar,
+        revision_id=revision_id if revision_id else name,
+        revision_no=revision_no,
+        revision_date=revision_date,
+        revision_date_format=revision_date_format,
+        source_service=source_service,
+        destination_service=destination_service,
+        test=test,
+        commit=</b></font>commit,
+        **term_fields
+    )
+    return salt.utils.napalm.loaded_ret(<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>ret, loaded, test, debug)
+def filter(
+    name,  # pylint: disable=redefined-builtin
+    filter_name,
+    filter_options=None,
+    terms=None,
+    prepend=True,
+    pillar_key="acl",
+    pillarenv=None,
+    saltenv=None,
+    merge_pillar=False,
+    only_lower_merge=False,
+    revision_id=None,
+    revision_no=None,
+    revision_date=True,
+    revision_date_format="%Y/%m/%d",
+    test=False,
+    commit=True,
+    debug=False,
+):
+    """
+    Generate and load the configuration of a policy filter.
+    filter_name
+        The name of the policy filter.
+    filter_options
+        Additional filter options. These options are platform-specific.
+        See the complete list of options_.
+        .. _options: https://github.com/google/capirca/wiki/Policy-format#header-section
+    terms
+        Dictionary of terms for this policy filter.
+        If not specified or empty, will try to load the configuration from the pillar,
+        unless ``merge_pillar`` is set as ``False``.
+    prepend: ``True``
+        When ``merge_pillar`` is set as ``True``, the final list of terms generated by merging
+        the terms from ``terms`` with those defined in the pillar (if any): new terms are prepended
+        at the beginning, while existing ones will preserve the position. To add the new terms
+        at the end of the list, set this argument to ``False``.
+    pillar_key: ``acl``
+        The key in the pillar containing the default attributes values. Default: ``acl``.
+    pillarenv
+        Query the master to generate fresh pillar data on the fly,
+        specifically from the requested pillar environment.
+    saltenv
+        Included only for compatibility with
+        :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
+    merge_pillar: ``False``
+        Merge ``terms`` with the corresponding value from the pillar. Default: ``False``.
+        .. note::
+            By default this state does not merge, to avoid any unexpected behaviours.
+            The merge logic depends on the ``prepend`` argument.
+            The terms specified through the ``terms`` argument have higher priority
+            than the pillar.
+    only_lower_merge: ``False``
+        Specify if it should merge only the terms fields. Otherwise it will try
+        to merge also filters fields. Default: ``False``.
+        This option requires ``merge_pillar``, otherwise it is ignored.
+    revision_id
+        Add a comment in the filter config having the description for the changes applied.
+    revision_no
+        The revision count.
+    revision_date: ``True``
+        Boolean flag: display the date when the filter configuration was generated. Default: ``True``.
+    revision_date_format: ``%Y/%m/%d``
+        The date format to be used when generating the perforce data. Default: ``%Y/%m/%d`` (&lt;year&gt;/&lt;month&gt;/&lt;day&gt;).
+    test: ``False``
+        Dry run? If set as ``True``, will apply the config, discard and return the changes.
+        Default: ``False`` and will commit the changes on the device.
+    commit: ``True``
+        Commit? Default: ``True``.
+    debug: ``False``
+        Debug mode. Will insert a new key under the output dictionary,
+        as ``loaded_config`` containing the raw configuration loaded on the device.
+    CLI Example:
+    .. code-block:: bash
+        salt 'edge01.flw01' state.sls router.acl test=True
+    Output Example:
+    .. code-block:: text
+        edge01.flw01:
+        ----------
+                  ID: my-filter
+            Function: netacl.filter
+              Result: None
+             Comment: Testing mode: Configuration discarded.
+             Started: 12:24:40.598232
+            Duration: 2437.139 ms
+             Changes:
+                      ----------
+                      diff:
+                          ---
+                          +++
+                          @@ -1228,9 +1228,24 @@
+                          !
+                          +ipv4 access-list my-filter
+                          + 10 remark $Id: my-filter_state $
+                          + 20 remark $Revision: 5 $
+                          + 30 remark my-other-term
+                          + 40 permit tcp any range 5678 5680 any
+                          +!
+                          +!
+                      loaded:
+                          ! $Id: my-filter_state $
+                          ! $Revision: 5 $
+                          no ipv6 access-list my-filter
+                          ipv6 access-list my-filter
+                           remark $Id: my-filter_state $
+                           remark $Revision: 5 $
+                           remark my-other-term
+                           permit tcp any range 5678 5680 any
+                          exit
+        Summary for edge01.flw01
+        ------------
+        Succeeded: 1 (unchanged=1, changed=1)
+        Failed:    0
+        ------------
+        Total states run:     1
+        Total run time:   2.437 s
+    Pillar example:
+    .. code-block:: yaml
+        acl:
+          - my-filter:
+              options:
+                - inet6
+              terms:
+                - my-term:
+                    source_port: [1234, 1235]
+                    protocol:
+                      - tcp
+                      - udp
+                    source_address: 1.2.3.4
+                    action: reject
+                - my-other-term:
+                    source_port:
+                      - [5678, 5680]
+                    protocol: tcp
+                    action: accept
+    State SLS Example:
+    .. code-block:: jinja
+        {%- set filter_name = 'my-filter' -%}
+        {%- set my_filter_cfg = salt.netacl.get_filter_pillar(filter_name, pillar_key='firewall') -%}
+        my_first_filter_state:
+          netacl.filter:
+            - filter_name: {{ filter_name }}
+            - options: {{ my_filter_cfg['options'] | json }}
+            - terms: {{ my_filter_cfg['terms'] | json }}
+            - revision_date: false
+            - revision_no: 5
+            - debug: true
+    Or:
+    .. code-block:: yaml
+        my_first_filter_state:
+          netacl.filter:
+            - filter_name: my-filter
+            - merge_pillar: true
+            - pillar_key: firewall
+            - revision_date: false
+            - revision_no: 5
+            - debug: true
+    In the example above, as ``inet6`` has been specified in the ``filter_options``,
+    the configuration chunk referring to ``my-term`` has been ignored as it referred to
+    IPv4 only (from ``source_address`` field).
+    .. note::
+        The first method allows the user to eventually apply complex manipulation
+        and / or retrieve the data from external services before passing the
+        data to the state. The second one is more straightforward, for less
+        complex cases when loading the data directly from the pillar is sufficient.
+    .. note::
+        When passing retrieved pillar data into the state file, it is strongly
+        recommended to use the json serializer explicitly (`` | json``),
+        instead of relying on the default Python serializer.
+    """
+    ret =</b></font> salt.utils.napalm.default_ret(name)
+    test = __opts__["test"] or test
+    if not filter_options:
+    if not terms:
+        terms = []
+    loaded <font color="#151b8d"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>= __salt__["netacl.load_filter_config"](
+        filter_name,
+        filter_options=filter_options,
+        terms=terms,
+        prepend=prepend,
+        pillar_key=pillar_key,
+        pillarenv=pillarenv,
+        saltenv=saltenv,
+        merge_pillar=merge_pillar,
+        only_lower_merge=only_lower_merge,
+        revision_id=</b></font>revision_id if revision_id else name,
+        revision_no=revision_no,
+        revision_date=revision_date,
+        revision_date_format=revision_date_format,
+        test=test,
+        commit=commit,
+        debug=debug,
+    )
+<font color="#53858b"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>def managed(
+    name,
+    filters=None,
+    prepend=True,
+    pillar_key="acl",
+    pillarenv=None,
+    saltenv=None,
+    merge_pillar=False,
+    only_lower_merge=False,
+    revision_id=None,
+    revision_no=None,
+    revision_date=True,
+    revision_date_format="%Y/%m/%d",
+    test=False,
+    commit=True,
+    debug=</b></font>False,
+):
+    """
+    Manage the whole firewall configuration.
+    filters
+        Dictionary of filters for this policy.
+        If not specified or empty, will try to load the configuration from the pillar,
+        unless ``merge_pillar`` is set as ``False``.
+    prepend: ``True``
+        When ``merge_pillar`` is set as ``True``, the final list of filters generated by merging
+        the filters from ``filters`` with those defined in the pillar (if any): new filters are prepended
+        at the beginning, while existing ones will preserve the position. To add the new filters
+        at the end of the list, set this argument to ``False``.
+    pillar_key: ``acl``
+        The key in the pillar containing the default attributes values. Default: ``acl``.
+    pillarenv
+        Query the master to generate fresh pillar data on the fly,
+        specifically from the requested pillar environment.
+    saltenv
+        Included only for compatibility with
+        :conf_minion:`pillarenv_from_saltenv`, and is otherwise ignored.
+    merge_pillar: ``False``
+        Merge the ``filters`` will the corresponding values from the pillar. Default: ``False``.
+        .. note::
+            By default this state does not merge, to avoid any unexpected behaviours.
+            The merge logic depends on the ``prepend`` argument.
+            The filters specified through the ``filters`` argument have higher priority
+            than the pillar.
+    only_lower_merge: ``False``
+        Specify if it should merge only the filters and terms fields. Otherwise it will try
+        to merge everything at the policy level. Default: ``False``.
+        This option requires ``merge_pillar``, otherwise it is ignored.
+    test: ``False``
+        Dry run? If set as ``True``, will apply the config, discard and return the changes.
+        Default: ``False`` and will commit the changes on the device.
+    revision_id
+        Add a comment in the policy config having the description for the changes applied.
+    revision_no
+        The revision count.
+    revision_date: ``True``
+        Boolean flag: display the date when the policy configuration was generated. Default: ``True``.
+    revision_date_format: ``%Y/%m/%d``
+        The date format to be used when generating the perforce data. Default: ``%Y/%m/%d`` (&lt;year&gt;/&lt;month&gt;/&lt;day&gt;).
+    commit: ``True``
+        Commit? Default: ``True``.
+    debug: ``False``
+        Debug mode. Will insert a new key under the output dictionary,
+        as ``loaded_config`` containing the raw configuration loaded on the device.
+    CLI Example:
+    .. code-block:: bash
+        salt 'edge01.bjm01' state.sls router.acl test=True
+    Output Example:
+    .. code-block:: text
+        edge01.bjm01:
+        -------------
+                      ID: netacl_example
+                Function: netacl.managed
+                  Result: None
+                 Comment: Testing mode: Configuration discarded.
+                 Started: 12:03:24.807023
+                Duration: 5569.453 ms
+                 Changes:
+                          ----------
+                          diff:
+                              [edit firewall]
+                              +    family inet {
+                              +        /*
+                              +         ** $Id: netacl_example $
+                              +         ** $Date: 2017/07/03 $
+                              +         ** $Revision: 2 $
+                              +         **
+                              +         */
+                              +        filter my-filter {
+                              +            interface-specific;
+                              +            term my-term {
+                              +                from {
+                              +                    source-address {
+                              +                        1.2.3.4/32;
+                              +                    }
+                              +                    protocol [ tcp udp ];
+                              +                    source-port [ 1234 1235 ];
+                              +                }
+                              +                then {
+                              +                    reject;
+                              +                }
+                              +            }
+                              +            term my-other-term {
+                              +                from {
+                              +                    protocol tcp;
+                              +                    source-port 5678-5680;
+                              +                }
+                              +                then accept;
+                              +            }
+                              +        }
+                              +        /*
+                              +         ** $Id: netacl_example $
+                              +         ** $Date: 2017/07/03 $
+                              +         ** $Revision: 2 $
+                              +         **
+                              +         */
+                              +        filter block-icmp {
+                              +            interface-specific;
+                              +            term first-term {
+                              +                from {
+                              +                    protocol icmp;
+                              +                }
+                              +                then {
+                              +                    reject;
+                              +                }
+                              +            }
+                              +        }
+                              +    }
+                          loaded:
+                              firewall {
+                                  family inet {
+                                      replace:
+                                      /*
+                                      ** $Id: netacl_example $
+                                      ** $Date: 2017/07/03 $
+                                      ** $Revision: 2 $
+                                      **
+                                      */
+                                      filter my-filter {
+                                          interface-specific;
+                                          term my-term {
+                                              from {
+                                                  source-address {
+                                                      1.2.3.4/32;
+                                                  }
+                                                  protocol [ tcp udp ];
+                                                  source-port [ 1234 1235 ];
+                                              }
+                                              then {
+                                                  reject;
+                                              }
+                                          }
+                                          term my-other-term {
+                                              from {
+                                                  protocol tcp;
+                                                  source-port 5678-5680;
+                                              }
+                                              then accept;
+                                          }
+                                      }
+                                  }
+                              }
+                              firewall {
+                                  family inet {
+                                      replace:
+                                      /*
+                                      ** $Id: netacl_example $
+                                      ** $Date: 2017/07/03 $
+                                      ** $Revision: 2 $
+                                      **
+                                      */
+                                      filter block-icmp {
+                                          interface-specific;
+                                          term first-term {
+                                              from {
+                                                  protocol icmp;
+                                              }
+                                              then {
+                                                  reject;
+                                              }
+                                          }
+                                      }
+                                  }
+                              }
+            Summary for edge01.bjm01
+            ------------
+            Succeeded: 1 (unchanged=1, changed=1)
+            Failed:    0
+            ------------
+            Total states run:     1
+            Total run time:   5.569 s
+    The policy configuration has been loaded from the pillar, having the following structure:
+    .. code-block:: yaml
+        firewall:
+          - my-filter:
+              terms:
+                - my-term:
+                    source_port: [1234, 1235]
+                    protocol:
+                      - tcp
+                      - udp
+                    source_address: 1.2.3.4
+                    action: reject
+                - my-other-term:
+                    source_port:
+                      - [5678, 5680]
+                    protocol: tcp
+                    action: accept
+          - block-icmp:
+              terms:
+                - first-term:
+                    protocol:
+                      - icmp
+                    action: reject
+    Example SLS file:
+    .. code-block:: jinja
+        {%- set fw_filters = pillar.get('firewall', {}) -%}
+        netacl_example:
+          netacl.managed:
+            - filters: {{ fw_filters | json }}
+            - revision_no: 2
+            - debug: true
+    Or:
+    .. code-block:: yaml
+        netacl_example:
+          netacl.managed:
+            - pillar_key: firewall
+            - merge_pillar: true
+            - revision_no: 2
+            - debug: true
+    .. note::
+        The first method allows the user to eventually apply complex manipulation
+        and / or retrieve the data from external services before passing the
+        data to the state. The second one is more straightforward, for less
+        complex cases when loading the data directly from the pillar is sufficient.
+    .. note::
+        When passing retrieved pillar data into the state file, it is strongly
+        recommended to use the json serializer explicitly (`` | json``),
+        instead of relying on the default Python serializer.
+    """
+    ret = salt.utils.napalm.default_ret(name)
+    test = __opts__["test"] or test
+        filters = []
+    loaded = __salt__["netacl.load_policy_config"](
+        filters<font color="#6cc417"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>=filters,
+        prepend=prepend,
+        pillar_key=pillar_key,
+        pillarenv=pillarenv,
+        saltenv=saltenv,
+        merge_pillar=merge_pillar,
+        only_lower_merge=only_lower_merge,
+        revision_id=revision_id if revision_id else name,
+        revision_no=revision_no,
+        revision_date=revision_date,
+        revision_date_format=revision_date_format,
+        test=</b></font>test,
+        commit=commit,
+        debug=debug,
+    )
+    return salt.utils.napalm.loaded_ret(ret, loaded, test, debug)
 </pre>
 </div>
 </div>

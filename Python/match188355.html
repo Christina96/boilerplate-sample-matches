@@ -40,999 +40,1415 @@ Matches for archive.py &amp; test_file_selinux.py
 </h3>
 <hr/>
 <pre>
-1 import errno
-2 import os
-3 import re
-4 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>import shlex
-5 import stat
-6 import string
-7 import tarfile
-8 from contextlib import closing
-9 from urllib.parse import urlparse
-10 import salt.utils.args
-11 import salt.utils.files
-12 import salt.utils.hashutils
-13 import salt.utils.path
-14 import salt.utils.platform
-15 import salt.utils.url
-16 from salt.exceptions import CommandExecutionError, CommandNotFoundError
-17 log = logging.getLogger(</b></font>__name__)
-18 def _path_is_abs(path):
-19     if path is None:
-20         return True
-21     try:
-22         return os.path.isabs(path)
-23     except AttributeError:
-24         return False
-25 def _add_explanation(ret, source_hash_trigger, contents_missing):
-26     if source_hash_trigger:
-27         ret["comment"] += ", due to source_hash update"
-28     elif contents_missing:
-29         ret["comment"] += ", due to absence of one or more files/dirs"
-30 def _gen_checksum(path):
-31     return {
-32         "hsum": salt.utils.hashutils.get_hash(path, form=__opts__["hash_type"]),
-33         "hash_type": __opts__["hash_type"],
-34     }
-35 def _checksum_file_path(path):
-36     try:
-37         relpath = ".".join((os.path.relpath(path, __opts__["cachedir"]), "hash"))
-38         if re.match(r"..[/\\]", relpath):
-39             relpath = salt.utils.path.join(
-40                 "local",
-41                 os.path.splitdrive(path)[-1].lstrip("/\\"),
-42             )
-43     except ValueError as exc:
-44         if str(exc).startswith("path is on"):
-45             drive, path = os.path.splitdrive(path)
-46             relpath = salt.utils.path.join(
-47                 "local",
-48                 drive.rstrip(":"),
-49                 path.lstrip("/\\"),
-50             )
-51         elif str(exc).startswith("Cannot mix UNC"):
-52             relpath = salt.utils.path.join("unc", path)
-53         else:
-54             raise
-55     ret = salt.utils.path.join(__opts__["cachedir"], "archive_hash", relpath)
-56     log.debug("Using checksum file %s for cached archive file %s", ret, path)
-57     return ret
-58 def _update_checksum(path):
-59     checksum_file = _checksum_file_path(path)
-60     checksum_dir = os.path.dirname(checksum_file)
-61     if not os.path.isdir(checksum_dir):
-62         os.makedirs(checksum_dir)
-63     source_sum = _gen_checksum(path)
-64     hash_type = source_sum.get("hash_type")
-65     hsum = source_sum.get("hsum")
-66     if hash_type and hsum:
-67         lines = []
-68         try:
-69             try:
-70                 with salt.utils.files.fopen(checksum_file, "r") as fp_:
-71                     for line in fp_:
-72                         try:
-73                             lines.append(line.rstrip("\n").split(":", 1))
-74                         except ValueError:
-75                             continue
-76             except OSError as exc:
-77                 if exc.errno != errno.ENOENT:
-78                     raise
-79             with salt.utils.files.fopen(checksum_file, "w") as fp_:
-80                 for line in lines:
-81                     if line[0] == hash_type:
-82                         line[1] = hsum
-83                     fp_.write("{}:{}\n".format(*line))
-84                 if hash_type not in [x[0] for x in lines]:
-85                     fp_.write("{}:{}\n".format(hash_type, hsum))
-86         except OSError as exc:
-87             log.warning(
-88                 "Failed to update checksum for %s: %s",
-89                 path,
-90                 exc.__str__(),
-91                 exc_info=True,
-92             )
-93 def _read_cached_checksum(path, form=None):
-94     if form is None:
-95         form = __opts__["hash_type"]
-96     checksum_file = _checksum_file_path(path)
-97     try:
-98         with salt.utils.files.fopen(checksum_file, "r") as fp_:
-99             for line in fp_:
-100                 hash_type, hsum = line.rstrip("\n").split(":", 1)
-101                 if hash_type == form:
-102                     break
-103             else:
-104                 return None
-105     except (OSError, ValueError):
-106         return None
-107     else:
-108         return {"hash_type": hash_type, "hsum": hsum}
-109 def _compare_checksum(cached, source_sum):
-110     cached_sum = _read_cached_checksum(
-111         cached, form=source_sum.get("hash_type", __opts__["hash_type"])
-112     )
-113     return source_sum == cached_sum
-114 def _is_bsdtar():
-115     return "bsdtar" in __salt__["cmd.run"](["tar", "--version"], python_shell=False)
-116 def _cleanup_destdir(name):
-117     try:
-118         os.rmdir(name)
-119     except OSError:
-120         pass
-121 def extracted(
-122     name,
-123     source,
-124     source_hash=None,
-125     source_hash_name=None,
-126     source_hash_update=False,
-127     skip_files_list_verify=False,
-128     skip_verify=False,
-129     password=None,
-130     options=None,
-131     list_options=None,
-132     force=False,
-133     overwrite=False,
-134     clean=False,
-135     clean_parent=False,
-136     user=None,
-137     group=None,
-138     if_missing=None,
-139     trim_output=False,
-140     use_cmd_unzip=None,
-141     extract_perms=True,
-142     enforce_toplevel=True,
-143     enforce_ownership_on=None,
-144     archive_format=None,
-145     use_etag=False,
-146     **kwargs
-147 ):
-148     ret = {"name": name, "result": False, "changes": {}, "comment": ""}
-149     kwargs = salt.utils.args.clean_kwargs(**kwargs)
-150     if skip_files_list_verify and skip_verify:
-151         ret[
-152             "comment"
-153         ] = 'Only one of "skip_files_list_verify" and "skip_verify" can be set to True'
-154         return ret
-155     if "keep_source" in kwargs and "keep" in kwargs:
-156         ret.setdefault("warnings", []).append(
-157             "Both 'keep_source' and 'keep' were used. Since these both "
-158             "do the same thing, 'keep' was ignored."
-159         )
-160         keep_source = bool(kwargs.pop("keep_source"))
-161         kwargs.pop("keep")
-162     elif "keep_source" in kwargs:
-163         keep_source = bool(kwargs.pop("keep_source"))
-164     elif "keep" in kwargs:
-165         keep_source = bool(kwargs.pop("keep"))
-166     else:
-167         keep_source = True
-168     if not _path_is_abs(name):
-169         ret["comment"] = "{} is not an absolute path".format(name)
-170         return ret
-171     else:
-172         if not name:
-173             ret["comment"] = "Name of the directory path needs to be specified"
-174             return ret
-175         name = name.rstrip(os.sep)
-176         if os.path.isfile(name):
-177             ret["comment"] = "{} exists and is not a directory".format(name)
-178             return ret
-179         name += os.sep
-180     if not _path_is_abs(if_missing):
-181         ret["comment"] = "Value for 'if_missing' is not an absolute path"
-182         return ret
-183     if not _path_is_abs(enforce_ownership_on):
-184         ret["comment"] = "Value for 'enforce_ownership_on' is not an absolute path"
-185         return ret
-186     else:
-187         if enforce_ownership_on is not None:
-188             try:
-189                 not_rel = os.path.relpath(enforce_ownership_on, name).startswith(
-190                     ".." + os.sep
-191                 )
-192             except Exception:  # pylint: disable=broad-except
-193                 not_rel = True
-194             if not_rel:
-195                 ret[
-196                     "comment"
-197                 ] = "Value for 'enforce_ownership_on' must be within {}".format(name)
-198                 return ret
-199     if if_missing is not None and os.path.exists(if_missing):
-200         ret["result"] = True
-201         ret["comment"] = "Path {} exists".format(if_missing)
-202         return ret
-203     if user or group:
-204         if salt.utils.platform.is_windows():
-205             ret[
-206                 "comment"
-207             ] = "User/group ownership cannot be enforced on Windows minions"
-208             return ret
-209         if user:
-210             uid = __salt__["file.user_to_uid"](user)
-211             if uid == "":
-212                 ret["comment"] = "User {} does not exist".format(user)
-213                 return ret
-214         else:
-215             uid = -1
-216         if group:
-217             gid = __salt__["file.group_to_gid"](group)
-218             if gid == "":
-219                 ret["comment"] = "Group {} does not exist".format(group)
-220                 return ret
-221         else:
-222             gid = -1
-223     else:
-224         uid = gid = -1
-225     if source_hash_update and not source_hash:
-226         ret.setdefault("warnings", []).append(
-227             "The 'source_hash_update' argument is ignored when "
-228             "'source_hash' is not also specified."
-229         )
-230     try:
-231         source_match = __salt__["file.source_list"](source, source_hash, __env__)[0]
-232     except CommandExecutionError as exc:
-233         ret["result"] = False
-234         ret["comment"] = exc.strerror
-235         return ret
-236     if not source_match:
-237         ret["result"] = False
-238         ret["comment"] = 'Invalid source "{}"'.format(source)
-239         return ret
-240     urlparsed_source = urlparse(source_match)
-241     urlparsed_scheme = urlparsed_source.scheme
-242     urlparsed_path = os.path.join(
-243         urlparsed_source.netloc, urlparsed_source.path
-244     ).rstrip(os.sep)
-245     if urlparsed_scheme and urlparsed_scheme.lower() in string.ascii_lowercase:
-246         urlparsed_path = ":".join([urlparsed_scheme, urlparsed_path])
-247         urlparsed_scheme = "file"
-248     source_hash_basename = urlparsed_path or urlparsed_source.netloc
-249     source_is_local = urlparsed_scheme in salt.utils.files.LOCAL_PROTOS
-250     if source_is_local:
-251         source_match = os.path.realpath(os.path.expanduser(urlparsed_path))
-252         if not os.path.isfile(source_match):
-253             ret["comment"] = "Source file '{}' does not exist".format(
-254                 salt.utils.url.redact_http_basic_auth(source_match)
-255             )
-256             return ret
-257     valid_archive_formats = ("tar", "rar", "zip")
-258     if not archive_format:
-259         archive_format = salt.utils.files.guess_archive_type(source_hash_basename)
-260         if archive_format is None:
-261             ret["comment"] = (
-262                 "Could not guess archive_format from the value of the "
-263                 "'source' argument. Please set this archive_format to one "
-264                 "of the following: {}".format(", ".join(valid_archive_formats))
-265             )
-266             return ret
-267     try:
-268         archive_format = archive_format.lower()
-269     except AttributeError:
-270         pass
-271     if archive_format not in valid_archive_formats:
-272         ret["comment"] = (
-273             "Invalid archive_format '{}'. Either set it to a supported "
-274             "value ({}) or remove this argument and the archive format will "
-275             "be guessed based on file extension.".format(
-276                 archive_format,
-277                 ", ".join(valid_archive_formats),
-278             )
-279         )
-280         return ret
-281     if options is not None and not isinstance(options, str):
-282         options = str(options)
-283     strip_components = None
-284     if options and archive_format == "tar":
-285         try:
-286             strip_components = int(
-287                 re.search(
-288                     r"""--strip(?:-components)?(?:\s+|=)["']?(\d+)["']?""", options
-289                 ).group(1)
-290             )
-291         except (AttributeError, ValueError):
-292             pass
-293     if archive_format == "zip":
-294         if options:
-295             if use_cmd_unzip is None:
-296                 log.info(
-297                     "Presence of CLI options in archive.extracted state for "
-298                     "'%s' implies that use_cmd_unzip is set to True.",
-299                     name,
-300                 )
-301                 use_cmd_unzip = True
-302             elif not use_cmd_unzip:
-303                 ret["comment"] = (
-304                     "'use_cmd_unzip' cannot be set to False if CLI options "
-305                     "are being specified (via the 'options' argument). "
-306                     "Either remove 'use_cmd_unzip', or set it to True."
-307                 )
-308                 return ret
-309             if use_cmd_unzip:
-310                 if "archive.cmd_unzip" not in __salt__:
-311                     ret["comment"] = (
-312                         "archive.cmd_unzip function not available, unzip might "
-313                         "not be installed on minion"
-314                     )
-315                     return ret
-316         if password:
-317             if use_cmd_unzip is None:
-318                 log.info(
-319                     "Presence of a password in archive.extracted state for "
-320                     "'%s' implies that use_cmd_unzip is set to False.",
-321                     name,
-322                 )
-323                 use_cmd_unzip = False
-324             elif use_cmd_unzip:
-325                 ret.setdefault("warnings", []).append(
-326                     "Using a password in combination with setting "
-327                     "'use_cmd_unzip' to True is considered insecure. It is "
-328                     "recommended to remove the 'use_cmd_unzip' argument (or "
-329                     "set it to False) and allow Salt to extract the archive "
-330                     "using Python's built-in ZIP file support."
-331                 )
-332     else:
-333         if password:
-334             ret[
-335                 "comment"
-336             ] = "The 'password' argument is only supported for zip archives"
-337             return ret
-338     if archive_format == "rar":
-339         if "archive.unrar" not in __salt__:
-340             ret["comment"] = (
-341                 "archive.unrar function not available, rar/unrar might "
-342                 "not be installed on minion"
-343             )
-344             return ret
-345     supports_options = ("tar", "zip")
-346     if options and archive_format not in supports_options:
-347         ret["comment"] = (
-348             "The 'options' argument is only compatible with the following "
-349             "archive formats: {}".format(", ".join(supports_options))
-350         )
-351         return ret
-352     if trim_output:
-353         if trim_output is True:
-354             trim_output = 100
-355         elif not isinstance(trim_output, (bool, int)):
-356             try:
-357                 trim_output = int(trim_output)
-358             except TypeError:
-359                 ret[
-360                     "comment"
-361                 ] = "Invalid value for trim_output, must be True/False or an integer"
-362                 return ret
-363     if source_hash:
-364         try:
-365             source_sum = __salt__["file.get_source_sum"](
-366                 source=source_match,
-367                 source_hash=source_hash,
-368                 source_hash_name=source_hash_name,
-369                 saltenv=__env__,
-370             )
-371         except CommandExecutionError as exc:
-372             ret["comment"] = exc.strerror
-373             return ret
-374     else:
-375         source_sum = {}
-376     if skip_files_list_verify:
-377         if source_is_local:
-378             cached = source_match
-379         else:
-380             cached = __salt__["cp.is_cached"](source_match, saltenv=__env__)
-381         if cached:
-382             existing_cached_source_sum = _read_cached_checksum(cached)
-383             log.debug(
-384                 'Existing source sum is: "%s". Expected source sum is "%s"',
-385                 existing_cached_source_sum,
-386                 source_sum,
-387             )
-388         else:
-389             parsed = urlparse(source_match)
-390             expected_cached_path = salt.utils.path.join(
-391                 __opts__["cachedir"], "extrn_files", __env__, parsed.netloc, parsed.path
-392             )
-393             existing_cached_source_sum = _read_cached_checksum(expected_cached_path)
-394         if source_sum and existing_cached_source_sum:
-395             if existing_cached_source_sum["hsum"] == source_sum["hsum"]:
-396                 ret["result"] = None if __opts__["test"] else True
-397                 ret["comment"] = (
-398                     "Archive {} existing source sum is the same as the "
-399                     "expected one and skip_files_list_verify argument was set "
-400                     "to True. Extraction is not needed".format(
-401                         salt.utils.url.redact_http_basic_auth(source_match)
-402                     )
-403                 )
-404                 return ret
-405         else:
-406             log.debug("There is no cached source %s available on minion", source_match)
-407     if source_is_local:
-408         cached = source_match
-409     else:
-410         if __opts__["test"]:
-411             ret["result"] = None
-412             ret["comment"] = (
-413                 "Archive {} would be cached (if necessary) and checked to "
-414                 "discover if extraction is needed".format(
-415                     salt.utils.url.redact_http_basic_auth(source_match)
-416                 )
-417             )
-418             return ret
-419         if "file.cached" not in __states__:
-420             ret[
-421                 "comment"
-422             ] = "Unable to cache {}, file.cached state not available".format(
-423                 salt.utils.url.redact_http_basic_auth(source_match)
-424             )
-425             return ret
-426         try:
-427             result = __states__["file.cached"](
-428                 source_match,
-429                 source_hash=source_hash,
-430                 source_hash_name=source_hash_name,
-431                 skip_verify=skip_verify,
-432                 saltenv=__env__,
-433                 use_etag=use_etag,
-434             )
-435         except Exception as exc:  # pylint: disable=broad-except
-436             msg = "Failed to cache {}: {}".format(
-437                 salt.utils.url.redact_http_basic_auth(source_match), exc.__str__()
-438             )
-439             log.exception(msg)
-440             ret["comment"] = msg
-441             return ret
-442         else:
-443             log.debug("file.cached: %s", result)
-444         if result["result"]:
-445             cached = __salt__["cp.is_cached"](source_match, saltenv=__env__)
-446         else:
-447             log.debug(
-448                 "failed to download %s",
-449                 salt.utils.url.redact_http_basic_auth(source_match),
-450             )
-451             return result
-452     existing_cached_source_sum = _read_cached_checksum(cached)
-453     if source_hash and source_hash_update and not skip_verify:
-454         _update_checksum(cached)
-455     if archive_format == "zip" and not password:
-456         log.debug("Checking %s to see if it is password-protected", source_match)
-457         try:
-458             encrypted_zip = __salt__["archive.is_encrypted"](
-459                 cached, clean=False, saltenv=__env__, use_etag=use_etag
-460             )
-461         except CommandExecutionError:
-462             pass
-463         else:
-464             if encrypted_zip:
-465                 ret["comment"] = (
-466                     "Archive {} is password-protected, but no password was "
-467                     "specified. Please set the 'password' argument.".format(
-468                         salt.utils.url.redact_http_basic_auth(source_match)
-469                     )
-470                 )
-471                 return ret
-472     try:
-473         contents = __salt__["archive.list"](
-474             cached,
-475             archive_format=archive_format,
-476             options=list_options,
-477             strip_components=strip_components,
-478             clean=False,
-479             verbose=True,
-480             use_etag=use_etag,
-481         )
-482     except CommandExecutionError as exc:
-483         contents = None
-484         errors = []
-485         if not if_missing:
-486             errors.append("'if_missing' must be set")
-487         if not enforce_ownership_on and (user or group):
-488             errors.append(
-489                 "Ownership cannot be managed without setting 'enforce_ownership_on'."
-490             )
-491         msg = exc.strerror
-492         if errors:
-493             msg += "\n\n"
-494             if archive_format == "tar":
-495                 msg += (
-496                     "If the source archive is a tar archive compressed using "
-497                     "a compression type not natively supported by the tar "
-498                     "command, then setting the 'list_options' argument may "
-499                     "allow the contents to be listed. Otherwise, if Salt is "
-500                     "unable to determine the files/directories in the "
-501                     "archive, the following workaround(s) would need to be "
-502                     "used for this state to proceed"
-503                 )
-504             else:
-505                 msg += (
-506                     "The following workarounds must be used for this state to proceed"
-507                 )
-508             msg += " (assuming the source file is a valid {} archive):\n".format(
-509                 archive_format
-510             )
-511             for error in errors:
-512                 msg += "\n- {}".format(error)
-513         ret["comment"] = msg
-514         return ret
-515     if (
-516         enforce_toplevel
-517         and contents is not None
-518         and (
-519             len(contents["top_level_dirs"]) &gt; 1 or len(contents["top_level_files"]) &gt; 0
-520         )
-521     ):
-522         ret["comment"] = (
-523             "Archive does not have a single top-level directory. "
-524             "To allow this archive to be extracted, set "
-525             "'enforce_toplevel' to False. To avoid a "
-526             "'{}-bomb' it may also be advisable to set a "
-527             "top-level directory by adding it to the 'name' "
-528             "value (for example, setting 'name' to {} "
-529             "instead of {}).".format(
-530                 archive_format,
-531                 os.path.join(name, "some_dir"),
-532                 name,
-533             )
-534         )
-535         return ret
-536     if clean and clean_parent:
-537         ret["comment"] = "Only one of 'clean' and 'clean_parent' can be set to True"
-538         ret["result"] = False
-539         return ret
-540     extraction_needed = overwrite
-541     contents_missing = False
-542     try:
-543         if_missing_path_exists = os.path.exists(if_missing)
-544     except TypeError:
-545         if_missing_path_exists = False
-546     if not if_missing_path_exists:
-547         if contents is None:
-548             try:
-549                 os.lstat(if_missing)
-550                 extraction_needed = False
-551             except OSError as exc:
-552                 if exc.errno == errno.ENOENT:
-553                     extraction_needed = True
-554                 else:
-555                     ret["comment"] = (
-556                         "Failed to check for existence of if_missing path "
-557                         "({}): {}".format(if_missing, exc.__str__())
-558                     )
-559                     return ret
-560         else:
-561             incorrect_type = []
-562             for path_list, func in (
-563                 (contents["dirs"], stat.S_ISDIR),
-564                 (
-565                     contents["files"],
-566                     lambda x: not stat.S_ISLNK(x) and not stat.S_ISDIR(x),
-567                 ),
-568                 (contents["links"], stat.S_ISLNK),
-569             ):
-570                 for path in path_list:
-571                     full_path = salt.utils.path.join(name, path)
-572                     try:
-573                         path_mode = os.lstat(full_path.rstrip(os.sep)).st_mode
-574                         if not func(path_mode):
-575                             incorrect_type.append(path)
-576                     except OSError as exc:
-577                         if exc.errno == errno.ENOENT:
-578                             extraction_needed = True
-579                             contents_missing = True
-580                         elif exc.errno != errno.ENOTDIR:
-581                             ret["comment"] = exc.__str__()
-582                             return ret
-583             if incorrect_type:
-584                 incorrect_paths = "\n\n" + "\n".join(
-585                     ["- {}".format(x) for x in incorrect_type]
-586                 )
-587                 ret["comment"] = (
-588                     "The below paths (relative to {}) exist, but are the "
-589                     "incorrect type (file instead of directory, symlink "
-590                     "instead of file, etc.).".format(name)
-591                 )
-592                 if __opts__["test"] and clean and contents is not None:
-593                     ret["result"] = None
-594                     ret["comment"] += (
-595                         " Since the 'clean' option is enabled, the "
-596                         "destination paths would be cleared and the "
-597                         "archive would be extracted.{}".format(incorrect_paths)
-598                     )
-599                     return ret
-600                 if __opts__["test"] and clean_parent and contents is not None:
-601                     ret["result"] = None
-602                     ret["comment"] += (
-603                         " Since the 'clean_parent' option is enabled, the "
-604                         "destination parent directory would be removed first "
-605                         "and then re-created and the archive would be "
-606                         "extracted"
-607                     )
-608                     return ret
-609                 if not (clean and contents is not None):
-610                     if not force:
-611                         ret["comment"] += (
-612                             " To proceed with extraction, set 'force' to "
-613                             "True. Note that this will remove these paths "
-614                             "before extracting.{}".format(incorrect_paths)
-615                         )
-616                         return ret
-617                     else:
-618                         errors = []
-619                         for path in incorrect_type:
-620                             full_path = os.path.join(name, path)
-621                             try:
-622                                 salt.utils.files.rm_rf(full_path.rstrip(os.sep))
-623                                 ret["changes"].setdefault("removed", []).append(
-624                                     full_path
-625                                 )
-626                                 extraction_needed = True
-627                             except OSError as exc:
-628                                 if exc.errno != errno.ENOENT:
-629                                     errors.append(exc.__str__())
-630                         if errors:
-631                             msg = (
-632                                 "One or more paths existed by were the incorrect "
-633                                 "type (i.e. file instead of directory or "
-634                                 "vice-versa), but could not be removed. The "
-635                                 "following errors were observed:\n"
-636                             )
-637                             for error in errors:
-638                                 msg += "\n- {}".format(error)
-639                             ret["comment"] = msg
-640                             return ret
-641     if (
-642         not extraction_needed
-643         and source_hash_update
-644         and existing_cached_source_sum is not None
-645         and not _compare_checksum(cached, existing_cached_source_sum)
-646     ):
-647         extraction_needed = True
-648         source_hash_trigger = True
-649     else:
-650         source_hash_trigger = False
-651     created_destdir = False
-652     if extraction_needed:
-653         if source_is_local and source_hash and not skip_verify:
-654             ret["result"] = __salt__["file.check_hash"](
-655                 source_match, source_sum["hsum"]
-656             )
-657             if not ret["result"]:
-658                 ret["comment"] = "{} does not match the desired source_hash {}".format(
-659                     salt.utils.url.redact_http_basic_auth(source_match),
-660                     source_sum["hsum"],
-661                 )
-662                 return ret
-663         if __opts__["test"]:
-664             ret["result"] = None
-665             ret["comment"] = "Archive {} would be extracted to {}".format(
-666                 salt.utils.url.redact_http_basic_auth(source_match), name
-667             )
-668             if clean and contents is not None:
-669                 ret["comment"] += ", after cleaning destination path(s)"
-670             _add_explanation(ret, source_hash_trigger, contents_missing)
-671             return ret
-672         if clean_parent and contents is not None:
-673             errors = []
-674             log.debug("Removing directory %s due to clean_parent set to True", name)
-675             try:
-676                 salt.utils.files.rm_rf(name.rstrip(os.sep))
-677                 ret["changes"].setdefault(
-678                     "removed",
-679                     "Directory {} was removed prior to the extraction".format(name),
-680                 )
-681             except OSError as exc:
-682                 if exc.errno != errno.ENOENT:
-683                     errors.append(str(exc))
-684             if errors:
-685                 msg = (
-686                     "Unable to remove the directory {}. The following "
-687                     "errors were observed:\n".format(name)
-688                 )
-689                 for error in errors:
-690                     msg += "\n- {}".format(error)
-691                 ret["comment"] = msg
-692                 return ret
-693         if clean and contents is not None:
-694             errors = []
-695             log.debug("Cleaning archive paths from within %s", name)
-696             for path in contents["top_level_dirs"] + contents["top_level_files"]:
-697                 full_path = os.path.join(name, path)
-698                 try:
-699                     log.debug("Removing %s", full_path)
-700                     salt.utils.files.rm_rf(full_path.rstrip(os.sep))
-701                     ret["changes"].setdefault("removed", []).append(full_path)
-702                 except OSError as exc:
-703                     if exc.errno != errno.ENOENT:
-704                         errors.append(exc.__str__())
-705             if errors:
-706                 msg = (
-707                     "One or more paths could not be cleaned. The following "
-708                     "errors were observed:\n"
-709                 )
-710                 for error in errors:
-711                     msg += "\n- {}".format(error)
-712                 ret["comment"] = msg
-713                 return ret
-714         if not os.path.isdir(name):
-715             __states__["file.directory"](name, user=user, makedirs=True)
-716             created_destdir = True
-717         log.debug("Extracting %s to %s", cached, name)
-718         try:
-719             if archive_format == "zip":
-720                 if use_cmd_unzip:
-721                     try:
-722                         files = __salt__["archive.cmd_unzip"](
-723                             cached,
-724                             name,
-725                             options=options,
-726                             trim_output=trim_output,
-727                             password=password,
-728                             **kwargs
-729                         )
-730                     except (CommandExecutionError, CommandNotFoundError) as exc:
-731                         ret["comment"] = exc.strerror
-732                         return ret
-733                 else:
-734                     files = __salt__["archive.unzip"](
-735                         cached,
-736                         name,
-737                         options=options,
-738                         trim_output=trim_output,
-739                         password=password,
-740                         extract_perms=extract_perms,
-741                         **kwargs
-742                     )
-743             elif archive_format == "rar":
-744                 try:
-745                     files = __salt__["archive.unrar"](
-746                         cached, name, trim_output=trim_output, **kwargs
-747                     )
-748                 except (CommandExecutionError, CommandNotFoundError) as exc:
-749                     ret["comment"] = exc.strerror
-750                     return ret
-751             else:
-752                 if options is None:
-753                     try:
-754                         with closing(tarfile.open(cached, "r")) as tar:
-755                             tar.extractall(salt.utils.stringutils.to_str(name))
-756                             files = tar.getnames()
-757                             if trim_output:
-758                                 files = files[:trim_output]
-759                     except tarfile.ReadError:
-760                         if salt.utils.path.which("xz"):
-761                             if (
-762                                 __salt__["cmd.retcode"](
-763                                     ["xz", "-t", cached],
-764                                     python_shell=False,
-765                                     ignore_retcode=True,
-766                                 )
-767                                 == 0
-768                             ):
-769                                 log.debug(
-770                                     "Tar file is XZ-compressed, attempting "
-771                                     "decompression and extraction using XZ Utils "
-772                                     "and the tar command"
-773                                 )
-774                                 cmd = "xz --decompress --stdout {0} | tar xvf -"
-775                                 results = __salt__["cmd.run_all"](
-776                                     cmd.format(shlex.quote(cached)),
-777                                     cwd=name,
-778                                     python_shell=True,
-779                                 )
-780                                 if results["retcode"] != 0:
-781                                     if created_destdir:
-782                                         _cleanup_destdir(name)
-783                                     ret["result"] = False
-784                                     ret["changes"] = results
-785                                     return ret
-786                                 if _is_bsdtar():
-787                                     files = results["stderr"]
-788                                 else:
-789                                     files = results["stdout"]
-790                             else:
-791                                 if created_destdir:
-792                                     _cleanup_destdir(name)
-793                                 ret["result"] = False
-794                                 ret["comment"] = (
-795                                     "Failed to read from tar archive using "
-796                                     "Python's native tar file support. If "
-797                                     "archive is compressed using something "
-798                                     "other than gzip or bzip2, the "
-799                                     "'options' argument may be required to "
-800                                     "pass the correct options to the tar "
-801                                     "command in order to extract the archive."
-802                                 )
-803                                 return ret
-804                         else:
-805                             if created_destdir:
-806                                 _cleanup_destdir(name)
-807                             ret["result"] = False
-808                             ret["comment"] = (
-809                                 "Failed to read from tar archive. If it is "
-810                                 "XZ-compressed, install xz-utils to attempt "
-811                                 "extraction."
-812                             )
-813                             return ret
-814                 else:
-815                     if not salt.utils.path.which("tar"):
-816                         ret["comment"] = (
-817                             "tar command not available, it might not be "
-818                             "installed on minion"
-819                         )
-820                         return ret
-821                     tar_opts = [
-822                         x
-823                         for x in shlex.split(options)
-824                         if x not in ("v", "-v", "--verbose")
-825                     ]
-826                     tar_cmd = ["tar"]
-827                     tar_shortopts = "xv"
-828                     tar_longopts = []
-829                     for position, opt in enumerate(tar_opts):
-830                         if opt.startswith("-"):
-831                             tar_longopts.append(opt)
-832                         else:
-833                             if position &gt; 0:
-834                                 tar_longopts.append(opt)
-835                             else:
-836                                 append_opt = opt
-837                                 append_opt = append_opt.replace("x", "")
-838                                 append_opt = append_opt.replace("f", "")
-839                                 tar_shortopts = tar_shortopts + append_opt
-840                     if __grains__["os"].lower() == "openbsd":
-841                         tar_shortopts = "-" + tar_shortopts
-842                     tar_cmd.append(tar_shortopts)
-843                     tar_cmd.extend(tar_longopts)
-844                     tar_cmd.extend(["-f", cached])
-845                     results = __salt__["cmd.run_all"](
-846                         tar_cmd, cwd=name, python_shell=False
-847                     )
-848                     if results["retcode"] != 0:
-849                         ret["result"] = False
-850                         ret["changes"] = results
-851                         return ret
-852                     if _is_bsdtar():
-853                         files = results["stderr"].splitlines()
-854                         if trim_output:
-855                             files = files[:trim_output]
-856                     else:
-857                         files = results["stdout"].splitlines()
-858                         if trim_output:
-859                             files = files[:trim_output]
-860                     if not files:
-861                         files = "no tar output so far"
-862         except CommandExecutionError as exc:
-863             ret["comment"] = exc.strerror
-864             return ret
-865     enforce_missing = []
-866     enforce_failed = []
-867     if user or group:
-868         if enforce_ownership_on:
-869             if os.path.isdir(enforce_ownership_on):
-870                 enforce_dirs = [enforce_ownership_on]
-871                 enforce_files = []
-872                 enforce_links = []
-873             else:
-874                 enforce_dirs = []
-875                 enforce_files = [enforce_ownership_on]
-876                 enforce_links = []
-877         else:
-878             if contents is not None:
-879                 enforce_dirs = contents["top_level_dirs"]
-880                 enforce_files = contents["top_level_files"]
-881                 enforce_links = contents["top_level_links"]
-882         recurse = []
-883         if user:
-884             recurse.append("user")
-885         if group:
-886             recurse.append("group")
-887         recurse_str = ", ".join(recurse)
-888         owner_changes = {x: y for x, y in (("user", user), ("group", group)) if y}
-889         for dirname in enforce_dirs:
-890             full_path = os.path.join(name, dirname)
-891             if not os.path.isdir(full_path):
-892                 if not __opts__["test"]:
-893                     enforce_missing.append(full_path)
-894             else:
-895                 log.debug(
-896                     "Enforcing %s ownership on %s using a file.directory state%s",
-897                     recurse_str,
-898                     dirname,
-899                     " (dry-run only)" if __opts__["test"] else "",
-900                 )
-901                 dir_result = __states__["file.directory"](
-902                     full_path, user=user, group=group, recurse=recurse
-903                 )
-904                 log.debug("file.directory: %s", dir_result)
-905                 if dir_result.get("changes"):
-906                     ret["changes"]["updated ownership"] = True
-907                 try:
-908                     if not dir_result["result"]:
-909                         enforce_failed.append(full_path)
-910                 except (KeyError, TypeError):
-911                     log.warning(
-912                         "Bad state return %s for file.directory state on %s",
-913                         dir_result,
-914                         dirname,
-915                     )
-916         for filename in enforce_files + enforce_links:
-917             full_path = os.path.join(name, filename)
-918             try:
-919                 file_stat = os.lstat(full_path)
-920             except OSError as exc:
-921                 if not __opts__["test"]:
-922                     if exc.errno == errno.ENOENT:
-923                         enforce_missing.append(full_path)
-924                     enforce_failed.append(full_path)
-925             else:
-926                 if (uid != -1 and uid != file_stat.st_uid) or (
-927                     gid != -1 and gid != file_stat.st_gid
-928                 ):
-929                     if __opts__["test"]:
-930                         ret["changes"]["updated ownership"] = True
-931                     else:
-932                         try:
-933                             os.lchown(full_path, uid, gid)
-934                             ret["changes"]["updated ownership"] = True
-935                         except OSError:
-936                             enforce_failed.append(filename)
-937     if extraction_needed:
-938         if len(files) &gt; 0:
-939             if created_destdir:
-940                 ret["changes"]["directories_created"] = [name]
-941             ret["changes"]["extracted_files"] = files
-942             ret["comment"] = "{} extracted to {}".format(
-943                 salt.utils.url.redact_http_basic_auth(source_match),
-944                 name,
-945             )
-946             _add_explanation(ret, source_hash_trigger, contents_missing)
-947             ret["comment"] += ". Output was trimmed to {} number of lines".format(
-948                 trim_output
-949             )
-950             ret["result"] = True
-951         else:
-952             ret["result"] = False
-953             ret["comment"] = "No files were extracted from {}".format(
-954                 salt.utils.url.redact_http_basic_auth(source_match)
-955             )
-956     else:
-957         ret["result"] = True
-958         if if_missing_path_exists:
-959             ret["comment"] = "{} exists".format(if_missing)
-960         else:
-961             ret["comment"] = "All files in archive are already present"
-962         if __opts__["test"]:
-963             if ret["changes"].get("updated ownership"):
-964                 ret["result"] = None
-965                 ret[
-966                     "comment"
-967                 ] += ". Ownership would be updated on one or more files/directories."
-968     if enforce_missing:
-969         if not if_missing:
-970             ret["result"] = False
-971         ret["comment"] += (
-972             "\n\nWhile trying to enforce user/group ownership, the following "
-973             "paths were missing:\n"
-974         )
-975         for item in enforce_missing:
-976             ret["comment"] += "\n- {}".format(item)
-977     if enforce_failed:
-978         ret["result"] = False
-979         ret["comment"] += (
-980             "\n\nWhile trying to enforce user/group ownership, Salt was "
-981             "unable to change ownership on the following paths:\n"
-982         )
-983         for item in enforce_failed:
-984             ret["comment"] += "\n- {}".format(item)
-985     if not source_is_local:
-986         if keep_source:
-987             log.debug("Keeping cached source file %s", cached)
-988         else:
-989             log.debug("Cleaning cached source file %s", cached)
-990             result = __states__["file.not_cached"](source_match, saltenv=__env__)
-991             if not result["result"]:
-992                 ret.setdefault("warnings", []).append(result["comment"])
-993     return ret
+"""
+Extract an archive
+.. versionadded:: 2014.1.0
+"""
+import errno
+import os
+import re
+<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>import shlex
+import stat
+import string
+import tarfile
+from contextlib import closing
+from urllib.parse import urlparse
+import salt.utils.args
+import salt.utils.files
+import salt.utils.hashutils
+import salt.utils.path
+import salt.utils.platform
+import salt.utils.url
+from salt.exceptions import CommandExecutionError, CommandNotFoundError
+log = logging.getLogger(</b></font>__name__)
+def _path_is_abs(path):
+    """
+    Return a bool telling whether or ``path`` is absolute. If ``path`` is None,
+    return ``True``. This function is designed to validate variables which
+    optionally contain a file path.
+    """
+    if path is None:
+        return True
+    try:
+        return os.path.isabs(path)
+    except AttributeError:
+        return False
+def _add_explanation(ret, source_hash_trigger, contents_missing):
+    """
+    Common code to add additional explanation to the state's comment field,
+    both when test=True and not
+    """
+    if source_hash_trigger:
+        ret["comment"] += ", due to source_hash update"
+    elif contents_missing:
+        ret["comment"] += ", due to absence of one or more files/dirs"
+def _gen_checksum(path):
+    return {
+        "hsum": salt.utils.hashutils.get_hash(path, form=__opts__["hash_type"]),
+        "hash_type": __opts__["hash_type"],
+    }
+def _checksum_file_path(path):
+    try:
+        relpath = ".".join((os.path.relpath(path, __opts__["cachedir"]), "hash"))
+        if re.match(r"..[/\\]", relpath):
+            relpath = salt.utils.path.join(
+                "local",
+                os.path.splitdrive(path)[-1].lstrip("/\\"),
+            )
+    except ValueError as exc:
+        if str(exc).startswith("path is on"):
+            drive, path = os.path.splitdrive(path)
+            relpath = salt.utils.path.join(
+                "local",
+                drive.rstrip(":"),
+                path.lstrip("/\\"),
+            )
+        elif str(exc).startswith("Cannot mix UNC"):
+            relpath = salt.utils.path.join("unc", path)
+        else:
+            raise
+    ret = salt.utils.path.join(__opts__["cachedir"], "archive_hash", relpath)
+    log.debug("Using checksum file %s for cached archive file %s", ret, path)
+    return ret
+def _update_checksum(path):
+    checksum_file = _checksum_file_path(path)
+    checksum_dir = os.path.dirname(checksum_file)
+    if not os.path.isdir(checksum_dir):
+        os.makedirs(checksum_dir)
+    source_sum = _gen_checksum(path)
+    hash_type = source_sum.get("hash_type")
+    hsum = source_sum.get("hsum")
+    if hash_type and hsum:
+        lines = []
+        try:
+            try:
+                with salt.utils.files.fopen(checksum_file, "r") as fp_:
+                    for line in fp_:
+                        try:
+                            lines.append(line.rstrip("\n").split(":", 1))
+                        except ValueError:
+                            continue
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    raise
+            with salt.utils.files.fopen(checksum_file, "w") as fp_:
+                for line in lines:
+                    if line[0] == hash_type:
+                        line[1] = hsum
+                    fp_.write("{}:{}\n".format(*line))
+                if hash_type not in [x[0] for x in lines]:
+                    fp_.write("{}:{}\n".format(hash_type, hsum))
+        except OSError as exc:
+            log.warning(
+                "Failed to update checksum for %s: %s",
+                path,
+                exc.__str__(),
+                exc_info=True,
+            )
+def _read_cached_checksum(path, form=None):
+    if form is None:
+        form = __opts__["hash_type"]
+    checksum_file = _checksum_file_path(path)
+    try:
+        with salt.utils.files.fopen(checksum_file, "r") as fp_:
+            for line in fp_:
+                hash_type, hsum = line.rstrip("\n").split(":", 1)
+                if hash_type == form:
+                    break
+            else:
+                return None
+    except (OSError, ValueError):
+        return None
+    else:
+        return {"hash_type": hash_type, "hsum": hsum}
+def _compare_checksum(cached, source_sum):
+    cached_sum = _read_cached_checksum(
+        cached, form=source_sum.get("hash_type", __opts__["hash_type"])
+    )
+    return source_sum == cached_sum
+def _is_bsdtar():
+    return "bsdtar" in __salt__["cmd.run"](["tar", "--version"], python_shell=False)
+def _cleanup_destdir(name):
+    """
+    Attempt to remove the specified directory
+    """
+    try:
+        os.rmdir(name)
+    except OSError:
+        pass
+def extracted(
+    name,
+    source,
+    source_hash=None,
+    source_hash_name=None,
+    source_hash_update=False,
+    skip_files_list_verify=False,
+    skip_verify=False,
+    password=None,
+    options=None,
+    list_options=None,
+    force=False,
+    overwrite=False,
+    clean=False,
+    clean_parent=False,
+    user=None,
+    group=None,
+    if_missing=None,
+    trim_output=False,
+    use_cmd_unzip=None,
+    extract_perms=True,
+    enforce_toplevel=True,
+    enforce_ownership_on=None,
+    archive_format=None,
+    use_etag=False,
+    **kwargs
+):
+    """
+    .. versionadded:: 2014.1.0
+    .. versionchanged:: 2016.11.0,3005
+        This state has been rewritten. Some arguments are new to this release
+        and will not be available in the 2016.3 release cycle (and earlier).
+        Additionally, the **ZIP Archive Handling** section below applies
+        specifically to the 2016.11.0 release (and newer).
+    Ensure that an archive is extracted to a specific directory.
+    .. important::
+        **Changes for 2016.11.0**
+        In earlier releases, this state would rely on the ``if_missing``
+        argument to determine whether or not the archive needed to be
+        extracted. When this argument was not passed, then the state would just
+        assume ``if_missing`` is the same as the ``name`` argument (i.e. the
+        parent directory into which the archive would be extracted).
+        This caused a number of annoyances. One such annoyance was the need to
+        know beforehand a path that would result from the extraction of the
+        archive, and setting ``if_missing`` to that directory, like so:
+        .. code-block:: yaml
+            extract_myapp:
+              archive.extracted:
+                - name: /var/www
+                - source: salt://apps/src/myapp-16.2.4.tar.gz
+                - user: www
+                - group: www
+                - if_missing: /var/www/myapp-16.2.4
+        If ``/var/www`` already existed, this would effectively make
+        ``if_missing`` a required argument, just to get Salt to extract the
+        archive.
+        Some users worked around this by adding the top-level directory of the
+        archive to the end of the ``name`` argument, and then used ``--strip``
+        or ``--strip-components`` to remove that top-level dir when extracting:
+        .. code-block:: yaml
+            extract_myapp:
+              archive.extracted:
+                - name: /var/www/myapp-16.2.4
+                - source: salt://apps/src/myapp-16.2.4.tar.gz
+                - user: www
+                - group: www
+        With the rewrite for 2016.11.0, these workarounds are no longer
+        necessary. ``if_missing`` is still a supported argument, but it is no
+        longer required. The equivalent SLS in 2016.11.0 would be:
+        .. code-block:: yaml
+            extract_myapp:
+              archive.extracted:
+                - name: /var/www
+                - source: salt://apps/src/myapp-16.2.4.tar.gz
+                - user: www
+                - group: www
+        Salt now uses a function called :py:func:`archive.list
+        &lt;salt.modules.archive.list&gt;` to get a list of files/directories in the
+        archive. Using this information, the state can now check the minion to
+        see if any paths are missing, and know whether or not the archive needs
+        to be extracted. This makes the ``if_missing`` argument unnecessary in
+        most use cases.
+    .. important::
+        **ZIP Archive Handling**
+        *Note: this information applies to 2016.11.0 and later.*
+        Salt has two different functions for extracting ZIP archives:
+        1. :py:func:`archive.unzip &lt;salt.modules.archive.unzip&gt;`, which uses
+           Python's zipfile_ module to extract ZIP files.
+        2. :py:func:`archive.cmd_unzip &lt;salt.modules.archive.cmd_unzip&gt;`, which
+           uses the ``unzip`` CLI command to extract ZIP files.
+        Salt will prefer the use of :py:func:`archive.cmd_unzip
+        &lt;salt.modules.archive.cmd_unzip&gt;` when CLI options are specified (via
+        the ``options`` argument), and will otherwise prefer the
+        :py:func:`archive.unzip &lt;salt.modules.archive.unzip&gt;` function. Use
+        of :py:func:`archive.cmd_unzip &lt;salt.modules.archive.cmd_unzip&gt;` can be
+        forced however by setting the ``use_cmd_unzip`` argument to ``True``.
+        By contrast, setting this argument to ``False`` will force usage of
+        :py:func:`archive.unzip &lt;salt.modules.archive.unzip&gt;`. For example:
+        .. code-block:: yaml
+            /var/www:
+              archive.extracted:
+                - source: salt://foo/bar/myapp.zip
+                - use_cmd_unzip: True
+        When ``use_cmd_unzip`` is omitted, Salt will choose which extraction
+        function to use based on the source archive and the arguments passed to
+        the state. When in doubt, simply do not set this argument; it is
+        provided as a means of overriding the logic Salt uses to decide which
+        function to use.
+        There are differences in the features available in both extraction
+        functions. These are detailed below.
+        - *Command-line options* (only supported by :py:func:`archive.cmd_unzip
+          &lt;salt.modules.archive.cmd_unzip&gt;`) - When the ``options`` argument is
+          used, :py:func:`archive.cmd_unzip &lt;salt.modules.archive.cmd_unzip&gt;`
+          is the only function that can be used to extract the archive.
+          Therefore, if ``use_cmd_unzip`` is specified and set to ``False``,
+          and ``options`` is also set, the state will not proceed.
+        - *Permissions* - Due to an `upstream bug in Python`_, permissions are
+          not preserved when the zipfile_ module is used to extract an archive.
+          As of the 2016.11.0 release, :py:func:`archive.unzip
+          &lt;salt.modules.archive.unzip&gt;` (as well as this state) has an
+          ``extract_perms`` argument which, when set to ``True`` (the default),
+          will attempt to match the permissions of the extracted
+          files/directories to those defined within the archive. To disable
+          this functionality and have the state not attempt to preserve the
+          permissions from the ZIP archive, set ``extract_perms`` to ``False``:
+          .. code-block:: yaml
+              /var/www:
+                archive.extracted:
+                  - source: salt://foo/bar/myapp.zip
+                  - extract_perms: False
+    .. _`upstream bug in Python`: https://bugs.python.org/issue15795
+    name
+        Directory into which the archive should be extracted
+    source
+        Archive to be extracted
+        .. note::
+            This argument uses the same syntax as its counterpart in the
+            :py:func:`file.managed &lt;salt.states.file.managed&gt;` state.
+    source_hash
+        Hash of source file, or file with list of hash-to-file mappings
+        .. note::
+            This argument uses the same syntax as its counterpart in the
+            :py:func:`file.managed &lt;salt.states.file.managed&gt;` state.
+        .. versionchanged:: 2016.11.0
+            If this argument specifies the hash itself, instead of a URI to a
+            file containing hashes, the hash type can now be omitted and Salt
+            will determine the hash type based on the length of the hash. For
+            example, both of the below states are now valid, while before only
+            the second one would be:
+        .. code-block:: yaml
+            foo_app:
+              archive.extracted:
+                - name: /var/www
+                - source: https://mydomain.tld/foo.tar.gz
+                - source_hash: 3360db35e682f1c5f9c58aa307de16d41361618c
+            bar_app:
+              archive.extracted:
+                - name: /var/www
+                - source: https://mydomain.tld/bar.tar.gz
+                - source_hash: sha1=5edb7d584b82ddcbf76e311601f5d4442974aaa5
+    source_hash_name
+        When ``source_hash`` refers to a hash file, Salt will try to find the
+        correct hash by matching the filename part of the ``source`` URI. When
+        managing a file with a ``source`` of ``salt://files/foo.tar.gz``, then
+        the following line in a hash file would match:
+        .. code-block:: text
+            acbd18db4cc2f85cedef654fccc4a4d8    foo.tar.gz
+        This line would also match:
+        .. code-block:: text
+            acbd18db4cc2f85cedef654fccc4a4d8    ./dir1/foo.tar.gz
+        However, sometimes a hash file will include multiple similar paths:
+        .. code-block:: text
+            37b51d194a7513e45b56f6524f2d51f2    ./dir1/foo.txt
+            acbd18db4cc2f85cedef654fccc4a4d8    ./dir2/foo.txt
+            73feffa4b7f6bb68e44cf984c85f6e88    ./dir3/foo.txt
+        In cases like this, Salt may match the incorrect hash. This argument
+        can be used to tell Salt which filename to match, to ensure that the
+        correct hash is identified. For example:
+        .. code-block:: yaml
+            /var/www:
+              archive.extracted:
+                - source: https://mydomain.tld/dir2/foo.tar.gz
+                - source_hash: https://mydomain.tld/hashes
+                - source_hash_name: ./dir2/foo.tar.gz
+        .. note::
+            This argument must contain the full filename entry from the
+            checksum file, as this argument is meant to disambiguate matches
+            for multiple files that have the same basename. So, in the
+            example above, simply using ``foo.txt`` would not match.
+        .. versionadded:: 2016.11.0
+    source_hash_update : False
+        Set this to ``True`` if archive should be extracted if source_hash has
+        changed and there is a difference between the archive and the local files.
+        This would extract regardless of the ``if_missing`` parameter.
+        Note that this is only checked if the ``source`` value has not changed.
+        If it has (e.g. to increment a version number in the path) then the
+        archive will not be extracted even if the hash has changed.
+        .. note::
+            Setting this to ``True`` along with ``keep_source`` set to ``False``
+            will result the ``source`` re-download to do a archive file list check.
+            If it's not desirable please consider the ``skip_files_list_verify``
+            argument.
+        .. versionadded:: 2016.3.0
+    skip_files_list_verify : False
+        Set this to ``True`` if archive should be extracted if ``source_hash`` has
+        changed but only checksums of the archive will be checked to determine if
+        the extraction is required.
+        It will try to find a local cache of the ``source`` and check its hash against
+        the ``source_hash``. If there is no local cache available, for example if you
+        set the ``keep_source`` to ``False``,  it will try to find a cached source hash
+        file in the Minion archives cache directory.
+        .. note::
+            The current limitation of this logic is that you have to set
+            minions ``hash_type`` config option to the same one that you're going
+            to pass via ``source_hash`` argument.
+        .. warning::
+            With this argument set to ``True`` Salt will only check for the ``source_hash``
+            against the local hash of the ``sourse``. So if you, for example, remove extracted
+            files without clearing the Salt Minion cache next time you execute the state Salt
+            will not notice that extraction is required if the hashes are still match.
+        .. versionadded:: 3000
+    skip_verify : False
+        If ``True``, hash verification of remote file sources (``http://``,
+        ``https://``, ``ftp://``) will be skipped, and the ``source_hash``
+        argument will be ignored.
+        .. versionadded:: 2016.3.4
+    keep_source : True
+        For ``source`` archives not local to the minion (i.e. from the Salt
+        fileserver or a remote source such as ``http(s)`` or ``ftp``), Salt
+        will need to download the archive to the minion cache before they can
+        be extracted. To remove the downloaded archive after extraction, set
+        this argument to ``False``.
+        .. versionadded:: 2017.7.3
+    keep : True
+        Same as ``keep_source``, kept for backward-compatibility.
+        .. note::
+            If both ``keep_source`` and ``keep`` are used, ``keep`` will be
+            ignored.
+    password
+        **For ZIP archives only.** Password used for extraction.
+        .. versionadded:: 2016.3.0
+        .. versionchanged:: 2016.11.0
+          The newly-added :py:func:`archive.is_encrypted
+          &lt;salt.modules.archive.is_encrypted&gt;` function will be used to
+          determine if the archive is password-protected. If it is, then the
+          ``password`` argument will be required for the state to proceed.
+    options
+        **For tar and zip archives only.**  This option can be used to specify
+        a string of additional arguments to pass to the tar/zip command.
+        If this argument is not used, then the minion will attempt to use
+        Python's native tarfile_/zipfile_ support to extract it. For zip
+        archives, this argument is mostly used to overwrite existing files with
+        ``o``.
+        Using this argument means that the ``tar`` or ``unzip`` command will be
+        used, which is less platform-independent, so keep this in mind when
+        using this option; the CLI options must be valid options for the
+        ``tar``/``unzip`` implementation on the minion's OS.
+        .. versionadded:: 2016.11.0
+        .. versionchanged:: 2015.8.11,2016.3.2
+            XZ-compressed tar archives no longer require ``J`` to manually be
+            set in the ``options``, they are now detected automatically and
+            decompressed using the xz_ CLI command and extracted using ``tar
+            xvf``. This is a more platform-independent solution, as not all tar
+            implementations support the ``J`` argument for extracting archives.
+        .. note::
+            For tar archives, main operators like ``-x``, ``--extract``,
+            ``--get``, ``-c`` and ``-f``/``--file`` should *not* be used here.
+    list_options
+        **For tar archives only.** This state uses :py:func:`archive.list
+        &lt;salt.modules.archive.list_&gt;` to discover the contents of the source
+        archive so that it knows which file paths should exist on the minion if
+        the archive has already been extracted. For the vast majority of tar
+        archives, :py:func:`archive.list &lt;salt.modules.archive.list_&gt;` "just
+        works". Archives compressed using gzip, bzip2, and xz/lzma (with the
+        help of the xz_ CLI command) are supported automatically. However, for
+        archives compressed using other compression types, CLI options must be
+        passed to :py:func:`archive.list &lt;salt.modules.archive.list_&gt;`.
+        This argument will be passed through to :py:func:`archive.list
+        &lt;salt.modules.archive.list_&gt;` as its ``options`` argument, to allow it
+        to successfully list the archive's contents. For the vast majority of
+        archives, this argument should not need to be used, it should only be
+        needed in cases where the state fails with an error stating that the
+        archive's contents could not be listed.
+        .. versionadded:: 2016.11.0
+    force : False
+        If a path that should be occupied by a file in the extracted result is
+        instead a directory (or vice-versa), the state will fail. Set this
+        argument to ``True`` to force these paths to be removed in order to
+        allow the archive to be extracted.
+        .. warning::
+            Use this option *very* carefully.
+        .. versionadded:: 2016.11.0
+    overwrite : False
+        Set this to ``True`` to force the archive to be extracted. This is
+        useful for cases where the filenames/directories have not changed, but
+        the content of the files have.
+        .. versionadded:: 2016.11.1
+    clean : False
+        Set this to ``True`` to remove any top-level files and recursively
+        remove any top-level directory paths before extracting.
+        .. note::
+            Files will only be cleaned first if extracting the archive is
+            deemed necessary, either by paths missing on the minion, or if
+            ``overwrite`` is set to ``True``.
+        .. versionadded:: 2016.11.1
+    clean_parent : False
+        If ``True``, and the archive is extracted, delete the parent
+        directory (i.e. the directory into which the archive is extracted), and
+        then re-create that directory before extracting. Note that ``clean``
+        and ``clean_parent`` are mutually exclusive.
+        .. versionadded:: 3000
+    user
+        The user to own each extracted file. Not available on Windows.
+        .. versionadded:: 2015.8.0
+        .. versionchanged:: 2016.3.0
+            When used in combination with ``if_missing``, ownership will only
+            be enforced if ``if_missing`` is a directory.
+        .. versionchanged:: 2016.11.0
+            Ownership will be enforced only on the file/directory paths found
+            by running :py:func:`archive.list &lt;salt.modules.archive.list_&gt;` on
+            the source archive. An alternative root directory on which to
+            enforce ownership can be specified using the
+            ``enforce_ownership_on`` argument.
+    group
+        The group to own each extracted file. Not available on Windows.
+        .. versionadded:: 2015.8.0
+        .. versionchanged:: 2016.3.0
+            When used in combination with ``if_missing``, ownership will only
+            be enforced if ``if_missing`` is a directory.
+        .. versionchanged:: 2016.11.0
+            Ownership will be enforced only on the file/directory paths found
+            by running :py:func:`archive.list &lt;salt.modules.archive.list_&gt;` on
+            the source archive. An alternative root directory on which to
+            enforce ownership can be specified using the
+            ``enforce_ownership_on`` argument.
+    if_missing
+        If specified, this path will be checked, and if it exists then the
+        archive will not be extracted. This path can be either a directory or a
+        file, so this option can also be used to check for a semaphore file and
+        conditionally skip extraction.
+        .. versionchanged:: 2016.3.0
+            When used in combination with either ``user`` or ``group``,
+            ownership will only be enforced when ``if_missing`` is a directory.
+        .. versionchanged:: 2016.11.0
+            Ownership enforcement is no longer tied to this argument, it is
+            simply checked for existence and extraction will be skipped if
+            if is present.
+    trim_output : False
+        Useful for archives with many files in them. This can either be set to
+        ``True`` (in which case only the first 100 files extracted will be
+        in the state results), or it can be set to an integer for more exact
+        control over the max number of files to include in the state results.
+        .. versionadded:: 2016.3.0
+    use_cmd_unzip : False
+        Set to ``True`` for zip files to force usage of the
+        :py:func:`archive.cmd_unzip &lt;salt.modules.archive.cmd_unzip&gt;` function
+        to extract.
+        .. versionadded:: 2016.11.0
+    extract_perms : True
+        **For ZIP archives only.** When using :py:func:`archive.unzip
+        &lt;salt.modules.archive.unzip&gt;` to extract ZIP archives, Salt works
+        around an `upstream bug in Python`_ to set the permissions on extracted
+        files/directories to match those encoded into the ZIP archive. Set this
+        argument to ``False`` to skip this workaround.
+        .. versionadded:: 2016.11.0
+    enforce_toplevel : True
+        This option will enforce a single directory at the top level of the
+        source archive, to prevent extracting a 'tar-bomb'. Set this argument
+        to ``False`` to allow archives with files (or multiple directories) at
+        the top level to be extracted.
+        .. versionadded:: 2016.11.0
+    enforce_ownership_on
+        When ``user`` or ``group`` is specified, Salt will default to enforcing
+        permissions on the file/directory paths detected by running
+        :py:func:`archive.list &lt;salt.modules.archive.list_&gt;` on the source
+        archive. Use this argument to specify an alternate directory on which
+        ownership should be enforced.
+        .. note::
+            This path must be within the path specified by the ``name``
+            argument.
+        .. versionadded:: 2016.11.0
+    archive_format
+        One of ``tar``, ``zip``, or ``rar``.
+        .. versionchanged:: 2016.11.0
+            If omitted, the archive format will be guessed based on the value
+            of the ``source`` argument. If the minion is running a release
+            older than 2016.11.0, this option is required.
+    .. _tarfile: https://docs.python.org/2/library/tarfile.html
+    .. _zipfile: https://docs.python.org/2/library/zipfile.html
+    .. _xz: http://tukaani.org/xz/
+    use_etag
+        If ``True``, remote http/https file sources will attempt to use the
+        ETag header to determine if the remote file needs to be downloaded.
+        This provides a lightweight mechanism for promptly refreshing files
+        changed on a web server without requiring a full hash comparison via
+        the ``source_hash`` parameter.
+        .. versionadded:: 3005
+    **Examples**
+    1. tar with lmza (i.e. xz) compression:
+       .. code-block:: yaml
+           graylog2-server:
+             archive.extracted:
+               - name: /opt/
+               - source: https://github.com/downloads/Graylog2/graylog2-server/graylog2-server-0.9.6p1.tar.lzma
+               - source_hash: md5=499ae16dcae71eeb7c3a30c75ea7a1a6
+    2. tar archive with flag for verbose output, and enforcement of user/group
+       ownership:
+       .. code-block:: yaml
+           graylog2-server:
+             archive.extracted:
+               - name: /opt/
+               - source: https://github.com/downloads/Graylog2/graylog2-server/graylog2-server-0.9.6p1.tar.gz
+               - source_hash: md5=499ae16dcae71eeb7c3a30c75ea7a1a6
+               - options: v
+               - user: foo
+               - group: foo
+    3. tar archive, with ``source_hash_update`` set to ``True`` to prevent
+       state from attempting extraction unless the ``source_hash`` differs
+       from the previous time the archive was extracted:
+       .. code-block:: yaml
+           graylog2-server:
+             archive.extracted:
+               - name: /opt/
+               - source: https://github.com/downloads/Graylog2/graylog2-server/graylog2-server-0.9.6p1.tar.lzma
+               - source_hash: md5=499ae16dcae71eeb7c3a30c75ea7a1a6
+               - source_hash_update: True
+    """
+    ret = {"name": name, "result": False, "changes": {}, "comment": ""}
+    kwargs = salt.utils.args.clean_kwargs(**kwargs)
+    if skip_files_list_verify and skip_verify:
+        ret[
+            "comment"
+        ] = 'Only one of "skip_files_list_verify" and "skip_verify" can be set to True'
+        return ret
+    if "keep_source" in kwargs and "keep" in kwargs:
+        ret.setdefault("warnings", []).append(
+            "Both 'keep_source' and 'keep' were used. Since these both "
+            "do the same thing, 'keep' was ignored."
+        )
+        keep_source = bool(kwargs.pop("keep_source"))
+        kwargs.pop("keep")
+    elif "keep_source" in kwargs:
+        keep_source = bool(kwargs.pop("keep_source"))
+    elif "keep" in kwargs:
+        keep_source = bool(kwargs.pop("keep"))
+    else:
+        keep_source = True
+    if not _path_is_abs(name):
+        ret["comment"] = "{} is not an absolute path".format(name)
+        return ret
+    else:
+        if not name:
+            ret["comment"] = "Name of the directory path needs to be specified"
+            return ret
+        name = name.rstrip(os.sep)
+        if os.path.isfile(name):
+            ret["comment"] = "{} exists and is not a directory".format(name)
+            return ret
+        name += os.sep
+    if not _path_is_abs(if_missing):
+        ret["comment"] = "Value for 'if_missing' is not an absolute path"
+        return ret
+    if not _path_is_abs(enforce_ownership_on):
+        ret["comment"] = "Value for 'enforce_ownership_on' is not an absolute path"
+        return ret
+    else:
+        if enforce_ownership_on is not None:
+            try:
+                not_rel = os.path.relpath(enforce_ownership_on, name).startswith(
+                    ".." + os.sep
+                )
+            except Exception:  # pylint: disable=broad-except
+                not_rel = True
+            if not_rel:
+                ret[
+                    "comment"
+                ] = "Value for 'enforce_ownership_on' must be within {}".format(name)
+                return ret
+    if if_missing is not None and os.path.exists(if_missing):
+        ret["result"] = True
+        ret["comment"] = "Path {} exists".format(if_missing)
+        return ret
+    if user or group:
+        if salt.utils.platform.is_windows():
+            ret[
+                "comment"
+            ] = "User/group ownership cannot be enforced on Windows minions"
+            return ret
+        if user:
+            uid = __salt__["file.user_to_uid"](user)
+            if uid == "":
+                ret["comment"] = "User {} does not exist".format(user)
+                return ret
+        else:
+            uid = -1
+        if group:
+            gid = __salt__["file.group_to_gid"](group)
+            if gid == "":
+                ret["comment"] = "Group {} does not exist".format(group)
+                return ret
+        else:
+            gid = -1
+    else:
+        uid = gid = -1
+    if source_hash_update and not source_hash:
+        ret.setdefault("warnings", []).append(
+            "The 'source_hash_update' argument is ignored when "
+            "'source_hash' is not also specified."
+        )
+    try:
+        source_match = __salt__["file.source_list"](source, source_hash, __env__)[0]
+    except CommandExecutionError as exc:
+        ret["result"] = False
+        ret["comment"] = exc.strerror
+        return ret
+    if not source_match:
+        ret["result"] = False
+        ret["comment"] = 'Invalid source "{}"'.format(source)
+        return ret
+    urlparsed_source = urlparse(source_match)
+    urlparsed_scheme = urlparsed_source.scheme
+    urlparsed_path = os.path.join(
+        urlparsed_source.netloc, urlparsed_source.path
+    ).rstrip(os.sep)
+    if urlparsed_scheme and urlparsed_scheme.lower() in string.ascii_lowercase:
+        urlparsed_path = ":".join([urlparsed_scheme, urlparsed_path])
+        urlparsed_scheme = "file"
+    source_hash_basename = urlparsed_path or urlparsed_source.netloc
+    source_is_local = urlparsed_scheme in salt.utils.files.LOCAL_PROTOS
+    if source_is_local:
+        source_match = os.path.realpath(os.path.expanduser(urlparsed_path))
+        if not os.path.isfile(source_match):
+            ret["comment"] = "Source file '{}' does not exist".format(
+                salt.utils.url.redact_http_basic_auth(source_match)
+            )
+            return ret
+    valid_archive_formats = ("tar", "rar", "zip")
+    if not archive_format:
+        archive_format = salt.utils.files.guess_archive_type(source_hash_basename)
+        if archive_format is None:
+            ret["comment"] = (
+                "Could not guess archive_format from the value of the "
+                "'source' argument. Please set this archive_format to one "
+                "of the following: {}".format(", ".join(valid_archive_formats))
+            )
+            return ret
+    try:
+        archive_format = archive_format.lower()
+    except AttributeError:
+        pass
+    if archive_format not in valid_archive_formats:
+        ret["comment"] = (
+            "Invalid archive_format '{}'. Either set it to a supported "
+            "value ({}) or remove this argument and the archive format will "
+            "be guessed based on file extension.".format(
+                archive_format,
+                ", ".join(valid_archive_formats),
+            )
+        )
+        return ret
+    if options is not None and not isinstance(options, str):
+        options = str(options)
+    strip_components = None
+    if options and archive_format == "tar":
+        try:
+            strip_components = int(
+                re.search(
+                    r"""--strip(?:-components)?(?:\s+|=)["']?(\d+)["']?""", options
+                ).group(1)
+            )
+        except (AttributeError, ValueError):
+            pass
+    if archive_format == "zip":
+        if options:
+            if use_cmd_unzip is None:
+                log.info(
+                    "Presence of CLI options in archive.extracted state for "
+                    "'%s' implies that use_cmd_unzip is set to True.",
+                    name,
+                )
+                use_cmd_unzip = True
+            elif not use_cmd_unzip:
+                ret["comment"] = (
+                    "'use_cmd_unzip' cannot be set to False if CLI options "
+                    "are being specified (via the 'options' argument). "
+                    "Either remove 'use_cmd_unzip', or set it to True."
+                )
+                return ret
+            if use_cmd_unzip:
+                if "archive.cmd_unzip" not in __salt__:
+                    ret["comment"] = (
+                        "archive.cmd_unzip function not available, unzip might "
+                        "not be installed on minion"
+                    )
+                    return ret
+        if password:
+            if use_cmd_unzip is None:
+                log.info(
+                    "Presence of a password in archive.extracted state for "
+                    "'%s' implies that use_cmd_unzip is set to False.",
+                    name,
+                )
+                use_cmd_unzip = False
+            elif use_cmd_unzip:
+                ret.setdefault("warnings", []).append(
+                    "Using a password in combination with setting "
+                    "'use_cmd_unzip' to True is considered insecure. It is "
+                    "recommended to remove the 'use_cmd_unzip' argument (or "
+                    "set it to False) and allow Salt to extract the archive "
+                    "using Python's built-in ZIP file support."
+                )
+    else:
+        if password:
+            ret[
+                "comment"
+            ] = "The 'password' argument is only supported for zip archives"
+            return ret
+    if archive_format == "rar":
+        if "archive.unrar" not in __salt__:
+            ret["comment"] = (
+                "archive.unrar function not available, rar/unrar might "
+                "not be installed on minion"
+            )
+            return ret
+    supports_options = ("tar", "zip")
+    if options and archive_format not in supports_options:
+        ret["comment"] = (
+            "The 'options' argument is only compatible with the following "
+            "archive formats: {}".format(", ".join(supports_options))
+        )
+        return ret
+    if trim_output:
+        if trim_output is True:
+            trim_output = 100
+        elif not isinstance(trim_output, (bool, int)):
+            try:
+                trim_output = int(trim_output)
+            except TypeError:
+                ret[
+                    "comment"
+                ] = "Invalid value for trim_output, must be True/False or an integer"
+                return ret
+    if source_hash:
+        try:
+            source_sum = __salt__["file.get_source_sum"](
+                source=source_match,
+                source_hash=source_hash,
+                source_hash_name=source_hash_name,
+                saltenv=__env__,
+            )
+        except CommandExecutionError as exc:
+            ret["comment"] = exc.strerror
+            return ret
+    else:
+        source_sum = {}
+    if skip_files_list_verify:
+        if source_is_local:
+            cached = source_match
+        else:
+            cached = __salt__["cp.is_cached"](source_match, saltenv=__env__)
+        if cached:
+            existing_cached_source_sum = _read_cached_checksum(cached)
+            log.debug(
+                'Existing source sum is: "%s". Expected source sum is "%s"',
+                existing_cached_source_sum,
+                source_sum,
+            )
+        else:
+            parsed = urlparse(source_match)
+            expected_cached_path = salt.utils.path.join(
+                __opts__["cachedir"], "extrn_files", __env__, parsed.netloc, parsed.path
+            )
+            existing_cached_source_sum = _read_cached_checksum(expected_cached_path)
+        if source_sum and existing_cached_source_sum:
+            if existing_cached_source_sum["hsum"] == source_sum["hsum"]:
+                ret["result"] = None if __opts__["test"] else True
+                ret["comment"] = (
+                    "Archive {} existing source sum is the same as the "
+                    "expected one and skip_files_list_verify argument was set "
+                    "to True. Extraction is not needed".format(
+                        salt.utils.url.redact_http_basic_auth(source_match)
+                    )
+                )
+                return ret
+        else:
+            log.debug("There is no cached source %s available on minion", source_match)
+    if source_is_local:
+        cached = source_match
+    else:
+        if __opts__["test"]:
+            ret["result"] = None
+            ret["comment"] = (
+                "Archive {} would be cached (if necessary) and checked to "
+                "discover if extraction is needed".format(
+                    salt.utils.url.redact_http_basic_auth(source_match)
+                )
+            )
+            return ret
+        if "file.cached" not in __states__:
+            ret[
+                "comment"
+            ] = "Unable to cache {}, file.cached state not available".format(
+                salt.utils.url.redact_http_basic_auth(source_match)
+            )
+            return ret
+        try:
+            result = __states__["file.cached"](
+                source_match,
+                source_hash=source_hash,
+                source_hash_name=source_hash_name,
+                skip_verify=skip_verify,
+                saltenv=__env__,
+                use_etag=use_etag,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            msg = "Failed to cache {}: {}".format(
+                salt.utils.url.redact_http_basic_auth(source_match), exc.__str__()
+            )
+            log.exception(msg)
+            ret["comment"] = msg
+            return ret
+        else:
+            log.debug("file.cached: %s", result)
+        if result["result"]:
+            cached = __salt__["cp.is_cached"](source_match, saltenv=__env__)
+        else:
+            log.debug(
+                "failed to download %s",
+                salt.utils.url.redact_http_basic_auth(source_match),
+            )
+            return result
+    existing_cached_source_sum = _read_cached_checksum(cached)
+    if source_hash and source_hash_update and not skip_verify:
+        _update_checksum(cached)
+    if archive_format == "zip" and not password:
+        log.debug("Checking %s to see if it is password-protected", source_match)
+        try:
+            encrypted_zip = __salt__["archive.is_encrypted"](
+                cached, clean=False, saltenv=__env__, use_etag=use_etag
+            )
+        except CommandExecutionError:
+            pass
+        else:
+            if encrypted_zip:
+                ret["comment"] = (
+                    "Archive {} is password-protected, but no password was "
+                    "specified. Please set the 'password' argument.".format(
+                        salt.utils.url.redact_http_basic_auth(source_match)
+                    )
+                )
+                return ret
+    try:
+        contents = __salt__["archive.list"](
+            cached,
+            archive_format=archive_format,
+            options=list_options,
+            strip_components=strip_components,
+            clean=False,
+            verbose=True,
+            use_etag=use_etag,
+        )
+    except CommandExecutionError as exc:
+        contents = None
+        errors = []
+        if not if_missing:
+            errors.append("'if_missing' must be set")
+        if not enforce_ownership_on and (user or group):
+            errors.append(
+                "Ownership cannot be managed without setting 'enforce_ownership_on'."
+            )
+        msg = exc.strerror
+        if errors:
+            msg += "\n\n"
+            if archive_format == "tar":
+                msg += (
+                    "If the source archive is a tar archive compressed using "
+                    "a compression type not natively supported by the tar "
+                    "command, then setting the 'list_options' argument may "
+                    "allow the contents to be listed. Otherwise, if Salt is "
+                    "unable to determine the files/directories in the "
+                    "archive, the following workaround(s) would need to be "
+                    "used for this state to proceed"
+                )
+            else:
+                msg += (
+                    "The following workarounds must be used for this state to proceed"
+                )
+            msg += " (assuming the source file is a valid {} archive):\n".format(
+                archive_format
+            )
+            for error in errors:
+                msg += "\n- {}".format(error)
+        ret["comment"] = msg
+        return ret
+    if (
+        enforce_toplevel
+        and contents is not None
+        and (
+            len(contents["top_level_dirs"]) &gt; 1 or len(contents["top_level_files"]) &gt; 0
+        )
+    ):
+        ret["comment"] = (
+            "Archive does not have a single top-level directory. "
+            "To allow this archive to be extracted, set "
+            "'enforce_toplevel' to False. To avoid a "
+            "'{}-bomb' it may also be advisable to set a "
+            "top-level directory by adding it to the 'name' "
+            "value (for example, setting 'name' to {} "
+            "instead of {}).".format(
+                archive_format,
+                os.path.join(name, "some_dir"),
+                name,
+            )
+        )
+        return ret
+    if clean and clean_parent:
+        ret["comment"] = "Only one of 'clean' and 'clean_parent' can be set to True"
+        ret["result"] = False
+        return ret
+    extraction_needed = overwrite
+    contents_missing = False
+    try:
+        if_missing_path_exists = os.path.exists(if_missing)
+    except TypeError:
+        if_missing_path_exists = False
+    if not if_missing_path_exists:
+        if contents is None:
+            try:
+                os.lstat(if_missing)
+                extraction_needed = False
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    extraction_needed = True
+                else:
+                    ret["comment"] = (
+                        "Failed to check for existence of if_missing path "
+                        "({}): {}".format(if_missing, exc.__str__())
+                    )
+                    return ret
+        else:
+            incorrect_type = []
+            for path_list, func in (
+                (contents["dirs"], stat.S_ISDIR),
+                (
+                    contents["files"],
+                    lambda x: not stat.S_ISLNK(x) and not stat.S_ISDIR(x),
+                ),
+                (contents["links"], stat.S_ISLNK),
+            ):
+                for path in path_list:
+                    full_path = salt.utils.path.join(name, path)
+                    try:
+                        path_mode = os.lstat(full_path.rstrip(os.sep)).st_mode
+                        if not func(path_mode):
+                            incorrect_type.append(path)
+                    except OSError as exc:
+                        if exc.errno == errno.ENOENT:
+                            extraction_needed = True
+                            contents_missing = True
+                        elif exc.errno != errno.ENOTDIR:
+                            ret["comment"] = exc.__str__()
+                            return ret
+            if incorrect_type:
+                incorrect_paths = "\n\n" + "\n".join(
+                    ["- {}".format(x) for x in incorrect_type]
+                )
+                ret["comment"] = (
+                    "The below paths (relative to {}) exist, but are the "
+                    "incorrect type (file instead of directory, symlink "
+                    "instead of file, etc.).".format(name)
+                )
+                if __opts__["test"] and clean and contents is not None:
+                    ret["result"] = None
+                    ret["comment"] += (
+                        " Since the 'clean' option is enabled, the "
+                        "destination paths would be cleared and the "
+                        "archive would be extracted.{}".format(incorrect_paths)
+                    )
+                    return ret
+                if __opts__["test"] and clean_parent and contents is not None:
+                    ret["result"] = None
+                    ret["comment"] += (
+                        " Since the 'clean_parent' option is enabled, the "
+                        "destination parent directory would be removed first "
+                        "and then re-created and the archive would be "
+                        "extracted"
+                    )
+                    return ret
+                if not (clean and contents is not None):
+                    if not force:
+                        ret["comment"] += (
+                            " To proceed with extraction, set 'force' to "
+                            "True. Note that this will remove these paths "
+                            "before extracting.{}".format(incorrect_paths)
+                        )
+                        return ret
+                    else:
+                        errors = []
+                        for path in incorrect_type:
+                            full_path = os.path.join(name, path)
+                            try:
+                                salt.utils.files.rm_rf(full_path.rstrip(os.sep))
+                                ret["changes"].setdefault("removed", []).append(
+                                    full_path
+                                )
+                                extraction_needed = True
+                            except OSError as exc:
+                                if exc.errno != errno.ENOENT:
+                                    errors.append(exc.__str__())
+                        if errors:
+                            msg = (
+                                "One or more paths existed by were the incorrect "
+                                "type (i.e. file instead of directory or "
+                                "vice-versa), but could not be removed. The "
+                                "following errors were observed:\n"
+                            )
+                            for error in errors:
+                                msg += "\n- {}".format(error)
+                            ret["comment"] = msg
+                            return ret
+    if (
+        not extraction_needed
+        and source_hash_update
+        and existing_cached_source_sum is not None
+        and not _compare_checksum(cached, existing_cached_source_sum)
+    ):
+        extraction_needed = True
+        source_hash_trigger = True
+    else:
+        source_hash_trigger = False
+    created_destdir = False
+    if extraction_needed:
+        if source_is_local and source_hash and not skip_verify:
+            ret["result"] = __salt__["file.check_hash"](
+                source_match, source_sum["hsum"]
+            )
+            if not ret["result"]:
+                ret["comment"] = "{} does not match the desired source_hash {}".format(
+                    salt.utils.url.redact_http_basic_auth(source_match),
+                    source_sum["hsum"],
+                )
+                return ret
+        if __opts__["test"]:
+            ret["result"] = None
+            ret["comment"] = "Archive {} would be extracted to {}".format(
+                salt.utils.url.redact_http_basic_auth(source_match), name
+            )
+            if clean and contents is not None:
+                ret["comment"] += ", after cleaning destination path(s)"
+            _add_explanation(ret, source_hash_trigger, contents_missing)
+            return ret
+        if clean_parent and contents is not None:
+            errors = []
+            log.debug("Removing directory %s due to clean_parent set to True", name)
+            try:
+                salt.utils.files.rm_rf(name.rstrip(os.sep))
+                ret["changes"].setdefault(
+                    "removed",
+                    "Directory {} was removed prior to the extraction".format(name),
+                )
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    errors.append(str(exc))
+            if errors:
+                msg = (
+                    "Unable to remove the directory {}. The following "
+                    "errors were observed:\n".format(name)
+                )
+                for error in errors:
+                    msg += "\n- {}".format(error)
+                ret["comment"] = msg
+                return ret
+        if clean and contents is not None:
+            errors = []
+            log.debug("Cleaning archive paths from within %s", name)
+            for path in contents["top_level_dirs"] + contents["top_level_files"]:
+                full_path = os.path.join(name, path)
+                try:
+                    log.debug("Removing %s", full_path)
+                    salt.utils.files.rm_rf(full_path.rstrip(os.sep))
+                    ret["changes"].setdefault("removed", []).append(full_path)
+                except OSError as exc:
+                    if exc.errno != errno.ENOENT:
+                        errors.append(exc.__str__())
+            if errors:
+                msg = (
+                    "One or more paths could not be cleaned. The following "
+                    "errors were observed:\n"
+                )
+                for error in errors:
+                    msg += "\n- {}".format(error)
+                ret["comment"] = msg
+                return ret
+        if not os.path.isdir(name):
+            __states__["file.directory"](name, user=user, makedirs=True)
+            created_destdir = True
+        log.debug("Extracting %s to %s", cached, name)
+        try:
+            if archive_format == "zip":
+                if use_cmd_unzip:
+                    try:
+                        files = __salt__["archive.cmd_unzip"](
+                            cached,
+                            name,
+                            options=options,
+                            trim_output=trim_output,
+                            password=password,
+                            **kwargs
+                        )
+                    except (CommandExecutionError, CommandNotFoundError) as exc:
+                        ret["comment"] = exc.strerror
+                        return ret
+                else:
+                    files = __salt__["archive.unzip"](
+                        cached,
+                        name,
+                        options=options,
+                        trim_output=trim_output,
+                        password=password,
+                        extract_perms=extract_perms,
+                        **kwargs
+                    )
+            elif archive_format == "rar":
+                try:
+                    files = __salt__["archive.unrar"](
+                        cached, name, trim_output=trim_output, **kwargs
+                    )
+                except (CommandExecutionError, CommandNotFoundError) as exc:
+                    ret["comment"] = exc.strerror
+                    return ret
+            else:
+                if options is None:
+                    try:
+                        with closing(tarfile.open(cached, "r")) as tar:
+                            tar.extractall(salt.utils.stringutils.to_str(name))
+                            files = tar.getnames()
+                            if trim_output:
+                                files = files[:trim_output]
+                    except tarfile.ReadError:
+                        if salt.utils.path.which("xz"):
+                            if (
+                                __salt__["cmd.retcode"](
+                                    ["xz", "-t", cached],
+                                    python_shell=False,
+                                    ignore_retcode=True,
+                                )
+                                == 0
+                            ):
+                                log.debug(
+                                    "Tar file is XZ-compressed, attempting "
+                                    "decompression and extraction using XZ Utils "
+                                    "and the tar command"
+                                )
+                                cmd = "xz --decompress --stdout {0} | tar xvf -"
+                                results = __salt__["cmd.run_all"](
+                                    cmd.format(shlex.quote(cached)),
+                                    cwd=name,
+                                    python_shell=True,
+                                )
+                                if results["retcode"] != 0:
+                                    if created_destdir:
+                                        _cleanup_destdir(name)
+                                    ret["result"] = False
+                                    ret["changes"] = results
+                                    return ret
+                                if _is_bsdtar():
+                                    files = results["stderr"]
+                                else:
+                                    files = results["stdout"]
+                            else:
+                                if created_destdir:
+                                    _cleanup_destdir(name)
+                                ret["result"] = False
+                                ret["comment"] = (
+                                    "Failed to read from tar archive using "
+                                    "Python's native tar file support. If "
+                                    "archive is compressed using something "
+                                    "other than gzip or bzip2, the "
+                                    "'options' argument may be required to "
+                                    "pass the correct options to the tar "
+                                    "command in order to extract the archive."
+                                )
+                                return ret
+                        else:
+                            if created_destdir:
+                                _cleanup_destdir(name)
+                            ret["result"] = False
+                            ret["comment"] = (
+                                "Failed to read from tar archive. If it is "
+                                "XZ-compressed, install xz-utils to attempt "
+                                "extraction."
+                            )
+                            return ret
+                else:
+                    if not salt.utils.path.which("tar"):
+                        ret["comment"] = (
+                            "tar command not available, it might not be "
+                            "installed on minion"
+                        )
+                        return ret
+                    tar_opts = [
+                        x
+                        for x in shlex.split(options)
+                        if x not in ("v", "-v", "--verbose")
+                    ]
+                    tar_cmd = ["tar"]
+                    tar_shortopts = "xv"
+                    tar_longopts = []
+                    for position, opt in enumerate(tar_opts):
+                        if opt.startswith("-"):
+                            tar_longopts.append(opt)
+                        else:
+                            if position &gt; 0:
+                                tar_longopts.append(opt)
+                            else:
+                                append_opt = opt
+                                append_opt = append_opt.replace("x", "")
+                                append_opt = append_opt.replace("f", "")
+                                tar_shortopts = tar_shortopts + append_opt
+                    if __grains__["os"].lower() == "openbsd":
+                        tar_shortopts = "-" + tar_shortopts
+                    tar_cmd.append(tar_shortopts)
+                    tar_cmd.extend(tar_longopts)
+                    tar_cmd.extend(["-f", cached])
+                    results = __salt__["cmd.run_all"](
+                        tar_cmd, cwd=name, python_shell=False
+                    )
+                    if results["retcode"] != 0:
+                        ret["result"] = False
+                        ret["changes"] = results
+                        return ret
+                    if _is_bsdtar():
+                        files = results["stderr"].splitlines()
+                        if trim_output:
+                            files = files[:trim_output]
+                    else:
+                        files = results["stdout"].splitlines()
+                        if trim_output:
+                            files = files[:trim_output]
+                    if not files:
+                        files = "no tar output so far"
+        except CommandExecutionError as exc:
+            ret["comment"] = exc.strerror
+            return ret
+    enforce_missing = []
+    enforce_failed = []
+    if user or group:
+        if enforce_ownership_on:
+            if os.path.isdir(enforce_ownership_on):
+                enforce_dirs = [enforce_ownership_on]
+                enforce_files = []
+                enforce_links = []
+            else:
+                enforce_dirs = []
+                enforce_files = [enforce_ownership_on]
+                enforce_links = []
+        else:
+            if contents is not None:
+                enforce_dirs = contents["top_level_dirs"]
+                enforce_files = contents["top_level_files"]
+                enforce_links = contents["top_level_links"]
+        recurse = []
+        if user:
+            recurse.append("user")
+        if group:
+            recurse.append("group")
+        recurse_str = ", ".join(recurse)
+        owner_changes = {x: y for x, y in (("user", user), ("group", group)) if y}
+        for dirname in enforce_dirs:
+            full_path = os.path.join(name, dirname)
+            if not os.path.isdir(full_path):
+                if not __opts__["test"]:
+                    enforce_missing.append(full_path)
+            else:
+                log.debug(
+                    "Enforcing %s ownership on %s using a file.directory state%s",
+                    recurse_str,
+                    dirname,
+                    " (dry-run only)" if __opts__["test"] else "",
+                )
+                dir_result = __states__["file.directory"](
+                    full_path, user=user, group=group, recurse=recurse
+                )
+                log.debug("file.directory: %s", dir_result)
+                if dir_result.get("changes"):
+                    ret["changes"]["updated ownership"] = True
+                try:
+                    if not dir_result["result"]:
+                        enforce_failed.append(full_path)
+                except (KeyError, TypeError):
+                    log.warning(
+                        "Bad state return %s for file.directory state on %s",
+                        dir_result,
+                        dirname,
+                    )
+        for filename in enforce_files + enforce_links:
+            full_path = os.path.join(name, filename)
+            try:
+                file_stat = os.lstat(full_path)
+            except OSError as exc:
+                if not __opts__["test"]:
+                    if exc.errno == errno.ENOENT:
+                        enforce_missing.append(full_path)
+                    enforce_failed.append(full_path)
+            else:
+                if (uid != -1 and uid != file_stat.st_uid) or (
+                    gid != -1 and gid != file_stat.st_gid
+                ):
+                    if __opts__["test"]:
+                        ret["changes"]["updated ownership"] = True
+                    else:
+                        try:
+                            os.lchown(full_path, uid, gid)
+                            ret["changes"]["updated ownership"] = True
+                        except OSError:
+                            enforce_failed.append(filename)
+    if extraction_needed:
+        if len(files) &gt; 0:
+            if created_destdir:
+                ret["changes"]["directories_created"] = [name]
+            ret["changes"]["extracted_files"] = files
+            ret["comment"] = "{} extracted to {}".format(
+                salt.utils.url.redact_http_basic_auth(source_match),
+                name,
+            )
+            _add_explanation(ret, source_hash_trigger, contents_missing)
+            ret["comment"] += ". Output was trimmed to {} number of lines".format(
+                trim_output
+            )
+            ret["result"] = True
+        else:
+            ret["result"] = False
+            ret["comment"] = "No files were extracted from {}".format(
+                salt.utils.url.redact_http_basic_auth(source_match)
+            )
+    else:
+        ret["result"] = True
+        if if_missing_path_exists:
+            ret["comment"] = "{} exists".format(if_missing)
+        else:
+            ret["comment"] = "All files in archive are already present"
+        if __opts__["test"]:
+            if ret["changes"].get("updated ownership"):
+                ret["result"] = None
+                ret[
+                    "comment"
+                ] += ". Ownership would be updated on one or more files/directories."
+    if enforce_missing:
+        if not if_missing:
+            ret["result"] = False
+        ret["comment"] += (
+            "\n\nWhile trying to enforce user/group ownership, the following "
+            "paths were missing:\n"
+        )
+        for item in enforce_missing:
+            ret["comment"] += "\n- {}".format(item)
+    if enforce_failed:
+        ret["result"] = False
+        ret["comment"] += (
+            "\n\nWhile trying to enforce user/group ownership, Salt was "
+            "unable to change ownership on the following paths:\n"
+        )
+        for item in enforce_failed:
+            ret["comment"] += "\n- {}".format(item)
+    if not source_is_local:
+        if keep_source:
+            log.debug("Keeping cached source file %s", cached)
+        else:
+            log.debug("Cleaning cached source file %s", cached)
+            result = __states__["file.not_cached"](source_match, saltenv=__env__)
+            if not result["result"]:
+                ret.setdefault("warnings", []).append(result["comment"])
+    return ret
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -1045,101 +1461,113 @@ Matches for archive.py &amp; test_file_selinux.py
 </h3>
 <hr/>
 <pre>
-1 import os
-2 import shutil
-3 import pytest
-4 import salt.config
-5 import salt.loader
-6 import salt.modules.cmdmod as cmdmod
-7 import salt.modules.file as filemod
-8 import salt.utils.data
-9 import salt.utils.files
-10 import salt.utils.platform
-11 import salt.utils.stringutils
-12 from tests.support.mock import MagicMock, patch
-13 log = logging.getLogger(</b></font>__name__)
-14 pytestmark = pytest.mark.skipif(
-15     salt.modules.selinux.getenforce() != "Enforcing",
-16     reason="Skip if selinux not enabled",
-17 )
-18 @pytest.fixture
-19 def configure_loader_modules():
-20     return {
-21         filemod: {
-22             "__salt__": {
-23                 "cmd.run": cmdmod.run,
-24                 "cmd.run_all": cmdmod.run_all,
-25                 "cmd.retcode": cmdmod.retcode,
-26                 "selinux.fcontext_add_policy": MagicMock(
-27                     return_value={"retcode": 0, "stdout": ""}
-28                 ),
-29             },
-30             "__opts__": {"test": False},
-31         }
-32     }
-33 @pytest.fixture
-34 def subdir(tmp_path):
-35     subdir = tmp_path / "file-selinux-test-dir"
-36     subdir.mkdir()
-37     yield subdir
-38     shutil.rmtree(str(subdir))
-39 @pytest.fixture
-40 def tfile1(subdir):
-41     filename = str(subdir / "tfile1")
-42     with salt.utils.files.fopen(filename, "w+"):
-43         pass
-44     yield filename
-45     os.remove(filename)
-46 @pytest.fixture
-47 def tfile2(subdir):
-48     filename = str(subdir / "tfile2")
-49     with salt.utils.files.fopen(filename, "w+"):
-50         pass
-51     yield filename
-52     os.remove(filename)
-53 @pytest.fixture
-54 def tfile3(subdir):
-55     filename = str(subdir / "tfile3")
-56     with salt.utils.files.fopen(filename, "w+"):
-57         pass
-58     yield filename
-59     os.remove(filename)
-60 def test_selinux_getcontext(tfile1):
-61     result = filemod.get_selinux_context(tfile1)
-62     assert result == "unconfined_u:object_r:user_tmp_t:s0"
-63 def test_selinux_setcontext(tfile2):
-64     result = filemod.set_selinux_context(tfile2, user="system_u")
-65     assert result == "system_u:object_r:user_tmp_t:s0"
-66 def test_selinux_setcontext_persist(tfile2):
-67     result = filemod.set_selinux_context(tfile2, user="system_u", persist=True)
-68     assert result == "system_u:object_r:user_tmp_t:s0"
-69 def test_file_check_perms(tfile3):
-70     expected_result = (
-71         {
-72             "comment": "The file {} is set to be changed".format(tfile3),
-73             "changes": {
-74                 "selinux": {"New": "Type: lost_found_t", "Old": "Type: user_tmp_t"},
-75                 "mode": "0664",
-76             },
-77             "name": tfile3,
-78             "result": True,
-79         },
-80         {"luser": "root", "lmode": "0644", "lgroup": "root"},
-81     )
-82     with patch("salt.utils.path.which") as m_which:
-83         m_which.return_value = None
-84         result = filemod.check_perms(
-85             tfile3,
-86             {},
-87             "root",
-88             "root",
-89             664,
-90             seuser=None,
-91             serole=None,
-92             setype="lost_found_t",
-93             serange=None,
-94         )
-95         assert result == expected_result
+import os
+import shutil
+import pytest
+import salt.config
+import salt.loader
+import salt.modules.cmdmod as cmdmod
+import salt.modules.file as filemod
+import salt.utils.data
+import salt.utils.files
+import salt.utils.platform
+import salt.utils.stringutils
+from tests.support.mock import MagicMock, patch
+log = logging.getLogger(</b></font>__name__)
+pytestmark = pytest.mark.skipif(
+    salt.modules.selinux.getenforce() != "Enforcing",
+    reason="Skip if selinux not enabled",
+)
+@pytest.fixture
+def configure_loader_modules():
+    return {
+        filemod: {
+            "__salt__": {
+                "cmd.run": cmdmod.run,
+                "cmd.run_all": cmdmod.run_all,
+                "cmd.retcode": cmdmod.retcode,
+                "selinux.fcontext_add_policy": MagicMock(
+                    return_value={"retcode": 0, "stdout": ""}
+                ),
+            },
+            "__opts__": {"test": False},
+        }
+    }
+@pytest.fixture
+def subdir(tmp_path):
+    subdir = tmp_path / "file-selinux-test-dir"
+    subdir.mkdir()
+    yield subdir
+    shutil.rmtree(str(subdir))
+@pytest.fixture
+def tfile1(subdir):
+    filename = str(subdir / "tfile1")
+    with salt.utils.files.fopen(filename, "w+"):
+        pass
+    yield filename
+    os.remove(filename)
+@pytest.fixture
+def tfile2(subdir):
+    filename = str(subdir / "tfile2")
+    with salt.utils.files.fopen(filename, "w+"):
+        pass
+    yield filename
+    os.remove(filename)
+@pytest.fixture
+def tfile3(subdir):
+    filename = str(subdir / "tfile3")
+    with salt.utils.files.fopen(filename, "w+"):
+        pass
+    yield filename
+    os.remove(filename)
+def test_selinux_getcontext(tfile1):
+    """
+    Test get selinux context
+    Assumes default selinux attributes on temporary files
+    """
+    result = filemod.get_selinux_context(tfile1)
+    assert result == "unconfined_u:object_r:user_tmp_t:s0"
+def test_selinux_setcontext(tfile2):
+    """
+    Test set selinux context
+    Assumes default selinux attributes on temporary files
+    """
+    result = filemod.set_selinux_context(tfile2, user="system_u")
+    assert result == "system_u:object_r:user_tmp_t:s0"
+def test_selinux_setcontext_persist(tfile2):
+    """
+    Test set selinux context with persist=True
+    Assumes default selinux attributes on temporary files
+    """
+    result = filemod.set_selinux_context(tfile2, user="system_u", persist=True)
+    assert result == "system_u:object_r:user_tmp_t:s0"
+def test_file_check_perms(tfile3):
+    expected_result = (
+        {
+            "comment": "The file {} is set to be changed".format(tfile3),
+            "changes": {
+                "selinux": {"New": "Type: lost_found_t", "Old": "Type: user_tmp_t"},
+                "mode": "0664",
+            },
+            "name": tfile3,
+            "result": True,
+        },
+        {"luser": "root", "lmode": "0644", "lgroup": "root"},
+    )
+    with patch("salt.utils.path.which") as m_which:
+        m_which.return_value = None
+        result = filemod.check_perms(
+            tfile3,
+            {},
+            "root",
+            "root",
+            664,
+            seuser=None,
+            serole=None,
+            setype="lost_found_t",
+            serange=None,
+        )
+        assert result == expected_result
 </pre>
 </div>
 </div>

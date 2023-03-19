@@ -40,419 +40,461 @@ Matches for simple_httpclient.py &amp; nspawn.py
 </h3>
 <hr/>
 <pre>
-1 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>from __future__ import absolute_import, division, print_function
-2 from salt.ext.tornado.escape import utf8, _unicode
-3 from salt.ext.tornado import gen
-4 from salt.ext.tornado.httpclient import HTTPResponse, HTTPError, AsyncHTTPClient, main, _RequestProxy
-5 from salt.ext.tornado import httputil
-6 from salt.ext.tornado.http1connection import HTTP1Connection, HTTP1ConnectionParameters
-7 from salt.ext.tornado.iostream import StreamClosedError
-8 from salt.ext.tornado.netutil import Resolver, OverrideResolver, _client_ssl_defaults
-9 from salt.ext.tornado.log import gen_log
-10 from salt.ext.tornado import stack_context
-11 from salt.ext.tornado.tcpclient import TCPClient
-12 from salt.ext.tornado.util import PY3
-13 import base64
-14 import</b></font> collections
-15 import copy
-16 import functools
-17 import re
-18 import socket
-19 import sys
-20 from io import BytesIO
-21 if PY3:
-22     import urllib.parse as urlparse
-23 else:
-24     import urlparse
-25 try:
-26     import ssl
-27 except ImportError:
-28     ssl = None
-29 try:
-30     import certifi
-31 except ImportError:
-32     certifi = None
-33 def _default_ca_certs():
-34     if certifi is None:
-35         raise Exception("The 'certifi' package is required to use https "
-36                         "in simple_httpclient")
-37     return certifi.where()
-38 class SimpleAsyncHTTPClient(AsyncHTTPClient):
-39     def initialize(self, io_loop, max_clients=10,
-40                    hostname_mapping=None, max_buffer_size=104857600,
-41                    resolver=None, defaults=None, max_header_size=None,
-42                    max_body_size=None):
-43         super(SimpleAsyncHTTPClient, self).initialize(io_loop,
-44                                                       defaults=defaults)
-45         self.max_clients = max_clients
-46         self.queue = collections.deque()
-47         self.active = {}
-48         self.waiting = {}
-49         self.max_buffer_size = max_buffer_size
-50         self.max_header_size = max_header_size
-51         self.max_body_size = max_body_size
-52         if resolver:
-53             self.resolver = resolver
-54             self.own_resolver = False
-55         else:
-56             self.resolver = Resolver(io_loop=io_loop)
-57             self.own_resolver = True
-58         if hostname_mapping is not None:
-59             self.resolver = OverrideResolver(resolver=self.resolver,
-60                                              mapping=hostname_mapping)
-61         self.tcp_client = TCPClient(resolver=self.resolver, io_loop=io_loop)
-62     def close(self):
-63         super(SimpleAsyncHTTPClient, self).close()
-64         if self.own_resolver:
-65             self.resolver.close()
-66         self.tcp_client.close()
-67     def fetch_impl(self, request, callback):
-68         key = object()
-69         self.queue.append((key, request, callback))
-70         if not len(self.active) &lt; self.max_clients:
-71             timeout_handle = self.io_loop.add_timeout(
-72                 self.io_loop.time() + min(request.connect_timeout,
-73                                           request.request_timeout),
-74                 functools.partial(self._on_timeout, key, "in request queue"))
-75         else:
-76             timeout_handle = None
-77         self.waiting[key] = (request, callback, timeout_handle)
-78         self._process_queue()
-79         if self.queue:
-80             gen_log.debug("max_clients limit reached, request queued. "
-81                           "%d active, %d queued requests." % (
-82                               len(self.active), len(self.queue)))
-83     def _process_queue(self):
-84         with stack_context.NullContext():
-85             while self.queue and len(self.active) &lt; self.max_clients:
-86                 key, request, callback = self.queue.popleft()
-87                 if key not in self.waiting:
-88                     continue
-89                 self._remove_timeout(key)
-90                 self.active[key] = (request, callback)
-91                 release_callback = functools.partial(self._release_fetch, key)
-92                 self._handle_request(request, release_callback, callback)
-93     def _connection_class(self):
-94         return _HTTPConnection
-95     def _handle_request(self, request, release_callback, final_callback):
-96         self._connection_class()(
-97             self.io_loop, self, request, release_callback,
-98             final_callback, self.max_buffer_size, self.tcp_client,
-99             self.max_header_size, self.max_body_size)
-100     def _release_fetch(self, key):
-101         del self.active[key]
-102         self._process_queue()
-103     def _remove_timeout(self, key):
-104         if key in self.waiting:
-105             request, callback, timeout_handle = self.waiting[key]
-106             if timeout_handle is not None:
-107                 self.io_loop.remove_timeout(timeout_handle)
-108             del self.waiting[key]
-109     def _on_timeout(self, key, info=None):
-110         request, callback, timeout_handle = self.waiting[key]
-111         self.queue.remove((key, request, callback))
-112         error_message = "Timeout {0}".format(info) if info else "Timeout"
-113         timeout_response = HTTPResponse(
-114             request, 599, error=HTTPError(599, error_message),
-115             request_time=self.io_loop.time() - request.start_time)
-116         self.io_loop.add_callback(callback, timeout_response)
-117         del self.waiting[key]
-118 class _HTTPConnection(httputil.HTTPMessageDelegate):
-119     _SUPPORTED_METHODS = set(["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-120     def __init__(self, io_loop, client, request, release_callback,
-121                  final_callback, max_buffer_size, tcp_client,
-122                  max_header_size, max_body_size):
-123         self.start_time = io_loop.time()
-124         self.io_loop = io_loop
-125         self.client = client
-126         self.request = request
-127         self.release_callback = release_callback
-128         self.final_callback = final_callback
-129         self.max_buffer_size = max_buffer_size
-130         self.tcp_client = tcp_client
-131         self.max_header_size = max_header_size
-132         self.max_body_size = max_body_size
-133         self.code = None
-134         self.headers = None
-135         self.chunks = []
-136         self._decompressor = None
-137         self._timeout = None
-138         self._sockaddr = None
-139         with stack_context.ExceptionStackContext(self._handle_exception):
-140             self.parsed = urlparse.urlsplit(_unicode(self.request.url))
-141             if self.parsed.scheme not in ("http", "https"):
-142                 raise ValueError("Unsupported url scheme: %s" %
-143                                  self.request.url)
-144             netloc = self.parsed.netloc
-145             if "@" in netloc:
-146                 userpass, _, netloc = netloc.rpartition("@")
-147             host, port = httputil.split_host_and_port(netloc)
-148             if port is None:
-149                 port = 443 if self.parsed.scheme == "https" else 80
-150             if re.match(r'^\[.*\]$', host):
-151                 host = host[1:-1]
-152             self.parsed_hostname = host  # save final host for _on_connect
-153             if request.allow_ipv6 is False:
-154                 af = socket.AF_INET
-155             else:
-156                 af = socket.AF_UNSPEC
-157             ssl_options = self._get_ssl_options(self.parsed.scheme)
-158             timeout = min(self.request.connect_timeout, self.request.request_timeout)
-159             if timeout:
-160                 self._timeout = self.io_loop.add_timeout(
-161                     self.start_time + timeout,
-162                     stack_context.wrap(functools.partial(self._on_timeout, "while connecting")))
-163             self.tcp_client.connect(host, port, af=af,
-164                                     ssl_options=ssl_options,
-165                                     max_buffer_size=self.max_buffer_size,
-166                                     callback=self._on_connect)
-167     def _get_ssl_options(self, scheme):
-168         if scheme == "https":
-169             if self.request.ssl_options is not None:
-170                 return self.request.ssl_options
-171             if (self.request.validate_cert and
-172                     self.request.ca_certs is None and
-173                     self.request.client_cert is None and
-174                     self.request.client_key is None):
-175                 return _client_ssl_defaults
-176             ssl_options = {}
-177             if self.request.validate_cert:
-178                 ssl_options["cert_reqs"] = ssl.CERT_REQUIRED
-179             if self.request.ca_certs is not None:
-180                 ssl_options["ca_certs"] = self.request.ca_certs
-181             elif not hasattr(ssl, 'create_default_context'):
-182                 ssl_options["ca_certs"] = _default_ca_certs()
-183             if self.request.client_key is not None:
-184                 ssl_options["keyfile"] = self.request.client_key
-185             if self.request.client_cert is not None:
-186                 ssl_options["certfile"] = self.request.client_cert
-187             if sys.version_info &gt;= (2, 7):
-188                 ssl_options["ciphers"] = "DEFAULT:!SSLv2:!EXPORT:!DES"
-189             else:
-190                 ssl_options["ssl_version"] = ssl.PROTOCOL_TLSv1
-191             return ssl_options
-192         return None
-193     def _on_timeout(self, info=None):
-194         self._timeout = None
-195         error_message = "Timeout {0}".format(info) if info else "Timeout"
-196         if self.final_callback is not None:
-197             raise HTTPError(599, error_message)
-198     def _remove_timeout(self):
-199         if self._timeout is not None:
-200             self.io_loop.remove_timeout(self._timeout)
-201             self._timeout = None
-202     def _on_connect(self, stream):
-203         if self.final_callback is None:
-204             stream.close()
-205             return
-206         self.stream = stream
-207         self.stream.set_close_callback(self.on_connection_close)
-208         self._remove_timeout()
-209         if self.final_callback is None:
-210             return
-211         if self.request.request_timeout:
-212             self._timeout = self.io_loop.add_timeout(
-213                 self.start_time + self.request.request_timeout,
-214                 stack_context.wrap(functools.partial(self._on_timeout, "during request")))
-215         if (self.request.method not in self._SUPPORTED_METHODS and
-216                 not self.request.allow_nonstandard_methods):
-217             raise KeyError("unknown method %s" % self.request.method)
-218         for key in ('network_interface',
-219                     'proxy_host', 'proxy_port',
-220                     'proxy_username', 'proxy_password',
-221                     'proxy_auth_mode'):
-222             if getattr(self.request, key, None):
-223                 raise NotImplementedError('%s not supported' % key)
-224         if "Connection" not in self.request.headers:
-225             self.request.headers["Connection"] = "close"
-226         if "Host" not in self.request.headers:
-227             if '@' in self.parsed.netloc:
-228                 self.request.headers["Host"] = self.parsed.netloc.rpartition('@')[-1]
-229             else:
-230                 self.request.headers["Host"] = self.parsed.netloc
-231         username, password = None, None
-232         if self.parsed.username is not None:
-233             username, password = self.parsed.username, self.parsed.password
-234         elif self.request.auth_username is not None:
-235             username = self.request.auth_username
-236             password = self.request.auth_password or ''
-237         if username is not None:
-238             if self.request.auth_mode not in (None, "basic"):
-239                 raise ValueError("unsupported auth_mode %s",
-240                                  self.request.auth_mode)
-241             auth = utf8(username) + b":" + utf8(password)
-242             self.request.headers["Authorization"] = (b"Basic " +
-243                                                      base64.b64encode(auth))
-244         if self.request.user_agent:
-245             self.request.headers["User-Agent"] = self.request.user_agent
-246         if not self.request.allow_nonstandard_methods:
-247             body_expected = self.request.method in ("POST", "PATCH", "PUT")
-248             body_present = (self.request.body is not None or
-249                             self.request.body_producer is not None)
-250             if ((body_expected and not body_present) or
-251                     (body_present and not body_expected)):
-252                 raise ValueError(
-253                     'Body must %sbe None for method %s (unless '
-254                     'allow_nonstandard_methods is true)' %
-255                     ('not ' if body_expected else '', self.request.method))
-256         if self.request.expect_100_continue:
-257             self.request.headers["Expect"] = "100-continue"
-258         if self.request.body is not None:
-259             self.request.headers["Content-Length"] = str(len(
-260                 self.request.body))
-261         if (self.request.method == "POST" and
-262                 "Content-Type" not in self.request.headers):
-263             self.request.headers["Content-Type"] = "application/x-www-form-urlencoded"
-264         if self.request.decompress_response:
-265             self.request.headers["Accept-Encoding"] = "gzip"
-266         req_path = ((self.parsed.path or '/') +
-267                     (('?' + self.parsed.query) if self.parsed.query else ''))
-268         self.connection = self._create_connection(stream)
-269         start_line = httputil.RequestStartLine(self.request.method,
-270                                                req_path, '')
-271         self.connection.write_headers(start_line, self.request.headers)
-272         if self.request.expect_100_continue:
-273             self._read_response()
-274         else:
-275             self._write_body(True)
-276     def _create_connection(self, stream):
-277         stream.set_nodelay(True)
-278         connection = HTTP1Connection(
-279             stream, True,
-280             HTTP1ConnectionParameters(
-281                 no_keep_alive=True,
-282                 max_header_size=self.max_header_size,
-283                 max_body_size=self.max_body_size,
-284                 decompress=self.request.decompress_response),
-285             self._sockaddr)
-286         return connection
-287     def _write_body(self, start_read):
-288         if self.request.body is not None:
-289             self.connection.write(self.request.body)
-290         elif self.request.body_producer is not None:
-291             fut = self.request.body_producer(self.connection.write)
-292             if fut is not None:
-293                 fut = gen.convert_yielded(fut)
-294                 def on_body_written(fut):
-295                     fut.result()
-296                     self.connection.finish()
-297                     if start_read:
-298                         self._read_response()
-299                 self.io_loop.add_future(fut, on_body_written)
-300                 return
-301         self.connection.finish()
-302         if start_read:
-303             self._read_response()
-304     def _read_response(self):
-305         self.io_loop.add_future(
-306             self.connection.read_response(self),
-307             lambda f: f.result())
-308     def _release(self):
-309         if self.release_callback is not None:
-310             release_callback = self.release_callback
-311             self.release_callback = None
-312             release_callback()
-313     def _run_callback(self, response):
-314         self._release()
-315         if self.final_callback is not None:
-316             final_callback = self.final_callback
-317             self.final_callback = None
-318             self.io_loop.add_callback(final_callback, response)
-319     def _handle_exception(self, typ, value, tb):
-320         if self.final_callback:
-321             self._remove_timeout()
-322             if isinstance(value, StreamClosedError):
-323                 if value.real_error is None:
-324                     value = HTTPError(599, "Stream closed")
-325                 else:
-326                     value = value.real_error
-327             self._run_callback(HTTPResponse(self.request, 599, error=value,
-328                                             request_time=self.io_loop.time() - self.start_time,
-329                                             ))
-330             if hasattr(self, "stream"):
-331                 self.stream.close()
-332             return True
-333         else:
-334             return isinstance(value, StreamClosedError)
-335     def on_connection_close(self):
-336         if self.final_callback is not None:
-337             message = "Connection closed"
-338             if self.stream.error:
-339                 raise self.stream.error
-340             try:
-341                 raise HTTPError(599, message)
-342             except HTTPError:
-343                 self._handle_exception(*sys.exc_info())
-344     def headers_received(self, first_line, headers):
-345         if self.request.expect_100_continue and first_line.code == 100:
-346             self._write_body(False)
-347             return
-348         self.code = first_line.code
-349         self.reason = first_line.reason
-350         self.headers = headers
-351         if self._should_follow_redirect():
-352             return
-353         if self.request.header_callback is not None:
-354             self.request.header_callback('%s %s %s\r\n' % first_line)
-355             for k, v in self.headers.get_all():
-356                 self.request.header_callback("%s: %s\r\n" % (k, v))
-357             self.request.header_callback('\r\n')
-358     def _should_follow_redirect(self):
-359         return (self.request.follow_redirects and
-360                 self.request.max_redirects &gt; 0 and
-361                 self.code in (301, 302, 303, 307, 308))
-362     def finish(self):
-363         data = b''.join(self.chunks)
-364         self._remove_timeout()
-365         original_request = getattr(self.request, "original_request",
-366                                    self.request)
-367         if self._should_follow_redirect():
-368             assert isinstance(self.request, _RequestProxy)
-369             new_request = copy.copy(self.request.request)
-370             new_request.url = urlparse.urljoin(self.request.url,
-371                                                self.headers["Location"])
-372             new_request.max_redirects = self.request.max_redirects - 1
-373             del new_request.headers["Host"]
-374             if self.code in (302, 303):
-375                 new_request.method = "GET"
-376                 new_request.body = None
-377                 for h in ["Content-Length", "Content-Type",
-378                           "Content-Encoding", "Transfer-Encoding"]:
-379                     try:
-380                         del self.request.headers[h]
-381                     except KeyError:
-382                         pass
-383             new_request.original_request = original_request
-384             final_callback = self.final_callback
-385             self.final_callback = None
-386             self._release()
-387             self.client.fetch(new_request, final_callback)
-388             self._on_end_request()
-389             return
-390         if self.request.streaming_callback:
-391             buffer = BytesIO()
-392         else:
-393             buffer = BytesIO(data)  # TODO: don't require one big string?
-394         response = HTTPResponse(original_request,
-395                                 self.code, reason=getattr(self, 'reason', None),
-396                                 headers=self.headers,
-397                                 request_time=self.io_loop.time() - self.start_time,
-398                                 buffer=buffer,
-399                                 effective_url=self.request.url)
-400         self._run_callback(response)
-401         self._on_end_request()
-402     def _on_end_request(self):
-403         self.stream.close()
-404     def data_received(self, chunk):
-405         if self._should_follow_redirect():
-406             return
-407         if self.request.streaming_callback is not None:
-408             self.request.streaming_callback(chunk)
-409         else:
-410             self.chunks.append(chunk)
-411 if __name__ == "__main__":
-412     AsyncHTTPClient.configure(SimpleAsyncHTTPClient)
-413     main()
+<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>from __future__ import absolute_import, division, print_function
+from salt.ext.tornado.escape import utf8, _unicode
+from salt.ext.tornado import gen
+from salt.ext.tornado.httpclient import HTTPResponse, HTTPError, AsyncHTTPClient, main, _RequestProxy
+from salt.ext.tornado import httputil
+from salt.ext.tornado.http1connection import HTTP1Connection, HTTP1ConnectionParameters
+from salt.ext.tornado.iostream import StreamClosedError
+from salt.ext.tornado.netutil import Resolver, OverrideResolver, _client_ssl_defaults
+from salt.ext.tornado.log import gen_log
+from salt.ext.tornado import stack_context
+from salt.ext.tornado.tcpclient import TCPClient
+from salt.ext.tornado.util import PY3
+import base64
+import</b></font> collections
+import copy
+import functools
+import re
+import socket
+import sys
+from io import BytesIO
+if PY3:
+    import urllib.parse as urlparse
+else:
+    import urlparse
+try:
+    import ssl
+except ImportError:
+    ssl = None
+try:
+    import certifi
+except ImportError:
+    certifi = None
+def _default_ca_certs():
+    if certifi is None:
+        raise Exception("The 'certifi' package is required to use https "
+                        "in simple_httpclient")
+    return certifi.where()
+class SimpleAsyncHTTPClient(AsyncHTTPClient):
+    """Non-blocking HTTP client with no external dependencies.
+    This class implements an HTTP 1.1 client on top of Tornado's IOStreams.
+    Some features found in the curl-based AsyncHTTPClient are not yet
+    supported.  In particular, proxies are not supported, connections
+    are not reused, and callers cannot select the network interface to be
+    used.
+    """
+    def initialize(self, io_loop, max_clients=10,
+                   hostname_mapping=None, max_buffer_size=104857600,
+                   resolver=None, defaults=None, max_header_size=None,
+                   max_body_size=None):
+        """Creates a AsyncHTTPClient.
+        Only a single AsyncHTTPClient instance exists per IOLoop
+        in order to provide limitations on the number of pending connections.
+        ``force_instance=True`` may be used to suppress this behavior.
+        Note that because of this implicit reuse, unless ``force_instance``
+        is used, only the first call to the constructor actually uses
+        its arguments. It is recommended to use the ``configure`` method
+        instead of the constructor to ensure that arguments take effect.
+        ``max_clients`` is the number of concurrent requests that can be
+        in progress; when this limit is reached additional requests will be
+        queued. Note that time spent waiting in this queue still counts
+        against the ``request_timeout``.
+        ``hostname_mapping`` is a dictionary mapping hostnames to IP addresses.
+        It can be used to make local DNS changes when modifying system-wide
+        settings like ``/etc/hosts`` is not possible or desirable (e.g. in
+        unittests).
+        ``max_buffer_size`` (default 100MB) is the number of bytes
+        that can be read into memory at once. ``max_body_size``
+        (defaults to ``max_buffer_size``) is the largest response body
+        that the client will accept.  Without a
+        ``streaming_callback``, the smaller of these two limits
+        applies; with a ``streaming_callback`` only ``max_body_size``
+        does.
+        .. versionchanged:: 4.2
+           Added the ``max_body_size`` argument.
+        """
+        super(SimpleAsyncHTTPClient, self).initialize(io_loop,
+                                                      defaults=defaults)
+        self.max_clients = max_clients
+        self.queue = collections.deque()
+        self.active = {}
+        self.waiting = {}
+        self.max_buffer_size = max_buffer_size
+        self.max_header_size = max_header_size
+        self.max_body_size = max_body_size
+        if resolver:
+            self.resolver = resolver
+            self.own_resolver = False
+        else:
+            self.resolver = Resolver(io_loop=io_loop)
+            self.own_resolver = True
+        if hostname_mapping is not None:
+            self.resolver = OverrideResolver(resolver=self.resolver,
+                                             mapping=hostname_mapping)
+        self.tcp_client = TCPClient(resolver=self.resolver, io_loop=io_loop)
+    def close(self):
+        super(SimpleAsyncHTTPClient, self).close()
+        if self.own_resolver:
+            self.resolver.close()
+        self.tcp_client.close()
+    def fetch_impl(self, request, callback):
+        key = object()
+        self.queue.append((key, request, callback))
+        if not len(self.active) &lt; self.max_clients:
+            timeout_handle = self.io_loop.add_timeout(
+                self.io_loop.time() + min(request.connect_timeout,
+                                          request.request_timeout),
+                functools.partial(self._on_timeout, key, "in request queue"))
+        else:
+            timeout_handle = None
+        self.waiting[key] = (request, callback, timeout_handle)
+        self._process_queue()
+        if self.queue:
+            gen_log.debug("max_clients limit reached, request queued. "
+                          "%d active, %d queued requests." % (
+                              len(self.active), len(self.queue)))
+    def _process_queue(self):
+        with stack_context.NullContext():
+            while self.queue and len(self.active) &lt; self.max_clients:
+                key, request, callback = self.queue.popleft()
+                if key not in self.waiting:
+                    continue
+                self._remove_timeout(key)
+                self.active[key] = (request, callback)
+                release_callback = functools.partial(self._release_fetch, key)
+                self._handle_request(request, release_callback, callback)
+    def _connection_class(self):
+        return _HTTPConnection
+    def _handle_request(self, request, release_callback, final_callback):
+        self._connection_class()(
+            self.io_loop, self, request, release_callback,
+            final_callback, self.max_buffer_size, self.tcp_client,
+            self.max_header_size, self.max_body_size)
+    def _release_fetch(self, key):
+        del self.active[key]
+        self._process_queue()
+    def _remove_timeout(self, key):
+        if key in self.waiting:
+            request, callback, timeout_handle = self.waiting[key]
+            if timeout_handle is not None:
+                self.io_loop.remove_timeout(timeout_handle)
+            del self.waiting[key]
+    def _on_timeout(self, key, info=None):
+        """Timeout callback of request.
+        Construct a timeout HTTPResponse when a timeout occurs.
+        :arg object key: A simple object to mark the request.
+        :info string key: More detailed timeout information.
+        """
+        request, callback, timeout_handle = self.waiting[key]
+        self.queue.remove((key, request, callback))
+        error_message = "Timeout {0}".format(info) if info else "Timeout"
+        timeout_response = HTTPResponse(
+            request, 599, error=HTTPError(599, error_message),
+            request_time=self.io_loop.time() - request.start_time)
+        self.io_loop.add_callback(callback, timeout_response)
+        del self.waiting[key]
+class _HTTPConnection(httputil.HTTPMessageDelegate):
+    _SUPPORTED_METHODS = set(["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+    def __init__(self, io_loop, client, request, release_callback,
+                 final_callback, max_buffer_size, tcp_client,
+                 max_header_size, max_body_size):
+        self.start_time = io_loop.time()
+        self.io_loop = io_loop
+        self.client = client
+        self.request = request
+        self.release_callback = release_callback
+        self.final_callback = final_callback
+        self.max_buffer_size = max_buffer_size
+        self.tcp_client = tcp_client
+        self.max_header_size = max_header_size
+        self.max_body_size = max_body_size
+        self.code = None
+        self.headers = None
+        self.chunks = []
+        self._decompressor = None
+        self._timeout = None
+        self._sockaddr = None
+        with stack_context.ExceptionStackContext(self._handle_exception):
+            self.parsed = urlparse.urlsplit(_unicode(self.request.url))
+            if self.parsed.scheme not in ("http", "https"):
+                raise ValueError("Unsupported url scheme: %s" %
+                                 self.request.url)
+            netloc = self.parsed.netloc
+            if "@" in netloc:
+                userpass, _, netloc = netloc.rpartition("@")
+            host, port = httputil.split_host_and_port(netloc)
+            if port is None:
+                port = 443 if self.parsed.scheme == "https" else 80
+            if re.match(r'^\[.*\]$', host):
+                host = host[1:-1]
+            self.parsed_hostname = host  # save final host for _on_connect
+            if request.allow_ipv6 is False:
+                af = socket.AF_INET
+            else:
+                af = socket.AF_UNSPEC
+            ssl_options = self._get_ssl_options(self.parsed.scheme)
+            timeout = min(self.request.connect_timeout, self.request.request_timeout)
+            if timeout:
+                self._timeout = self.io_loop.add_timeout(
+                    self.start_time + timeout,
+                    stack_context.wrap(functools.partial(self._on_timeout, "while connecting")))
+            self.tcp_client.connect(host, port, af=af,
+                                    ssl_options=ssl_options,
+                                    max_buffer_size=self.max_buffer_size,
+                                    callback=self._on_connect)
+    def _get_ssl_options(self, scheme):
+        if scheme == "https":
+            if self.request.ssl_options is not None:
+                return self.request.ssl_options
+            if (self.request.validate_cert and
+                    self.request.ca_certs is None and
+                    self.request.client_cert is None and
+                    self.request.client_key is None):
+                return _client_ssl_defaults
+            ssl_options = {}
+            if self.request.validate_cert:
+                ssl_options["cert_reqs"] = ssl.CERT_REQUIRED
+            if self.request.ca_certs is not None:
+                ssl_options["ca_certs"] = self.request.ca_certs
+            elif not hasattr(ssl, 'create_default_context'):
+                ssl_options["ca_certs"] = _default_ca_certs()
+            if self.request.client_key is not None:
+                ssl_options["keyfile"] = self.request.client_key
+            if self.request.client_cert is not None:
+                ssl_options["certfile"] = self.request.client_cert
+            if sys.version_info &gt;= (2, 7):
+                ssl_options["ciphers"] = "DEFAULT:!SSLv2:!EXPORT:!DES"
+            else:
+                ssl_options["ssl_version"] = ssl.PROTOCOL_TLSv1
+            return ssl_options
+        return None
+    def _on_timeout(self, info=None):
+        """Timeout callback of _HTTPConnection instance.
+        Raise a timeout HTTPError when a timeout occurs.
+        :info string key: More detailed timeout information.
+        """
+        self._timeout = None
+        error_message = "Timeout {0}".format(info) if info else "Timeout"
+        if self.final_callback is not None:
+            raise HTTPError(599, error_message)
+    def _remove_timeout(self):
+        if self._timeout is not None:
+            self.io_loop.remove_timeout(self._timeout)
+            self._timeout = None
+    def _on_connect(self, stream):
+        if self.final_callback is None:
+            stream.close()
+            return
+        self.stream = stream
+        self.stream.set_close_callback(self.on_connection_close)
+        self._remove_timeout()
+        if self.final_callback is None:
+            return
+        if self.request.request_timeout:
+            self._timeout = self.io_loop.add_timeout(
+                self.start_time + self.request.request_timeout,
+                stack_context.wrap(functools.partial(self._on_timeout, "during request")))
+        if (self.request.method not in self._SUPPORTED_METHODS and
+                not self.request.allow_nonstandard_methods):
+            raise KeyError("unknown method %s" % self.request.method)
+        for key in ('network_interface',
+                    'proxy_host', 'proxy_port',
+                    'proxy_username', 'proxy_password',
+                    'proxy_auth_mode'):
+            if getattr(self.request, key, None):
+                raise NotImplementedError('%s not supported' % key)
+        if "Connection" not in self.request.headers:
+            self.request.headers["Connection"] = "close"
+        if "Host" not in self.request.headers:
+            if '@' in self.parsed.netloc:
+                self.request.headers["Host"] = self.parsed.netloc.rpartition('@')[-1]
+            else:
+                self.request.headers["Host"] = self.parsed.netloc
+        username, password = None, None
+        if self.parsed.username is not None:
+            username, password = self.parsed.username, self.parsed.password
+        elif self.request.auth_username is not None:
+            username = self.request.auth_username
+            password = self.request.auth_password or ''
+        if username is not None:
+            if self.request.auth_mode not in (None, "basic"):
+                raise ValueError("unsupported auth_mode %s",
+                                 self.request.auth_mode)
+            auth = utf8(username) + b":" + utf8(password)
+            self.request.headers["Authorization"] = (b"Basic " +
+                                                     base64.b64encode(auth))
+        if self.request.user_agent:
+            self.request.headers["User-Agent"] = self.request.user_agent
+        if not self.request.allow_nonstandard_methods:
+            body_expected = self.request.method in ("POST", "PATCH", "PUT")
+            body_present = (self.request.body is not None or
+                            self.request.body_producer is not None)
+            if ((body_expected and not body_present) or
+                    (body_present and not body_expected)):
+                raise ValueError(
+                    'Body must %sbe None for method %s (unless '
+                    'allow_nonstandard_methods is true)' %
+                    ('not ' if body_expected else '', self.request.method))
+        if self.request.expect_100_continue:
+            self.request.headers["Expect"] = "100-continue"
+        if self.request.body is not None:
+            self.request.headers["Content-Length"] = str(len(
+                self.request.body))
+        if (self.request.method == "POST" and
+                "Content-Type" not in self.request.headers):
+            self.request.headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if self.request.decompress_response:
+            self.request.headers["Accept-Encoding"] = "gzip"
+        req_path = ((self.parsed.path or '/') +
+                    (('?' + self.parsed.query) if self.parsed.query else ''))
+        self.connection = self._create_connection(stream)
+        start_line = httputil.RequestStartLine(self.request.method,
+                                               req_path, '')
+        self.connection.write_headers(start_line, self.request.headers)
+        if self.request.expect_100_continue:
+            self._read_response()
+        else:
+            self._write_body(True)
+    def _create_connection(self, stream):
+        stream.set_nodelay(True)
+        connection = HTTP1Connection(
+            stream, True,
+            HTTP1ConnectionParameters(
+                no_keep_alive=True,
+                max_header_size=self.max_header_size,
+                max_body_size=self.max_body_size,
+                decompress=self.request.decompress_response),
+            self._sockaddr)
+        return connection
+    def _write_body(self, start_read):
+        if self.request.body is not None:
+            self.connection.write(self.request.body)
+        elif self.request.body_producer is not None:
+            fut = self.request.body_producer(self.connection.write)
+            if fut is not None:
+                fut = gen.convert_yielded(fut)
+                def on_body_written(fut):
+                    fut.result()
+                    self.connection.finish()
+                    if start_read:
+                        self._read_response()
+                self.io_loop.add_future(fut, on_body_written)
+                return
+        self.connection.finish()
+        if start_read:
+            self._read_response()
+    def _read_response(self):
+        self.io_loop.add_future(
+            self.connection.read_response(self),
+            lambda f: f.result())
+    def _release(self):
+        if self.release_callback is not None:
+            release_callback = self.release_callback
+            self.release_callback = None
+            release_callback()
+    def _run_callback(self, response):
+        self._release()
+        if self.final_callback is not None:
+            final_callback = self.final_callback
+            self.final_callback = None
+            self.io_loop.add_callback(final_callback, response)
+    def _handle_exception(self, typ, value, tb):
+        if self.final_callback:
+            self._remove_timeout()
+            if isinstance(value, StreamClosedError):
+                if value.real_error is None:
+                    value = HTTPError(599, "Stream closed")
+                else:
+                    value = value.real_error
+            self._run_callback(HTTPResponse(self.request, 599, error=value,
+                                            request_time=self.io_loop.time() - self.start_time,
+                                            ))
+            if hasattr(self, "stream"):
+                self.stream.close()
+            return True
+        else:
+            return isinstance(value, StreamClosedError)
+    def on_connection_close(self):
+        if self.final_callback is not None:
+            message = "Connection closed"
+            if self.stream.error:
+                raise self.stream.error
+            try:
+                raise HTTPError(599, message)
+            except HTTPError:
+                self._handle_exception(*sys.exc_info())
+    def headers_received(self, first_line, headers):
+        if self.request.expect_100_continue and first_line.code == 100:
+            self._write_body(False)
+            return
+        self.code = first_line.code
+        self.reason = first_line.reason
+        self.headers = headers
+        if self._should_follow_redirect():
+            return
+        if self.request.header_callback is not None:
+            self.request.header_callback('%s %s %s\r\n' % first_line)
+            for k, v in self.headers.get_all():
+                self.request.header_callback("%s: %s\r\n" % (k, v))
+            self.request.header_callback('\r\n')
+    def _should_follow_redirect(self):
+        return (self.request.follow_redirects and
+                self.request.max_redirects &gt; 0 and
+                self.code in (301, 302, 303, 307, 308))
+    def finish(self):
+        data = b''.join(self.chunks)
+        self._remove_timeout()
+        original_request = getattr(self.request, "original_request",
+                                   self.request)
+        if self._should_follow_redirect():
+            assert isinstance(self.request, _RequestProxy)
+            new_request = copy.copy(self.request.request)
+            new_request.url = urlparse.urljoin(self.request.url,
+                                               self.headers["Location"])
+            new_request.max_redirects = self.request.max_redirects - 1
+            del new_request.headers["Host"]
+            if self.code in (302, 303):
+                new_request.method = "GET"
+                new_request.body = None
+                for h in ["Content-Length", "Content-Type",
+                          "Content-Encoding", "Transfer-Encoding"]:
+                    try:
+                        del self.request.headers[h]
+                    except KeyError:
+                        pass
+            new_request.original_request = original_request
+            final_callback = self.final_callback
+            self.final_callback = None
+            self._release()
+            self.client.fetch(new_request, final_callback)
+            self._on_end_request()
+            return
+        if self.request.streaming_callback:
+            buffer = BytesIO()
+        else:
+            buffer = BytesIO(data)  # TODO: don't require one big string?
+        response = HTTPResponse(original_request,
+                                self.code, reason=getattr(self, 'reason', None),
+                                headers=self.headers,
+                                request_time=self.io_loop.time() - self.start_time,
+                                buffer=buffer,
+                                effective_url=self.request.url)
+        self._run_callback(response)
+        self._on_end_request()
+    def _on_end_request(self):
+        self.stream.close()
+    def data_received(self, chunk):
+        if self._should_follow_redirect():
+            return
+        if self.request.streaming_callback is not None:
+            self.request.streaming_callback(chunk)
+        else:
+            self.chunks.append(chunk)
+if __name__ == "__main__":
+    AsyncHTTPClient.configure(SimpleAsyncHTTPClient)
+    main()
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -465,1163 +507,1176 @@ Matches for simple_httpclient.py &amp; nspawn.py
 </h3>
 <hr/>
 <pre>
-1 """
-2 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>import errno
-3 import functools
-4 import logging
-5 import os
-6 import re
-7 import shutil
-8 import tempfile
-9 import time
-10 import salt.defaults.exitcodes
-11 import salt.utils.args
-12 import salt.utils.functools
-13 import salt.utils.path
-14 import salt.utils.systemd
-15 from</b></font> salt.exceptions import CommandExecutionError, SaltInvocationError
-16 log = logging.getLogger(__name__)
-17 __func_alias__ = {
-18     "list_": "list",
-19 }
-20 __virtualname__ = "nspawn"
-21 SEED_MARKER = "/nspawn.initial_seed"
-22 WANT = "/etc/systemd/system/multi-user.target.wants/systemd-nspawn@{0}.service"
-23 EXEC_DRIVER = "nsenter"
-24 def __virtual__():
-25     """
-26     Only work on systems that have been booted with systemd
-27     """
-28     if __grains__["kernel"] == "Linux" and salt.utils.systemd.booted(__context__):
-29         if salt.utils.systemd.version() is None:
-30             log.error("nspawn: Unable to determine systemd version")
-31         else:
-32             return __virtualname__
-33     return (
-34         False,
-35         "The nspawn execution module failed to load: "
-36         "only work on systems that have been booted with systemd.",
-37     )
-38 def _sd_version():
-39     """
-40     Returns __context__.get('systemd.version', 0), avoiding duplication of the
-41     call to dict.get and making it easier to change how we handle this context
-42     var in the future
-43     """
-44     return salt.utils.systemd.version(__context__)
-45 def _ensure_exists(wrapped):
-46     """
-47     Decorator to ensure that the named container exists.
-48     """
-49     @functools.wraps(wrapped)
-50     def check_exists(name, *args, **kwargs):
-51         if not exists(name):
-52             raise CommandExecutionError("Container '{}' does not exist".format(name))
-53         return wrapped(name, *args, **salt.utils.args.clean_kwargs(**kwargs))
-54     return check_exists
-55 def _root(name="", all_roots=False):
-56     """
-57     Return the container root directory. Starting with systemd 219, new
-58     images go into /var/lib/machines.
-59     """
-60     if _sd_version() &gt;= 219:
-61         if all_roots:
-62             return [
-63                 os.path.join(x, name)
-64                 for x in ("/var/lib/machines", "/var/lib/container")
-65             ]
-66         else:
-67             return os.path.join("/var/lib/machines", name)
-68     else:
-69         ret = os.path.join("/var/lib/container", name)
-70         if all_roots:
-71             return [ret]
-72         else:
-73             return ret
-74 def _make_container_root(name):
-75     """
-76     Make the container root directory
-77     """
-78     path = _root(name)
-79     if os.path.exists(path):
-80         __context__["retcode"] = salt.defaults.exitcodes.SALT_BUILD_FAIL
-81         raise CommandExecutionError("Container {} already exists".format(name))
-82     else:
-83         try:
-84             os.makedirs(path)
-85             return path
-86         except OSError as exc:
-87             raise CommandExecutionError(
-88                 "Unable to make container root directory {}: {}".format(name, exc)
-89             )
-90 def _build_failed(dst, name):
-91     try:
-92         __context__["retcode"] = salt.defaults.exitcodes.SALT_BUILD_FAIL
-93         shutil.rmtree(dst)
-94     except OSError as exc:
-95         if exc.errno != errno.ENOENT:
-96             raise CommandExecutionError(
-97                 "Unable to cleanup container root dir {}".format(dst)
-98             )
-99     raise CommandExecutionError("Container {} failed to build".format(name))
-100 def _bootstrap_arch(name, **kwargs):
-101     """
-102     Bootstrap an Arch Linux container
-103     """
-104     if not salt.utils.path.which("pacstrap"):
-105         raise CommandExecutionError(
-106             "pacstrap not found, is the arch-install-scripts package installed?"
-107         )
-108     dst = _make_container_root(name)
-109     cmd = "pacstrap -c -d {} base".format(dst)
-110     ret = __salt__["cmd.run_all"](cmd, python_shell=False)
-111     if ret["retcode"] != 0:
-112         _build_failed(dst, name)
-113     return ret
-114 def _bootstrap_debian(name, **kwargs):
-115     """
-116     Bootstrap a Debian Linux container
-117     """
-118     version = kwargs.get("version", False)
-119     if not version:
-120         if __grains__["os"].lower() == "debian":
-121             version = __grains__["osrelease"]
-122         else:
-123             version = "stable"
-124     release_blacklist = [
-125         "hamm",
-126         "slink",
-127         "potato",
-128         "woody",
-129         "sarge",
-130         "etch",
-131         "lenny",
-132         "squeeze",
-133         "wheezy",
-134     ]
-135     if version in release_blacklist:
-136         raise CommandExecutionError(
-137             'Unsupported Debian version "{}". '
-138             'Only "stable" or "jessie" and newer are supported'.format(version)
-139         )
-140     dst = _make_container_root(name)
-141     cmd = "debootstrap --arch=amd64 {} {}".format(version, dst)
-142     ret = __salt__["cmd.run_all"](cmd, python_shell=False)
-143     if ret["retcode"] != 0:
-144         _build_failed(dst, name)
-145     return ret
-146 def _bootstrap_fedora(name, **kwargs):
-147     """
-148     Bootstrap a Fedora container
-149     """
-150     dst = _make_container_root(name)
-151     if not kwargs.get("version", False):
-152         if __grains__["os"].lower() == "fedora":
-153             version = __grains__["osrelease"]
-154         else:
-155             version = "21"
-156     else:
-157         version = "21"
-158     cmd = (
-159         "yum -y --releasever={} --nogpg --installroot={} "
-160         '--disablerepo="*" --enablerepo=fedora install systemd passwd yum '
-161         "fedora-release vim-minimal".format(version, dst)
-162     )
-163     ret = __salt__["cmd.run_all"](cmd, python_shell=False)
-164     if ret["retcode"] != 0:
-165         _build_failed(dst, name)
-166     return ret
-167 def _bootstrap_ubuntu(name, **kwargs):
-168     """
-169     Bootstrap a Ubuntu Linux container
-170     """
-171     version = kwargs.get("version", False)
-172     if not version:
-173         if __grains__["os"].lower() == "ubuntu":
-174             version = __grains__["oscodename"]
-175         else:
-176             version = "xenial"
-177     dst = _make_container_root(name)
-178     cmd = "debootstrap --arch=amd64 {} {}".format(version, dst)
-179     ret = __salt__["cmd.run_all"](cmd, python_shell=False)
-180     if ret["retcode"] != 0:
-181         _build_failed(dst, name)
-182     return ret
-183 def _clear_context():
-184     """
-185     Clear any lxc variables set in __context__
-186     """
-187     for var in [x for x in __context__ if x.startswith("nspawn.")]:
-188         log.trace("Clearing __context__['%s']", var)
-189         __context__.pop(var, None)
-190 def _ensure_running(name):
-191     """
-192     Raise an exception if the container does not exist
-193     """
-194     if state(name) != "running":
-195         return True
-196     else:
-197         return start(name)
-198 def _ensure_systemd(version):
-199     """
-200     Raises an exception if the systemd version is not greater than the
-201     passed version.
-202     """
-203     try:
-204         version = int(version)
-205     except ValueError:
-206         raise CommandExecutionError("Invalid version '{}'".format(version))
-207     try:
-208         installed = _sd_version()
-209         log.debug("nspawn: detected systemd %s", installed)
-210     except (IndexError, ValueError):
-211         raise CommandExecutionError("nspawn: Unable to get systemd version")
-212     if installed &lt; version:
-213         raise CommandExecutionError(
-214             "This function requires systemd &gt;= {} (Detected version: {}).".format(
-215                 version, installed
-216             )
-217         )
-218 def _machinectl(cmd, output_loglevel="debug", ignore_retcode=False, use_vt=False):
-219     """
-220     Helper function to run machinectl
-221     """
-222     prefix = "machinectl --no-legend --no-pager"
-223     return __salt__["cmd.run_all"](
-224         "{} {}".format(prefix, cmd),
-225         output_loglevel=output_loglevel,
-226         ignore_retcode=ignore_retcode,
-227         use_vt=use_vt,
-228     )
-229 @_ensure_exists
-230 def _run(
-231     name,
-232     cmd,
-233     output=None,
-234     no_start=False,
-235     stdin=None,
-236     python_shell=True,
-237     preserve_state=False,
-238     output_loglevel="debug",
-239     ignore_retcode=False,
-240     use_vt=False,
-241     keep_env=None,
-242 ):
-243     """
-244     Common logic for nspawn.run functions
-245     """
-246     orig_state = state(name)
-247     exc = None
-248     try:
-249         ret = __salt__["container_resource.run"](
-250             name,
-251             cmd,
-252             container_type=__virtualname__,
-253             exec_driver=EXEC_DRIVER,
-254             output=output,
-255             no_start=no_start,
-256             stdin=stdin,
-257             python_shell=python_shell,
-258             output_loglevel=output_loglevel,
-259             ignore_retcode=ignore_retcode,
-260             use_vt=use_vt,
-261             keep_env=keep_env,
-262         )
-263     finally:
-264         if preserve_state and orig_state == "stopped" and state(name) != "stopped":
-265             stop(name)
-266     if output in (None, "all"):
-267         return ret
-268     else:
-269         return ret[output]
-270 @_ensure_exists
-271 def pid(name):
-272     """
-273     Returns the PID of a container
-274     name
-275         Container name
-276     CLI Example:
-277     .. code-block:: bash
-278         salt myminion nspawn.pid arch1
-279     """
-280     try:
-281         return int(info(name).get("PID"))
-282     except (TypeError, ValueError) as exc:
-283         raise CommandExecutionError(
-284             "Unable to get PID for container '{}': {}".format(name, exc)
-285         )
-286 def run(
-287     name,
-288     cmd,
-289     no_start=False,
-290     preserve_state=True,
-291     stdin=None,
-292     python_shell=True,
-293     output_loglevel="debug",
-294     use_vt=False,
-295     ignore_retcode=False,
-296     keep_env=None,
-297 ):
-298     """
-299     Run :mod:`cmd.run &lt;salt.modules.cmdmod.run&gt;` within a container
-300     name
-301         Name of the container in which to run the command
-302     cmd
-303         Command to run
-304     no_start : False
-305         If the container is not running, don't start it
-306     preserve_state : True
-307         After running the command, return the container to its previous state
-308     stdin : None
-309         Standard input to be used for the command
-310     output_loglevel : debug
-311         Level at which to log the output from the command. Set to ``quiet`` to
-312         suppress logging.
-313     use_vt : False
-314         Use SaltStack's utils.vt to stream output to console.
-315     keep_env : None
-316         If not passed, only a sane default PATH environment variable will be
-317         set. If ``True``, all environment variables from the container's host
-318         will be kept. Otherwise, a comma-separated list (or Python list) of
-319         environment variable names can be passed, and those environment
-320         variables will be kept.
-321     CLI Example:
-322     .. code-block:: bash
-323         salt myminion nspawn.run mycontainer 'ifconfig -a'
-324     """
-325     return _run(
-326         name,
-327         cmd,
-328         output=None,
-329         no_start=no_start,
-330         preserve_state=preserve_state,
-331         stdin=stdin,
-332         python_shell=python_shell,
-333         output_loglevel=output_loglevel,
-334         use_vt=use_vt,
-335         ignore_retcode=ignore_retcode,
-336         keep_env=keep_env,
-337     )
-338 def run_stdout(
-339     name,
-340     cmd,
-341     no_start=False,
-342     preserve_state=True,
-343     stdin=None,
-344     python_shell=True,
-345     output_loglevel="debug",
-346     use_vt=False,
-347     ignore_retcode=False,
-348     keep_env=None,
-349 ):
-350     """
-351     Run :mod:`cmd.run_stdout &lt;salt.modules.cmdmod.run_stdout&gt;` within a container
-352     name
-353         Name of the container in which to run the command
-354     cmd
-355         Command to run
-356     no_start : False
-357         If the container is not running, don't start it
-358     preserve_state : True
-359         After running the command, return the container to its previous state
-360     stdin : None
-361         Standard input to be used for the command
-362     output_loglevel : debug
-363         Level at which to log the output from the command. Set to ``quiet`` to
-364         suppress logging.
-365     use_vt : False
-366         Use SaltStack's utils.vt to stream output to console. Assumes
-367         ``output=all``.
-368     keep_env : None
-369         If not passed, only a sane default PATH environment variable will be
-370         set. If ``True``, all environment variables from the container's host
-371         will be kept. Otherwise, a comma-separated list (or Python list) of
-372         environment variable names can be passed, and those environment
-373         variables will be kept.
-374     CLI Example:
-375     .. code-block:: bash
-376         salt myminion nspawn.run_stdout mycontainer 'ifconfig -a'
-377     """
-378     return _run(
-379         name,
-380         cmd,
-381         output="stdout",
-382         no_start=no_start,
-383         preserve_state=preserve_state,
-384         stdin=stdin,
-385         python_shell=python_shell,
-386         output_loglevel=output_loglevel,
-387         use_vt=use_vt,
-388         ignore_retcode=ignore_retcode,
-389         keep_env=keep_env,
-390     )
-391 def run_stderr(
-392     name,
-393     cmd,
-394     no_start=False,
-395     preserve_state=True,
-396     stdin=None,
-397     python_shell=True,
-398     output_loglevel="debug",
-399     use_vt=False,
-400     ignore_retcode=False,
-401     keep_env=None,
-402 ):
-403     """
-404     Run :mod:`cmd.run_stderr &lt;salt.modules.cmdmod.run_stderr&gt;` within a container
-405     name
-406         Name of the container in which to run the command
-407     cmd
-408         Command to run
-409     no_start : False
-410         If the container is not running, don't start it
-411     preserve_state : True
-412         After running the command, return the container to its previous state
-413     stdin : None
-414         Standard input to be used for the command
-415     output_loglevel : debug
-416         Level at which to log the output from the command. Set to ``quiet`` to
-417         suppress logging.
-418     use_vt : False
-419         Use SaltStack's utils.vt to stream output to console. Assumes
-420         ``output=all``.
-421     keep_env : None
-422         If not passed, only a sane default PATH environment variable will be
-423         set. If ``True``, all environment variables from the container's host
-424         will be kept. Otherwise, a comma-separated list (or Python list) of
-425         environment variable names can be passed, and those environment
-426         variables will be kept.
-427     CLI Example:
-428     .. code-block:: bash
-429         salt myminion nspawn.run_stderr mycontainer 'ip addr show'
-430     """
-431     return _run(
-432         name,
-433         cmd,
-434         output="stderr",
-435         no_start=no_start,
-436         preserve_state=preserve_state,
-437         stdin=stdin,
-438         python_shell=python_shell,
-439         output_loglevel=output_loglevel,
-440         use_vt=use_vt,
-441         ignore_retcode=ignore_retcode,
-442         keep_env=keep_env,
-443     )
-444 def retcode(
-445     name,
-446     cmd,
-447     no_start=False,
-448     preserve_state=True,
-449     stdin=None,
-450     python_shell=True,
-451     output_loglevel="debug",
-452     use_vt=False,
-453     ignore_retcode=False,
-454     keep_env=None,
-455 ):
-456     """
-457     Run :mod:`cmd.retcode &lt;salt.modules.cmdmod.retcode&gt;` within a container
-458     name
-459         Name of the container in which to run the command
-460     cmd
-461         Command to run
-462     no_start : False
-463         If the container is not running, don't start it
-464     preserve_state : True
-465         After running the command, return the container to its previous state
-466     stdin : None
-467         Standard input to be used for the command
-468     output_loglevel : debug
-469         Level at which to log the output from the command. Set to ``quiet`` to
-470         suppress logging.
-471     use_vt : False
-472         Use SaltStack's utils.vt to stream output to console. Assumes
-473         ``output=all``.
-474     keep_env : None
-475         If not passed, only a sane default PATH environment variable will be
-476         set. If ``True``, all environment variables from the container's host
-477         will be kept. Otherwise, a comma-separated list (or Python list) of
-478         environment variable names can be passed, and those environment
-479         variables will be kept.
-480     CLI Example:
-481     .. code-block:: bash
-482         salt myminion nspawn.retcode mycontainer 'ip addr show'
-483     """
-484     return _run(
-485         name,
-486         cmd,
-487         output="retcode",
-488         no_start=no_start,
-489         preserve_state=preserve_state,
-490         stdin=stdin,
-491         python_shell=python_shell,
-492         output_loglevel=output_loglevel,
-493         use_vt=use_vt,
-494         ignore_retcode=ignore_retcode,
-495         keep_env=keep_env,
-496     )
-497 def run_all(
-498     name,
-499     cmd,
-500     no_start=False,
-501     preserve_state=True,
-502     stdin=None,
-503     python_shell=True,
-504     output_loglevel="debug",
-505     use_vt=False,
-506     ignore_retcode=False,
-507     keep_env=None,
-508 ):
-509     """
-510     Run :mod:`cmd.run_all &lt;salt.modules.cmdmod.run_all&gt;` within a container
-511     .. note::
-512         While the command is run within the container, it is initiated from the
-513         host. Therefore, the PID in the return dict is from the host, not from
-514         the container.
-515     name
-516         Name of the container in which to run the command
-517     cmd
-518         Command to run
-519     no_start : False
-520         If the container is not running, don't start it
-521     preserve_state : True
-522         After running the command, return the container to its previous state
-523     stdin : None
-524         Standard input to be used for the command
-525     output_loglevel : debug
-526         Level at which to log the output from the command. Set to ``quiet`` to
-527         suppress logging.
-528     use_vt : False
-529         Use SaltStack's utils.vt to stream output to console. Assumes
-530         ``output=all``.
-531     keep_env : None
-532         If not passed, only a sane default PATH environment variable will be
-533         set. If ``True``, all environment variables from the container's host
-534         will be kept. Otherwise, a comma-separated list (or Python list) of
-535         environment variable names can be passed, and those environment
-536         variables will be kept.
-537     CLI Example:
-538     .. code-block:: bash
-539         salt myminion nspawn.run_all mycontainer 'ip addr show'
-540     """
-541     return _run(
-542         name,
-543         cmd,
-544         output="all",
-545         no_start=no_start,
-546         preserve_state=preserve_state,
-547         stdin=stdin,
-548         python_shell=python_shell,
-549         output_loglevel=output_loglevel,
-550         use_vt=use_vt,
-551         ignore_retcode=ignore_retcode,
-552         keep_env=keep_env,
-553     )
-554 def bootstrap_container(name, dist=None, version=None):
-555     """
-556     Bootstrap a container from package servers, if dist is None the os the
-557     minion is running as will be created, otherwise the needed bootstrapping
-558     tools will need to be available on the host.
-559     CLI Example:
-560     .. code-block:: bash
-561         salt myminion nspawn.bootstrap_container &lt;name&gt;
-562     """
-563     if not dist:
-564         dist = __grains__["os"].lower()
-565         log.debug("nspawn.bootstrap: no dist provided, defaulting to '%s'", dist)
-566     try:
-567         return globals()["_bootstrap_{}".format(dist)](name, version=version)
-568     except KeyError:
-569         raise CommandExecutionError('Unsupported distribution "{}"'.format(dist))
-570 def _needs_install(name):
-571     ret = 0
-572     has_minion = retcode(name, "command -v salt-minion")
-573     if has_minion:
-574         processes = run_stdout(name, "ps aux")
-575         if "salt-minion" not in processes:
-576             ret = 1
-577         else:
-578             retcode(name, "salt-call --local service.stop salt-minion")
-579     else:
-580         ret = 1
-581     return ret
-582 def bootstrap_salt(
-583     name,
-584     config=None,
-585     approve_key=True,
-586     install=True,
-587     pub_key=None,
-588     priv_key=None,
-589     bootstrap_url=None,
-590     force_install=False,
-591     unconditional_install=False,
-592     bootstrap_delay=None,
-593     bootstrap_args=None,
-594     bootstrap_shell=None,
-595 ):
-596     """
-597     Bootstrap a container from package servers, if dist is None the os the
-598     minion is running as will be created, otherwise the needed bootstrapping
-599     tools will need to be available on the host.
-600     CLI Example:
-601     .. code-block:: bash
-602         salt '*' nspawn.bootstrap_salt arch1
-603     """
-604     if bootstrap_delay is not None:
-605         try:
-606             time.sleep(bootstrap_delay)
-607         except TypeError:
-608             time.sleep(5)
-609     c_info = info(name)
-610     if not c_info:
-611         return None
-612     if bootstrap_args:
-613         if "{0}" not in bootstrap_args:
-614             bootstrap_args += " -c {0}"
-615     else:
-616         bootstrap_args = "-c {0}"
-617     if not bootstrap_shell:
-618         bootstrap_shell = "sh"
-619     orig_state = _ensure_running(name)
-620     if not orig_state:
-621         return orig_state
-622     if not force_install:
-623         needs_install = _needs_install(name)
-624     else:
-625         needs_install = True
-626     seeded = retcode(name, "test -e '{}'".format(SEED_MARKER)) == 0
-627     tmp = tempfile.mkdtemp()
-628     if seeded and not unconditional_install:
-629         ret = True
-630     else:
-631         ret = False
-632         cfg_files = __salt__["seed.mkconfig"](
-633             config,
-634             tmp=tmp,
-635             id_=name,
-636             approve_key=approve_key,
-637             pub_key=pub_key,
-638             priv_key=priv_key,
-639         )
-640         if needs_install or force_install or unconditional_install:
-641             if install:
-642                 rstr = __salt__["test.random_hash"]()
-643                 configdir = "/tmp/.c_{}".format(rstr)
-644                 run(name, "install -m 0700 -d {}".format(configdir), python_shell=False)
-645                 bs_ = __salt__["config.gather_bootstrap_script"](
-646                     bootstrap=bootstrap_url
-647                 )
-648                 dest_dir = os.path.join("/tmp", rstr)
-649                 for cmd in [
-650                     "mkdir -p {}".format(dest_dir),
-651                     "chmod 700 {}".format(dest_dir),
-652                 ]:
-653                     if run_stdout(name, cmd):
-654                         log.error("tmpdir %s creation failed (%s)", dest_dir, cmd)
-655                         return False
-656                 copy_to(name, bs_, "{}/bootstrap.sh".format(dest_dir), makedirs=True)
-657                 copy_to(name, cfg_files["config"], os.path.join(configdir, "minion"))
-658                 copy_to(
-659                     name, cfg_files["privkey"], os.path.join(configdir, "minion.pem")
-660                 )
-661                 copy_to(
-662                     name, cfg_files["pubkey"], os.path.join(configdir, "minion.pub")
-663                 )
-664                 bootstrap_args = bootstrap_args.format(configdir)
-665                 cmd = "{0} {2}/bootstrap.sh {1}".format(
-666                     bootstrap_shell, bootstrap_args.replace("'", "''"), dest_dir
-667                 )
-668                 log.info("Running %s in LXC container '%s'", cmd, name)
-669                 ret = retcode(name, cmd, output_loglevel="info", use_vt=True) == 0
-670             else:
-671                 ret = False
-672         else:
-673             minion_config = salt.config.minion_config(cfg_files["config"])
-674             pki_dir = minion_config["pki_dir"]
-675             copy_to(name, cfg_files["config"], "/etc/salt/minion")
-676             copy_to(name, cfg_files["privkey"], os.path.join(pki_dir, "minion.pem"))
-677             copy_to(name, cfg_files["pubkey"], os.path.join(pki_dir, "minion.pub"))
-678             run(
-679                 name, "salt-call --local service.enable salt-minion", python_shell=False
-680             )
-681             ret = True
-682         shutil.rmtree(tmp)
-683         if orig_state == "stopped":
-684             stop(name)
-685         if ret:
-686             run(name, "touch '{}'".format(SEED_MARKER), python_shell=False)
-687     return ret
-688 def list_all():
-689     """
-690     Lists all nspawn containers
-691     CLI Example:
-692     .. code-block:: bash
-693         salt myminion nspawn.list_all
-694     """
-695     ret = []
-696     if _sd_version() &gt;= 219:
-697         for line in _machinectl("list-images")["stdout"].splitlines():
-698             try:
-699                 ret.append(line.split()[0])
-700             except IndexError:
-701                 continue
-702     else:
-703         rootdir = _root()
-704         try:
-705             for dirname in os.listdir(rootdir):
-706                 if os.path.isdir(os.path.join(rootdir, dirname)):
-707                     ret.append(dirname)
-708         except OSError:
-709             pass
-710     return ret
-711 def list_running():
-712     """
-713     Lists running nspawn containers
-714     .. note::
-715         ``nspawn.list`` also works to list running containers
-716     CLI Example:
-717     .. code-block:: bash
-718         salt myminion nspawn.list_running
-719         salt myminion nspawn.list
-720     """
-721     ret = []
-722     for line in _machinectl("list")["stdout"].splitlines():
-723         try:
-724             ret.append(line.split()[0])
-725         except IndexError:
-726             pass
-727     return sorted(ret)
-728 list_ = salt.utils.functools.alias_function(list_running, "list_")
-729 def list_stopped():
-730     """
-731     Lists stopped nspawn containers
-732     CLI Example:
-733     .. code-block:: bash
-734         salt myminion nspawn.list_stopped
-735     """
-736     return sorted(set(list_all()) - set(list_running()))
-737 def exists(name):
-738     """
-739     Returns true if the named container exists
-740     CLI Example:
-741     .. code-block:: bash
-742         salt myminion nspawn.exists &lt;name&gt;
-743     """
-744     contextkey = "nspawn.exists.{}".format(name)
-745     if contextkey in __context__:
-746         return __context__[contextkey]
-747     __context__[contextkey] = name in list_all()
-748     return __context__[contextkey]
-749 @_ensure_exists
-750 def state(name):
-751     """
-752     Return state of container (running or stopped)
-753     CLI Example:
-754     .. code-block:: bash
-755         salt myminion nspawn.state &lt;name&gt;
-756     """
-757     try:
-758         cmd = "show {} --property=State".format(name)
-759         return _machinectl(cmd, ignore_retcode=True)["stdout"].split("=")[-1]
-760     except IndexError:
-761         return "stopped"
-762 def info(name, **kwargs):
-763     """
-764     Return info about a container
-765     .. note::
-766         The container must be running for ``machinectl`` to gather information
-767         about it. If the container is stopped, then this function will start
-768         it.
-769     start : False
-770         If ``True``, then the container will be started to retrieve the info. A
-771         ``Started`` key will be in the return data if the container was
-772         started.
-773     CLI Example:
-774     .. code-block:: bash
-775         salt myminion nspawn.info arch1
-776         salt myminion nspawn.info arch1 force_start=False
-777     """
-778     kwargs = salt.utils.args.clean_kwargs(**kwargs)
-779     start_ = kwargs.pop("start", False)
-780     if kwargs:
-781         salt.utils.args.invalid_kwargs(kwargs)
-782     if not start_:
-783         _ensure_running(name)
-784     elif name not in list_running():
-785         start(name)
-786     c_info = _machinectl("status {}".format(name))
-787     if c_info["retcode"] != 0:
-788         raise CommandExecutionError(
-789             "Unable to get info for container '{}'".format(name)
-790         )
-791     key_name_map = {
-792         "Iface": "Network Interface",
-793         "Leader": "PID",
-794         "Service": False,
-795         "Since": "Running Since",
-796     }
-797     ret = {}
-798     kv_pair = re.compile(r"^\s+([A-Za-z]+): (.+)$")
-799     tree = re.compile(r"[|`]")
-800     lines = c_info["stdout"].splitlines()
-801     multiline = False
-802     cur_key = None
-803     for idx, line in enumerate(lines):
-804         match = kv_pair.match(line)
-805         if match:
-806             key, val = match.groups()
-807             key = key_name_map.get(key, key)
-808             if key is False:
-809                 continue
-810             elif key == "PID":
-811                 try:
-812                     val = val.split()[0]
-813                 except IndexError:
-814                     pass
-815             cur_key = key
-816             if multiline:
-817                 multiline = False
-818             ret[key] = val
-819         else:
-820             if cur_key is None:
-821                 continue
-822             if tree.search(lines[idx]):
-823                 break
-824             if multiline:
-825                 ret[cur_key].append(lines[idx].strip())
-826             else:
-827                 ret[cur_key] = [ret[key], lines[idx].strip()]
-828                 multiline = True
-829     return ret
-830 @_ensure_exists
-831 def enable(name):
-832     """
-833     Set the named container to be launched at boot
-834     CLI Example:
-835     .. code-block:: bash
-836         salt myminion nspawn.enable &lt;name&gt;
-837     """
-838     cmd = "systemctl enable systemd-nspawn@{}".format(name)
-839     if __salt__["cmd.retcode"](cmd, python_shell=False) != 0:
-840         __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
-841         return False
-842     return True
-843 @_ensure_exists
-844 def disable(name):
-845     """
-846     Set the named container to *not* be launched at boot
-847     CLI Example:
-848     .. code-block:: bash
-849         salt myminion nspawn.enable &lt;name&gt;
-850     """
-851     cmd = "systemctl disable systemd-nspawn@{}".format(name)
-852     if __salt__["cmd.retcode"](cmd, python_shell=False) != 0:
-853         __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
-854         return False
-855     return True
-856 @_ensure_exists
-857 def start(name):
-858     """
-859     Start the named container
-860     CLI Example:
-861     .. code-block:: bash
-862         salt myminion nspawn.start &lt;name&gt;
-863     """
-864     if _sd_version() &gt;= 219:
-865         ret = _machinectl("start {}".format(name))
-866     else:
-867         cmd = "systemctl start systemd-nspawn@{}".format(name)
-868         ret = __salt__["cmd.run_all"](cmd, python_shell=False)
-869     if ret["retcode"] != 0:
-870         __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
-871         return False
-872     return True
-873 @_ensure_exists
-874 def stop(name, kill=False):
-875     """
-876     This is a compatibility function which provides the logic for
-877     nspawn.poweroff and nspawn.terminate.
-878     """
-879     if _sd_version() &gt;= 219:
-880         if kill:
-881             action = "terminate"
-882         else:
-883             action = "poweroff"
-884         ret = _machinectl("{} {}".format(action, name))
-885     else:
-886         cmd = "systemctl stop systemd-nspawn@{}".format(name)
-887         ret = __salt__["cmd.run_all"](cmd, python_shell=False)
-888     if ret["retcode"] != 0:
-889         __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
-890         return False
-891     return True
-892 def poweroff(name):
-893     """
-894     Issue a clean shutdown to the container.  Equivalent to running
-895     ``machinectl poweroff`` on the named container.
-896     For convenience, running ``nspawn.stop``(as shown in the CLI examples
-897     below) is equivalent to running ``nspawn.poweroff``.
-898     .. note::
-899         ``machinectl poweroff`` is only supported in systemd &gt;= 219. On earlier
-900         systemd versions, running this function will simply issue a clean
-901         shutdown via ``systemctl``.
-902     CLI Examples:
-903     .. code-block:: bash
-904         salt myminion nspawn.poweroff arch1
-905         salt myminion nspawn.stop arch1
-906     """
-907     return stop(name, kill=False)
-908 def terminate(name):
-909     """
-910     Kill all processes in the container without issuing a clean shutdown.
-911     Equivalent to running ``machinectl terminate`` on the named container.
-912     For convenience, running ``nspawn.stop`` and passing ``kill=True`` (as
-913     shown in the CLI examples below) is equivalent to running
-914     ``nspawn.terminate``.
-915     .. note::
-916         ``machinectl terminate`` is only supported in systemd &gt;= 219. On
-917         earlier systemd versions, running this function will simply issue a
-918         clean shutdown via ``systemctl``.
-919     CLI Examples:
-920     .. code-block:: bash
-921         salt myminion nspawn.terminate arch1
-922         salt myminion nspawn.stop arch1 kill=True
-923     """
-924     return stop(name, kill=True)
-925 def restart(name):
-926     """
-927     This is a compatibility function which simply calls nspawn.reboot.
-928     """
-929     return reboot(name)
-930 @_ensure_exists
-931 def reboot(name, kill=False):
-932     """
-933     Reboot the container by sending a SIGINT to its init process. Equivalent
-934     to running ``machinectl reboot`` on the named container.
-935     For convenience, running ``nspawn.restart`` (as shown in the CLI examples
-936     below) is equivalent to running ``nspawn.reboot``.
-937     .. note::
-938         ``machinectl reboot`` is only supported in systemd &gt;= 219. On earlier
-939         systemd versions, running this function will instead restart the
-940         container via ``systemctl``.
-941     CLI Examples:
-942     .. code-block:: bash
-943         salt myminion nspawn.reboot arch1
-944         salt myminion nspawn.restart arch1
-945     """
-946     if _sd_version() &gt;= 219:
-947         if state(name) == "running":
-948             ret = _machinectl("reboot {}".format(name))
-949         else:
-950             return start(name)
-951     else:
-952         cmd = "systemctl stop systemd-nspawn@{}".format(name)
-953         ret = __salt__["cmd.run_all"](cmd, python_shell=False)
-954         if ret["retcode"] != 0:
-955             __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
-956             return False
-957         cmd = "systemctl start systemd-nspawn@{}".format(name)
-958         ret = __salt__["cmd.run_all"](cmd, python_shell=False)
-959     if ret["retcode"] != 0:
-960         __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
-961         return False
-962     return True
-963 @_ensure_exists
-964 def remove(name, stop=False):
-965     """
-966     Remove the named container
-967     .. warning::
-968         This function will remove all data associated with the container. It
-969         will not, however, remove the btrfs subvolumes created by pulling
-970         container images (:mod:`nspawn.pull_raw
-971         &lt;salt.modules.nspawn.pull_raw&gt;`, :mod:`nspawn.pull_tar
-972         &lt;salt.modules.nspawn.pull_tar&gt;`, :mod:`nspawn.pull_dkr
-973         &lt;salt.modules.nspawn.pull_dkr&gt;`).
-974     stop : False
-975         If ``True``, the container will be destroyed even if it is
-976         running/frozen.
-977     CLI Examples:
-978     .. code-block:: bash
-979         salt '*' nspawn.remove foo
-980         salt '*' nspawn.remove foo stop=True
-981     """
-982     if not stop and state(name) != "stopped":
-983         raise CommandExecutionError("Container '{}' is not stopped".format(name))
-984     def _failed_remove(name, exc):
-985         raise CommandExecutionError(
-986             "Unable to remove container '{}': {}".format(name, exc)
-987         )
-988     if _sd_version() &gt;= 219:
-989         ret = _machinectl("remove {}".format(name))
-990         if ret["retcode"] != 0:
-991             __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
-992             _failed_remove(name, ret["stderr"])
-993     else:
-994         try:
-995             shutil.rmtree(os.path.join(_root(), name))
-996         except OSError as exc:
-997             _failed_remove(name, exc)
-998     return True
-999 destroy = salt.utils.functools.alias_function(remove, "destroy")
-1000 @_ensure_exists
-1001 def copy_to(name, source, dest, overwrite=False, makedirs=False):
-1002     """
-1003     Copy a file from the host into a container
-1004     name
-1005         Container name
-1006     source
-1007         File to be copied to the container
-1008     dest
-1009         Destination on the container. Must be an absolute path.
-1010     overwrite : False
-1011         Unless this option is set to ``True``, then if a file exists at the
-1012         location specified by the ``dest`` argument, an error will be raised.
-1013     makedirs : False
-1014         Create the parent directory on the container if it does not already
-1015         exist.
-1016     CLI Example:
-1017     .. code-block:: bash
-1018         salt 'minion' nspawn.copy_to /tmp/foo /root/foo
-1019     """
-1020     path = source
-1021     try:
-1022         if source.startswith("salt://"):
-1023             cached_source = __salt__["cp.cache_file"](source)
-1024             if not cached_source:
-1025                 raise CommandExecutionError("Unable to cache {}".format(source))
-1026             path = cached_source
-1027     except AttributeError:
-1028         raise SaltInvocationError("Invalid source file {}".format(source))
-1029     if _sd_version() &gt;= 219:
-1030         pass
-1031     return __salt__["container_resource.copy_to"](
-1032         name,
-1033         path,
-1034         dest,
-1035         container_type=__virtualname__,
-1036         exec_driver=EXEC_DRIVER,
-1037         overwrite=overwrite,
-1038         makedirs=makedirs,
-1039     )
-1040 cp = salt.utils.functools.alias_function(copy_to, "cp")
-1041 def _pull_image(pull_type, image, name, **kwargs):
-1042     """
-1043     Common logic for machinectl pull-* commands
-1044     """
-1045     _ensure_systemd(219)
-1046     if exists(name):
-1047         raise SaltInvocationError("Container '{}' already exists".format(name))
-1048     if pull_type in ("raw", "tar"):
-1049         valid_kwargs = ("verify",)
-1050     elif pull_type == "dkr":
-1051         valid_kwargs = ("index",)
-1052     else:
-1053         raise SaltInvocationError("Unsupported image type '{}'".format(pull_type))
-1054     kwargs = salt.utils.args.clean_kwargs(**kwargs)
-1055     bad_kwargs = {
-1056         x: y
-1057         for x, y in salt.utils.args.clean_kwargs(**kwargs).items()
-1058         if x not in valid_kwargs
-1059     }
-1060     if bad_kwargs:
-1061         salt.utils.args.invalid_kwargs(bad_kwargs)
-1062     pull_opts = []
-1063     if pull_type in ("raw", "tar"):
-1064         verify = kwargs.get("verify", False)
-1065         if not verify:
-1066             pull_opts.append("--verify=no")
-1067         else:
-1068             def _bad_verify():
-1069                 raise SaltInvocationError(
-1070                     "'verify' must be one of the following: signature, checksum"
-1071                 )
-1072             try:
-1073                 verify = verify.lower()
-1074             except AttributeError:
-1075                 _bad_verify()
-1076             else:
-1077                 if verify not in ("signature", "checksum"):
-1078                     _bad_verify()
-1079                 pull_opts.append("--verify={}".format(verify))
-1080     elif pull_type == "dkr":
-1081         if "index" in kwargs:
-1082             pull_opts.append("--dkr-index-url={}".format(kwargs["index"]))
-1083     cmd = "pull-{} {} {} {}".format(pull_type, " ".join(pull_opts), image, name)
-1084     result = _machinectl(cmd, use_vt=True)
-1085     if result["retcode"] != 0:
-1086         msg = (
-1087             "Error occurred pulling image. Stderr from the pull command "
-1088             "(if any) follows: "
-1089         )
-1090         if result["stderr"]:
-1091             msg += "\n\n{}".format(result["stderr"])
-1092         raise CommandExecutionError(msg)
-1093     return True
-1094 def pull_raw(url, name, verify=False):
-1095     """
-1096     Execute a ``machinectl pull-raw`` to download a .qcow2 or raw disk image,
-1097     and add it to /var/lib/machines as a new container.
-1098     .. note::
-1099         **Requires systemd &gt;= 219**
-1100     url
-1101         URL from which to download the container
-1102     name
-1103         Name for the new container
-1104     verify : False
-1105         Perform signature or checksum verification on the container. See the
-1106         ``machinectl(1)`` man page (section titled "Image Transfer Commands")
-1107         for more information on requirements for image verification. To perform
-1108         signature verification, use ``verify=signature``. For checksum
-1109         verification, use ``verify=checksum``. By default, no verification will
-1110         be performed.
-1111     CLI Examples:
-1112     .. code-block:: bash
-1113         salt myminion nspawn.pull_raw http://ftp.halifax.rwth-aachen.de/fedora/linux/releases/21/Cloud/Images/x86_64/Fedora-Cloud-Base-20141203-21.x86_64.raw.xz fedora21
-1114     """
-1115     return _pull_image("raw", url, name, verify=verify)
-1116 def pull_tar(url, name, verify=False):
-1117     """
-1118     Execute a ``machinectl pull-raw`` to download a .tar container image,
-1119     and add it to /var/lib/machines as a new container.
-1120     .. note::
-1121         **Requires systemd &gt;= 219**
-1122     url
-1123         URL from which to download the container
-1124     name
-1125         Name for the new container
-1126     verify : False
-1127         Perform signature or checksum verification on the container. See the
-1128         ``machinectl(1)`` man page (section titled "Image Transfer Commands")
-1129         for more information on requirements for image verification. To perform
-1130         signature verification, use ``verify=signature``. For checksum
-1131         verification, use ``verify=checksum``. By default, no verification will
-1132         be performed.
-1133     CLI Examples:
-1134     .. code-block:: bash
-1135         salt myminion nspawn.pull_tar http://foo.domain.tld/containers/archlinux-2015.02.01.tar.gz arch2
-1136     """
-1137     return _pull_image("tar", url, name, verify=verify)
-1138 def pull_dkr(url, name, index):
-1139     """
-1140     Execute a ``machinectl pull-dkr`` to download a docker image and add it to
-1141     /var/lib/machines as a new container.
-1142     .. note::
-1143         **Requires systemd &gt;= 219**
-1144     url
-1145         URL from which to download the container
-1146     name
-1147         Name for the new container
-1148     index
-1149         URL of the Docker index server from which to pull (must be an
-1150         ``http://`` or ``https://`` URL).
-1151     CLI Examples:
-1152     .. code-block:: bash
-1153         salt myminion nspawn.pull_dkr centos/centos6 cent6 index=https://get.docker.com
-1154         salt myminion nspawn.pull_docker centos/centos6 cent6 index=https://get.docker.com
-1155     """
-1156     return _pull_image("dkr", url, name, index=index)
-1157 pull_docker = salt.utils.functools.alias_function(pull_dkr, "pull_docker")
+"""
+Manage nspawn containers
+.. versionadded:: 2015.8.0
+`systemd-nspawn(1)`__ is a tool used to manage lightweight namespace
+containers. This execution module provides several functions to help manage
+these containers.
+.. __: http://www.freedesktop.org/software/systemd/man/systemd-nspawn.html
+Minions running systemd &gt;= 219 will place new containers in
+``/var/lib/machines``, while those running systemd &lt; 219 will place them in
+``/var/lib/container``.
+.. note:
+    ``nsenter(1)`` is required to run commands within containers. It should
+    already be present on any systemd host, as part of the **util-linux**
+    package.
+<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>import errno
+import functools
+import logging
+import os
+import re
+import shutil
+import tempfile
+import time
+import salt.defaults.exitcodes
+import salt.utils.args
+import salt.utils.functools
+import salt.utils.path
+import salt.utils.systemd
+from</b></font> salt.exceptions import CommandExecutionError, SaltInvocationError
+log = logging.getLogger(__name__)
+__func_alias__ = {
+    "list_": "list",
+}
+__virtualname__ = "nspawn"
+SEED_MARKER = "/nspawn.initial_seed"
+WANT = "/etc/systemd/system/multi-user.target.wants/systemd-nspawn@{0}.service"
+EXEC_DRIVER = "nsenter"
+def __virtual__():
+    """
+    Only work on systems that have been booted with systemd
+    """
+    if __grains__["kernel"] == "Linux" and salt.utils.systemd.booted(__context__):
+        if salt.utils.systemd.version() is None:
+            log.error("nspawn: Unable to determine systemd version")
+        else:
+            return __virtualname__
+    return (
+        False,
+        "The nspawn execution module failed to load: "
+        "only work on systems that have been booted with systemd.",
+    )
+def _sd_version():
+    """
+    Returns __context__.get('systemd.version', 0), avoiding duplication of the
+    call to dict.get and making it easier to change how we handle this context
+    var in the future
+    """
+    return salt.utils.systemd.version(__context__)
+def _ensure_exists(wrapped):
+    """
+    Decorator to ensure that the named container exists.
+    """
+    @functools.wraps(wrapped)
+    def check_exists(name, *args, **kwargs):
+        if not exists(name):
+            raise CommandExecutionError("Container '{}' does not exist".format(name))
+        return wrapped(name, *args, **salt.utils.args.clean_kwargs(**kwargs))
+    return check_exists
+def _root(name="", all_roots=False):
+    """
+    Return the container root directory. Starting with systemd 219, new
+    images go into /var/lib/machines.
+    """
+    if _sd_version() &gt;= 219:
+        if all_roots:
+            return [
+                os.path.join(x, name)
+                for x in ("/var/lib/machines", "/var/lib/container")
+            ]
+        else:
+            return os.path.join("/var/lib/machines", name)
+    else:
+        ret = os.path.join("/var/lib/container", name)
+        if all_roots:
+            return [ret]
+        else:
+            return ret
+def _make_container_root(name):
+    """
+    Make the container root directory
+    """
+    path = _root(name)
+    if os.path.exists(path):
+        __context__["retcode"] = salt.defaults.exitcodes.SALT_BUILD_FAIL
+        raise CommandExecutionError("Container {} already exists".format(name))
+    else:
+        try:
+            os.makedirs(path)
+            return path
+        except OSError as exc:
+            raise CommandExecutionError(
+                "Unable to make container root directory {}: {}".format(name, exc)
+            )
+def _build_failed(dst, name):
+    try:
+        __context__["retcode"] = salt.defaults.exitcodes.SALT_BUILD_FAIL
+        shutil.rmtree(dst)
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            raise CommandExecutionError(
+                "Unable to cleanup container root dir {}".format(dst)
+            )
+    raise CommandExecutionError("Container {} failed to build".format(name))
+def _bootstrap_arch(name, **kwargs):
+    """
+    Bootstrap an Arch Linux container
+    """
+    if not salt.utils.path.which("pacstrap"):
+        raise CommandExecutionError(
+            "pacstrap not found, is the arch-install-scripts package installed?"
+        )
+    dst = _make_container_root(name)
+    cmd = "pacstrap -c -d {} base".format(dst)
+    ret = __salt__["cmd.run_all"](cmd, python_shell=False)
+    if ret["retcode"] != 0:
+        _build_failed(dst, name)
+    return ret
+def _bootstrap_debian(name, **kwargs):
+    """
+    Bootstrap a Debian Linux container
+    """
+    version = kwargs.get("version", False)
+    if not version:
+        if __grains__["os"].lower() == "debian":
+            version = __grains__["osrelease"]
+        else:
+            version = "stable"
+    release_blacklist = [
+        "hamm",
+        "slink",
+        "potato",
+        "woody",
+        "sarge",
+        "etch",
+        "lenny",
+        "squeeze",
+        "wheezy",
+    ]
+    if version in release_blacklist:
+        raise CommandExecutionError(
+            'Unsupported Debian version "{}". '
+            'Only "stable" or "jessie" and newer are supported'.format(version)
+        )
+    dst = _make_container_root(name)
+    cmd = "debootstrap --arch=amd64 {} {}".format(version, dst)
+    ret = __salt__["cmd.run_all"](cmd, python_shell=False)
+    if ret["retcode"] != 0:
+        _build_failed(dst, name)
+    return ret
+def _bootstrap_fedora(name, **kwargs):
+    """
+    Bootstrap a Fedora container
+    """
+    dst = _make_container_root(name)
+    if not kwargs.get("version", False):
+        if __grains__["os"].lower() == "fedora":
+            version = __grains__["osrelease"]
+        else:
+            version = "21"
+    else:
+        version = "21"
+    cmd = (
+        "yum -y --releasever={} --nogpg --installroot={} "
+        '--disablerepo="*" --enablerepo=fedora install systemd passwd yum '
+        "fedora-release vim-minimal".format(version, dst)
+    )
+    ret = __salt__["cmd.run_all"](cmd, python_shell=False)
+    if ret["retcode"] != 0:
+        _build_failed(dst, name)
+    return ret
+def _bootstrap_ubuntu(name, **kwargs):
+    """
+    Bootstrap a Ubuntu Linux container
+    """
+    version = kwargs.get("version", False)
+    if not version:
+        if __grains__["os"].lower() == "ubuntu":
+            version = __grains__["oscodename"]
+        else:
+            version = "xenial"
+    dst = _make_container_root(name)
+    cmd = "debootstrap --arch=amd64 {} {}".format(version, dst)
+    ret = __salt__["cmd.run_all"](cmd, python_shell=False)
+    if ret["retcode"] != 0:
+        _build_failed(dst, name)
+    return ret
+def _clear_context():
+    """
+    Clear any lxc variables set in __context__
+    """
+    for var in [x for x in __context__ if x.startswith("nspawn.")]:
+        log.trace("Clearing __context__['%s']", var)
+        __context__.pop(var, None)
+def _ensure_running(name):
+    """
+    Raise an exception if the container does not exist
+    """
+    if state(name) != "running":
+        return True
+    else:
+        return start(name)
+def _ensure_systemd(version):
+    """
+    Raises an exception if the systemd version is not greater than the
+    passed version.
+    """
+    try:
+        version = int(version)
+    except ValueError:
+        raise CommandExecutionError("Invalid version '{}'".format(version))
+    try:
+        installed = _sd_version()
+        log.debug("nspawn: detected systemd %s", installed)
+    except (IndexError, ValueError):
+        raise CommandExecutionError("nspawn: Unable to get systemd version")
+    if installed &lt; version:
+        raise CommandExecutionError(
+            "This function requires systemd &gt;= {} (Detected version: {}).".format(
+                version, installed
+            )
+        )
+def _machinectl(cmd, output_loglevel="debug", ignore_retcode=False, use_vt=False):
+    """
+    Helper function to run machinectl
+    """
+    prefix = "machinectl --no-legend --no-pager"
+    return __salt__["cmd.run_all"](
+        "{} {}".format(prefix, cmd),
+        output_loglevel=output_loglevel,
+        ignore_retcode=ignore_retcode,
+        use_vt=use_vt,
+    )
+@_ensure_exists
+def _run(
+    name,
+    cmd,
+    output=None,
+    no_start=False,
+    stdin=None,
+    python_shell=True,
+    preserve_state=False,
+    output_loglevel="debug",
+    ignore_retcode=False,
+    use_vt=False,
+    keep_env=None,
+):
+    """
+    Common logic for nspawn.run functions
+    """
+    orig_state = state(name)
+    exc = None
+    try:
+        ret = __salt__["container_resource.run"](
+            name,
+            cmd,
+            container_type=__virtualname__,
+            exec_driver=EXEC_DRIVER,
+            output=output,
+            no_start=no_start,
+            stdin=stdin,
+            python_shell=python_shell,
+            output_loglevel=output_loglevel,
+            ignore_retcode=ignore_retcode,
+            use_vt=use_vt,
+            keep_env=keep_env,
+        )
+    finally:
+        if preserve_state and orig_state == "stopped" and state(name) != "stopped":
+            stop(name)
+    if output in (None, "all"):
+        return ret
+    else:
+        return ret[output]
+@_ensure_exists
+def pid(name):
+    """
+    Returns the PID of a container
+    name
+        Container name
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.pid arch1
+    """
+    try:
+        return int(info(name).get("PID"))
+    except (TypeError, ValueError) as exc:
+        raise CommandExecutionError(
+            "Unable to get PID for container '{}': {}".format(name, exc)
+        )
+def run(
+    name,
+    cmd,
+    no_start=False,
+    preserve_state=True,
+    stdin=None,
+    python_shell=True,
+    output_loglevel="debug",
+    use_vt=False,
+    ignore_retcode=False,
+    keep_env=None,
+):
+    """
+    Run :mod:`cmd.run &lt;salt.modules.cmdmod.run&gt;` within a container
+    name
+        Name of the container in which to run the command
+    cmd
+        Command to run
+    no_start : False
+        If the container is not running, don't start it
+    preserve_state : True
+        After running the command, return the container to its previous state
+    stdin : None
+        Standard input to be used for the command
+    output_loglevel : debug
+        Level at which to log the output from the command. Set to ``quiet`` to
+        suppress logging.
+    use_vt : False
+        Use SaltStack's utils.vt to stream output to console.
+    keep_env : None
+        If not passed, only a sane default PATH environment variable will be
+        set. If ``True``, all environment variables from the container's host
+        will be kept. Otherwise, a comma-separated list (or Python list) of
+        environment variable names can be passed, and those environment
+        variables will be kept.
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.run mycontainer 'ifconfig -a'
+    """
+    return _run(
+        name,
+        cmd,
+        output=None,
+        no_start=no_start,
+        preserve_state=preserve_state,
+        stdin=stdin,
+        python_shell=python_shell,
+        output_loglevel=output_loglevel,
+        use_vt=use_vt,
+        ignore_retcode=ignore_retcode,
+        keep_env=keep_env,
+    )
+def run_stdout(
+    name,
+    cmd,
+    no_start=False,
+    preserve_state=True,
+    stdin=None,
+    python_shell=True,
+    output_loglevel="debug",
+    use_vt=False,
+    ignore_retcode=False,
+    keep_env=None,
+):
+    """
+    Run :mod:`cmd.run_stdout &lt;salt.modules.cmdmod.run_stdout&gt;` within a container
+    name
+        Name of the container in which to run the command
+    cmd
+        Command to run
+    no_start : False
+        If the container is not running, don't start it
+    preserve_state : True
+        After running the command, return the container to its previous state
+    stdin : None
+        Standard input to be used for the command
+    output_loglevel : debug
+        Level at which to log the output from the command. Set to ``quiet`` to
+        suppress logging.
+    use_vt : False
+        Use SaltStack's utils.vt to stream output to console. Assumes
+        ``output=all``.
+    keep_env : None
+        If not passed, only a sane default PATH environment variable will be
+        set. If ``True``, all environment variables from the container's host
+        will be kept. Otherwise, a comma-separated list (or Python list) of
+        environment variable names can be passed, and those environment
+        variables will be kept.
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.run_stdout mycontainer 'ifconfig -a'
+    """
+    return _run(
+        name,
+        cmd,
+        output="stdout",
+        no_start=no_start,
+        preserve_state=preserve_state,
+        stdin=stdin,
+        python_shell=python_shell,
+        output_loglevel=output_loglevel,
+        use_vt=use_vt,
+        ignore_retcode=ignore_retcode,
+        keep_env=keep_env,
+    )
+def run_stderr(
+    name,
+    cmd,
+    no_start=False,
+    preserve_state=True,
+    stdin=None,
+    python_shell=True,
+    output_loglevel="debug",
+    use_vt=False,
+    ignore_retcode=False,
+    keep_env=None,
+):
+    """
+    Run :mod:`cmd.run_stderr &lt;salt.modules.cmdmod.run_stderr&gt;` within a container
+    name
+        Name of the container in which to run the command
+    cmd
+        Command to run
+    no_start : False
+        If the container is not running, don't start it
+    preserve_state : True
+        After running the command, return the container to its previous state
+    stdin : None
+        Standard input to be used for the command
+    output_loglevel : debug
+        Level at which to log the output from the command. Set to ``quiet`` to
+        suppress logging.
+    use_vt : False
+        Use SaltStack's utils.vt to stream output to console. Assumes
+        ``output=all``.
+    keep_env : None
+        If not passed, only a sane default PATH environment variable will be
+        set. If ``True``, all environment variables from the container's host
+        will be kept. Otherwise, a comma-separated list (or Python list) of
+        environment variable names can be passed, and those environment
+        variables will be kept.
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.run_stderr mycontainer 'ip addr show'
+    """
+    return _run(
+        name,
+        cmd,
+        output="stderr",
+        no_start=no_start,
+        preserve_state=preserve_state,
+        stdin=stdin,
+        python_shell=python_shell,
+        output_loglevel=output_loglevel,
+        use_vt=use_vt,
+        ignore_retcode=ignore_retcode,
+        keep_env=keep_env,
+    )
+def retcode(
+    name,
+    cmd,
+    no_start=False,
+    preserve_state=True,
+    stdin=None,
+    python_shell=True,
+    output_loglevel="debug",
+    use_vt=False,
+    ignore_retcode=False,
+    keep_env=None,
+):
+    """
+    Run :mod:`cmd.retcode &lt;salt.modules.cmdmod.retcode&gt;` within a container
+    name
+        Name of the container in which to run the command
+    cmd
+        Command to run
+    no_start : False
+        If the container is not running, don't start it
+    preserve_state : True
+        After running the command, return the container to its previous state
+    stdin : None
+        Standard input to be used for the command
+    output_loglevel : debug
+        Level at which to log the output from the command. Set to ``quiet`` to
+        suppress logging.
+    use_vt : False
+        Use SaltStack's utils.vt to stream output to console. Assumes
+        ``output=all``.
+    keep_env : None
+        If not passed, only a sane default PATH environment variable will be
+        set. If ``True``, all environment variables from the container's host
+        will be kept. Otherwise, a comma-separated list (or Python list) of
+        environment variable names can be passed, and those environment
+        variables will be kept.
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.retcode mycontainer 'ip addr show'
+    """
+    return _run(
+        name,
+        cmd,
+        output="retcode",
+        no_start=no_start,
+        preserve_state=preserve_state,
+        stdin=stdin,
+        python_shell=python_shell,
+        output_loglevel=output_loglevel,
+        use_vt=use_vt,
+        ignore_retcode=ignore_retcode,
+        keep_env=keep_env,
+    )
+def run_all(
+    name,
+    cmd,
+    no_start=False,
+    preserve_state=True,
+    stdin=None,
+    python_shell=True,
+    output_loglevel="debug",
+    use_vt=False,
+    ignore_retcode=False,
+    keep_env=None,
+):
+    """
+    Run :mod:`cmd.run_all &lt;salt.modules.cmdmod.run_all&gt;` within a container
+    .. note::
+        While the command is run within the container, it is initiated from the
+        host. Therefore, the PID in the return dict is from the host, not from
+        the container.
+    name
+        Name of the container in which to run the command
+    cmd
+        Command to run
+    no_start : False
+        If the container is not running, don't start it
+    preserve_state : True
+        After running the command, return the container to its previous state
+    stdin : None
+        Standard input to be used for the command
+    output_loglevel : debug
+        Level at which to log the output from the command. Set to ``quiet`` to
+        suppress logging.
+    use_vt : False
+        Use SaltStack's utils.vt to stream output to console. Assumes
+        ``output=all``.
+    keep_env : None
+        If not passed, only a sane default PATH environment variable will be
+        set. If ``True``, all environment variables from the container's host
+        will be kept. Otherwise, a comma-separated list (or Python list) of
+        environment variable names can be passed, and those environment
+        variables will be kept.
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.run_all mycontainer 'ip addr show'
+    """
+    return _run(
+        name,
+        cmd,
+        output="all",
+        no_start=no_start,
+        preserve_state=preserve_state,
+        stdin=stdin,
+        python_shell=python_shell,
+        output_loglevel=output_loglevel,
+        use_vt=use_vt,
+        ignore_retcode=ignore_retcode,
+        keep_env=keep_env,
+    )
+def bootstrap_container(name, dist=None, version=None):
+    """
+    Bootstrap a container from package servers, if dist is None the os the
+    minion is running as will be created, otherwise the needed bootstrapping
+    tools will need to be available on the host.
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.bootstrap_container &lt;name&gt;
+    """
+    if not dist:
+        dist = __grains__["os"].lower()
+        log.debug("nspawn.bootstrap: no dist provided, defaulting to '%s'", dist)
+    try:
+        return globals()["_bootstrap_{}".format(dist)](name, version=version)
+    except KeyError:
+        raise CommandExecutionError('Unsupported distribution "{}"'.format(dist))
+def _needs_install(name):
+    ret = 0
+    has_minion = retcode(name, "command -v salt-minion")
+    if has_minion:
+        processes = run_stdout(name, "ps aux")
+        if "salt-minion" not in processes:
+            ret = 1
+        else:
+            retcode(name, "salt-call --local service.stop salt-minion")
+    else:
+        ret = 1
+    return ret
+def bootstrap_salt(
+    name,
+    config=None,
+    approve_key=True,
+    install=True,
+    pub_key=None,
+    priv_key=None,
+    bootstrap_url=None,
+    force_install=False,
+    unconditional_install=False,
+    bootstrap_delay=None,
+    bootstrap_args=None,
+    bootstrap_shell=None,
+):
+    """
+    Bootstrap a container from package servers, if dist is None the os the
+    minion is running as will be created, otherwise the needed bootstrapping
+    tools will need to be available on the host.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' nspawn.bootstrap_salt arch1
+    """
+    if bootstrap_delay is not None:
+        try:
+            time.sleep(bootstrap_delay)
+        except TypeError:
+            time.sleep(5)
+    c_info = info(name)
+    if not c_info:
+        return None
+    if bootstrap_args:
+        if "{0}" not in bootstrap_args:
+            bootstrap_args += " -c {0}"
+    else:
+        bootstrap_args = "-c {0}"
+    if not bootstrap_shell:
+        bootstrap_shell = "sh"
+    orig_state = _ensure_running(name)
+    if not orig_state:
+        return orig_state
+    if not force_install:
+        needs_install = _needs_install(name)
+    else:
+        needs_install = True
+    seeded = retcode(name, "test -e '{}'".format(SEED_MARKER)) == 0
+    tmp = tempfile.mkdtemp()
+    if seeded and not unconditional_install:
+        ret = True
+    else:
+        ret = False
+        cfg_files = __salt__["seed.mkconfig"](
+            config,
+            tmp=tmp,
+            id_=name,
+            approve_key=approve_key,
+            pub_key=pub_key,
+            priv_key=priv_key,
+        )
+        if needs_install or force_install or unconditional_install:
+            if install:
+                rstr = __salt__["test.random_hash"]()
+                configdir = "/tmp/.c_{}".format(rstr)
+                run(name, "install -m 0700 -d {}".format(configdir), python_shell=False)
+                bs_ = __salt__["config.gather_bootstrap_script"](
+                    bootstrap=bootstrap_url
+                )
+                dest_dir = os.path.join("/tmp", rstr)
+                for cmd in [
+                    "mkdir -p {}".format(dest_dir),
+                    "chmod 700 {}".format(dest_dir),
+                ]:
+                    if run_stdout(name, cmd):
+                        log.error("tmpdir %s creation failed (%s)", dest_dir, cmd)
+                        return False
+                copy_to(name, bs_, "{}/bootstrap.sh".format(dest_dir), makedirs=True)
+                copy_to(name, cfg_files["config"], os.path.join(configdir, "minion"))
+                copy_to(
+                    name, cfg_files["privkey"], os.path.join(configdir, "minion.pem")
+                )
+                copy_to(
+                    name, cfg_files["pubkey"], os.path.join(configdir, "minion.pub")
+                )
+                bootstrap_args = bootstrap_args.format(configdir)
+                cmd = "{0} {2}/bootstrap.sh {1}".format(
+                    bootstrap_shell, bootstrap_args.replace("'", "''"), dest_dir
+                )
+                log.info("Running %s in LXC container '%s'", cmd, name)
+                ret = retcode(name, cmd, output_loglevel="info", use_vt=True) == 0
+            else:
+                ret = False
+        else:
+            minion_config = salt.config.minion_config(cfg_files["config"])
+            pki_dir = minion_config["pki_dir"]
+            copy_to(name, cfg_files["config"], "/etc/salt/minion")
+            copy_to(name, cfg_files["privkey"], os.path.join(pki_dir, "minion.pem"))
+            copy_to(name, cfg_files["pubkey"], os.path.join(pki_dir, "minion.pub"))
+            run(
+                name, "salt-call --local service.enable salt-minion", python_shell=False
+            )
+            ret = True
+        shutil.rmtree(tmp)
+        if orig_state == "stopped":
+            stop(name)
+        if ret:
+            run(name, "touch '{}'".format(SEED_MARKER), python_shell=False)
+    return ret
+def list_all():
+    """
+    Lists all nspawn containers
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.list_all
+    """
+    ret = []
+    if _sd_version() &gt;= 219:
+        for line in _machinectl("list-images")["stdout"].splitlines():
+            try:
+                ret.append(line.split()[0])
+            except IndexError:
+                continue
+    else:
+        rootdir = _root()
+        try:
+            for dirname in os.listdir(rootdir):
+                if os.path.isdir(os.path.join(rootdir, dirname)):
+                    ret.append(dirname)
+        except OSError:
+            pass
+    return ret
+def list_running():
+    """
+    Lists running nspawn containers
+    .. note::
+        ``nspawn.list`` also works to list running containers
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.list_running
+        salt myminion nspawn.list
+    """
+    ret = []
+    for line in _machinectl("list")["stdout"].splitlines():
+        try:
+            ret.append(line.split()[0])
+        except IndexError:
+            pass
+    return sorted(ret)
+list_ = salt.utils.functools.alias_function(list_running, "list_")
+def list_stopped():
+    """
+    Lists stopped nspawn containers
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.list_stopped
+    """
+    return sorted(set(list_all()) - set(list_running()))
+def exists(name):
+    """
+    Returns true if the named container exists
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.exists &lt;name&gt;
+    """
+    contextkey = "nspawn.exists.{}".format(name)
+    if contextkey in __context__:
+        return __context__[contextkey]
+    __context__[contextkey] = name in list_all()
+    return __context__[contextkey]
+@_ensure_exists
+def state(name):
+    """
+    Return state of container (running or stopped)
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.state &lt;name&gt;
+    """
+    try:
+        cmd = "show {} --property=State".format(name)
+        return _machinectl(cmd, ignore_retcode=True)["stdout"].split("=")[-1]
+    except IndexError:
+        return "stopped"
+def info(name, **kwargs):
+    """
+    Return info about a container
+    .. note::
+        The container must be running for ``machinectl`` to gather information
+        about it. If the container is stopped, then this function will start
+        it.
+    start : False
+        If ``True``, then the container will be started to retrieve the info. A
+        ``Started`` key will be in the return data if the container was
+        started.
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.info arch1
+        salt myminion nspawn.info arch1 force_start=False
+    """
+    kwargs = salt.utils.args.clean_kwargs(**kwargs)
+    start_ = kwargs.pop("start", False)
+    if kwargs:
+        salt.utils.args.invalid_kwargs(kwargs)
+    if not start_:
+        _ensure_running(name)
+    elif name not in list_running():
+        start(name)
+    c_info = _machinectl("status {}".format(name))
+    if c_info["retcode"] != 0:
+        raise CommandExecutionError(
+            "Unable to get info for container '{}'".format(name)
+        )
+    key_name_map = {
+        "Iface": "Network Interface",
+        "Leader": "PID",
+        "Service": False,
+        "Since": "Running Since",
+    }
+    ret = {}
+    kv_pair = re.compile(r"^\s+([A-Za-z]+): (.+)$")
+    tree = re.compile(r"[|`]")
+    lines = c_info["stdout"].splitlines()
+    multiline = False
+    cur_key = None
+    for idx, line in enumerate(lines):
+        match = kv_pair.match(line)
+        if match:
+            key, val = match.groups()
+            key = key_name_map.get(key, key)
+            if key is False:
+                continue
+            elif key == "PID":
+                try:
+                    val = val.split()[0]
+                except IndexError:
+                    pass
+            cur_key = key
+            if multiline:
+                multiline = False
+            ret[key] = val
+        else:
+            if cur_key is None:
+                continue
+            if tree.search(lines[idx]):
+                break
+            if multiline:
+                ret[cur_key].append(lines[idx].strip())
+            else:
+                ret[cur_key] = [ret[key], lines[idx].strip()]
+                multiline = True
+    return ret
+@_ensure_exists
+def enable(name):
+    """
+    Set the named container to be launched at boot
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.enable &lt;name&gt;
+    """
+    cmd = "systemctl enable systemd-nspawn@{}".format(name)
+    if __salt__["cmd.retcode"](cmd, python_shell=False) != 0:
+        __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
+        return False
+    return True
+@_ensure_exists
+def disable(name):
+    """
+    Set the named container to *not* be launched at boot
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.enable &lt;name&gt;
+    """
+    cmd = "systemctl disable systemd-nspawn@{}".format(name)
+    if __salt__["cmd.retcode"](cmd, python_shell=False) != 0:
+        __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
+        return False
+    return True
+@_ensure_exists
+def start(name):
+    """
+    Start the named container
+    CLI Example:
+    .. code-block:: bash
+        salt myminion nspawn.start &lt;name&gt;
+    """
+    if _sd_version() &gt;= 219:
+        ret = _machinectl("start {}".format(name))
+    else:
+        cmd = "systemctl start systemd-nspawn@{}".format(name)
+        ret = __salt__["cmd.run_all"](cmd, python_shell=False)
+    if ret["retcode"] != 0:
+        __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
+        return False
+    return True
+@_ensure_exists
+def stop(name, kill=False):
+    """
+    This is a compatibility function which provides the logic for
+    nspawn.poweroff and nspawn.terminate.
+    """
+    if _sd_version() &gt;= 219:
+        if kill:
+            action = "terminate"
+        else:
+            action = "poweroff"
+        ret = _machinectl("{} {}".format(action, name))
+    else:
+        cmd = "systemctl stop systemd-nspawn@{}".format(name)
+        ret = __salt__["cmd.run_all"](cmd, python_shell=False)
+    if ret["retcode"] != 0:
+        __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
+        return False
+    return True
+def poweroff(name):
+    """
+    Issue a clean shutdown to the container.  Equivalent to running
+    ``machinectl poweroff`` on the named container.
+    For convenience, running ``nspawn.stop``(as shown in the CLI examples
+    below) is equivalent to running ``nspawn.poweroff``.
+    .. note::
+        ``machinectl poweroff`` is only supported in systemd &gt;= 219. On earlier
+        systemd versions, running this function will simply issue a clean
+        shutdown via ``systemctl``.
+    CLI Examples:
+    .. code-block:: bash
+        salt myminion nspawn.poweroff arch1
+        salt myminion nspawn.stop arch1
+    """
+    return stop(name, kill=False)
+def terminate(name):
+    """
+    Kill all processes in the container without issuing a clean shutdown.
+    Equivalent to running ``machinectl terminate`` on the named container.
+    For convenience, running ``nspawn.stop`` and passing ``kill=True`` (as
+    shown in the CLI examples below) is equivalent to running
+    ``nspawn.terminate``.
+    .. note::
+        ``machinectl terminate`` is only supported in systemd &gt;= 219. On
+        earlier systemd versions, running this function will simply issue a
+        clean shutdown via ``systemctl``.
+    CLI Examples:
+    .. code-block:: bash
+        salt myminion nspawn.terminate arch1
+        salt myminion nspawn.stop arch1 kill=True
+    """
+    return stop(name, kill=True)
+def restart(name):
+    """
+    This is a compatibility function which simply calls nspawn.reboot.
+    """
+    return reboot(name)
+@_ensure_exists
+def reboot(name, kill=False):
+    """
+    Reboot the container by sending a SIGINT to its init process. Equivalent
+    to running ``machinectl reboot`` on the named container.
+    For convenience, running ``nspawn.restart`` (as shown in the CLI examples
+    below) is equivalent to running ``nspawn.reboot``.
+    .. note::
+        ``machinectl reboot`` is only supported in systemd &gt;= 219. On earlier
+        systemd versions, running this function will instead restart the
+        container via ``systemctl``.
+    CLI Examples:
+    .. code-block:: bash
+        salt myminion nspawn.reboot arch1
+        salt myminion nspawn.restart arch1
+    """
+    if _sd_version() &gt;= 219:
+        if state(name) == "running":
+            ret = _machinectl("reboot {}".format(name))
+        else:
+            return start(name)
+    else:
+        cmd = "systemctl stop systemd-nspawn@{}".format(name)
+        ret = __salt__["cmd.run_all"](cmd, python_shell=False)
+        if ret["retcode"] != 0:
+            __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
+            return False
+        cmd = "systemctl start systemd-nspawn@{}".format(name)
+        ret = __salt__["cmd.run_all"](cmd, python_shell=False)
+    if ret["retcode"] != 0:
+        __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
+        return False
+    return True
+@_ensure_exists
+def remove(name, stop=False):
+    """
+    Remove the named container
+    .. warning::
+        This function will remove all data associated with the container. It
+        will not, however, remove the btrfs subvolumes created by pulling
+        container images (:mod:`nspawn.pull_raw
+        &lt;salt.modules.nspawn.pull_raw&gt;`, :mod:`nspawn.pull_tar
+        &lt;salt.modules.nspawn.pull_tar&gt;`, :mod:`nspawn.pull_dkr
+        &lt;salt.modules.nspawn.pull_dkr&gt;`).
+    stop : False
+        If ``True``, the container will be destroyed even if it is
+        running/frozen.
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' nspawn.remove foo
+        salt '*' nspawn.remove foo stop=True
+    """
+    if not stop and state(name) != "stopped":
+        raise CommandExecutionError("Container '{}' is not stopped".format(name))
+    def _failed_remove(name, exc):
+        raise CommandExecutionError(
+            "Unable to remove container '{}': {}".format(name, exc)
+        )
+    if _sd_version() &gt;= 219:
+        ret = _machinectl("remove {}".format(name))
+        if ret["retcode"] != 0:
+            __context__["retcode"] = salt.defaults.exitcodes.EX_UNAVAILABLE
+            _failed_remove(name, ret["stderr"])
+    else:
+        try:
+            shutil.rmtree(os.path.join(_root(), name))
+        except OSError as exc:
+            _failed_remove(name, exc)
+    return True
+destroy = salt.utils.functools.alias_function(remove, "destroy")
+@_ensure_exists
+def copy_to(name, source, dest, overwrite=False, makedirs=False):
+    """
+    Copy a file from the host into a container
+    name
+        Container name
+    source
+        File to be copied to the container
+    dest
+        Destination on the container. Must be an absolute path.
+    overwrite : False
+        Unless this option is set to ``True``, then if a file exists at the
+        location specified by the ``dest`` argument, an error will be raised.
+    makedirs : False
+        Create the parent directory on the container if it does not already
+        exist.
+    CLI Example:
+    .. code-block:: bash
+        salt 'minion' nspawn.copy_to /tmp/foo /root/foo
+    """
+    path = source
+    try:
+        if source.startswith("salt://"):
+            cached_source = __salt__["cp.cache_file"](source)
+            if not cached_source:
+                raise CommandExecutionError("Unable to cache {}".format(source))
+            path = cached_source
+    except AttributeError:
+        raise SaltInvocationError("Invalid source file {}".format(source))
+    if _sd_version() &gt;= 219:
+        pass
+    return __salt__["container_resource.copy_to"](
+        name,
+        path,
+        dest,
+        container_type=__virtualname__,
+        exec_driver=EXEC_DRIVER,
+        overwrite=overwrite,
+        makedirs=makedirs,
+    )
+cp = salt.utils.functools.alias_function(copy_to, "cp")
+def _pull_image(pull_type, image, name, **kwargs):
+    """
+    Common logic for machinectl pull-* commands
+    """
+    _ensure_systemd(219)
+    if exists(name):
+        raise SaltInvocationError("Container '{}' already exists".format(name))
+    if pull_type in ("raw", "tar"):
+        valid_kwargs = ("verify",)
+    elif pull_type == "dkr":
+        valid_kwargs = ("index",)
+    else:
+        raise SaltInvocationError("Unsupported image type '{}'".format(pull_type))
+    kwargs = salt.utils.args.clean_kwargs(**kwargs)
+    bad_kwargs = {
+        x: y
+        for x, y in salt.utils.args.clean_kwargs(**kwargs).items()
+        if x not in valid_kwargs
+    }
+    if bad_kwargs:
+        salt.utils.args.invalid_kwargs(bad_kwargs)
+    pull_opts = []
+    if pull_type in ("raw", "tar"):
+        verify = kwargs.get("verify", False)
+        if not verify:
+            pull_opts.append("--verify=no")
+        else:
+            def _bad_verify():
+                raise SaltInvocationError(
+                    "'verify' must be one of the following: signature, checksum"
+                )
+            try:
+                verify = verify.lower()
+            except AttributeError:
+                _bad_verify()
+            else:
+                if verify not in ("signature", "checksum"):
+                    _bad_verify()
+                pull_opts.append("--verify={}".format(verify))
+    elif pull_type == "dkr":
+        if "index" in kwargs:
+            pull_opts.append("--dkr-index-url={}".format(kwargs["index"]))
+    cmd = "pull-{} {} {} {}".format(pull_type, " ".join(pull_opts), image, name)
+    result = _machinectl(cmd, use_vt=True)
+    if result["retcode"] != 0:
+        msg = (
+            "Error occurred pulling image. Stderr from the pull command "
+            "(if any) follows: "
+        )
+        if result["stderr"]:
+            msg += "\n\n{}".format(result["stderr"])
+        raise CommandExecutionError(msg)
+    return True
+def pull_raw(url, name, verify=False):
+    """
+    Execute a ``machinectl pull-raw`` to download a .qcow2 or raw disk image,
+    and add it to /var/lib/machines as a new container.
+    .. note::
+        **Requires systemd &gt;= 219**
+    url
+        URL from which to download the container
+    name
+        Name for the new container
+    verify : False
+        Perform signature or checksum verification on the container. See the
+        ``machinectl(1)`` man page (section titled "Image Transfer Commands")
+        for more information on requirements for image verification. To perform
+        signature verification, use ``verify=signature``. For checksum
+        verification, use ``verify=checksum``. By default, no verification will
+        be performed.
+    CLI Examples:
+    .. code-block:: bash
+        salt myminion nspawn.pull_raw http://ftp.halifax.rwth-aachen.de/fedora/linux/releases/21/Cloud/Images/x86_64/Fedora-Cloud-Base-20141203-21.x86_64.raw.xz fedora21
+    """
+    return _pull_image("raw", url, name, verify=verify)
+def pull_tar(url, name, verify=False):
+    """
+    Execute a ``machinectl pull-raw`` to download a .tar container image,
+    and add it to /var/lib/machines as a new container.
+    .. note::
+        **Requires systemd &gt;= 219**
+    url
+        URL from which to download the container
+    name
+        Name for the new container
+    verify : False
+        Perform signature or checksum verification on the container. See the
+        ``machinectl(1)`` man page (section titled "Image Transfer Commands")
+        for more information on requirements for image verification. To perform
+        signature verification, use ``verify=signature``. For checksum
+        verification, use ``verify=checksum``. By default, no verification will
+        be performed.
+    CLI Examples:
+    .. code-block:: bash
+        salt myminion nspawn.pull_tar http://foo.domain.tld/containers/archlinux-2015.02.01.tar.gz arch2
+    """
+    return _pull_image("tar", url, name, verify=verify)
+def pull_dkr(url, name, index):
+    """
+    Execute a ``machinectl pull-dkr`` to download a docker image and add it to
+    /var/lib/machines as a new container.
+    .. note::
+        **Requires systemd &gt;= 219**
+    url
+        URL from which to download the container
+    name
+        Name for the new container
+    index
+        URL of the Docker index server from which to pull (must be an
+        ``http://`` or ``https://`` URL).
+    CLI Examples:
+    .. code-block:: bash
+        salt myminion nspawn.pull_dkr centos/centos6 cent6 index=https://get.docker.com
+        salt myminion nspawn.pull_docker centos/centos6 cent6 index=https://get.docker.com
+    """
+    return _pull_image("dkr", url, name, index=index)
+pull_docker = salt.utils.functools.alias_function(pull_dkr, "pull_docker")
 </pre>
 </div>
 </div>

@@ -40,194 +40,282 @@ Matches for cache_3.py &amp; tomcat_1.py
 </h3>
 <hr/>
 <pre>
-1 import logging
-2 import os
-3 <font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>import re
-4 import time
-5 import salt.config
-6 import salt.payload
-7 import salt.utils.atomicfile
-8 import salt.utils.data
-9 import salt.utils.dictupdate
-10 import salt.utils.files
-11 import salt.utils.msgpack
-12 from salt.utils.zeromq import zmq
-13 log = logging.getLogger(</b></font>__name__)
-14 class CacheFactory:
-15     @classmethod
-16     def factory(cls, backend, ttl, *args, **kwargs):
-17         log.debug("Factory backend: %s", backend)
-18         if backend == "memory":
-19             return CacheDict(ttl, *args, **kwargs)
-20         elif backend == "disk":
-21             return CacheDisk(ttl, kwargs["minion_cache_path"], *args, **kwargs)
-22         else:
-23             log.error("CacheFactory received unrecognized cache type")
-24 class CacheDict(dict):
-25     def __init__(self, ttl, *args, **kwargs):
-26         dict.__init__(self, *args, **kwargs)
-27         self._ttl = ttl
-28         self._key_cache_time = {}
-29     def _enforce_ttl_key(self, key):
-30         if key not in self._key_cache_time:
-31             return
-32         if time.time() - self._key_cache_time[key] &gt; self._ttl:
-33             del self._key_cache_time[key]
-34             dict.__delitem__(self, key)
-35     def __getitem__(self, key):
-36         self._enforce_ttl_key(key)
-37         return dict.__getitem__(self, key)
-38     def __setitem__(self, key, val):
-39         self._key_cache_time[key] = time.time()
-40         dict.__setitem__(self, key, val)
-41     def __contains__(self, key):
-42         self._enforce_ttl_key(key)
-43         return dict.__contains__(self, key)
-44 class CacheDisk(CacheDict):
-45     def __init__(self, ttl, path, *args, **kwargs):
-46         super().__init__(ttl, *args, **kwargs)
-47         self._path = path
-48         self._dict = {}
-49         self._read()
-50     def _enforce_ttl_key(self, key):
-51         if key not in self._key_cache_time:
-52             return
-53         if time.time() - self._key_cache_time[key] &gt; self._ttl:
-54             del self._key_cache_time[key]
-55             self._dict.__delitem__(key)
-56     def __contains__(self, key):
-57         self._enforce_ttl_key(key)
-58         return self._dict.__contains__(key)
-59     def __getitem__(self, key):
-60         self._enforce_ttl_key(key)
-61         return self._dict.__getitem__(key)
-62     def __setitem__(self, key, val):
-63         self._key_cache_time[key] = time.time()
-64         self._dict.__setitem__(key, val)
-65         self._write()
-66     def __delitem__(self, key):
-67         del self._key_cache_time[key]
-68         self._dict.__delitem__(key)
-69         self._write()
-70     def clear(self):
-71         self._key_cache_time.clear()
-72         self._dict.clear()
-73         self._write()
-74     def _read(self):
-75         if not salt.utils.msgpack.HAS_MSGPACK or not os.path.exists(self._path):
-76             return
-77         with salt.utils.files.fopen(self._path, "rb") as fp_:
-78             cache = salt.utils.data.decode(
-79                 salt.utils.msgpack.load(fp_, encoding=__salt_system_encoding__)
-80             )
-81         if "CacheDisk_cachetime" in cache:  # new format
-82             self._dict = cache["CacheDisk_data"]
-83             self._key_cache_time = cache["CacheDisk_cachetime"]
-84         else:  # old format
-85             self._dict = cache
-86             timestamp = os.path.getmtime(self._path)
-87             for key in self._dict:
-88                 self._key_cache_time[key] = timestamp
-89         if log.isEnabledFor(logging.DEBUG):
-90             log.debug("Disk cache retrieved: %s", cache)
-91     def _write(self):
-92         if not salt.utils.msgpack.HAS_MSGPACK:
-93             return
-94         with salt.utils.atomicfile.atomic_open(self._path, "wb+") as fp_:
-95             cache = {
-96                 "CacheDisk_data": self._dict,
-97                 "CacheDisk_cachetime": self._key_cache_time,
-98             }
-99             salt.utils.msgpack.dump(cache, fp_, use_bin_type=True)
-100 class CacheCli:
-101     def __init__(self, opts):
-102         self.opts = opts
-103         self.cache_sock = os.path.join(self.opts["sock_dir"], "con_cache.ipc")
-104         self.cache_upd_sock = os.path.join(self.opts["sock_dir"], "con_upd.ipc")
-105         context = zmq.Context()
-106         self.creq_out = context.socket(zmq.REQ)
-107         self.creq_out.setsockopt(zmq.LINGER, 100)
-108         self.creq_out.connect("ipc://" + self.cache_sock)
-109         self.cupd_out = context.socket(zmq.PUB)
-110         self.cupd_out.setsockopt(zmq.LINGER, 1)
-111         self.cupd_out.connect("ipc://" + self.cache_upd_sock)
-112     def put_cache(self, minions):
-113         self.cupd_out.send(salt.payload.dumps(minions))
-114     def get_cached(self):
-115         msg = salt.payload.dumps("minions")
-116         self.creq_out.send(msg)
-117         min_list = salt.payload.loads(self.creq_out.recv())
-118         return min_list
-119 class CacheRegex:
-120     def __init__(
-121         self, prepend="", append="", size=1000, keep_fraction=0.8, max_age=3600
-122     ):
-123         self.prepend = prepend
-124         self.append = append
-125         self.size = size
-126         self.clear_size = int(size - size * (keep_fraction))
-127         if self.clear_size &gt;= size:
-128             self.clear_size = int(size / 2) + 1
-129             if self.clear_size &gt; size:
-130                 self.clear_size = size
-131         self.max_age = max_age
-132         self.cache = {}
-133         self.timestamp = time.time()
-134     def clear(self):
-135         self.cache.clear()
-136     def sweep(self):
-137         if self.max_age &lt; time.time() - self.timestamp:
-138             self.clear()
-139             self.timestamp = time.time()
-140         else:
-141             paterns = list(self.cache.values())
-142             paterns.sort()
-143             for idx in range(self.clear_size):
-144                 del self.cache[paterns[idx][2]]
-145     def get(self, pattern):
-146         try:
-147             self.cache[pattern][0] += 1
-148             return self.cache[pattern][1]
-149         except KeyError:
-150             pass
-151         if len(self.cache) &gt; self.size:
-152             self.sweep()
-153         regex = re.compile("{}{}{}".format(self.prepend, pattern, self.append))
-154         self.cache[pattern] = [1, regex, pattern, time.time()]
-155         return regex
-156 class ContextCache:
-157     def __init__(self, opts, name):
-158         self.opts = opts
-159         self.cache_path = os.path.join(opts["cachedir"], "context", "{}.p".format(name))
-160     def cache_context(self, context):
-161         if not os.path.isdir(os.path.dirname(self.cache_path)):
-162             os.mkdir(os.path.dirname(self.cache_path))
-163         with salt.utils.files.fopen(self.cache_path, "w+b") as cache:
-164             salt.payload.dump(context, cache)
-165     def get_cache_context(self):
-166         with salt.utils.files.fopen(self.cache_path, "rb") as cache:
-167             return salt.utils.data.decode(salt.payload.load(cache))
-168 def context_cache(func):
-169     @functools.wraps(func)
-170     def context_cache_wrap(*args, **kwargs):
-171         try:
-172             func_context = func.__globals__["__context__"].value()
-173         except AttributeError:
-174             func_context = func.__globals__["__context__"]
-175         try:
-176             func_opts = func.__globals__["__opts__"].value()
-177         except AttributeError:
-178             func_opts = func.__globals__["__opts__"]
-179         func_name = func.__globals__["__name__"]
-180         context_cache = ContextCache(func_opts, func_name)
-181         if not func_context and os.path.isfile(context_cache.cache_path):
-182             salt.utils.dictupdate.update(
-183                 func_context, context_cache.get_cache_context()
-184             )
-185         else:
-186             context_cache.cache_context(func_context)
-187         return func(*args, **kwargs)
-188     return context_cache_wrap
+"""
+In-memory caching used by Salt
+"""
+import logging
+import os
+<font color="#0000ff"><a href="#"><img align="right" alt="other" border="0" src="forward.gif"/></a><b>import re
+import time
+import salt.config
+import salt.payload
+import salt.utils.atomicfile
+import salt.utils.data
+import salt.utils.dictupdate
+import salt.utils.files
+import salt.utils.msgpack
+from salt.utils.zeromq import zmq
+log = logging.getLogger(</b></font>__name__)
+class CacheFactory:
+    """
+    Cache which can use a number of backends
+    """
+    @classmethod
+    def factory(cls, backend, ttl, *args, **kwargs):
+        log.debug("Factory backend: %s", backend)
+        if backend == "memory":
+            return CacheDict(ttl, *args, **kwargs)
+        elif backend == "disk":
+            return CacheDisk(ttl, kwargs["minion_cache_path"], *args, **kwargs)
+        else:
+            log.error("CacheFactory received unrecognized cache type")
+class CacheDict(dict):
+    """
+    Subclass of dict that will lazily delete items past ttl
+    """
+    def __init__(self, ttl, *args, **kwargs):
+        dict.__init__(self, *args, **kwargs)
+        self._ttl = ttl
+        self._key_cache_time = {}
+    def _enforce_ttl_key(self, key):
+        """
+        Enforce the TTL to a specific key, delete if its past TTL
+        """
+        if key not in self._key_cache_time:
+            return
+        if time.time() - self._key_cache_time[key] &gt; self._ttl:
+            del self._key_cache_time[key]
+            dict.__delitem__(self, key)
+    def __getitem__(self, key):
+        """
+        Check if the key is ttld out, then do the get
+        """
+        self._enforce_ttl_key(key)
+        return dict.__getitem__(self, key)
+    def __setitem__(self, key, val):
+        """
+        Make sure to update the key cache time
+        """
+        self._key_cache_time[key] = time.time()
+        dict.__setitem__(self, key, val)
+    def __contains__(self, key):
+        self._enforce_ttl_key(key)
+        return dict.__contains__(self, key)
+class CacheDisk(CacheDict):
+    """
+    Class that represents itself as a dictionary to a consumer
+    but uses a disk-based backend. Serialization and de-serialization
+    is done with msgpack
+    """
+    def __init__(self, ttl, path, *args, **kwargs):
+        super().__init__(ttl, *args, **kwargs)
+        self._path = path
+        self._dict = {}
+        self._read()
+    def _enforce_ttl_key(self, key):
+        """
+        Enforce the TTL to a specific key, delete if its past TTL
+        """
+        if key not in self._key_cache_time:
+            return
+        if time.time() - self._key_cache_time[key] &gt; self._ttl:
+            del self._key_cache_time[key]
+            self._dict.__delitem__(key)
+    def __contains__(self, key):
+        self._enforce_ttl_key(key)
+        return self._dict.__contains__(key)
+    def __getitem__(self, key):
+        """
+        Check if the key is ttld out, then do the get
+        """
+        self._enforce_ttl_key(key)
+        return self._dict.__getitem__(key)
+    def __setitem__(self, key, val):
+        """
+        Make sure to update the key cache time
+        """
+        self._key_cache_time[key] = time.time()
+        self._dict.__setitem__(key, val)
+        self._write()
+    def __delitem__(self, key):
+        """
+        Make sure to remove the key cache time
+        """
+        del self._key_cache_time[key]
+        self._dict.__delitem__(key)
+        self._write()
+    def clear(self):
+        """
+        Clear the cache
+        """
+        self._key_cache_time.clear()
+        self._dict.clear()
+        self._write()
+    def _read(self):
+        """
+        Read in from disk
+        """
+        if not salt.utils.msgpack.HAS_MSGPACK or not os.path.exists(self._path):
+            return
+        with salt.utils.files.fopen(self._path, "rb") as fp_:
+            cache = salt.utils.data.decode(
+                salt.utils.msgpack.load(fp_, encoding=__salt_system_encoding__)
+            )
+        if "CacheDisk_cachetime" in cache:  # new format
+            self._dict = cache["CacheDisk_data"]
+            self._key_cache_time = cache["CacheDisk_cachetime"]
+        else:  # old format
+            self._dict = cache
+            timestamp = os.path.getmtime(self._path)
+            for key in self._dict:
+                self._key_cache_time[key] = timestamp
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("Disk cache retrieved: %s", cache)
+    def _write(self):
+        """
+        Write out to disk
+        """
+        if not salt.utils.msgpack.HAS_MSGPACK:
+            return
+        with salt.utils.atomicfile.atomic_open(self._path, "wb+") as fp_:
+            cache = {
+                "CacheDisk_data": self._dict,
+                "CacheDisk_cachetime": self._key_cache_time,
+            }
+            salt.utils.msgpack.dump(cache, fp_, use_bin_type=True)
+class CacheCli:
+    """
+    Connection client for the ConCache. Should be used by all
+    components that need the list of currently connected minions
+    """
+    def __init__(self, opts):
+        """
+        Sets up the zmq-connection to the ConCache
+        """
+        self.opts = opts
+        self.cache_sock = os.path.join(self.opts["sock_dir"], "con_cache.ipc")
+        self.cache_upd_sock = os.path.join(self.opts["sock_dir"], "con_upd.ipc")
+        context = zmq.Context()
+        self.creq_out = context.socket(zmq.REQ)
+        self.creq_out.setsockopt(zmq.LINGER, 100)
+        self.creq_out.connect("ipc://" + self.cache_sock)
+        self.cupd_out = context.socket(zmq.PUB)
+        self.cupd_out.setsockopt(zmq.LINGER, 1)
+        self.cupd_out.connect("ipc://" + self.cache_upd_sock)
+    def put_cache(self, minions):
+        """
+        published the given minions to the ConCache
+        """
+        self.cupd_out.send(salt.payload.dumps(minions))
+    def get_cached(self):
+        """
+        queries the ConCache for a list of currently connected minions
+        """
+        msg = salt.payload.dumps("minions")
+        self.creq_out.send(msg)
+        min_list = salt.payload.loads(self.creq_out.recv())
+        return min_list
+class CacheRegex:
+    """
+    Create a regular expression object cache for the most frequently
+    used patterns to minimize compilation of the same patterns over
+    and over again
+    """
+    def __init__(
+        self, prepend="", append="", size=1000, keep_fraction=0.8, max_age=3600
+    ):
+        self.prepend = prepend
+        self.append = append
+        self.size = size
+        self.clear_size = int(size - size * (keep_fraction))
+        if self.clear_size &gt;= size:
+            self.clear_size = int(size / 2) + 1
+            if self.clear_size &gt; size:
+                self.clear_size = size
+        self.max_age = max_age
+        self.cache = {}
+        self.timestamp = time.time()
+    def clear(self):
+        """
+        Clear the cache
+        """
+        self.cache.clear()
+    def sweep(self):
+        """
+        Sweep the cache and remove the outdated or least frequently
+        used entries
+        """
+        if self.max_age &lt; time.time() - self.timestamp:
+            self.clear()
+            self.timestamp = time.time()
+        else:
+            paterns = list(self.cache.values())
+            paterns.sort()
+            for idx in range(self.clear_size):
+                del self.cache[paterns[idx][2]]
+    def get(self, pattern):
+        """
+        Get a compiled regular expression object based on pattern and
+        cache it when it is not in the cache already
+        """
+        try:
+            self.cache[pattern][0] += 1
+            return self.cache[pattern][1]
+        except KeyError:
+            pass
+        if len(self.cache) &gt; self.size:
+            self.sweep()
+        regex = re.compile("{}{}{}".format(self.prepend, pattern, self.append))
+        self.cache[pattern] = [1, regex, pattern, time.time()]
+        return regex
+class ContextCache:
+    def __init__(self, opts, name):
+        """
+        Create a context cache
+        """
+        self.opts = opts
+        self.cache_path = os.path.join(opts["cachedir"], "context", "{}.p".format(name))
+    def cache_context(self, context):
+        """
+        Cache the given context to disk
+        """
+        if not os.path.isdir(os.path.dirname(self.cache_path)):
+            os.mkdir(os.path.dirname(self.cache_path))
+        with salt.utils.files.fopen(self.cache_path, "w+b") as cache:
+            salt.payload.dump(context, cache)
+    def get_cache_context(self):
+        """
+        Retrieve a context cache from disk
+        """
+        with salt.utils.files.fopen(self.cache_path, "rb") as cache:
+            return salt.utils.data.decode(salt.payload.load(cache))
+def context_cache(func):
+    """
+    A decorator to be used module functions which need to cache their
+    context.
+    To evaluate a __context__ and re-hydrate it if a given key
+    is empty or contains no items, pass a list of keys to evaulate.
+    """
+    @functools.wraps(func)
+    def context_cache_wrap(*args, **kwargs):
+        try:
+            func_context = func.__globals__["__context__"].value()
+        except AttributeError:
+            func_context = func.__globals__["__context__"]
+        try:
+            func_opts = func.__globals__["__opts__"].value()
+        except AttributeError:
+            func_opts = func.__globals__["__opts__"]
+        func_name = func.__globals__["__name__"]
+        context_cache = ContextCache(func_opts, func_name)
+        if not func_context and os.path.isfile(context_cache.cache_path):
+            salt.utils.dictupdate.update(
+                func_context, context_cache.get_cache_context()
+            )
+        else:
+            context_cache.cache_context(func_context)
+        return func(*args, **kwargs)
+    return context_cache_wrap
 </pre>
 </div>
 <div style="flex-grow: 1;">
@@ -240,257 +328,535 @@ Matches for cache_3.py &amp; tomcat_1.py
 </h3>
 <hr/>
 <pre>
-1 <font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>import glob
-2 import hashlib
-3 import logging
-4 import os
-5 import re
-6 import tempfile
-7 import urllib.parse
-8 import urllib.request
-9 import salt.utils.data
-10 import salt.utils.stringutils
-11 log = logging.getLogger(</b></font>__name__)
-12 __func_alias__ = {"reload_": "reload"}
-13 __valid_configs = {
-14     "user": ["tomcat-manager.user", "tomcat-manager:user"],
-15     "passwd": ["tomcat-manager.passwd", "tomcat-manager:passwd"],
-16 }
-17 def __virtual__():
-18     if __catalina_home() or _auth("dummy"):
-19         return "tomcat"
-20     return (
-21         False,
-22         "Tomcat execution module not loaded: neither Tomcat installed locally nor"
-23         " tomcat-manager credentials set in grains/pillar/config.",
-24     )
-25 def __catalina_home():
-26     locations = ["/usr/share/tomcat*", "/opt/tomcat"]
-27     for location in locations:
-28         folders = glob.glob(location)
-29         if folders:
-30             for catalina_home in folders:
-31                 if os.path.isdir(catalina_home + "/bin"):
-32                     return catalina_home
-33     return False
-34 def _get_credentials():
-35     ret = {"user": False, "passwd": False}
-36     for item in ret:
-37         for struct in [__opts__, __grains__, __pillar__]:
-38             for config_key in __valid_configs[item]:
-39                 value = salt.utils.data.traverse_dict_and_list(struct, config_key, None)
-40                 if value:
-41                     ret[item] = value
-42                     break
-43     return ret["user"], ret["passwd"]
-44 def _auth(uri):
-45     user, password = _get_credentials()
-46     if user is False or password is False:
-47         return False
-48     basic = urllib.request.HTTPBasicAuthHandler()
-49     basic.add_password(
-50         realm="Tomcat Manager Application", uri=uri, user=user, passwd=password
-51     )
-52     digest = urllib.request.HTTPDigestAuthHandler()
-53     digest.add_password(
-54         realm="Tomcat Manager Application", uri=uri, user=user, passwd=password
-55     )
-56     return urllib.request.build_opener(basic, digest)
-57 def extract_war_version(war):
-58     basename = os.path.basename(war)
-59     war_package = os.path.splitext(basename)[0]  # remove '.war'
-60     version = re.findall("-([\\d.-]+)$", war_package)  # try semver
-61     return version[0] if version and len(version) == 1 else None  # default to none
-62 def _wget(cmd, opts=None, url="http://localhost:8080/manager", timeout=180):
-63     ret = {"res": True, "msg": []}
-64     auth = _auth(url)
-65     if auth is False:
-66         ret["res"] = False
-67         ret["msg"] = "missing username and password settings (grain/pillar)"
-68         return ret
-69     if url[-1] != "/":
-70         url += "/"
-71     url6 = url
-72     url += "text/{}".format(cmd)
-73     url6 += "{}".format(cmd)
-74     if opts:
-75         url += "?{}".format(urllib.parse.urlencode(opts))
-76         url6 += "?{}".format(urllib.parse.urlencode(opts))
-77     urllib.request.install_opener(auth)
-78     try:
-79         ret["msg"] = urllib.request.urlopen(url, timeout=timeout).read().splitlines()
-80     except Exception:  # pylint: disable=broad-except
-81         try:
-82             ret["msg"] = (
-83                 urllib.request.urlopen(url6, timeout=timeout).read().splitlines()
-84             )
-85         except Exception:  # pylint: disable=broad-except
-86             ret["msg"] = "Failed to create HTTP request"
-87     for key, value in enumerate(ret["msg"]):
-88         try:
-89             ret["msg"][key] = salt.utils.stringutils.to_unicode(value, "utf-8")
-90         except (UnicodeDecodeError, AttributeError):
-91             pass
-92     if not ret["msg"][0].startswith("OK"):
-93         ret["res"] = False
-94     return ret
-95 def _simple_cmd(cmd, app, url="http://localhost:8080/manager", timeout=180):
-96     try:
-97         opts = {"path": app, "version": ls(url)[app]["version"]}
-98         return "\n".join(_wget(cmd, opts, url, timeout=timeout)["msg"])
-99     except Exception:  # pylint: disable=broad-except
-100         return "FAIL - No context exists for path {}".format(app)
-101 def leaks(url="http://localhost:8080/manager", timeout=180):
-102     return _wget("findleaks", {"statusLine": "true"}, url, timeout=timeout)["msg"]
-103 def status(url="http://localhost:8080/manager", timeout=180):
-104     return _wget("list", {}, url, timeout=timeout)["res"]
-105 def ls(url="http://localhost:8080/manager", timeout=180):
-106     ret = {}
-107     data = _wget("list", "", url, timeout=timeout)
-108     if data["res"] is False:
-109         return {}
-110     data["msg"].pop(0)
-111     for line in data["msg"]:
-112         tmp = line.split(":")
-113         ret[tmp[0]] = {
-114             "mode": tmp[1],
-115             "sessions": tmp[2],
-116             "fullname": tmp[3],
-117             "version": "",
-118         }
-119         sliced = tmp[3].split("##")
-120         if len(sliced) &gt; 1:
-121             ret[tmp[0]]["version"] = sliced[1]
-122     return ret
-123 def stop(app, url="http://localhost:8080/manager", timeout=180):
-124     return _simple_cmd("stop", app, url, timeout=timeout)
-125 def start(app, url="http://localhost:8080/manager", timeout=180):
-126     return _simple_cmd("start", app, url, timeout=timeout)
-127 def reload_(app, url="http://localhost:8080/manager", timeout=180):
-128     return _simple_cmd("reload", app, url, timeout=timeout)
-129 def sessions(app, url="http://localhost:8080/manager", timeout=180):
-130     return _simple_cmd("sessions", app, url, timeout=timeout)
-131 def status_webapp(app, url="http://localhost:8080/manager", timeout=180):
-132     webapps = ls(url, timeout=timeout)
-133     for i in webapps:
-134         if i == app:
-135             return webapps[i]["mode"]
-136     return "missing"
-137 def serverinfo(url="http://localhost:8080/manager", timeout=180):
-138     data = _wget("serverinfo", {}, url, timeout=timeout)
-139     if data["res"] is False:
-140         return {"error": data["msg"]}
-141     ret = {}
-142     data["msg"].pop(0)
-143     for line in data["msg"]:
-144         tmp = line.split(":")
-145         ret[tmp[0].strip()] = tmp[1].strip()
-146     return ret
-147 def undeploy(app, url="http://localhost:8080/manager", timeout=180):
-148     return _simple_cmd("undeploy", app, url, timeout=timeout)
-149 def deploy_war(
-150     war,
-151     context,
-152     force="no",
-153     url="http://localhost:8080/manager",
-154     saltenv="base",
-155     timeout=180,
-156     temp_war_location=None,
-157     version=True,
-158 ):
-159     tfile = "salt.{}".format(os.path.basename(war))
-160     if temp_war_location is not None:
-161         if not os.path.isdir(temp_war_location):
-162             return 'Error - "{}" is not a directory'.format(temp_war_location)
-163         tfile = os.path.join(temp_war_location, tfile)
-164     else:
-165         tfile = os.path.join(tempfile.gettempdir(), tfile)
-166     cache = False
-167     if not os.path.isfile(war):
-168         cache = True
-169         cached = __salt__["cp.get_url"](war, tfile, saltenv)
-170         if not cached:
-171             return "FAIL - could not cache the WAR file"
-172         try:
-173             __salt__["file.set_mode"](cached, "0644")
-174         except KeyError:
-175             pass
-176     else:
-177         tfile = war
-178     opts = {
-179         "war": "file:{}".format(tfile),
-180         "path": context,
-181     }
-182     if version:
-183         version = extract_war_version(war) if version is True else version
-184         if isinstance(version, str):
-185             opts["version"] = version
-186     if force == "yes":
-187         opts["update"] = "true"
-188     deployed = _wget("deploy", opts, url, timeout=timeout)
-189     res = "\n".join(deployed["msg"])
-190     if cache:
-191         __salt__["file.remove"](tfile)
-192     return res
-193 def passwd(passwd, user="", alg="sha1", realm=None):
-194     digest = hasattr(hashlib, alg) and getattr(hashlib, alg) or None
-195     if digest:
-196         if realm:
-197             digest.update(
-198                 "{}:{}:{}".format(
-199                     user,
-200                     realm,
-201                     passwd,
-202                 )
-203             )
-204         else:
-205             digest.update(passwd)
-206     return digest and digest.hexdigest() or False
-207 def version():
-208     cmd = __catalina_home() + "/bin/catalina.sh version"
-209     out = __salt__["cmd.run"](cmd).splitlines()
-210     for line in out:
-211         if not line:
-212             continue
-213         if "Server version" in line:
-214             comps = line.split(": ")
-215             return comps[1]
-216 def fullversion():
-217     cmd = __catalina_home() + "/bin/catalina.sh version"
-218     ret = {}
-219     out = __salt__["cmd.run"](cmd).splitlines()
-220     for line in out:
-221         if not line:
-222             continue
-223         if ": " in line:
-224             comps = line.split(": ")
-225             ret[comps[0]] = comps[1].lstrip()
-226     return ret
-227 def signal(signal=None):
-228     valid_signals = {
-229         "forcestop": "stop -force",
-230         "securestart": "start -security",
-231         "start": "start",
-232         "stop": "stop",
-233     }
-234     if signal not in valid_signals:
-235         return
-236     cmd = "{}/bin/catalina.sh {}".format(__catalina_home(), valid_signals[signal])
-237     __salt__["cmd.run"](cmd)
-238 if __name__ == "__main__":
-239     __opts__ = {}
-240     __grains__ = {}
-241     __pillar__ = {
-242         "tomcat-manager.user": "foobar",
-243         "tomcat-manager.passwd": "barfoo1!",
-244     }
-245     old_format_creds = _get_credentials()
-246     __pillar__ = {"tomcat-manager": {"user": "foobar", "passwd": "barfoo1!"}}
-247     new_format_creds = _get_credentials()
-248     if old_format_creds == new_format_creds:
-249         log.info("Config backwards compatible")
-250     else:
-251         log.ifno("Config not backwards compatible")
+"""
+Support for Tomcat
+This module uses the manager webapp to manage Apache tomcat webapps.
+If the manager webapp is not configured some of the functions won't work.
+:configuration:
+    - Java bin path should be in default path
+    - If ipv6 is enabled make sure you permit manager access to ipv6 interface
+      "0:0:0:0:0:0:0:1"
+    - If you are using tomcat.tar.gz it has to be installed or symlinked under
+      ``/opt``, preferably using name tomcat
+    - "tomcat.signal start/stop" works but it does not use the startup scripts
+The following grains/pillar should be set:
+.. code-block:: yaml
+    tomcat-manager:
+      user: &lt;username&gt;
+      passwd: &lt;password&gt;
+or the old format:
+.. code-block:: yaml
+    tomcat-manager.user: &lt;username&gt;
+    tomcat-manager.passwd: &lt;password&gt;
+Also configure a user in the conf/tomcat-users.xml file:
+.. code-block:: xml
+    &lt;?xml version='1.0' encoding='utf-8'?&gt;
+    &lt;tomcat-users&gt;
+        &lt;role rolename="manager-script"/&gt;
+        &lt;user username="tomcat" password="tomcat" roles="manager-script"/&gt;
+    &lt;/tomcat-users&gt;
+.. note::
+   - More information about tomcat manager:
+     http://tomcat.apache.org/tomcat-7.0-doc/manager-howto.html
+   - if you use only this module for deployments you've might want to strict
+     access to the manager only from localhost for more info:
+     http://tomcat.apache.org/tomcat-7.0-doc/manager-howto.html#Configuring_Manager_Application_Access
+   - Tested on:
+     JVM Vendor:
+         Sun Microsystems Inc.
+     JVM Version:
+         1.6.0_43-b01
+     OS Architecture:
+         amd64
+     OS Name:
+         Linux
+     OS Version:
+         2.6.32-358.el6.x86_64
+     Tomcat Version:
+"""
+<font color="#0000ff"><div style="position:absolute;left:0"><a href="#"><img align="left" alt="other" border="0" src="back.gif"/></a></div><b>import glob
+import hashlib
+import logging
+import os
+import re
+import tempfile
+import urllib.parse
+import urllib.request
+import salt.utils.data
+import salt.utils.stringutils
+log = logging.getLogger(</b></font>__name__)
+__func_alias__ = {"reload_": "reload"}
+__valid_configs = {
+    "user": ["tomcat-manager.user", "tomcat-manager:user"],
+    "passwd": ["tomcat-manager.passwd", "tomcat-manager:passwd"],
+}
+def __virtual__():
+    """
+    Only load tomcat if it is installed or if grains/pillar config exists
+    """
+    if __catalina_home() or _auth("dummy"):
+        return "tomcat"
+    return (
+        False,
+        "Tomcat execution module not loaded: neither Tomcat installed locally nor"
+        " tomcat-manager credentials set in grains/pillar/config.",
+    )
+def __catalina_home():
+    """
+    Tomcat paths differ depending on packaging
+    """
+    locations = ["/usr/share/tomcat*", "/opt/tomcat"]
+    for location in locations:
+        folders = glob.glob(location)
+        if folders:
+            for catalina_home in folders:
+                if os.path.isdir(catalina_home + "/bin"):
+                    return catalina_home
+    return False
+def _get_credentials():
+    """
+    Get the username and password from opts, grains, or pillar
+    """
+    ret = {"user": False, "passwd": False}
+    for item in ret:
+        for struct in [__opts__, __grains__, __pillar__]:
+            for config_key in __valid_configs[item]:
+                value = salt.utils.data.traverse_dict_and_list(struct, config_key, None)
+                if value:
+                    ret[item] = value
+                    break
+    return ret["user"], ret["passwd"]
+def _auth(uri):
+    """
+    returns a authentication handler.
+    Get user &amp; password from grains, if are not set default to
+    modules.config.option
+    If user &amp; pass are missing return False
+    """
+    user, password = _get_credentials()
+    if user is False or password is False:
+        return False
+    basic = urllib.request.HTTPBasicAuthHandler()
+    basic.add_password(
+        realm="Tomcat Manager Application", uri=uri, user=user, passwd=password
+    )
+    digest = urllib.request.HTTPDigestAuthHandler()
+    digest.add_password(
+        realm="Tomcat Manager Application", uri=uri, user=user, passwd=password
+    )
+    return urllib.request.build_opener(basic, digest)
+def extract_war_version(war):
+    """
+    Extract the version from the war file name. There does not seem to be a
+    standard for encoding the version into the `war file name`_
+    .. _`war file name`: https://tomcat.apache.org/tomcat-6.0-doc/deployer-howto.html
+    Examples:
+    .. code-block:: bash
+        /path/salt-2015.8.6.war -&gt; 2015.8.6
+        /path/V6R2013xD5.war -&gt; None
+    """
+    basename = os.path.basename(war)
+    war_package = os.path.splitext(basename)[0]  # remove '.war'
+    version = re.findall("-([\\d.-]+)$", war_package)  # try semver
+    return version[0] if version and len(version) == 1 else None  # default to none
+def _wget(cmd, opts=None, url="http://localhost:8080/manager", timeout=180):
+    """
+    A private function used to issue the command to tomcat via the manager
+    webapp
+    cmd
+        the command to execute
+    url
+        The URL of the server manager webapp (example:
+        http://localhost:8080/manager)
+    opts
+        a dict of arguments
+    timeout
+        timeout for HTTP request
+    Return value is a dict in the from of::
+        {
+            res: [True|False]
+            msg: list of lines we got back from the manager
+        }
+    """
+    ret = {"res": True, "msg": []}
+    auth = _auth(url)
+    if auth is False:
+        ret["res"] = False
+        ret["msg"] = "missing username and password settings (grain/pillar)"
+        return ret
+    if url[-1] != "/":
+        url += "/"
+    url6 = url
+    url += "text/{}".format(cmd)
+    url6 += "{}".format(cmd)
+    if opts:
+        url += "?{}".format(urllib.parse.urlencode(opts))
+        url6 += "?{}".format(urllib.parse.urlencode(opts))
+    urllib.request.install_opener(auth)
+    try:
+        ret["msg"] = urllib.request.urlopen(url, timeout=timeout).read().splitlines()
+    except Exception:  # pylint: disable=broad-except
+        try:
+            ret["msg"] = (
+                urllib.request.urlopen(url6, timeout=timeout).read().splitlines()
+            )
+        except Exception:  # pylint: disable=broad-except
+            ret["msg"] = "Failed to create HTTP request"
+    for key, value in enumerate(ret["msg"]):
+        try:
+            ret["msg"][key] = salt.utils.stringutils.to_unicode(value, "utf-8")
+        except (UnicodeDecodeError, AttributeError):
+            pass
+    if not ret["msg"][0].startswith("OK"):
+        ret["res"] = False
+    return ret
+def _simple_cmd(cmd, app, url="http://localhost:8080/manager", timeout=180):
+    """
+    Simple command wrapper to commands that need only a path option
+    """
+    try:
+        opts = {"path": app, "version": ls(url)[app]["version"]}
+        return "\n".join(_wget(cmd, opts, url, timeout=timeout)["msg"])
+    except Exception:  # pylint: disable=broad-except
+        return "FAIL - No context exists for path {}".format(app)
+def leaks(url="http://localhost:8080/manager", timeout=180):
+    """
+    Find memory leaks in tomcat
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    timeout : 180
+        timeout for HTTP request
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.leaks
+    """
+    return _wget("findleaks", {"statusLine": "true"}, url, timeout=timeout)["msg"]
+def status(url="http://localhost:8080/manager", timeout=180):
+    """
+    Used to test if the tomcat manager is up
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    timeout : 180
+        timeout for HTTP request
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.status
+        salt '*' tomcat.status http://localhost:8080/manager
+    """
+    return _wget("list", {}, url, timeout=timeout)["res"]
+def ls(url="http://localhost:8080/manager", timeout=180):
+    """
+    list all the deployed webapps
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    timeout : 180
+        timeout for HTTP request
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.ls
+        salt '*' tomcat.ls http://localhost:8080/manager
+    """
+    ret = {}
+    data = _wget("list", "", url, timeout=timeout)
+    if data["res"] is False:
+        return {}
+    data["msg"].pop(0)
+    for line in data["msg"]:
+        tmp = line.split(":")
+        ret[tmp[0]] = {
+            "mode": tmp[1],
+            "sessions": tmp[2],
+            "fullname": tmp[3],
+            "version": "",
+        }
+        sliced = tmp[3].split("##")
+        if len(sliced) &gt; 1:
+            ret[tmp[0]]["version"] = sliced[1]
+    return ret
+def stop(app, url="http://localhost:8080/manager", timeout=180):
+    """
+    Stop the webapp
+    app
+        the webapp context path
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    timeout : 180
+        timeout for HTTP request
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.stop /jenkins
+        salt '*' tomcat.stop /jenkins http://localhost:8080/manager
+    """
+    return _simple_cmd("stop", app, url, timeout=timeout)
+def start(app, url="http://localhost:8080/manager", timeout=180):
+    """
+    Start the webapp
+    app
+        the webapp context path
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    timeout
+        timeout for HTTP request
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.start /jenkins
+        salt '*' tomcat.start /jenkins http://localhost:8080/manager
+    """
+    return _simple_cmd("start", app, url, timeout=timeout)
+def reload_(app, url="http://localhost:8080/manager", timeout=180):
+    """
+    Reload the webapp
+    app
+        the webapp context path
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    timeout : 180
+        timeout for HTTP request
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.reload /jenkins
+        salt '*' tomcat.reload /jenkins http://localhost:8080/manager
+    """
+    return _simple_cmd("reload", app, url, timeout=timeout)
+def sessions(app, url="http://localhost:8080/manager", timeout=180):
+    """
+    return the status of the webapp sessions
+    app
+        the webapp context path
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    timeout : 180
+        timeout for HTTP request
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.sessions /jenkins
+        salt '*' tomcat.sessions /jenkins http://localhost:8080/manager
+    """
+    return _simple_cmd("sessions", app, url, timeout=timeout)
+def status_webapp(app, url="http://localhost:8080/manager", timeout=180):
+    """
+    return the status of the webapp (stopped | running | missing)
+    app
+        the webapp context path
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    timeout : 180
+        timeout for HTTP request
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.status_webapp /jenkins
+        salt '*' tomcat.status_webapp /jenkins http://localhost:8080/manager
+    """
+    webapps = ls(url, timeout=timeout)
+    for i in webapps:
+        if i == app:
+            return webapps[i]["mode"]
+    return "missing"
+def serverinfo(url="http://localhost:8080/manager", timeout=180):
+    """
+    return details about the server
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    timeout : 180
+        timeout for HTTP request
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.serverinfo
+        salt '*' tomcat.serverinfo http://localhost:8080/manager
+    """
+    data = _wget("serverinfo", {}, url, timeout=timeout)
+    if data["res"] is False:
+        return {"error": data["msg"]}
+    ret = {}
+    data["msg"].pop(0)
+    for line in data["msg"]:
+        tmp = line.split(":")
+        ret[tmp[0].strip()] = tmp[1].strip()
+    return ret
+def undeploy(app, url="http://localhost:8080/manager", timeout=180):
+    """
+    Undeploy a webapp
+    app
+        the webapp context path
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    timeout : 180
+        timeout for HTTP request
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.undeploy /jenkins
+        salt '*' tomcat.undeploy /jenkins http://localhost:8080/manager
+    """
+    return _simple_cmd("undeploy", app, url, timeout=timeout)
+def deploy_war(
+    war,
+    context,
+    force="no",
+    url="http://localhost:8080/manager",
+    saltenv="base",
+    timeout=180,
+    temp_war_location=None,
+    version=True,
+):
+    """
+    Deploy a WAR file
+    war
+        absolute path to WAR file (should be accessible by the user running
+        tomcat) or a path supported by the salt.modules.cp.get_file function
+    context
+        the context path to deploy
+    force : False
+        set True to deploy the webapp even one is deployed in the context
+    url : http://localhost:8080/manager
+        the URL of the server manager webapp
+    saltenv : base
+        the environment for WAR file in used by salt.modules.cp.get_url
+        function
+    timeout : 180
+        timeout for HTTP request
+    temp_war_location : None
+        use another location to temporarily copy to war file
+        by default the system's temp directory is used
+    version : ''
+        Specify the war version.  If this argument is provided, it overrides
+        the version encoded in the war file name, if one is present.
+        Examples:
+        .. code-block:: bash
+            salt '*' tomcat.deploy_war salt://salt-2015.8.6.war version=2015.08.r6
+        .. versionadded:: 2015.8.6
+    CLI Examples:
+    cp module
+    .. code-block:: bash
+        salt '*' tomcat.deploy_war salt://application.war /api
+        salt '*' tomcat.deploy_war salt://application.war /api no
+        salt '*' tomcat.deploy_war salt://application.war /api yes http://localhost:8080/manager
+    minion local file system
+    .. code-block:: bash
+        salt '*' tomcat.deploy_war /tmp/application.war /api
+        salt '*' tomcat.deploy_war /tmp/application.war /api no
+        salt '*' tomcat.deploy_war /tmp/application.war /api yes http://localhost:8080/manager
+    """
+    tfile = "salt.{}".format(os.path.basename(war))
+    if temp_war_location is not None:
+        if not os.path.isdir(temp_war_location):
+            return 'Error - "{}" is not a directory'.format(temp_war_location)
+        tfile = os.path.join(temp_war_location, tfile)
+    else:
+        tfile = os.path.join(tempfile.gettempdir(), tfile)
+    cache = False
+    if not os.path.isfile(war):
+        cache = True
+        cached = __salt__["cp.get_url"](war, tfile, saltenv)
+        if not cached:
+            return "FAIL - could not cache the WAR file"
+        try:
+            __salt__["file.set_mode"](cached, "0644")
+        except KeyError:
+            pass
+    else:
+        tfile = war
+    opts = {
+        "war": "file:{}".format(tfile),
+        "path": context,
+    }
+    if version:
+        version = extract_war_version(war) if version is True else version
+        if isinstance(version, str):
+            opts["version"] = version
+    if force == "yes":
+        opts["update"] = "true"
+    deployed = _wget("deploy", opts, url, timeout=timeout)
+    res = "\n".join(deployed["msg"])
+    if cache:
+        __salt__["file.remove"](tfile)
+    return res
+def passwd(passwd, user="", alg="sha1", realm=None):
+    """
+    This function replaces the $CATALINA_HOME/bin/digest.sh script
+    convert a clear-text password to the $CATALINA_BASE/conf/tomcat-users.xml
+    format
+    CLI Examples:
+    .. code-block:: bash
+        salt '*' tomcat.passwd secret
+        salt '*' tomcat.passwd secret tomcat sha1
+        salt '*' tomcat.passwd secret tomcat sha1 'Protected Realm'
+    """
+    digest = hasattr(hashlib, alg) and getattr(hashlib, alg) or None
+    if digest:
+        if realm:
+            digest.update(
+                "{}:{}:{}".format(
+                    user,
+                    realm,
+                    passwd,
+                )
+            )
+        else:
+            digest.update(passwd)
+    return digest and digest.hexdigest() or False
+def version():
+    """
+    Return server version from catalina.sh version
+    CLI Example:
+    .. code-block:: bash
+        salt '*' tomcat.version
+    """
+    cmd = __catalina_home() + "/bin/catalina.sh version"
+    out = __salt__["cmd.run"](cmd).splitlines()
+    for line in out:
+        if not line:
+            continue
+        if "Server version" in line:
+            comps = line.split(": ")
+            return comps[1]
+def fullversion():
+    """
+    Return all server information from catalina.sh version
+    CLI Example:
+    .. code-block:: bash
+        salt '*' tomcat.fullversion
+    """
+    cmd = __catalina_home() + "/bin/catalina.sh version"
+    ret = {}
+    out = __salt__["cmd.run"](cmd).splitlines()
+    for line in out:
+        if not line:
+            continue
+        if ": " in line:
+            comps = line.split(": ")
+            ret[comps[0]] = comps[1].lstrip()
+    return ret
+def signal(signal=None):
+    """
+    Signals catalina to start, stop, securestart, forcestop.
+    CLI Example:
+    .. code-block:: bash
+        salt '*' tomcat.signal start
+    """
+    valid_signals = {
+        "forcestop": "stop -force",
+        "securestart": "start -security",
+        "start": "start",
+        "stop": "stop",
+    }
+    if signal not in valid_signals:
+        return
+    cmd = "{}/bin/catalina.sh {}".format(__catalina_home(), valid_signals[signal])
+    __salt__["cmd.run"](cmd)
+if __name__ == "__main__":
+    __opts__ = {}
+    __grains__ = {}
+    __pillar__ = {
+        "tomcat-manager.user": "foobar",
+        "tomcat-manager.passwd": "barfoo1!",
+    }
+    old_format_creds = _get_credentials()
+    __pillar__ = {"tomcat-manager": {"user": "foobar", "passwd": "barfoo1!"}}
+    new_format_creds = _get_credentials()
+    if old_format_creds == new_format_creds:
+        log.info("Config backwards compatible")
+    else:
+        log.ifno("Config not backwards compatible")
 </pre>
 </div>
 </div>

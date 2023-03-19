@@ -113,7 +113,7 @@ for file in files:
     print("delete_one_line_comments")
     filename = delete_empty_lines(filename)  # name of the new file
     print("delete_comments_from_file")
-    delete_comments_from_file(filename)
+    # delete_comments_from_file(filename)
 
 # x = "/Users/christinechaniotaki/Desktop/Boilerplate/boilerplate-sample-matches/Python/match2.html"
 # print("pame")
