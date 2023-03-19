@@ -18,7 +18,6 @@ def clean_lines(lines):
         #     print(line.strip())
         if start == -1 and line.startswith('"""') and "&gt;" not in lines[i - 2] and "&lt" not in lines[i - 2]:
             print("starts", i, line)
-            print("lines[i - 1]", lines[i - 2])
             type = '"""'
             start = i
             continue
@@ -73,7 +72,7 @@ def delete_one_line_comments(filename):
                 continue
             if line.startswith("'''") and line.endswith("'''") and len(line) > 5:
                 continue
-            if line.startswith("<a name") and line.find('"""'):
+            if line.startswith("<a name") and (line.find('"""') >= 0 or line.find('#') >= 0):
                 continue
             else:
                 write_file.write(current_line)
@@ -85,7 +84,7 @@ def delete_comments_from_file(filename):
     with open(filename, 'r') as file:
         lines = [line for line in file.readlines()]
         while True:
-        # for i in range(0, 200):
+            # for i in range(0, 200):
             # print(filename)
             before = len(lines)
             lines = clean_lines(lines)
@@ -113,12 +112,12 @@ for file in files:
     print("delete_one_line_comments")
     filename = delete_empty_lines(filename)  # name of the new file
     print("delete_comments_from_file")
-    # delete_comments_from_file(filename)
+    delete_comments_from_file(filename)
 
-# x = "/Users/christinechaniotaki/Desktop/Boilerplate/boilerplate-sample-matches/Python/match2.html"
+# x = "/Users/christinechaniotaki/Desktop/Boilerplate/boilerplate-sample-matches/Python/match184.html"
 # print("pame")
 # filename = delete_one_line_comments(x)
 # print("delete_one_line_comments")
 # filename = delete_empty_lines(filename)  # name of the new file
 # print("delete_comments_from_file")
-# delete_comments_from_file(filename)
+# delete_comments_from_file(x)
