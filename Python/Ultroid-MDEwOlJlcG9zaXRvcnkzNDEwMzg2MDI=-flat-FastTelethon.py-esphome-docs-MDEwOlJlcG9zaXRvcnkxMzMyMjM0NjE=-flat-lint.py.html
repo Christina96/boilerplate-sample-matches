@@ -1,0 +1,848 @@
+
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Code Files</title>
+            <style>
+                .column {
+                    width: 47%;
+                    float: left;
+                    padding: 12px;
+                    border: 2px solid #ffd0d0;
+                }
+        
+                .modal {
+                    display: none;
+                    position: fixed;
+                    z-index: 1;
+                    left: 0;
+                    top: 0;
+                    width: 100%;
+                    height: 100%;
+                    overflow: auto;
+                    background-color: rgb(0, 0, 0);
+                    background-color: rgba(0, 0, 0, 0.4);
+                }
+    
+                .modal-content {
+                    height: 250%;
+                    background-color: #fefefe;
+                    margin: 5% auto;
+                    padding: 20px;
+                    border: 1px solid #888;
+                    width: 80%;
+                }
+    
+                .close {
+                    color: #aaa;
+                    float: right;
+                    font-size: 20px;
+                    font-weight: bold;
+                    text-align: right;
+                }
+    
+                .close:hover, .close:focus {
+                    color: black;
+                    text-decoration: none;
+                    cursor: pointer;
+                }
+    
+                .row {
+                    float: right;
+                    width: 100%;
+                }
+    
+                .column_space  {
+                    white - space: pre-wrap;
+                }
+                 
+                pre {
+                    width: 100%;
+                    overflow-y: auto;
+                    background: #f8fef2;
+                }
+                
+                .match {
+                    cursor:pointer; 
+                    background-color:#00ffbb;
+                }
+        </style>
+    </head>
+    <body>
+        <h2>Similarity: 5.7407407407407405%, Tokens: 9</h2>
+        <div class="column">
+            <h3>Ultroid-MDEwOlJlcG9zaXRvcnkzNDEwMzg2MDI=-flat-FastTelethon.py</h3>
+            <pre><code>1  import asyncio
+2  import hashlib
+3  import logging
+4  import math
+5  import os
+6  from collections import defaultdict
+7  from typing import (
+8      AsyncGenerator,
+9      Awaitable,
+10      BinaryIO,
+11      DefaultDict,
+12      List,
+13      Optional,
+14      Tuple,
+15      Union,
+16  )
+17  from telethon import TelegramClient, helpers, utils
+18  from telethon.crypto import AuthKey
+19  from telethon.helpers import _maybe_await
+20  from telethon.network import MTProtoSender
+21  from telethon.tl.alltlobjects import LAYER
+22  from telethon.tl.functions import InvokeWithLayerRequest
+23  from telethon.tl.functions.auth import (
+24      ExportAuthorizationRequest,
+25      ImportAuthorizationRequest,
+26  )
+27  from telethon.tl.functions.upload import (
+28      GetFileRequest,
+29      SaveBigFilePartRequest,
+30      SaveFilePartRequest,
+31  )
+32  from telethon.tl.types import (
+33      Document,
+34      InputDocumentFileLocation,
+35      InputFile,
+36      InputFileBig,
+37      InputFileLocation,
+38      InputPeerPhotoFileLocation,
+39      InputPhotoFileLocation,
+40      TypeInputFile,
+41  )
+42  log: logging.Logger = logging.getLogger("_FastTelethon")
+43  TypeLocation = Union[
+44      Document,
+45      InputDocumentFileLocation,
+46      InputPeerPhotoFileLocation,
+47      InputFileLocation,
+48      InputPhotoFileLocation,
+49  ]
+50  class DownloadSender:
+51      client: TelegramClient
+52      sender: MTProtoSender
+53      request: GetFileRequest
+54      remaining: int
+55      stride: int
+56      def __init__(
+57          self,
+58          client: TelegramClient,
+59          sender: MTProtoSender,
+60          file: TypeLocation,
+61          offset: int,
+62          limit: int,
+63          stride: int,
+64          count: int,
+65      ) -> None:
+66          self.sender = sender
+67          self.client = client
+68          self.request = GetFileRequest(file, offset=offset, limit=limit)
+69          self.stride = stride
+70          self.remaining = count
+71      async def next(self) -> Optional[bytes]:
+72          if not self.remaining:
+73              return None
+74          result = await self.client._call(self.sender, self.request)
+75          self.remaining -= 1
+76          self.request.offset += self.stride
+77          return result.bytes
+78      def disconnect(self) -> Awaitable[None]:
+79          return self.sender.disconnect()
+80  class UploadSender:
+81      client: TelegramClient
+82      sender: MTProtoSender
+83      request: Union[SaveFilePartRequest, SaveBigFilePartRequest]
+84      part_count: int
+85      stride: int
+86      previous: Optional[asyncio.Task]
+87      loop: asyncio.AbstractEventLoop
+88      def __init__(
+89          self,
+90          client: TelegramClient,
+91          sender: MTProtoSender,
+92          file_id: int,
+93          part_count: int,
+94          big: bool,
+95          index: int,
+96          stride: int,
+97          loop: asyncio.AbstractEventLoop,
+98      ) -> None:
+99          self.client = client
+100          self.sender = sender
+101          self.part_count = part_count
+102          if big:
+103              self.request = SaveBigFilePartRequest(file_id, index, part_count, b"")
+104          else:
+105              self.request = SaveFilePartRequest(file_id, index, b"")
+106          self.stride = stride
+107          self.previous = None
+108          self.loop = loop
+109      async def next(self, data: bytes) -> None:
+110          if self.previous:
+111              await self.previous
+112          self.previous = self.loop.create_task(self._next(data))
+113      async def _next(self, data: bytes) -> None:
+114          self.request.bytes = data
+115          await self.client._call(self.sender, self.request)
+116          self.request.file_part += self.stride
+117      async def disconnect(self) -> None:
+118          if self.previous:
+119              await self.previous
+120          return await self.sender.disconnect()
+121  class ParallelTransferrer:
+122      client: TelegramClient
+123      loop: asyncio.AbstractEventLoop
+124      dc_id: int
+125      senders: Optional[List[Union[DownloadSender, UploadSender]]]
+126      auth_key: AuthKey
+127      upload_ticker: int
+128      def __init__(self, client: TelegramClient, dc_id: Optional[int] = None) -> None:
+129          self.client = client
+130          try:
+131              self.client.refresh_auth(client)
+132          except AttributeError:
+133              pass
+134          self.loop = self.client.loop
+135          self.dc_id = dc_id or self.client.session.dc_id
+136          self.auth_key = (
+137              None
+138              if dc_id and self.client.session.dc_id != dc_id
+139              else self.client.session.auth_key
+140          )
+141          self.senders = None
+142          self.upload_ticker = 0
+143          try:
+144              self.client.clear_auth(self.client)
+145          except AttributeError:
+146              pass
+147      async def _cleanup(self) -> None:
+148          await asyncio.gather(*[sender.disconnect() for sender in self.senders])
+149          self.senders = None
+150      @staticmethod
+151      def _get_connection_count(
+152          file_size: int,
+153      ) -> int:
+154          full_size = 100 * (1024 ** 2)
+155          if file_size > full_size:
+156              return 20
+157          return math.ceil((file_size / full_size) * 20)
+158      async def _init_download(
+159          self, connections: int, file: TypeLocation, part_count: int, part_size: int
+160      ) -> None:
+161          minimum, remainder = divmod(part_count, connections)
+162          def get_part_count() -> int:
+163              nonlocal remainder
+164              if remainder > 0:
+165                  remainder -= 1
+166                  return minimum + 1
+167              return minimum
+168          self.senders = [
+169              await self._create_download_sender(
+170                  file, 0, part_size, connections * part_size, get_part_count()
+171              ),
+172              *await asyncio.gather(
+173                  *[
+174                      self._create_download_sender(
+175                          file, i, part_size, connections * part_size, get_part_count()
+176                      )
+177                      for i in range(1, connections)
+178                  ]
+179              ),
+180          ]
+181      async def _create_download_sender(
+182          self,
+183          file: TypeLocation,
+184          index: int,
+185          part_size: int,
+186          stride: int,
+187          part_count: int,
+188      ) -> DownloadSender:
+189          return DownloadSender(
+190              self.client,
+191              await self._create_sender(),
+192              file,
+193              index * part_size,
+194              part_size,
+195              stride,
+196              part_count,
+197          )
+198      async def _init_upload(
+199          self, connections: int, file_id: int, part_count: int, big: bool
+200      ) -> None:
+201          self.senders = [
+202              await self._create_upload_sender(file_id, part_count, big, 0, connections),
+203              *await asyncio.gather(
+204                  *[
+205                      self._create_upload_sender(file_id, part_count, big, i, connections)
+206                      for i in range(1, connections)
+207                  ]
+208              ),
+209          ]
+210      async def _create_upload_sender(
+211          self, file_id: int, part_count: int, big: bool, index: int, stride: int
+212      ) -> UploadSender:
+213          return UploadSender(
+214              self.client,
+215              await self._create_sender(),
+216              file_id,
+217              part_count,
+218              big,
+219              index,
+220              stride,
+221              loop=self.loop,
+222          )
+223      async def _create_sender(self) -> MTProtoSender:
+224          dc = await self.client._get_dc(self.dc_id)
+225          sender = MTProtoSender(self.auth_key, loggers=self.client._log)
+226          await sender.connect(
+227              self.client._connection(
+228                  dc.ip_address,
+229                  dc.port,
+230                  dc.id,
+231                  loggers=self.client._log,
+232                  proxy=self.client._proxy,
+233              )
+234          )
+235          if not self.auth_key:
+236              auth = await self.client(ExportAuthorizationRequest(self.dc_id))
+237              self.client._init_request.query = ImportAuthorizationRequest(
+238                  id=auth.id, bytes=auth.bytes
+239              )
+240              req = InvokeWithLayerRequest(LAYER, self.client._init_request)
+241              await sender.send(req)
+242              self.auth_key = sender.auth_key
+243          return sender
+244      async def init_upload(
+245          self,
+246          file_id: int,
+247          file_size: int,
+248          part_size_kb: Optional[float] = None,
+249          connection_count: Optional[int] = None,
+250      ) -> Tuple[int, int, bool]:
+251          connection_count = connection_count or self._get_connection_count(file_size)
+252          part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
+253          part_count = (file_size + part_size - 1) // part_size
+254          is_large = file_size > 10 * (1024 ** 2)
+255          await self._init_upload(connection_count, file_id, part_count, is_large)
+256          return part_size, part_count, is_large
+257      async def upload(self, part: bytes) -> None:
+258          await self.senders[self.upload_ticker].next(part)
+259          self.upload_ticker = (self.upload_ticker + 1) % len(self.senders)
+260      async def finish_upload(self) -> None:
+261          await self._cleanup()
+262      async def download(
+263          self,
+264          file: TypeLocation,
+265          file_size: int,
+266          part_size_kb: Optional[float] = None,
+267          connection_count: Optional[int] = None,
+268      ) -> AsyncGenerator[bytes, None]:
+<span onclick='openModal()' class='match'>269          connection_count = connection_count or self._get_connection_count(file_size)
+270          part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
+271          part_count = math.ceil(file_size / part_size)
+</span>272          await self._init_download(connection_count, file, part_count, part_size)
+273          part = 0
+274          while part < part_count:
+275              tasks = [self.loop.create_task(sender.next()) for sender in self.senders]
+276              for task in tasks:
+277                  data = await task
+278                  if not data:
+279                      break
+280                  yield data
+281                  part += 1
+282          await self._cleanup()
+283  parallel_transfer_locks: DefaultDict[int, asyncio.Lock] = defaultdict(
+284      lambda: asyncio.Lock()
+285  )
+286  def stream_file(file_to_stream: BinaryIO, chunk_size=1024):
+287      while True:
+288          data_read = file_to_stream.read(chunk_size)
+289          if not data_read:
+290              break
+291          yield data_read
+292  async def _internal_transfer_to_telegram(
+293      client: TelegramClient,
+294      response: BinaryIO,
+295      filename: str,
+296      progress_callback: callable,
+297  ) -> Tuple[TypeInputFile, int]:
+298      file_id = helpers.generate_random_long()
+299      file_size = os.path.getsize(response.name)
+300      hash_md5 = hashlib.md5()
+301      uploader = ParallelTransferrer(client)
+302      part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
+303      buffer = bytearray()
+304      for data in stream_file(response):
+305          if progress_callback:
+306              try:
+307                  await _maybe_await(progress_callback(response.tell(), file_size))
+308              except BaseException:
+309                  pass
+310          if not is_large:
+311              hash_md5.update(data)
+312          if len(buffer) == 0 and len(data) == part_size:
+313              await uploader.upload(data)
+314              continue
+315          new_len = len(buffer) + len(data)
+316          if new_len >= part_size:
+317              cutoff = part_size - len(buffer)
+318              buffer.extend(data[:cutoff])
+319              await uploader.upload(bytes(buffer))
+320              buffer.clear()
+321              buffer.extend(data[cutoff:])
+322          else:
+323              buffer.extend(data)
+324      if len(buffer) > 0:
+325          await uploader.upload(bytes(buffer))
+326      await uploader.finish_upload()
+327      if is_large:
+328          return InputFileBig(file_id, part_count, filename), file_size
+329      return InputFile(file_id, part_count, filename, hash_md5.hexdigest()), file_size
+330  async def download_file(
+331      client: TelegramClient,
+332      location: TypeLocation,
+333      out: BinaryIO,
+334      progress_callback: callable = None,
+335  ) -> BinaryIO:
+336      size = location.size
+337      dc_id, location = utils.get_input_location(location)
+338      downloader = ParallelTransferrer(client, dc_id)
+339      downloaded = downloader.download(location, size)
+340      async for x in downloaded:
+341          out.write(x)
+342          if progress_callback:
+343              try:
+344                  await _maybe_await(progress_callback(out.tell(), size))
+345              except BaseException:
+346                  pass
+347      return out
+348  async def upload_file(
+349      client: TelegramClient,
+350      file: BinaryIO,
+351      filename: str,
+352      progress_callback: callable = None,
+353  ) -> TypeInputFile:
+354      return (
+355          await _internal_transfer_to_telegram(client, file, filename, progress_callback)
+356      )[0]
+</code></pre>
+        </div>
+        <div class="column">
+            <h3>esphome-docs-MDEwOlJlcG9zaXRvcnkxMzMyMjM0NjE=-flat-lint.py</h3>
+            <pre><code>1  #!/usr/bin/env python3
+2  import argparse
+3  import collections
+4  from pathlib import Path
+5  from typing import Optional
+6  import colorama
+7  import fnmatch
+8  import functools
+9  import os.path
+10  import re
+11  import sys
+12  import os
+13  import subprocess
+14  try:
+15      from PIL import Image
+16      PILLOW_INSTALLED = True
+17  except ImportError:
+18      print("Pillow could not be imported - will not run image checks")
+19      print("Install pillow with `pip3 install pillow`")
+20      PILLOW_INSTALLED = False
+21  class AnsiFore:
+22      KEEP = ""
+23      BLACK = "\033[30m"
+24      RED = "\033[31m"
+25      GREEN = "\033[32m"
+26      YELLOW = "\033[33m"
+27      BLUE = "\033[34m"
+28      MAGENTA = "\033[35m"
+29      CYAN = "\033[36m"
+30      WHITE = "\033[37m"
+31      RESET = "\033[39m"
+32      BOLD_BLACK = "\033[1;30m"
+33      BOLD_RED = "\033[1;31m"
+34      BOLD_GREEN = "\033[1;32m"
+35      BOLD_YELLOW = "\033[1;33m"
+36      BOLD_BLUE = "\033[1;34m"
+37      BOLD_MAGENTA = "\033[1;35m"
+38      BOLD_CYAN = "\033[1;36m"
+39      BOLD_WHITE = "\033[1;37m"
+40      BOLD_RESET = "\033[1;39m"
+41  class AnsiStyle:
+42      BRIGHT = "\033[1m"
+43      BOLD = "\033[1m"
+44      DIM = "\033[2m"
+45      THIN = "\033[2m"
+46      NORMAL = "\033[22m"
+47      RESET_ALL = "\033[0m"
+48  Fore = AnsiFore()
+49  Style = AnsiStyle()
+50  def print_error_for_file(file: str, body: Optional[str]):
+51      print(f"{AnsiFore.GREEN}### File {AnsiStyle.BRIGHT}{file}{AnsiStyle.RESET_ALL}")
+52      print()
+53      if body is not None:
+54          print(body)
+55          print()
+56  def git_ls_files(patterns=None):
+57      command = ["git", "ls-files", "-s"]
+58      if patterns is not None:
+59          command.extend(patterns)
+60      proc = subprocess.Popen(command, stdout=subprocess.PIPE)
+61      output, _ = proc.communicate()
+62      lines = [x.split() for x in output.decode("utf-8").splitlines()]
+63      return {s[3].strip(): int(s[0]) for s in lines}
+64  def find_all(a_str, sub):
+65      if not a_str.find(sub):
+66          return
+67      for i, line in enumerate(a_str.split("\n")):
+68          column = 0
+69          while True:
+70              column = line.find(sub, column)
+71              if column == -1:
+72                  break
+73              yield i, column
+74              column += len(sub)
+75  colorama.init()
+76  parser = argparse.ArgumentParser()
+77  parser.add_argument(
+78      "files", nargs="*", default=[], help="files to be processed (regex on path)"
+79  )
+80  args = parser.parse_args()
+81  EXECUTABLE_BIT = git_ls_files()
+82  files = list(EXECUTABLE_BIT.keys())
+83  file_name_re = re.compile("|".join(args.files))
+84  files = [p for p in files if file_name_re.search(p)]
+85  files.sort()
+86  file_types = (
+87      ".cfg",
+88      ".css",
+89      ".gif",
+90      ".h",
+91      ".html",
+92      ".ico",
+93      ".jpg",
+94      ".js",
+95      ".json",
+96      ".md",
+97      ".png",
+98      ".py",
+99      ".rst",
+100      ".svg",
+101      ".toml",
+102      ".txt",
+103      ".webmanifest",
+104      ".xml",
+105      ".yaml",
+106      ".yml",
+107      "",
+108  )
+109  docs_types = [".rst"]
+110  image_types = [".jpg", ".ico", ".png", ".svg", ".gif"]
+111  LINT_FILE_CHECKS = []
+112  LINT_CONTENT_CHECKS = []
+113  LINT_POST_CHECKS = []
+114  def run_check(lint_obj, fname, *args):
+115      include = lint_obj["include"]
+116      exclude = lint_obj["exclude"]
+117      func = lint_obj["func"]
+118      if include is not None:
+119          for incl in include:
+120              if fnmatch.fnmatch(fname, incl):
+121                  break
+122          else:
+123              return None
+124      for excl in exclude:
+125          if fnmatch.fnmatch(fname, excl):
+126              return None
+127      return func(*args)
+128  def run_checks(lints, fname, *args):
+129      for lint in lints:
+130          try:
+131              add_errors(fname, run_check(lint, fname, *args))
+132          except Exception:
+133              print(f"Check {lint['func'].__name__} on file {fname} failed:")
+134              raise
+135  def _add_check(checks, func, include=None, exclude=None):
+136      checks.append(
+137          {
+138              "include": include,
+139              "exclude": exclude or [],
+140              "func": func,
+141          }
+142      )
+143  def lint_file_check(**kwargs):
+144      def decorator(func):
+145          _add_check(LINT_FILE_CHECKS, func, **kwargs)
+146          return func
+147      return decorator
+148  def lint_content_check(**kwargs):
+149      def decorator(func):
+150          _add_check(LINT_CONTENT_CHECKS, func, **kwargs)
+151          return func
+152      return decorator
+153  def lint_post_check(func):
+154      _add_check(LINT_POST_CHECKS, func)
+155      return func
+156  def lint_re_check(regex, **kwargs):
+157      flags = kwargs.pop("flags", re.MULTILINE)
+158      prog = re.compile(regex, flags)
+159      decor = lint_content_check(**kwargs)
+160      def decorator(func):
+161          @functools.wraps(func)
+162          def new_func(fname, content):
+163              errors = []
+164              for match in prog.finditer(content):
+165                  if "NOLINT" in match.group(0):
+166                      continue
+167                  lineno = content.count("\n", 0, match.start()) + 1
+168                  substr = content[: match.start()]
+169                  col = len(substr) - substr.rfind("\n")
+170                  err = func(fname, match)
+171                  if err is None:
+172                      continue
+173                  errors.append((lineno, col + 1, err))
+174              return errors
+175          return decor(new_func)
+176      return decorator
+177  def lint_content_find_check(find, only_first=False, **kwargs):
+178      decor = lint_content_check(**kwargs)
+179      def decorator(func):
+180          @functools.wraps(func)
+181          def new_func(fname, content):
+182              find_ = find
+183              if callable(find):
+184                  find_ = find(fname, content)
+185              errors = []
+186              for line, col in find_all(content, find_):
+187                  err = func(fname)
+188                  errors.append((line + 1, col + 1, err))
+189                  if only_first:
+190                      break
+191              return errors
+192          return decor(new_func)
+193      return decorator
+194  @lint_file_check(exclude=[f"*{f}" for f in file_types])
+195  def lint_ext_check(fname: str, stat: os.stat_result):
+196      return (
+197          "This file extension is not a registered file type. If this is an error, please "
+198          "update the script/ci-custom.py script."
+199      )
+200  def lint_executable_bit(fname: str, stat: os.stat_result):
+201      ex = EXECUTABLE_BIT[fname]
+202      if ex != 100644:
+203          return (
+204              "File has invalid executable bit {}. If running from a windows machine please "
+205              "see disabling executable bit in git.".format(ex)
+206          )
+207      return None
+208  @lint_file_check(
+209  )
+210  def lint_index_images_size(fname: str, stat: os.stat_result):
+211      if stat.st_size > 40 * 1024:
+212          return (
+213              "Image is too large. The files in the images/ folder are displayed on esphome's "
+214              "front page and thus should be small (no more than 300x300px, and <40kb). "
+215              "Use a tool like https://compress-or-die.com/ to reduce the image size. "
+216              f"Size of file: {stat.st_size / 1024:.0f}kb"
+217          )
+218      return None
+219  @lint_file_check(include=[f"*{ext}" for ext in image_types])
+220  def lint_all_images_size(fname: str, stat: os.stat_result):
+221      if stat.st_size > 1024 * 1024:
+222          return (
+223              "Image is too large. Images in ESPHome's codebase should be 1MB in size max. "
+224              "Use a tool like https://compress-or-die.com/ to reduce the image size. "
+225              f"Size of file: {stat.st_size / 1024:.0f}kb"
+226          )
+227      return None
+228  if PILLOW_INSTALLED:
+229      @lint_file_check(
+230      )
+231      def lint_index_images_dimensions(fname: str, stat: os.stat_result):
+232          img = Image.open(fname)
+233          if img.width > 300 or img.height > 300:
+234              return (
+235                  "Image has too large dimensions. The images in the images/ folder are displayed on "
+236                  "ESPHome's main page, so need to be lightweight. We allow a max of 300x300 for images on this page. "
+237                  "Use a tool like https://compress-or-die.com/ to reduce the image size. "
+238                  f"Dimensions of this image: {img.width}x{img.height}"
+239              )
+240          return None
+241  @lint_content_find_check(
+242      "\t",
+243      only_first=True,
+244      exclude=[
+245          "Makefile",
+246      ],
+247  )
+248  def lint_tabs(fname):
+249      return "File contains tab character. Please convert tabs to spaces."
+250  @lint_content_find_check("\r", only_first=True)
+251  def lint_newline(fname):
+252      return "File contains Windows newline. Please set your editor to Unix newline mode."
+253  def lint_end_newline(fname, content):
+254      if content and not content.endswith("\n"):
+255          return "File does not end with a newline, please add an empty line at the end of the file."
+256      return None
+<span onclick='openModal()' class='match'>257  section_regex = re.compile(r"^(=+|-+|\*+|~+)$")
+258  directive_regex = re.compile(r"^(\s*)\.\. (.*)::.*$")
+259  directive_arg_regex = re.compile(r"^(\s+):.*:\s*.*$")
+</span>260  @lint_content_check(include=["*.rst"])
+261  def lint_directive_formatting(fname, content):
+262      errors = []
+263      lines = content.splitlines(keepends=False)
+264      for i, line in enumerate(lines):
+265          m = directive_regex.match(line)
+266          if m is None:
+267              continue
+268          base_indentation = len(m.group(1))
+269          directive_name = m.group(2)
+270          if directive_name.startswith("|") or directive_name == "seo":
+271              continue
+272          for j in range(i + 1, len(lines)):
+273              if not directive_arg_regex.match(lines[j]):
+274                  break
+275          else:
+276              continue
+277          if lines[j]:
+278              errors.append(
+279                  (
+280                      j,
+281                      1,
+282                      "Directive '{}' is not followed by an empty line. Please insert an "
+283                      "empty line after {}:{}".format(directive_name, fname, j),
+284                  )
+285              )
+286              continue
+287          k = j + 1
+288          for j in range(k, len(lines)):
+289              if not lines[j]:
+290                  continue
+291              num_spaces = len(lines[j]) - len(lines[j].lstrip())
+292              if num_spaces <= base_indentation:
+293                  break
+294              num_indent = num_spaces - base_indentation
+295              if j == k and num_indent != 4:
+296                  errors.append(
+297                      (
+298                          j + 1,
+299                          num_indent,
+300                          "Directive '{}' must be indented with 4 spaces, not {}. See "
+301                          "{}:{}".format(directive_name, num_indent, fname, j + 1),
+302                      )
+303                  )
+304                  break
+305      return errors
+306  @lint_re_check(
+307      r"https://esphome.io/",
+308      include=["*.rst"],
+309      exclude=[
+310          "components/web_server.rst",
+311      ],
+312  )
+313  def lint_esphome_io_link(fname, match):
+314      return (
+315          "All links to esphome.io should be relative, please remove esphome.io from URL"
+316      )
+317  def highlight(s):
+318      return f"\033[36m{s}\033[0m"
+319  errors = collections.defaultdict(list)
+320  def add_errors(fname, errs):
+321      if not isinstance(errs, list):
+322          errs = [errs]
+323      for err in errs:
+324          if err is None:
+325              continue
+326          try:
+327              lineno, col, msg = err
+328          except ValueError:
+329              lineno = 1
+330              col = 1
+331              msg = err
+332          if not isinstance(msg, str):
+333              raise ValueError("Error is not instance of string!")
+334          if not isinstance(lineno, int):
+335              raise ValueError("Line number is not an int!")
+336          if not isinstance(col, int):
+337              raise ValueError("Column number is not an int!")
+338          errors[fname].append((lineno, col, msg))
+339  for fname in files:
+340      p = Path(fname)
+341      if not p.is_file():
+342          continue
+343      run_checks(LINT_FILE_CHECKS, fname, fname, p.stat())
+344      if p.suffix in image_types:
+345          continue
+346      try:
+347          with open(fname, "r") as f_handle:
+348              content = f_handle.read()
+349      except UnicodeDecodeError:
+350          add_errors(
+351              fname,
+352              "File is not readable as UTF-8. Please set your editor to UTF-8 mode.",
+353          )
+354          continue
+355      run_checks(LINT_CONTENT_CHECKS, fname, fname, content)
+356  run_checks(LINT_POST_CHECKS, "POST")
+357  for f, errs in sorted(errors.items()):
+358      err_str = (
+359          f"{AnsiStyle.BOLD}{f}:{lineno}:{col}:{AnsiStyle.RESET_ALL} "
+360          f"{AnsiStyle.BOLD}{AnsiFore.RED}{'lint:'}{AnsiStyle.RESET_ALL} {msg}\n"
+361          for lineno, col, msg in errs
+362      )
+363      print_error_for_file(f, "\n".join(err_str))
+364  sys.exit(len(errors))
+</code></pre>
+        </div>
+    
+        <!-- The Modal -->
+        <div id="myModal" class="modal">
+            <div class="modal-content">
+                <span class="row close">&times;</span>
+                <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from Ultroid-MDEwOlJlcG9zaXRvcnkzNDEwMzg2MDI=-flat-FastTelethon.py</div>
+                <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from esphome-docs-MDEwOlJlcG9zaXRvcnkxMzMyMjM0NjE=-flat-lint.py</div>
+                <div class="column column_space"><pre><code>269          connection_count = connection_count or self._get_connection_count(file_size)
+270          part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
+271          part_count = math.ceil(file_size / part_size)
+</pre></code></div>
+                <div class="column column_space"><pre><code>257  section_regex = re.compile(r"^(=+|-+|\*+|~+)$")
+258  directive_regex = re.compile(r"^(\s*)\.\. (.*)::.*$")
+259  directive_arg_regex = re.compile(r"^(\s+):.*:\s*.*$")
+</pre></code></div>
+            </div>
+        </div>
+        <script>
+        // Get the modal
+        var modal = document.getElementById("myModal");
+        
+        // Get the button that opens the modal
+        var btn = document.getElementById("myBtn");
+        
+        // Get the <span> element that closes the modal
+        var span = document.getElementsByClassName("close")[0];
+        
+        // When the user clicks the button, open the modal
+        function openModal(){
+          modal.style.display = "block";
+        }
+        
+        // When the user clicks on <span> (x), close the modal
+        span.onclick = function() {
+        modal.style.display = "none";
+        }
+        
+        // When the user clicks anywhere outside of the modal, close it
+        window.onclick = function(event) {
+        if (event.target == modal) {
+        modal.style.display = "none";
+        } }
+        
+        </script>
+    </body>
+    </html>
+    
