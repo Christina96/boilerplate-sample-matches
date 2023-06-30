@@ -1,0 +1,1251 @@
+
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Code Files</title>
+            <style>
+                .column {
+                    width: 47%;
+                    float: left;
+                    padding: 12px;
+                    border: 2px solid #ffd0d0;
+                }
+        
+                .modal {
+                    display: none;
+                    position: fixed;
+                    z-index: 1;
+                    left: 0;
+                    top: 0;
+                    width: 100%;
+                    height: 100%;
+                    overflow: auto;
+                    background-color: rgb(0, 0, 0);
+                    background-color: rgba(0, 0, 0, 0.4);
+                }
+    
+                .modal-content {
+                    height: 250%;
+                    background-color: #fefefe;
+                    margin: 5% auto;
+                    padding: 20px;
+                    border: 1px solid #888;
+                    width: 80%;
+                }
+    
+                .close {
+                    color: #aaa;
+                    float: right;
+                    font-size: 20px;
+                    font-weight: bold;
+                    text-align: right;
+                }
+    
+                .close:hover, .close:focus {
+                    color: black;
+                    text-decoration: none;
+                    cursor: pointer;
+                }
+    
+                .row {
+                    float: right;
+                    width: 100%;
+                }
+    
+                .column_space  {
+                    white - space: pre-wrap;
+                }
+                 
+                pre {
+                    width: 100%;
+                    overflow-y: auto;
+                    background: #f8fef2;
+                }
+                
+                .match {
+                    cursor:pointer; 
+                    background-color:#00ffbb;
+                }
+        </style>
+    </head>
+    <body>
+        <h2>Tokens: 12, <button onclick='openModal()' class='match'></button></h2>
+        <div class="column">
+            <h3>runner-MDEwOlJlcG9zaXRvcnkxODQyODY4NzU=-flat-ProcessInvoker_16.cs</h3>
+            <pre><code>1  using System;
+2  using System.Collections.Concurrent;
+3  using System.Collections.Generic;
+4  using System.ComponentModel;
+5  using System.Diagnostics;
+6  using System.IO;
+7  using System.Linq;
+8  using System.Runtime.InteropServices;
+9  using System.Text;
+10  using System.Threading;
+11  using System.Threading.Channels;
+12  using System.Threading.Tasks;
+13  using GitHub.Runner.Sdk;
+14  namespace GitHub.Runner.Sdk
+15  {
+16      public sealed class ProcessInvoker : IDisposable
+17      {
+18          private Process _proc;
+19          private Stopwatch _stopWatch;
+20          private int _asyncStreamReaderCount = 0;
+21          private bool _waitingOnStreams = false;
+22          private readonly AsyncManualResetEvent _outputProcessEvent = new();
+23          private readonly TaskCompletionSource<bool> _processExitedCompletionSource = new();
+24          private readonly CancellationTokenSource _processStandardInWriteCancellationTokenSource = new();
+25          private readonly ConcurrentQueue<string> _errorData = new();
+26          private readonly ConcurrentQueue<string> _outputData = new();
+27          private readonly TimeSpan _sigintTimeout = TimeSpan.FromMilliseconds(7500);
+28          private readonly TimeSpan _sigtermTimeout = TimeSpan.FromMilliseconds(2500);
+29          private ITraceWriter Trace { get; set; }
+30          private class AsyncManualResetEvent
+31          {
+32              private volatile TaskCompletionSource<bool> m_tcs = new();
+33              public Task WaitAsync() { return m_tcs.Task; }
+34              public void Set()
+35              {
+36                  var tcs = m_tcs;
+37                  Task.Factory.StartNew(s => ((TaskCompletionSource<bool>)s).TrySetResult(true),
+38                      tcs, CancellationToken.None, TaskCreationOptions.PreferFairness, TaskScheduler.Default);
+39                  tcs.Task.Wait();
+40              }
+41              public void Reset()
+42              {
+43                  while (true)
+44                  {
+45                      var tcs = m_tcs;
+46                      if (!tcs.Task.IsCompleted ||
+47                          Interlocked.CompareExchange(ref m_tcs, new TaskCompletionSource<bool>(), tcs) == tcs)
+48                          return;
+49                  }
+50              }
+51          }
+52          public event EventHandler<ProcessDataReceivedEventArgs> OutputDataReceived;
+53          public event EventHandler<ProcessDataReceivedEventArgs> ErrorDataReceived;
+54          public ProcessInvoker(ITraceWriter trace)
+55          {
+56              this.Trace = trace;
+57          }
+58          public Task<int> ExecuteAsync(
+59              string workingDirectory,
+60              string fileName,
+61              string arguments,
+62              IDictionary<string, string> environment,
+63              CancellationToken cancellationToken)
+64          {
+65              return ExecuteAsync(
+66                  workingDirectory: workingDirectory,
+67                  fileName: fileName,
+68                  arguments: arguments,
+69                  environment: environment,
+70                  requireExitCodeZero: false,
+71                  cancellationToken: cancellationToken);
+72          }
+73          public Task<int> ExecuteAsync(
+74              string workingDirectory,
+75              string fileName,
+76              string arguments,
+77              IDictionary<string, string> environment,
+78              bool requireExitCodeZero,
+79              CancellationToken cancellationToken)
+80          {
+81              return ExecuteAsync(
+82                  workingDirectory: workingDirectory,
+83                  fileName: fileName,
+84                  arguments: arguments,
+85                  environment: environment,
+86                  requireExitCodeZero: requireExitCodeZero,
+87                  outputEncoding: null,
+88                  cancellationToken: cancellationToken);
+89          }
+90          public Task<int> ExecuteAsync(
+91              string workingDirectory,
+92              string fileName,
+93              string arguments,
+94              IDictionary<string, string> environment,
+95              bool requireExitCodeZero,
+96              Encoding outputEncoding,
+97              CancellationToken cancellationToken)
+98          {
+99              return ExecuteAsync(
+100                  workingDirectory: workingDirectory,
+101                  fileName: fileName,
+102                  arguments: arguments,
+103                  environment: environment,
+104                  requireExitCodeZero: requireExitCodeZero,
+105                  outputEncoding: outputEncoding,
+106                  killProcessOnCancel: false,
+107                  cancellationToken: cancellationToken);
+108          }
+109          public Task<int> ExecuteAsync(
+110              string workingDirectory,
+111              string fileName,
+112              string arguments,
+113              IDictionary<string, string> environment,
+114              bool requireExitCodeZero,
+115              Encoding outputEncoding,
+116              bool killProcessOnCancel,
+117              CancellationToken cancellationToken)
+118          {
+119              return ExecuteAsync(
+120                  workingDirectory: workingDirectory,
+121                  fileName: fileName,
+122                  arguments: arguments,
+123                  environment: environment,
+124                  requireExitCodeZero: requireExitCodeZero,
+125                  outputEncoding: outputEncoding,
+126                  killProcessOnCancel: killProcessOnCancel,
+127                  redirectStandardIn: null,
+128                  cancellationToken: cancellationToken);
+129          }
+130          public Task<int> ExecuteAsync(
+131              string workingDirectory,
+132              string fileName,
+133              string arguments,
+134              IDictionary<string, string> environment,
+135              bool requireExitCodeZero,
+136              Encoding outputEncoding,
+137              bool killProcessOnCancel,
+138              Channel<string> redirectStandardIn,
+139              CancellationToken cancellationToken)
+140          {
+141              return ExecuteAsync(
+142                  workingDirectory: workingDirectory,
+143                  fileName: fileName,
+144                  arguments: arguments,
+145                  environment: environment,
+146                  requireExitCodeZero: requireExitCodeZero,
+147                  outputEncoding: outputEncoding,
+148                  killProcessOnCancel: killProcessOnCancel,
+149                  redirectStandardIn: redirectStandardIn,
+150                  inheritConsoleHandler: false,
+151                  cancellationToken: cancellationToken);
+152          }
+153          public Task<int> ExecuteAsync(
+154              string workingDirectory,
+155              string fileName,
+156              string arguments,
+157              IDictionary<string, string> environment,
+158              bool requireExitCodeZero,
+159              Encoding outputEncoding,
+160              bool killProcessOnCancel,
+161              Channel<string> redirectStandardIn,
+162              bool inheritConsoleHandler,
+163              CancellationToken cancellationToken)
+164          {
+165              return ExecuteAsync(
+166                  workingDirectory: workingDirectory,
+167                  fileName: fileName,
+168                  arguments: arguments,
+169                  environment: environment,
+170                  requireExitCodeZero: requireExitCodeZero,
+171                  outputEncoding: outputEncoding,
+172                  killProcessOnCancel: killProcessOnCancel,
+173                  redirectStandardIn: redirectStandardIn,
+174                  inheritConsoleHandler: inheritConsoleHandler,
+175                  keepStandardInOpen: false,
+176                  highPriorityProcess: false,
+177                  cancellationToken: cancellationToken);
+178          }
+179          public async Task<int> ExecuteAsync(
+180              string workingDirectory,
+181              string fileName,
+182              string arguments,
+183              IDictionary<string, string> environment,
+184              bool requireExitCodeZero,
+185              Encoding outputEncoding,
+186              bool killProcessOnCancel,
+187              Channel<string> redirectStandardIn,
+188              bool inheritConsoleHandler,
+189              bool keepStandardInOpen,
+190              bool highPriorityProcess,
+191              CancellationToken cancellationToken)
+192          {
+193              ArgUtil.Null(_proc, nameof(_proc));
+194              ArgUtil.NotNullOrEmpty(fileName, nameof(fileName));
+195              Trace.Info("Starting process:");
+196              Trace.Info($"  File name: '{fileName}'");
+197              Trace.Info($"  Arguments: '{arguments}'");
+198              Trace.Info($"  Working directory: '{workingDirectory}'");
+199              Trace.Info($"  Require exit code zero: '{requireExitCodeZero}'");
+200              Trace.Info($"  Encoding web name: {outputEncoding?.WebName} ; code page: '{outputEncoding?.CodePage}'");
+201              Trace.Info($"  Force kill process on cancellation: '{killProcessOnCancel}'");
+202              Trace.Info($"  Redirected STDIN: '{redirectStandardIn != null}'");
+203              Trace.Info($"  Persist current code page: '{inheritConsoleHandler}'");
+204              Trace.Info($"  Keep redirected STDIN open: '{keepStandardInOpen}'");
+205              Trace.Info($"  High priority process: '{highPriorityProcess}'");
+206              _proc = new Process();
+207              _proc.StartInfo.FileName = fileName;
+208              _proc.StartInfo.Arguments = arguments;
+209              _proc.StartInfo.WorkingDirectory = workingDirectory;
+210              _proc.StartInfo.UseShellExecute = false;
+211              _proc.StartInfo.CreateNoWindow = !inheritConsoleHandler;
+212              _proc.StartInfo.RedirectStandardInput = true;
+213              _proc.StartInfo.RedirectStandardError = true;
+214              _proc.StartInfo.RedirectStandardOutput = true;
+215              if (_proc.StartInfo.RedirectStandardError)
+216              {
+217                  Interlocked.Increment(ref _asyncStreamReaderCount);
+218              }
+219              if (_proc.StartInfo.RedirectStandardOutput)
+220              {
+221                  Interlocked.Increment(ref _asyncStreamReaderCount);
+222              }
+223  #if OS_WINDOWS
+224              StringUtil.EnsureRegisterEncodings();
+225  #endif
+226              if (outputEncoding != null)
+227              {
+228                  _proc.StartInfo.StandardErrorEncoding = outputEncoding;
+229                  _proc.StartInfo.StandardOutputEncoding = outputEncoding;
+230              }
+231              if (environment != null && environment.Count > 0)
+232              {
+233                  foreach (KeyValuePair<string, string> kvp in environment)
+234                  {
+235  #if OS_WINDOWS
+236                      string tempKey = String.IsNullOrWhiteSpace(kvp.Key) ? kvp.Key : kvp.Key.Split('\0')[0];
+237                      string tempValue = String.IsNullOrWhiteSpace(kvp.Value) ? kvp.Value : kvp.Value.Split('\0')[0];
+238                      if(!String.IsNullOrWhiteSpace(tempKey))
+239                      {
+240                           _proc.StartInfo.Environment[tempKey] = tempValue;
+241                      }
+242  #else
+243                      _proc.StartInfo.Environment[kvp.Key] = kvp.Value;
+244  #endif
+245                  }
+246              }
+247              _proc.StartInfo.Environment["GITHUB_ACTIONS"] = "true";
+248              if (!_proc.StartInfo.Environment.ContainsKey("CI") &&
+249                  Environment.GetEnvironmentVariable("CI") == null)
+250              {
+251                  _proc.StartInfo.Environment["CI"] = "true";
+252              }
+253              _proc.EnableRaisingEvents = true;
+254              _proc.Exited += ProcessExitedHandler;
+255              _stopWatch = Stopwatch.StartNew();
+256              _proc.Start();
+257              if (!highPriorityProcess)
+258              {
+259                  DecreaseProcessPriority(_proc);
+260              }
+261              if (_proc.StartInfo.RedirectStandardError)
+262              {
+263                  StartReadStream(_proc.StandardError, _errorData);
+264              }
+265              if (_proc.StartInfo.RedirectStandardOutput)
+266              {
+267                  StartReadStream(_proc.StandardOutput, _outputData);
+268              }
+269              if (_proc.StartInfo.RedirectStandardInput)
+270              {
+271                  if (redirectStandardIn != null)
+272                  {
+273                      StartWriteStream(redirectStandardIn, _proc.StandardInput, keepStandardInOpen);
+274                  }
+275                  else
+276                  {
+277                      _proc.StandardInput.Close();
+278                  }
+279              }
+280              var cancellationFinished = new TaskCompletionSource<bool>();
+281              using (var registration = cancellationToken.Register(async () =>
+282              {
+283                  await CancelAndKillProcessTree(killProcessOnCancel);
+284                  cancellationFinished.TrySetResult(true);
+285              }))
+286              {
+287                  Trace.Info($"Process started with process id {_proc.Id}, waiting for process exit.");
+288                  while (true)
+289                  {
+290                      Task outputSignal = _outputProcessEvent.WaitAsync();
+291                      var signaled = await Task.WhenAny(outputSignal, _processExitedCompletionSource.Task);
+292                      if (signaled == outputSignal)
+293                      {
+294                          ProcessOutput();
+295                      }
+296                      else
+297                      {
+298                          _stopWatch.Stop();
+299                          break;
+300                      }
+301                  }
+302                  ProcessOutput();
+303                  if (cancellationToken.IsCancellationRequested)
+304                  {
+305                      await cancellationFinished.Task;
+306                      Trace.Info($"Process Cancellation finished.");
+307                  }
+308                  Trace.Info($"Finished process {_proc.Id} with exit code {_proc.ExitCode}, and elapsed time {_stopWatch.Elapsed}.");
+309              }
+310              cancellationToken.ThrowIfCancellationRequested();
+311              if (_proc.ExitCode != 0 && requireExitCodeZero)
+312              {
+313                  throw new ProcessExitCodeException(exitCode: _proc.ExitCode, fileName: fileName, arguments: arguments);
+314              }
+315              return _proc.ExitCode;
+316          }
+317          public void Dispose()
+318          {
+319              Dispose(true);
+320              GC.SuppressFinalize(this);
+321          }
+322          private void Dispose(bool disposing)
+323          {
+324              if (disposing)
+325              {
+326                  if (_proc != null)
+327                  {
+328                      _proc.Dispose();
+329                      _proc = null;
+330                  }
+331              }
+332          }
+333          private void ProcessOutput()
+334          {
+335              List<string> errorData = new();
+336              List<string> outputData = new();
+337              string errorLine;
+338              while (_errorData.TryDequeue(out errorLine))
+339              {
+340                  errorData.Add(errorLine);
+341              }
+342              string outputLine;
+343              while (_outputData.TryDequeue(out outputLine))
+344              {
+345                  outputData.Add(outputLine);
+346              }
+347              _outputProcessEvent.Reset();
+348              if (errorData != null && this.ErrorDataReceived != null)
+349              {
+350                  foreach (string line in errorData)
+351                  {
+352                      if (line != null)
+353                      {
+354                          this.ErrorDataReceived(this, new ProcessDataReceivedEventArgs(line));
+355                      }
+356                  }
+357              }
+358              if (outputData != null && this.OutputDataReceived != null)
+359              {
+360                  foreach (string line in outputData)
+361                  {
+362                      if (line != null)
+363                      {
+364                          this.OutputDataReceived(this, new ProcessDataReceivedEventArgs(line));
+365                      }
+366                  }
+367              }
+368          }
+369          private async Task CancelAndKillProcessTree(bool killProcessOnCancel)
+370          {
+371              ArgUtil.NotNull(_proc, nameof(_proc));
+372              if (!killProcessOnCancel)
+373              {
+374                  bool sigint_succeed = await SendSIGINT(_sigintTimeout);
+375                  if (sigint_succeed)
+376                  {
+377                      Trace.Info("Process cancelled successfully through Ctrl+C/SIGINT.");
+378                      return;
+379                  }
+380                  bool sigterm_succeed = await SendSIGTERM(_sigtermTimeout);
+381                  if (sigterm_succeed)
+382                  {
+383                      Trace.Info("Process terminate successfully through Ctrl+Break/SIGTERM.");
+384                      return;
+385                  }
+386              }
+387              Trace.Info("Kill entire process tree since both cancel and terminate signal has been ignored by the target process.");
+388              KillProcessTree();
+389          }
+390          private async Task<bool> SendSIGINT(TimeSpan timeout)
+391          {
+392  #if OS_WINDOWS
+393              return await SendCtrlSignal(ConsoleCtrlEvent.CTRL_C, timeout);
+394  #else
+395              return await SendSignal(Signals.SIGINT, timeout);
+396  #endif
+397          }
+398          private async Task<bool> SendSIGTERM(TimeSpan timeout)
+399          {
+400  #if OS_WINDOWS
+401              return await SendCtrlSignal(ConsoleCtrlEvent.CTRL_BREAK, timeout);
+402  #else
+403              return await SendSignal(Signals.SIGTERM, timeout);
+404  #endif
+405          }
+406          private void ProcessExitedHandler(object sender, EventArgs e)
+407          {
+408              if ((_proc.StartInfo.RedirectStandardError || _proc.StartInfo.RedirectStandardOutput) && _asyncStreamReaderCount != 0)
+409              {
+410                  _waitingOnStreams = true;
+411                  Task.Run(async () =>
+412                  {
+413                      await Task.Delay(TimeSpan.FromSeconds(5));
+414                      KillProcessTree();
+415                      _processExitedCompletionSource.TrySetResult(true);
+416                      _processStandardInWriteCancellationTokenSource.Cancel();
+417                  });
+418              }
+419              else
+420              {
+421                  _processExitedCompletionSource.TrySetResult(true);
+422                  _processStandardInWriteCancellationTokenSource.Cancel();
+423              }
+424          }
+425          private void StartReadStream(StreamReader reader, ConcurrentQueue<string> dataBuffer)
+426          {
+427              Task.Run(() =>
+428              {
+429                  while (!reader.EndOfStream)
+430                  {
+431                      string line = reader.ReadLine();
+432                      if (line != null)
+433                      {
+434                          dataBuffer.Enqueue(line);
+435                          _outputProcessEvent.Set();
+436                      }
+437                  }
+438                  Trace.Info("STDOUT/STDERR stream read finished.");
+439                  if (Interlocked.Decrement(ref _asyncStreamReaderCount) == 0 && _waitingOnStreams)
+440                  {
+441                      _processExitedCompletionSource.TrySetResult(true);
+442                      _processStandardInWriteCancellationTokenSource.Cancel();
+443                  }
+444              });
+445          }
+446          private void StartWriteStream(Channel<string> redirectStandardIn, StreamWriter standardIn, bool keepStandardInOpen)
+447          {
+448              Task.Run(async () =>
+449              {
+450                  var utf8Writer = new StreamWriter(standardIn.BaseStream, new UTF8Encoding(false));
+451                  while (!_processExitedCompletionSource.Task.IsCompleted)
+452                  {
+453                      ValueTask<string> dequeueTask = redirectStandardIn.Reader.ReadAsync(_processStandardInWriteCancellationTokenSource.Token);
+454                      string input = await dequeueTask;
+455                      if (input != null)
+456                      {
+457                          utf8Writer.WriteLine(input);
+458                          utf8Writer.Flush();
+459                          if (!keepStandardInOpen)
+460                          {
+461                              Trace.Info("Close STDIN after the first redirect finished.");
+462                              standardIn.Close();
+463                              break;
+464                          }
+465                      }
+466                  }
+467                  Trace.Info("STDIN stream write finished.");
+468              });
+469          }
+470          private void KillProcessTree()
+471          {
+472  #if OS_WINDOWS
+473              WindowsKillProcessTree();
+474  #else
+475              NixKillProcessTree();
+476  #endif
+477          }
+478          private void DecreaseProcessPriority(Process process)
+479          {
+480  #if OS_LINUX
+481              int oomScoreAdj = 500;
+482              string userOomScoreAdj;
+483              if (process.StartInfo.Environment.TryGetValue("PIPELINE_JOB_OOMSCOREADJ", out userOomScoreAdj))
+484              {
+485                  int userOomScoreAdjParsed;
+486                  if (int.TryParse(userOomScoreAdj, out userOomScoreAdjParsed) && userOomScoreAdjParsed >= -1000 && userOomScoreAdjParsed <= 1000)
+487                  {
+488                      oomScoreAdj = userOomScoreAdjParsed;
+489                  }
+490                  else
+491                  {
+492                      Trace.Info($"Invalid PIPELINE_JOB_OOMSCOREADJ ({userOomScoreAdj}). Valid range is -1000:1000. Using default 500.");
+493                  }
+494              }
+495              WriteProcessOomScoreAdj(process.Id, oomScoreAdj);
+496  #endif
+497          }
+498  #if OS_WINDOWS
+499          private async Task<bool> SendCtrlSignal(ConsoleCtrlEvent signal, TimeSpan timeout)
+500          {
+501              Trace.Info($"Sending {signal} to process {_proc.Id}.");
+502              ConsoleCtrlDelegate ctrlEventHandler = new ConsoleCtrlDelegate(ConsoleCtrlHandler);
+503              try
+504              {
+505                  if (!FreeConsole())
+506                  {
+507                      throw new Win32Exception(Marshal.GetLastWin32Error());
+508                  }
+509                  if (!AttachConsole(_proc.Id))
+510                  {
+511                      throw new Win32Exception(Marshal.GetLastWin32Error());
+512                  }
+513                  if (!SetConsoleCtrlHandler(ctrlEventHandler, true))
+514                  {
+515                      throw new Win32Exception(Marshal.GetLastWin32Error());
+516                  }
+517                  if (!GenerateConsoleCtrlEvent(signal, 0))
+518                  {
+519                      throw new Win32Exception(Marshal.GetLastWin32Error());
+520                  }
+521                  Trace.Info($"Successfully send {signal} to process {_proc.Id}.");
+522                  Trace.Info($"Waiting for process exit or {timeout.TotalSeconds} seconds after {signal} signal fired.");
+523                  var completedTask = await Task.WhenAny(Task.Delay(timeout), _processExitedCompletionSource.Task);
+524                  if (completedTask == _processExitedCompletionSource.Task)
+525                  {
+526                      Trace.Info("Process exit successfully.");
+527                      return true;
+528                  }
+529                  else
+530                  {
+531                      Trace.Info($"Process did not honor {signal} signal within {timeout.TotalSeconds} seconds.");
+532                      return false;
+533                  }
+534              }
+535              catch (Exception ex)
+536              {
+537                  Trace.Info($"{signal} signal doesn't fire successfully.");
+538                  Trace.Verbose($"Catch exception during send {signal} event to process {_proc.Id}");
+539                  Trace.Verbose(ex.ToString());
+540                  return false;
+541              }
+542              finally
+543              {
+544                  FreeConsole();
+545                  SetConsoleCtrlHandler(ctrlEventHandler, false);
+546              }
+547          }
+548          private bool ConsoleCtrlHandler(ConsoleCtrlEvent ctrlType)
+549          {
+550              switch (ctrlType)
+551              {
+552                  case ConsoleCtrlEvent.CTRL_C:
+553                      Trace.Info($"Ignore Ctrl+C to current process.");
+554                      return true;
+555                  case ConsoleCtrlEvent.CTRL_BREAK:
+556                      Trace.Info($"Ignore Ctrl+Break to current process.");
+557                      return true;
+558              }
+559              return false;
+560          }
+561          private void WindowsKillProcessTree()
+562          {
+563              var pid = _proc?.Id;
+564              if (pid == null)
+565              {
+566                  return;
+567              }
+568              Dictionary<int, int> processRelationship = new Dictionary<int, int>();
+569              Trace.Info($"Scan all processes to find relationship between all processes.");
+570              foreach (Process proc in Process.GetProcesses())
+571              {
+572                  try
+573                  {
+574                      if (!proc.SafeHandle.IsInvalid)
+575                      {
+576                          PROCESS_BASIC_INFORMATION pbi = new PROCESS_BASIC_INFORMATION();
+577                          int returnLength = 0;
+578                          int queryResult = NtQueryInformationProcess(proc.SafeHandle.DangerousGetHandle(), PROCESSINFOCLASS.ProcessBasicInformation, ref pbi, Marshal.SizeOf(pbi), ref returnLength);
+579                          if (queryResult == 0) 
+580                          {
+581                              Trace.Verbose($"Process: {proc.Id} is child process of {pbi.InheritedFromUniqueProcessId}.");
+582                              processRelationship[proc.Id] = (int)pbi.InheritedFromUniqueProcessId;
+583                          }
+584                          else
+585                          {
+586                              throw new Win32Exception(Marshal.GetLastWin32Error());
+587                          }
+588                      }
+589                  }
+590                  catch (Exception ex)
+591                  {
+592                      Trace.Verbose("Ignore any catched exception during detecting process relationship.");
+593                      Trace.Verbose(ex.ToString());
+594                  }
+595              }
+596              Trace.Verbose($"Start killing process tree of process '{pid.Value}'.");
+597              Stack<ProcessTerminationInfo> processesNeedtoKill = new Stack<ProcessTerminationInfo>();
+598              processesNeedtoKill.Push(new ProcessTerminationInfo(pid.Value, false));
+599              while (processesNeedtoKill.Count() > 0)
+600              {
+601                  ProcessTerminationInfo procInfo = processesNeedtoKill.Pop();
+602                  List<int> childProcessesIds = new List<int>();
+603                  if (!procInfo.ChildPidExpanded)
+604                  {
+605                      Trace.Info($"Find all child processes of process '{procInfo.Pid}'.");
+606                      childProcessesIds = processRelationship.Where(p => p.Value == procInfo.Pid).Select(k => k.Key).ToList();
+607                  }
+608                  if (childProcessesIds.Count > 0)
+609                  {
+610                      Trace.Info($"Need kill all child processes trees before kill process '{procInfo.Pid}'.");
+611                      processesNeedtoKill.Push(new ProcessTerminationInfo(procInfo.Pid, true));
+612                      foreach (var childPid in childProcessesIds)
+613                      {
+614                          Trace.Info($"Child process '{childPid}' needs be killed first.");
+615                          processesNeedtoKill.Push(new ProcessTerminationInfo(childPid, false));
+616                      }
+617                  }
+618                  else
+619                  {
+620                      Trace.Info($"Kill process '{procInfo.Pid}'.");
+621                      try
+622                      {
+623                          Process leafProcess = Process.GetProcessById(procInfo.Pid);
+624                          try
+625                          {
+626                              leafProcess.Kill();
+627                          }
+628                          catch (InvalidOperationException ex)
+629                          {
+630                              Trace.Verbose("Ignore InvalidOperationException during Process.Kill().");
+631                              Trace.Verbose(ex.ToString());
+632                          }
+633                          catch (Win32Exception ex) when (ex.NativeErrorCode == 5)
+634                          {
+635                              Trace.Verbose("Ignore Win32Exception with NativeErrorCode 5 during Process.Kill().");
+636                              Trace.Verbose(ex.ToString());
+637                          }
+638                          catch (Exception ex)
+639                          {
+640                              Trace.Verbose("Ignore additional exceptions during Process.Kill().");
+641                              Trace.Verbose(ex.ToString());
+642                          }
+643                      }
+644                      catch (ArgumentException ex)
+645                      {
+646                          Trace.Verbose("Ignore ArgumentException during Process.GetProcessById().");
+647                          Trace.Verbose(ex.ToString());
+648                      }
+649                      catch (Exception ex)
+650                      {
+651                          Trace.Verbose("Ignore additional exceptions during Process.GetProcessById().");
+652                          Trace.Verbose(ex.ToString());
+653                      }
+654                  }
+655              }
+656          }
+657          private class ProcessTerminationInfo
+658          {
+659              public ProcessTerminationInfo(int pid, bool expanded)
+660              {
+661                  Pid = pid;
+662                  ChildPidExpanded = expanded;
+663              }
+664              public int Pid { get; }
+665              public bool ChildPidExpanded { get; }
+666          }
+667          private enum ConsoleCtrlEvent
+668          {
+669              CTRL_C = 0,
+670              CTRL_BREAK = 1
+671          }
+672          private enum PROCESSINFOCLASS : int
+673          {
+674              ProcessBasicInformation = 0
+675          };
+676          [StructLayout(LayoutKind.Sequential)]
+677          private struct PROCESS_BASIC_INFORMATION
+678          {
+679              public long ExitStatus;
+680              public long PebBaseAddress;
+681              public long AffinityMask;
+<span onclick='openModal()' class='match'>682              public long BasePriority;
+683              public long UniqueProcessId;
+684              public long InheritedFromUniqueProcessId;
+685          };
+</span>686          [DllImport("ntdll.dll", SetLastError = true)]
+687          private static extern int NtQueryInformationProcess(IntPtr processHandle, PROCESSINFOCLASS processInformationClass, ref PROCESS_BASIC_INFORMATION processInformation, int processInformationLength, ref int returnLength);
+688          [DllImport("kernel32.dll", SetLastError = true)]
+689          private static extern bool GenerateConsoleCtrlEvent(ConsoleCtrlEvent sigevent, int dwProcessGroupId);
+690          [DllImport("kernel32.dll", SetLastError = true)]
+691          private static extern bool FreeConsole();
+692          [DllImport("kernel32.dll", SetLastError = true)]
+693          private static extern bool AttachConsole(int dwProcessId);
+694          [DllImport("kernel32.dll", SetLastError = true)]
+695          private static extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate HandlerRoutine, bool Add);
+696          private delegate Boolean ConsoleCtrlDelegate(ConsoleCtrlEvent CtrlType);
+697  #else
+698          private async Task<bool> SendSignal(Signals signal, TimeSpan timeout)
+699          {
+700              Trace.Info($"Sending {signal} to process {_proc.Id}.");
+701              int errorCode = kill(_proc.Id, (int)signal);
+702              if (errorCode != 0)
+703              {
+704                  Trace.Info($"{signal} signal doesn't fire successfully.");
+705                  Trace.Info($"Error code: {errorCode}.");
+706                  return false;
+707              }
+708              Trace.Info($"Successfully send {signal} to process {_proc.Id}.");
+709              Trace.Info($"Waiting for process exit or {timeout.TotalSeconds} seconds after {signal} signal fired.");
+710              var completedTask = await Task.WhenAny(Task.Delay(timeout), _processExitedCompletionSource.Task);
+711              if (completedTask == _processExitedCompletionSource.Task)
+712              {
+713                  Trace.Info("Process exit successfully.");
+714                  return true;
+715              }
+716              else
+717              {
+718                  Trace.Info($"Process did not honor {signal} signal within {timeout.TotalSeconds} seconds.");
+719                  return false;
+720              }
+721          }
+722          private void NixKillProcessTree()
+723          {
+724              try
+725              {
+726                  if (_proc?.HasExited == false)
+727                  {
+728                      _proc?.Kill();
+729                  }
+730              }
+731              catch (InvalidOperationException ex)
+732              {
+733                  Trace.Info("Ignore InvalidOperationException during Process.Kill().");
+734                  Trace.Info(ex.ToString());
+735              }
+736          }
+737  #if OS_LINUX
+738          private void WriteProcessOomScoreAdj(int processId, int oomScoreAdj)
+739          {
+740              try
+741              {
+742                  string procFilePath = $"/proc/{processId}/oom_score_adj";
+743                  if (File.Exists(procFilePath))
+744                  {
+745                      File.WriteAllText(procFilePath, oomScoreAdj.ToString());
+746                      Trace.Info($"Updated oom_score_adj to {oomScoreAdj} for PID: {processId}.");
+747                  }
+748              }
+749              catch (Exception ex)
+750              {
+751                  Trace.Info($"Failed to update oom_score_adj for PID: {processId}.");
+752                  Trace.Info(ex.ToString());
+753              }
+754          }
+755  #endif
+756          private enum Signals : int
+757          {
+758              SIGINT = 2,
+759              SIGTERM = 15
+760          }
+761          [DllImport("libc", SetLastError = true)]
+762          private static extern int kill(int pid, int sig);
+763  #endif
+764      }
+765      public sealed class ProcessExitCodeException : Exception
+766      {
+767          public int ExitCode { get; private set; }
+768          public ProcessExitCodeException(int exitCode, string fileName, string arguments)
+769              : base($"Exit code {exitCode} returned from process: file name '{fileName}', arguments '{arguments}'.")
+770          {
+771              ExitCode = exitCode;
+772          }
+773      }
+774      public sealed class ProcessDataReceivedEventArgs : EventArgs
+775      {
+776          public ProcessDataReceivedEventArgs(string data)
+777          {
+778              Data = data;
+779          }
+780          public string Data { get; set; }
+781      }
+782  }
+</code></pre>
+        </div>
+        <div class="column">
+            <h3>runner-MDEwOlJlcG9zaXRvcnkxODQyODY4NzU=-flat-ProcessExtensions.cs</h3>
+            <pre><code>1  using GitHub.Runner.Common.Util;
+2  using GitHub.Runner.Sdk;
+3  using System;
+4  using System.Collections.Concurrent;
+5  using System.Collections.Generic;
+6  using System.ComponentModel;
+7  using System.Diagnostics;
+8  using System.IO;
+9  using System.Linq;
+10  using System.Runtime.InteropServices;
+11  using System.Text;
+12  using System.Threading;
+13  using System.Threading.Tasks;
+14  namespace GitHub.Runner.Common
+15  {
+16  #if OS_WINDOWS
+17      public static class WindowsProcessExtensions
+18      {
+19          public static string GetEnvironmentVariable(this Process process, IHostContext hostContext, string variable)
+20          {
+21              var trace = hostContext.GetTrace(nameof(WindowsProcessExtensions));
+22              Dictionary<string, string> environmentVariables = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+23              IntPtr processHandle = process.SafeHandle.DangerousGetHandle();
+24              IntPtr environmentBlockAddress;
+25              if (Environment.Is64BitOperatingSystem)
+26              {
+27                  PROCESS_BASIC_INFORMATION64 pbi = new PROCESS_BASIC_INFORMATION64();
+28                  int returnLength = 0;
+29                  int status = NtQueryInformationProcess64(processHandle, PROCESSINFOCLASS.ProcessBasicInformation, ref pbi, Marshal.SizeOf(pbi), ref returnLength);
+30                  if (status != 0)
+31                  {
+32                      throw new Win32Exception(Marshal.GetLastWin32Error());
+33                  }
+34                  bool wow64;
+35                  if (!IsWow64Process(processHandle, out wow64))
+36                  {
+37                      throw new Win32Exception(Marshal.GetLastWin32Error());
+38                  }
+39                  if (!wow64)
+40                  {
+41                      IntPtr UserProcessParameterAddress = ReadIntPtr64(processHandle, new IntPtr(pbi.PebBaseAddress) + 0x20);
+42                      environmentBlockAddress = ReadIntPtr64(processHandle, UserProcessParameterAddress + 0x80);
+43                  }
+44                  else
+45                  {
+46                      IntPtr UserProcessParameterAddress = ReadIntPtr32(processHandle, new IntPtr(pbi.PebBaseAddress) + 0x1010);
+47                      environmentBlockAddress = ReadIntPtr32(processHandle, UserProcessParameterAddress + 0x48);
+48                  }
+49              }
+50              else
+51              {
+52                  PROCESS_BASIC_INFORMATION32 pbi = new PROCESS_BASIC_INFORMATION32();
+53                  int returnLength = 0;
+54                  int status = NtQueryInformationProcess32(processHandle, PROCESSINFOCLASS.ProcessBasicInformation, ref pbi, Marshal.SizeOf(pbi), ref returnLength);
+55                  if (status != 0)
+56                  {
+57                      throw new Win32Exception(Marshal.GetLastWin32Error());
+58                  }
+59                  IntPtr UserProcessParameterAddress = ReadIntPtr32(processHandle, new IntPtr(pbi.PebBaseAddress) + 0x10);
+60                  environmentBlockAddress = ReadIntPtr32(processHandle, UserProcessParameterAddress + 0x48);
+61              }
+62              MEMORY_BASIC_INFORMATION memInfo = new MEMORY_BASIC_INFORMATION();
+63              if (VirtualQueryEx(processHandle, environmentBlockAddress, ref memInfo, Marshal.SizeOf(memInfo)) == 0)
+64              {
+65                  throw new Win32Exception(Marshal.GetLastWin32Error());
+66              }
+67              Int64 dataSize = memInfo.RegionSize.ToInt64() - (environmentBlockAddress.ToInt64() - memInfo.BaseAddress.ToInt64());
+68              byte[] envData = new byte[dataSize];
+69              IntPtr res_len = IntPtr.Zero;
+70              if (!ReadProcessMemory(processHandle, environmentBlockAddress, envData, new IntPtr(dataSize), ref res_len))
+71              {
+72                  throw new Win32Exception(Marshal.GetLastWin32Error());
+73              }
+74              if (res_len.ToInt64() != dataSize)
+75              {
+76                  throw new ArgumentOutOfRangeException(nameof(ReadProcessMemory));
+77              }
+78              string environmentVariableString;
+79              Int64 environmentVariableBytesLength = 0;
+80              if (envData[0] != 0 && envData[1] == 0)
+81              {
+82                  for (Int64 index = 0; index < dataSize; index++)
+83                  {
+84                      if (environmentVariableBytesLength == 0 &&
+85                          envData[index] == 0 &&
+86                          index + 3 < dataSize &&
+87                          envData[index + 1] == 0 &&
+88                          envData[index + 2] == 0 &&
+89                          envData[index + 3] == 0)
+90                      {
+91                          environmentVariableBytesLength = index + 3;
+92                      }
+93                      else if (environmentVariableBytesLength != 0)
+94                      {
+95                          envData[index] = 0;
+96                      }
+97                  }
+98                  if (environmentVariableBytesLength == 0)
+99                  {
+100                      throw new ArgumentException(nameof(environmentVariableBytesLength));
+101                  }
+102                  environmentVariableString = Encoding.Unicode.GetString(envData);
+103              }
+104              else if (envData[0] != 0 && envData[1] != 0)
+105              {
+106                  for (Int64 index = 0; index < dataSize; index++)
+107                  {
+108                      if (environmentVariableBytesLength == 0 &&
+109                          envData[index] == 0 &&
+110                          index + 1 < dataSize &&
+111                          envData[index + 1] == 0)
+112                      {
+113                          environmentVariableBytesLength = index + 1;
+114                      }
+115                      else if (environmentVariableBytesLength != 0)
+116                      {
+117                          envData[index] = 0;
+118                      }
+119                  }
+120                  if (environmentVariableBytesLength == 0)
+121                  {
+122                      throw new ArgumentException(nameof(environmentVariableBytesLength));
+123                  }
+124                  environmentVariableString = Encoding.Default.GetString(envData);
+125              }
+126              else
+127              {
+128                  throw new ArgumentException(nameof(envData));
+129              }
+130              foreach (var envString in environmentVariableString.Split("\0", StringSplitOptions.RemoveEmptyEntries))
+131              {
+132                  string[] env = envString.Split("=", 2);
+133                  if (!string.IsNullOrEmpty(env[0]))
+134                  {
+135                      environmentVariables[env[0]] = env[1];
+136                      trace.Verbose($"PID:{process.Id} ({env[0]}={env[1]})");
+137                  }
+138              }
+139              if (environmentVariables.TryGetValue(variable, out string envVariable))
+140              {
+141                  return envVariable;
+142              }
+143              else
+144              {
+145                  return null;
+146              }
+147          }
+148          private static IntPtr ReadIntPtr32(IntPtr hProcess, IntPtr ptr)
+149          {
+150              IntPtr readPtr = IntPtr.Zero;
+151              IntPtr data = Marshal.AllocHGlobal(sizeof(Int32));
+152              try
+153              {
+154                  IntPtr res_len = IntPtr.Zero;
+155                  if (!ReadProcessMemory(hProcess, ptr, data, new IntPtr(sizeof(Int32)), ref res_len))
+156                  {
+157                      throw new Win32Exception(Marshal.GetLastWin32Error());
+158                  }
+159                  if (res_len.ToInt32() != sizeof(Int32))
+160                  {
+161                      throw new ArgumentOutOfRangeException(nameof(ReadProcessMemory));
+162                  }
+163                  readPtr = new IntPtr(Marshal.ReadInt32(data));
+164              }
+165              finally
+166              {
+167                  Marshal.FreeHGlobal(data);
+168              }
+169              return readPtr;
+170          }
+171          private static IntPtr ReadIntPtr64(IntPtr hProcess, IntPtr ptr)
+172          {
+173              IntPtr readPtr = IntPtr.Zero;
+174              IntPtr data = Marshal.AllocHGlobal(IntPtr.Size);
+175              try
+176              {
+177                  IntPtr res_len = IntPtr.Zero;
+178                  if (!ReadProcessMemory(hProcess, ptr, data, new IntPtr(sizeof(Int64)), ref res_len))
+179                  {
+180                      throw new Win32Exception(Marshal.GetLastWin32Error());
+181                  }
+182                  if (res_len.ToInt32() != IntPtr.Size)
+183                  {
+184                      throw new ArgumentOutOfRangeException(nameof(ReadProcessMemory));
+185                  }
+186                  readPtr = Marshal.ReadIntPtr(data);
+187              }
+188              finally
+189              {
+190                  Marshal.FreeHGlobal(data);
+191              }
+192              return readPtr;
+193          }
+194          private enum PROCESSINFOCLASS : int
+195          {
+196              ProcessBasicInformation = 0
+197          };
+198          [StructLayout(LayoutKind.Sequential)]
+199          private struct MEMORY_BASIC_INFORMATION
+200          {
+201              public IntPtr BaseAddress;
+202              public IntPtr AllocationBase;
+203              public int AllocationProtect;
+204              public IntPtr RegionSize;
+205              public int State;
+206              public int Protect;
+207              public int Type;
+208          }
+209          [StructLayout(LayoutKind.Sequential)]
+210          private struct PROCESS_BASIC_INFORMATION64
+211          {
+212              public long ExitStatus;
+213              public long PebBaseAddress;
+<span onclick='openModal()' class='match'>214              public long AffinityMask;
+215              public long BasePriority;
+216              public long UniqueProcessId;
+217              public long InheritedFromUniqueProcessId;
+</span>218          };
+219          [StructLayout(LayoutKind.Sequential)]
+220          private struct PROCESS_BASIC_INFORMATION32
+221          {
+222              public int ExitStatus;
+223              public int PebBaseAddress;
+224              public int AffinityMask;
+225              public int BasePriority;
+226              public int UniqueProcessId;
+227              public int InheritedFromUniqueProcessId;
+228          };
+229          [DllImport("ntdll.dll", SetLastError = true, EntryPoint = "NtQueryInformationProcess")]
+230          private static extern int NtQueryInformationProcess64(IntPtr processHandle, PROCESSINFOCLASS processInformationClass, ref PROCESS_BASIC_INFORMATION64 processInformation, int processInformationLength, ref int returnLength);
+231          [DllImport("ntdll.dll", SetLastError = true, EntryPoint = "NtQueryInformationProcess")]
+232          private static extern int NtQueryInformationProcess32(IntPtr processHandle, PROCESSINFOCLASS processInformationClass, ref PROCESS_BASIC_INFORMATION32 processInformation, int processInformationLength, ref int returnLength);
+233          [DllImport("kernel32.dll", SetLastError = true)]
+234          private static extern bool IsWow64Process(IntPtr processHandle, out bool wow64Process);
+235          [DllImport("kernel32.dll", SetLastError = true)]
+236          private static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, IntPtr lpBuffer, IntPtr dwSize, ref IntPtr lpNumberOfBytesRead);
+237          [DllImport("kernel32.dll", SetLastError = true)]
+238          private static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, IntPtr dwSize, ref IntPtr lpNumberOfBytesRead);
+239          [DllImport("kernel32.dll")]
+240          private static extern int VirtualQueryEx(IntPtr processHandle, IntPtr baseAddress, ref MEMORY_BASIC_INFORMATION memoryInformation, int memoryInformationLength);
+241      }
+242  #else
+243      public static class LinuxProcessExtensions
+244      {
+245          public static string GetEnvironmentVariable(this Process process, IHostContext hostContext, string variable)
+246          {
+247              var trace = hostContext.GetTrace(nameof(LinuxProcessExtensions));
+248              Dictionary<string, string> env = new();
+249              if (Directory.Exists("/proc"))
+250              {
+251                  string envFile = $"/proc/{process.Id}/environ";
+252                  trace.Info($"Read env from {envFile}");
+253                  string envContent = File.ReadAllText(envFile);
+254                  if (!string.IsNullOrEmpty(envContent))
+255                  {
+256                      var envList = envContent.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+257                      foreach (var envStr in envList)
+258                      {
+259                          var keyValuePair = envStr.Split('=', 2);
+260                          if (keyValuePair.Length == 2)
+261                          {
+262                              env[keyValuePair[0]] = keyValuePair[1];
+263                              trace.Verbose($"PID:{process.Id} ({keyValuePair[0]}={keyValuePair[1]})");
+264                          }
+265                      }
+266                  }
+267              }
+268              else
+269              {
+270                  trace.Info($"Read env from output of `ps e -p {process.Id} -o command`");
+271                  List<string> psOut = new();
+272                  object outputLock = new();
+273                  using (var p = hostContext.CreateService<IProcessInvoker>())
+274                  {
+275                      p.OutputDataReceived += delegate (object sender, ProcessDataReceivedEventArgs stdout)
+276                      {
+277                          if (!string.IsNullOrEmpty(stdout.Data))
+278                          {
+279                              lock (outputLock)
+280                              {
+281                                  psOut.Add(stdout.Data);
+282                              }
+283                          }
+284                      };
+285                      p.ErrorDataReceived += delegate (object sender, ProcessDataReceivedEventArgs stderr)
+286                      {
+287                          if (!string.IsNullOrEmpty(stderr.Data))
+288                          {
+289                              lock (outputLock)
+290                              {
+291                                  trace.Error(stderr.Data);
+292                              }
+293                          }
+294                      };
+295                      int exitCode = p.ExecuteAsync(workingDirectory: hostContext.GetDirectory(WellKnownDirectory.Root),
+296                                                    fileName: "ps",
+297                                                    arguments: $"e -p {process.Id} -o command",
+298                                                    environment: null,
+299                                                    cancellationToken: CancellationToken.None).GetAwaiter().GetResult();
+300                      if (exitCode == 0)
+301                      {
+302                          trace.Info($"Successfully dump environment variables for {process.Id}");
+303                          if (psOut.Count > 0)
+304                          {
+305                              string psOutputString = string.Join(" ", psOut);
+306                              trace.Verbose($"ps output: '{psOutputString}'");
+307                              int varStartIndex = psOutputString.IndexOf(variable, StringComparison.Ordinal);
+308                              if (varStartIndex >= 0)
+309                              {
+310                                  string rightPart = psOutputString.Substring(varStartIndex + variable.Length + 1);
+311                                  if (rightPart.IndexOf(' ') > 0)
+312                                  {
+313                                      string value = rightPart.Substring(0, rightPart.IndexOf(' '));
+314                                      env[variable] = value;
+315                                  }
+316                                  else
+317                                  {
+318                                      env[variable] = rightPart;
+319                                  }
+320                                  trace.Verbose($"PID:{process.Id} ({variable}={env[variable]})");
+321                              }
+322                          }
+323                      }
+324                  }
+325              }
+326              if (env.TryGetValue(variable, out string envVariable))
+327              {
+328                  return envVariable;
+329              }
+330              else
+331              {
+332                  return null;
+333              }
+334          }
+335      }
+336  #endif
+337  }
+</code></pre>
+        </div>
+    
+        <!-- The Modal -->
+        <div id="myModal" class="modal">
+            <div class="modal-content">
+                <span class="row close">&times;</span>
+                <div class='row'>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from runner-MDEwOlJlcG9zaXRvcnkxODQyODY4NzU=-flat-ProcessInvoker_16.cs</div>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from runner-MDEwOlJlcG9zaXRvcnkxODQyODY4NzU=-flat-ProcessExtensions.cs</div>
+                </div>
+                <div class="column column_space"><pre><code>682              public long BasePriority;
+683              public long UniqueProcessId;
+684              public long InheritedFromUniqueProcessId;
+685          };
+</pre></code></div>
+                <div class="column column_space"><pre><code>214              public long AffinityMask;
+215              public long BasePriority;
+216              public long UniqueProcessId;
+217              public long InheritedFromUniqueProcessId;
+</pre></code></div>
+            </div>
+        </div>
+        <script>
+        // Get the modal
+        var modal = document.getElementById("myModal");
+        
+        // Get the button that opens the modal
+        var btn = document.getElementById("myBtn");
+        
+        // Get the <span> element that closes the modal
+        var span = document.getElementsByClassName("close")[0];
+        
+        // When the user clicks the button, open the modal
+        function openModal(){
+          modal.style.display = "block";
+        }
+        
+        // When the user clicks on <span> (x), close the modal
+        span.onclick = function() {
+        modal.style.display = "none";
+        }
+        
+        // When the user clicks anywhere outside of the modal, close it
+        window.onclick = function(event) {
+        if (event.target == modal) {
+        modal.style.display = "none";
+        } }
+        
+        </script>
+    </body>
+    </html>
+    

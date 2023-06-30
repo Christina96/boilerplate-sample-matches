@@ -1,0 +1,1293 @@
+
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Code Files</title>
+            <style>
+                .column {
+                    width: 47%;
+                    float: left;
+                    padding: 12px;
+                    border: 2px solid #ffd0d0;
+                }
+        
+                .modal {
+                    display: none;
+                    position: fixed;
+                    z-index: 1;
+                    left: 0;
+                    top: 0;
+                    width: 100%;
+                    height: 100%;
+                    overflow: auto;
+                    background-color: rgb(0, 0, 0);
+                    background-color: rgba(0, 0, 0, 0.4);
+                }
+    
+                .modal-content {
+                    height: 250%;
+                    background-color: #fefefe;
+                    margin: 5% auto;
+                    padding: 20px;
+                    border: 1px solid #888;
+                    width: 80%;
+                }
+    
+                .close {
+                    color: #aaa;
+                    float: right;
+                    font-size: 20px;
+                    font-weight: bold;
+                    text-align: right;
+                }
+    
+                .close:hover, .close:focus {
+                    color: black;
+                    text-decoration: none;
+                    cursor: pointer;
+                }
+    
+                .row {
+                    float: right;
+                    width: 100%;
+                }
+    
+                .column_space  {
+                    white - space: pre-wrap;
+                }
+                 
+                pre {
+                    width: 100%;
+                    overflow-y: auto;
+                    background: #f8fef2;
+                }
+                
+                .match {
+                    cursor:pointer; 
+                    background-color:#00ffbb;
+                }
+        </style>
+    </head>
+    <body>
+        <h2>Tokens: 19, <button onclick='openModal()' class='match'></button></h2>
+        <div class="column">
+            <h3>npgsql-MDEwOlJlcG9zaXRvcnkyODgzNTc0-flat-CopyTests.cs</h3>
+            <pre><code>1  using System;
+2  using System.Collections;
+3  using System.Collections.Generic;
+4  using System.Data;
+5  using System.IO;
+6  using System.Numerics;
+7  using System.Text;
+8  using System.Threading;
+9  using System.Threading.Tasks;
+10  using Npgsql.Internal;
+11  using NpgsqlTypes;
+12  using NUnit.Framework;
+13  using static Npgsql.Tests.TestUtil;
+14  namespace Npgsql.Tests;
+15  public class CopyTests : MultiplexingTestBase
+16  {
+17      #region Issue 2257
+18      [Test, Description("Reproduce #2257")]
+19      public async Task Issue2257()
+20      {
+21          await using var conn = await OpenConnectionAsync();
+22          var table1 = await GetTempTableName(conn);
+23          var table2 = await GetTempTableName(conn);
+24          const int rowCount = 1000000;
+25          using (var cmd = conn.CreateCommand())
+26          {
+27              cmd.CommandText = $"CREATE TABLE {table1} AS SELECT * FROM generate_series(1, {rowCount}) id";
+28              await cmd.ExecuteNonQueryAsync();
+29              cmd.CommandText = $"ALTER TABLE {table1} ADD CONSTRAINT {table1}_pk PRIMARY KEY (id)";
+30              await cmd.ExecuteNonQueryAsync();
+31              cmd.CommandText = $"CREATE TABLE {table2} (master_id integer NOT NULL REFERENCES {table1} (id))";
+32              await cmd.ExecuteNonQueryAsync();
+33          }
+34          await using var writer = conn.BeginBinaryImport($"COPY {table2} FROM STDIN BINARY");
+35          writer.Timeout = TimeSpan.FromMilliseconds(3);
+36          var e = Assert.Throws<NpgsqlException>(() =>
+37          {
+38              for (var i = 1; i <= rowCount; ++i)
+39              {
+40                  writer.StartRow();
+41                  writer.Write(i);
+42              }
+43              writer.Complete();
+44          })!;
+45          Assert.That(e.InnerException, Is.TypeOf<TimeoutException>());
+46      }
+47      #endregion
+48      #region Raw
+49      [Test, Description("Exports data in binary format (raw mode) and then loads it back in")]
+50      public async Task Raw_binary_roundtrip([Values(false, true)] bool async)
+51      {
+52          using var conn = await OpenConnectionAsync();
+53          const int iterations = 500;
+54          var table = await GetTempTableName(conn);
+55          using (var tx = conn.BeginTransaction())
+56          {
+57              await conn.ExecuteNonQueryAsync($@"CREATE TABLE {table} (field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER)");
+58              using (var cmd =
+59                     new NpgsqlCommand($"INSERT INTO {table} (field_text, field_int4) VALUES (@p1, @p2)", conn))
+60              {
+61                  cmd.Parameters.AddWithValue("p1", NpgsqlDbType.Text, "HELLO");
+62                  cmd.Parameters.AddWithValue("p2", NpgsqlDbType.Integer, 8);
+63                  for (var i = 0; i < iterations; i++)
+64                  {
+65                      await cmd.ExecuteNonQueryAsync();
+66                  }
+67              }
+68              await tx.CommitAsync();
+69          }
+70          var data = new byte[10000];
+71          var len = 0;
+72          using (var outStream = async
+73                     ? await conn.BeginRawBinaryCopyAsync($"COPY {table} (field_text, field_int4) TO STDIN BINARY")
+74                     : conn.BeginRawBinaryCopy($"COPY {table} (field_text, field_int4) TO STDIN BINARY"))
+75          {
+76              StateAssertions(conn);
+77              while (true)
+78              {
+79                  var read = outStream.Read(data, len, data.Length - len);
+80                  if (read == 0)
+81                      break;
+82                  len += read;
+83              }
+84              Assert.That(len, Is.GreaterThan(conn.Settings.ReadBufferSize) & Is.LessThan(data.Length));
+85          }
+86          await conn.ExecuteNonQueryAsync($"TRUNCATE {table}");
+87          using (var inStream = async
+88                     ? await conn.BeginRawBinaryCopyAsync($"COPY {table} (field_text, field_int4) FROM STDIN BINARY")
+89                     : conn.BeginRawBinaryCopy($"COPY {table} (field_text, field_int4) FROM STDIN BINARY"))
+90          {
+91              StateAssertions(conn);
+92              inStream.Write(data, 0, len);
+93          }
+94          Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(iterations));
+95      }
+96      [Test, Description("Disposes a raw binary stream in the middle of an export")]
+97      public async Task Dispose_in_middle_of_raw_binary_export()
+98      {
+99          using var conn = await OpenConnectionAsync();
+<span onclick='openModal()' class='match'>100          var table = await GetTempTableName(conn);
+101          await conn.ExecuteNonQueryAsync($@"
+102  CREATE TABLE {table} (field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER);
+103  INSERT INTO {table} (field_text, field_int4) VALUES ('HELLO', 8)");
+104          var data = new byte[3];
+</span>105          using (var inStream = conn.BeginRawBinaryCopy($"COPY {table} (field_text, field_int4) TO STDIN BINARY"))
+106          {
+107              var len = inStream.Read(data, 0, data.Length);
+108              Assert.That(len, Is.EqualTo(data.Length));
+109          }
+110          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+111      }
+112      [Test, Description("Disposes a raw binary stream in the middle of an import")]
+113      public async Task Dispose_in_middle_of_raw_binary_import()
+114      {
+115          using var conn = await OpenConnectionAsync();
+116          var table = await GetTempTableName(conn);
+117          await conn.ExecuteNonQueryAsync($@"CREATE TABLE {table} (field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER)");
+118          var inStream = conn.BeginRawBinaryCopy($"COPY {table} (field_text, field_int4) FROM STDIN BINARY");
+119          inStream.Write(NpgsqlRawCopyStream.BinarySignature, 0, NpgsqlRawCopyStream.BinarySignature.Length);
+120          Assert.That(() => inStream.Dispose(), Throws.Exception
+121              .TypeOf<PostgresException>()
+122              .With.Property(nameof(PostgresException.SqlState)).EqualTo(PostgresErrorCodes.BadCopyFileFormat)
+123          );
+124          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+125      }
+126      [Test, Description("Cancels a binary write")]
+127      public async Task Cancel_raw_binary_import()
+128      {
+129          using var conn = await OpenConnectionAsync();
+130          var table = await GetTempTableName(conn);
+131          await conn.ExecuteNonQueryAsync($@"CREATE TABLE {table} (field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER)");
+132          var garbage = new byte[] {1, 2, 3, 4};
+133          using (var s = conn.BeginRawBinaryCopy($"COPY {table} (field_text, field_int4) FROM STDIN BINARY"))
+134          {
+135              s.Write(garbage, 0, garbage.Length);
+136              s.Cancel();
+137          }
+138          Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(0));
+139      }
+140      [Test]
+141      public async Task Import_large_value_raw()
+142      {
+143          using var conn = await OpenConnectionAsync();
+144          var table = await CreateTempTable(conn, "blob BYTEA");
+145          var data = new byte[conn.Settings.WriteBufferSize + 10];
+146          var dump = new byte[conn.Settings.WriteBufferSize + 200];
+147          var len = 0;
+148          using (var cmd = new NpgsqlCommand($"INSERT INTO {table} (blob) VALUES (@p)", conn))
+149          {
+150              cmd.Parameters.AddWithValue("p", data);
+151              await cmd.ExecuteNonQueryAsync();
+152          }
+153          using (var outStream = conn.BeginRawBinaryCopy($"COPY {table} (blob) TO STDIN BINARY"))
+154          {
+155              while (true)
+156              {
+157                  var read = outStream.Read(dump, len, dump.Length - len);
+158                  if (read == 0)
+159                      break;
+160                  len += read;
+161              }
+162              Assert.That(len < dump.Length);
+163          }
+164          await conn.ExecuteNonQueryAsync($"TRUNCATE {table}");
+165          using (var inStream = conn.BeginRawBinaryCopy($"COPY {table} (blob) FROM STDIN BINARY"))
+166          {
+167              inStream.Write(dump, 0, len);
+168          }
+169      }
+170      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2330")]
+171      public async Task Wrong_table_definition_raw_binary_copy()
+172      {
+173          using var conn = await OpenConnectionAsync();
+174          Assert.Throws<PostgresException>(() => conn.BeginRawBinaryCopy("COPY table_is_not_exist (blob) TO STDOUT BINARY"));
+175          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Open));
+176          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+177          Assert.Throws<PostgresException>(() => conn.BeginRawBinaryCopy("COPY table_is_not_exist (blob) FROM STDIN BINARY"));
+178          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Open));
+179          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+180      }
+181      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2330")]
+182      public async Task Wrong_format_raw_binary_copy()
+183      {
+184          if (IsMultiplexing)
+185              Assert.Ignore("Multiplexing: fails");
+186          using (var conn = await OpenConnectionAsync())
+187          {
+188              var table = await CreateTempTable(conn, "blob BYTEA");
+189              Assert.Throws<ArgumentException>(() => conn.BeginRawBinaryCopy($"COPY {table} (blob) TO STDOUT"));
+190              Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Broken));
+191          }
+192          using (var conn = await OpenConnectionAsync())
+193          {
+194              var table = await CreateTempTable(conn, "blob BYTEA");
+195              Assert.Throws<ArgumentException>(() => conn.BeginRawBinaryCopy($"COPY {table} (blob) FROM STDIN"));
+196              Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Broken));
+197          }
+198      }
+199      #endregion
+200      #region Binary
+201      [Test, Description("Roundtrips some data")]
+202      public async Task Binary_roundtrip([Values(false, true)] bool async)
+203      {
+204          using var conn = await OpenConnectionAsync();
+205          var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT");
+206          var longString = new StringBuilder(conn.Settings.WriteBufferSize + 50).Append('a').ToString();
+207          using (var writer = async
+208                     ? await conn.BeginBinaryImportAsync($"COPY {table} (field_text, field_int2) FROM STDIN BINARY")
+209                     : conn.BeginBinaryImport($"COPY {table} (field_text, field_int2) FROM STDIN BINARY"))
+210          {
+211              StateAssertions(conn);
+212              writer.StartRow();
+213              writer.Write("Hello");
+214              writer.Write((short)8, NpgsqlDbType.Smallint);
+215              writer.WriteRow("Something", (short)9);
+216              writer.StartRow();
+217              writer.Write(longString, "text");
+218              writer.WriteNull();
+219              var rowsWritten = writer.Complete();
+220              Assert.That(rowsWritten, Is.EqualTo(3));
+221          }
+222          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+223          using (var reader = async
+224                     ? await conn.BeginBinaryExportAsync($"COPY {table} (field_text, field_int2) TO STDIN BINARY")
+225                     : conn.BeginBinaryExport($"COPY {table} (field_text, field_int2) TO STDIN BINARY"))
+226          {
+227              StateAssertions(conn);
+228              Assert.That(reader.StartRow(), Is.EqualTo(2));
+229              Assert.That(reader.Read<string>(), Is.EqualTo("Hello"));
+230              Assert.That(reader.Read<int>(NpgsqlDbType.Smallint), Is.EqualTo(8));
+231              Assert.That(reader.StartRow(), Is.EqualTo(2));
+232              Assert.That(reader.IsNull, Is.False);
+233              Assert.That(reader.Read<string>(), Is.EqualTo("Something"));
+234              reader.Skip();
+235              Assert.That(reader.StartRow(), Is.EqualTo(2));
+236              Assert.That(reader.Read<string>(), Is.EqualTo(longString));
+237              Assert.That(reader.IsNull, Is.True);
+238              reader.Skip();
+239              Assert.That(reader.StartRow(), Is.EqualTo(-1));
+240          }
+241          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+242      }
+243      [Test]
+244      public async Task Cancel_binary_import()
+245      {
+246          using var conn = await OpenConnectionAsync();
+247          var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER");
+248          using (var writer = conn.BeginBinaryImport($"COPY {table} (field_text, field_int4) FROM STDIN BINARY"))
+249          {
+250              writer.StartRow();
+251              writer.Write("Hello");
+252              writer.Write(8);
+253          }
+254          Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(0));
+255      }
+256      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/657")]
+257      public async Task Import_bytea()
+258      {
+259          using var conn = await OpenConnectionAsync();
+260          var table = await CreateTempTable(conn, "field BYTEA");
+261          var data = new byte[] {1, 5, 8};
+262          using (var writer = conn.BeginBinaryImport($"COPY {table} (field) FROM STDIN BINARY"))
+263          {
+264              writer.StartRow();
+265              writer.Write(data, NpgsqlDbType.Bytea);
+266              var rowsWritten = writer.Complete();
+267              Assert.That(rowsWritten, Is.EqualTo(1));
+268          }
+269          Assert.That(await conn.ExecuteScalarAsync($"SELECT field FROM {table}"), Is.EqualTo(data));
+270      }
+271      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/4693")]
+272      public async Task Import_numeric()
+273      {
+274          await using var conn = await OpenConnectionAsync();
+275          var table = await CreateTempTable(conn, "field NUMERIC(1000)");
+276          await using (var writer = await conn.BeginBinaryImportAsync($"COPY {table} (field) FROM STDIN BINARY"))
+277          {
+278              await writer.StartRowAsync();
+279              await writer.WriteAsync(new BigInteger(1234), NpgsqlDbType.Numeric);
+280              await writer.StartRowAsync();
+281              await writer.WriteAsync(new BigInteger(5678), NpgsqlDbType.Numeric);
+282              var rowsWritten = await writer.CompleteAsync();
+283              Assert.That(rowsWritten, Is.EqualTo(2));
+284          }
+285          await using var cmd = conn.CreateCommand();
+286          cmd.CommandText = $"SELECT field FROM {table}";
+287          await using var reader = await cmd.ExecuteReaderAsync();
+288          Assert.IsTrue(await reader.ReadAsync());
+289          Assert.That(reader.GetValue(0), Is.EqualTo(1234m));
+290          Assert.IsTrue(await reader.ReadAsync());
+291          Assert.That(reader.GetValue(0), Is.EqualTo(5678m));
+292      }
+293      [Test]
+294      public async Task Import_string_array()
+295      {
+296          using var conn = await OpenConnectionAsync();
+297          var table = await CreateTempTable(conn, "field TEXT[]");
+298          var data = new[] {"foo", "a", "bar"};
+299          using (var writer = conn.BeginBinaryImport($"COPY {table} (field) FROM STDIN BINARY"))
+300          {
+301              writer.StartRow();
+302              writer.Write(data, NpgsqlDbType.Array | NpgsqlDbType.Text);
+303              var rowsWritten = writer.Complete();
+304              Assert.That(rowsWritten, Is.EqualTo(1));
+305          }
+306          Assert.That(await conn.ExecuteScalarAsync($"SELECT field FROM {table}"), Is.EqualTo(data));
+307      }
+308      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/816")]
+309      public async Task Import_string_with_buffer_length()
+310      {
+311          using var conn = await OpenConnectionAsync();
+312          var table = await CreateTempTable(conn, "field TEXT");
+313          var data = new string('a', conn.Settings.WriteBufferSize);
+314          using (var writer = conn.BeginBinaryImport($"COPY {table} (field) FROM STDIN BINARY"))
+315          {
+316              writer.StartRow();
+317              writer.Write(data, NpgsqlDbType.Text);
+318              var rowsWritten = writer.Complete();
+319              Assert.That(rowsWritten, Is.EqualTo(1));
+320          }
+321          Assert.That(await conn.ExecuteScalarAsync($"SELECT field FROM {table}"), Is.EqualTo(data));
+322      }
+323      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/662")]
+324      public async Task Import_direct_buffer()
+325      {
+326          using var conn = await OpenConnectionAsync();
+327          var table = await CreateTempTable(conn, "blob BYTEA");
+328          using var writer = conn.BeginBinaryImport($"COPY {table} (blob) FROM STDIN BINARY");
+329          var data = new byte[conn.Settings.WriteBufferSize + 10];
+330          writer.StartRow();
+331          writer.Write(data);
+332          writer.StartRow();
+333          writer.Write(data);
+334      }
+335      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2330")]
+336      public async Task Wrong_table_definition_binary_import()
+337      {
+338          using var conn = await OpenConnectionAsync();
+339          Assert.Throws<PostgresException>(() => conn.BeginBinaryImport("COPY table_is_not_exist (blob) FROM STDIN BINARY"));
+340          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Open));
+341          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+342      }
+343      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2330")]
+344      public async Task Wrong_format_binary_import()
+345      {
+346          if (IsMultiplexing)
+347              Assert.Ignore("Multiplexing: fails");
+348          using var conn = await OpenConnectionAsync();
+349          var table = await CreateTempTable(conn, "blob BYTEA");
+350          Assert.Throws<ArgumentException>(() => conn.BeginBinaryImport($"COPY {table} (blob) FROM STDIN"));
+351          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Broken));
+352      }
+353      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2330")]
+354      public async Task Wrong_table_definition_binary_export()
+355      {
+356          using var conn = await OpenConnectionAsync();
+357          Assert.Throws<PostgresException>(() => conn.BeginBinaryExport("COPY table_is_not_exist (blob) TO STDOUT BINARY"));
+358          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Open));
+359          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+360      }
+361      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2330")]
+362      public async Task Wrong_format_binary_export()
+363      {
+364          if (IsMultiplexing)
+365              Assert.Ignore("Multiplexing: fails");
+366          using var conn = await OpenConnectionAsync();
+367          var table = await CreateTempTable(conn, "blob BYTEA");
+368          Assert.Throws<ArgumentException>(() => conn.BeginBinaryExport($"COPY {table} (blob) TO STDOUT"));
+369          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Broken));
+370      }
+371      [Test, NonParallelizable, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/661")]
+372      [Ignore("Unreliable")]
+373      public async Task Unexpected_exception_binary_import()
+374      {
+375          if (IsMultiplexing)
+376              return;
+377          await using var dataSource = CreateDataSource();
+378          await using var conn = await dataSource.OpenConnectionAsync();
+379          var table = await CreateTempTable(conn, "blob BYTEA");
+380          var data = new byte[conn.Settings.WriteBufferSize + 10];
+381          var writer = conn.BeginBinaryImport($"COPY {table} (blob) FROM STDIN BINARY");
+382          using (var conn2 = await OpenConnectionAsync())
+383              conn2.ExecuteNonQuery($"SELECT pg_terminate_backend({conn.ProcessID})");
+384          Thread.Sleep(50);
+385          Assert.That(() =>
+386          {
+387              writer.StartRow();
+388              writer.Write(data);
+389              writer.Dispose();
+390          }, Throws.Exception.TypeOf<IOException>());
+391          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Broken));
+392      }
+393      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/657")]
+394      [Explicit]
+395      public async Task Import_bytea_massive()
+396      {
+397          using var conn = await OpenConnectionAsync();
+398          var table = await CreateTempTable(conn, "field BYTEA");
+399          const int iterations = 10000;
+400          var data = new byte[1024*1024];
+401          using (var writer = conn.BeginBinaryImport($"COPY {table} (field) FROM STDIN BINARY"))
+402          {
+403              for (var i = 0; i < iterations; i++)
+404              {
+405                  if (i%100 == 0)
+406                      Console.WriteLine("Iteration " + i);
+407                  writer.StartRow();
+408                  writer.Write(data, NpgsqlDbType.Bytea);
+409              }
+410          }
+411          Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(iterations));
+412      }
+413      [Test]
+414      public async Task Export_long_string()
+415      {
+416          const int iterations = 100;
+417          using var conn = await OpenConnectionAsync();
+418          var len = conn.Settings.WriteBufferSize;
+419          var table = await CreateTempTable(conn, "foo1 TEXT, foo2 TEXT, foo3 TEXT, foo4 TEXT, foo5 TEXT");
+420          using (var cmd = new NpgsqlCommand($"INSERT INTO {table} VALUES (@p, @p, @p, @p, @p)", conn))
+421          {
+422              cmd.Parameters.AddWithValue("p", new string('x', len));
+423              for (var i = 0; i < iterations; i++)
+424                  await cmd.ExecuteNonQueryAsync();
+425          }
+426          using (var reader = conn.BeginBinaryExport($"COPY {table} (foo1, foo2, foo3, foo4, foo5) TO STDIN BINARY"))
+427          {
+428              for (var row = 0; row < iterations; row++)
+429              {
+430                  Assert.That(reader.StartRow(), Is.EqualTo(5));
+431                  for (var col = 0; col < 5; col++)
+432                      Assert.That(reader.Read<string>().Length, Is.EqualTo(len));
+433              }
+434          }
+435      }
+436      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/1134")]
+437      public async Task Read_bit_string()
+438      {
+439          using var conn = await OpenConnectionAsync();
+440          var table = await GetTempTableName(conn);
+441          await conn.ExecuteNonQueryAsync($@"
+442  CREATE TABLE {table} (bits BIT(3), bitarray BIT(3)[]);
+443  INSERT INTO {table} (bits, bitarray) VALUES (B'101', ARRAY[B'101', B'111'])");
+444          using var reader = conn.BeginBinaryExport($"COPY {table} (bits, bitarray) TO STDIN BINARY");
+445          reader.StartRow();
+446          Assert.That(reader.Read<BitArray>(), Is.EqualTo(new BitArray(new[] { true, false, true })));
+447          Assert.That(reader.Read<BitArray[]>(), Is.EqualTo(new[]
+448          {
+449              new BitArray(new[] { true, false, true }),
+450              new BitArray(new[] { true, true, true })
+451          }));
+452      }
+453      [Test]
+454      public async Task Array()
+455      {
+456          var expected = new[] { 8 };
+457          using var conn = await OpenConnectionAsync();
+458          var table = await CreateTempTable(conn, "arr INTEGER[]");
+459          using (var writer = conn.BeginBinaryImport($"COPY {table} (arr) FROM STDIN BINARY"))
+460          {
+461              writer.StartRow();
+462              writer.Write(expected);
+463              var rowsWritten = writer.Complete();
+464              Assert.That(rowsWritten, Is.EqualTo(1));
+465          }
+466          using (var reader = conn.BeginBinaryExport($"COPY {table} (arr) TO STDIN BINARY"))
+467          {
+468              reader.StartRow();
+469              Assert.That(reader.Read<int[]>(), Is.EqualTo(expected));
+470          }
+471      }
+472      [Test]
+473      public async Task Enum()
+474      {
+475          await using var adminConnection = await OpenConnectionAsync();
+476          var type = await GetTempTypeName(adminConnection);
+477          await adminConnection.ExecuteNonQueryAsync($"CREATE TYPE {type} AS ENUM ('sad', 'ok', 'happy')");
+478          var dataSourceBuilder = CreateDataSourceBuilder();
+479          dataSourceBuilder.MapEnum<Mood>(type);
+480          await using var dataSource = dataSourceBuilder.Build();
+481          await using var connection = await dataSource.OpenConnectionAsync();
+482          var table = await CreateTempTable(connection, $"mymood {type}, mymoodarr {type}[]");
+483          await using (var writer = await connection.BeginBinaryImportAsync($"COPY {table} (mymood, mymoodarr) FROM STDIN BINARY"))
+484          {
+485              await writer.StartRowAsync();
+486              await writer.WriteAsync(Mood.Happy);
+487              await writer.WriteAsync(new[] { Mood.Happy });
+488              var rowsWritten = await writer.CompleteAsync();
+489              Assert.That(rowsWritten, Is.EqualTo(1));
+490          }
+491          await using (var reader = await connection.BeginBinaryExportAsync($"COPY {table} (mymood, mymoodarr) TO STDIN BINARY"))
+492          {
+493              await reader.StartRowAsync();
+494              Assert.That(reader.Read<Mood>(), Is.EqualTo(Mood.Happy));
+495              Assert.That(reader.Read<Mood[]>(), Is.EqualTo(new[] { Mood.Happy }));
+496          }
+497      }
+498      enum Mood { Sad, Ok, Happy };
+499      [Test]
+500      public async Task Read_null_as_nullable()
+501      {
+502          using var connection = await OpenConnectionAsync();
+503          using var exporter = connection.BeginBinaryExport("COPY (SELECT NULL::int) TO STDOUT BINARY");
+504          exporter.StartRow();
+505          Assert.That(exporter.Read<int?>(), Is.Null);
+506      }
+507      [Test]
+508      public async Task Read_null_as_non_nullable_throws()
+509      {
+510          using var connection = await OpenConnectionAsync();
+511          using var exporter = connection.BeginBinaryExport("COPY (SELECT NULL::int) TO STDOUT BINARY");
+512          exporter.StartRow();
+513          Assert.Throws<InvalidCastException>(() => exporter.Read<int>());
+514      }
+515      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/1440")]
+516      public async Task Error_during_import()
+517      {
+518          using var conn = await OpenConnectionAsync();
+519          var table = await CreateTempTable(conn, "foo INT UNIQUE");
+520          var writer = conn.BeginBinaryImport($"COPY {table} (foo) FROM STDIN BINARY");
+521          writer.StartRow();
+522          writer.Write(8);
+523          writer.StartRow();
+524          writer.Write(8);
+525          Assert.That(() => writer.Complete(), Throws.Exception
+526              .TypeOf<PostgresException>()
+527              .With.Property(nameof(PostgresException.SqlState)).EqualTo(PostgresErrorCodes.UniqueViolation));
+528          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+529      }
+530      [Test]
+531      public async Task Import_cannot_write_after_commit()
+532      {
+533          using var conn = await OpenConnectionAsync();
+534          var table = await CreateTempTable(conn, "foo INT");
+535          try
+536          {
+537              using var writer = conn.BeginBinaryImport($"COPY {table} (foo) FROM STDIN BINARY");
+538              writer.StartRow();
+539              writer.Write(8);
+540              var rowsWritten = writer.Complete();
+541              Assert.That(rowsWritten, Is.EqualTo(1));
+542              writer.StartRow();
+543              Assert.Fail("StartRow should have thrown");
+544          }
+545          catch (InvalidOperationException)
+546          {
+547              Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(1));
+548          }
+549      }
+550      [Test]
+551      public async Task Import_commit_in_middle_of_row()
+552      {
+553          using var conn = await OpenConnectionAsync();
+554          var table = await CreateTempTable(conn, "foo INT, bar TEXT");
+555          try
+556          {
+557              using var writer = conn.BeginBinaryImport($"COPY {table} (foo, bar) FROM STDIN BINARY");
+558              writer.StartRow();
+559              writer.Write(8);
+560              writer.Write("hello");
+561              writer.StartRow();
+562              writer.Write(9);
+563              writer.Complete();
+564              Assert.Fail("Commit should have thrown");
+565          }
+566          catch (InvalidOperationException)
+567          {
+568              Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(0));
+569          }
+570      }
+571      [Test]
+572      public async Task Import_exception_does_not_commit()
+573      {
+574          using var conn = await OpenConnectionAsync();
+575          var table = await CreateTempTable(conn, "foo INT");
+576          try
+577          {
+578              using var writer = conn.BeginBinaryImport($"COPY {table} (foo) FROM STDIN BINARY");
+579              writer.StartRow();
+580              writer.Write(8);
+581              throw new Exception("FOO");
+582          }
+583          catch (Exception e) when (e.Message == "FOO")
+584          {
+585              Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.Zero);
+586          }
+587      }
+588      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2347")]
+589      public async Task Write_column_out_of_bounds_throws()
+590      {
+591          using var conn = await OpenConnectionAsync();
+592          var table = await CreateTempTable(conn, "field_text TEXT, field_int2 INTEGER");
+593          using var writer = conn.BeginBinaryImport($"COPY {table} (field_text, field_int2) FROM STDIN BINARY");
+594          StateAssertions(conn);
+595          writer.StartRow();
+596          writer.Write("Hello");
+597          writer.Write(8, NpgsqlDbType.Smallint);
+598          Assert.Throws<InvalidOperationException>(() => writer.Write("I should not be here"));
+599          writer.StartRow();
+600          writer.Write("Hello");
+601          writer.Write(8, NpgsqlDbType.Smallint);
+602          Assert.Throws<InvalidOperationException>(() => writer.Write("I should not be here", NpgsqlDbType.Text));
+603          writer.StartRow();
+604          writer.Write("Hello");
+605          writer.Write(8, NpgsqlDbType.Smallint);
+606          Assert.Throws<InvalidOperationException>(() => writer.Write("I should not be here", "text"));
+607          Assert.Throws<InvalidOperationException>(() => writer.WriteRow("Hello", 8, "I should not be here"));
+608      }
+609      [Test]
+610      public async Task Cancel_raw_binary_export_when_not_consumed_and_then_Dispose()
+611      {
+612          await using var conn = await OpenConnectionAsync();
+613          var stream = conn.BeginRawBinaryCopy("COPY (select md5(random()::text) as id from generate_series(1, 100000)) TO STDOUT BINARY");
+614          var buffer = new byte[32];
+615          await stream.ReadAsync(buffer, 0, buffer.Length);
+616          stream.Cancel();
+617          Assert.DoesNotThrowAsync(async () => await stream.DisposeAsync());
+618          Assert.That(async () => await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1), "The connection is still OK");
+619      }
+620      [Test]
+621      public async Task Cancel_binary_export_when_not_consumed_and_then_Dispose()
+622      {
+623          await using var conn = await OpenConnectionAsync();
+624          var exporter = conn.BeginBinaryExport("COPY (select md5(random()::text) as id from generate_series(1, 100000)) TO STDOUT BINARY");
+625          await exporter.StartRowAsync();
+626          await exporter.ReadAsync<string>();
+627          exporter.Cancel();
+628          Assert.DoesNotThrowAsync(async () => await exporter.DisposeAsync());
+629          Assert.That(async () => await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1), "The connection is still OK");
+630      }
+631      [Test]
+632      [IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/4417")]
+633      public async Task Binary_copy_throws_for_nullable()
+634      {
+635          await using var conn = await OpenConnectionAsync();
+636          var tableName = await CreateTempTable(conn, "house_number integer");
+637          await using var writer = await conn.BeginBinaryImportAsync($"COPY {tableName}(house_number) FROM STDIN BINARY");
+638          int? value = 1;
+639          await writer.StartRowAsync();
+640          Assert.ThrowsAsync<InvalidCastException>(async () => await writer.WriteAsync(value, NpgsqlDbType.Integer));
+641      }
+642      [Test]
+643      [IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/5110")]
+644      public async Task Binary_copy_read_char_column()
+645      {
+646          await using var conn = await OpenConnectionAsync();
+647          var tableName = await CreateTempTable(conn, "id serial, value char");
+648          await using var cmd = conn.CreateCommand();
+649          cmd.CommandText = $"INSERT INTO {tableName}(value) VALUES ('d'), ('s')";
+650          await cmd.ExecuteNonQueryAsync();
+651          await using var export = await conn.BeginBinaryExportAsync($"COPY {tableName}(id, value) TO STDOUT (FORMAT BINARY)");
+652          while (await export.StartRowAsync() != -1)
+653          {
+654              var id = export.Read<int>();
+655              var value = export.Read<char>();
+656          }
+657      }
+658      #endregion
+659      #region Text
+660      [Test]
+661      public async Task Text_import([Values(false, true)] bool async)
+662      {
+663          using var conn = await OpenConnectionAsync();
+664          var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER");
+665          const string line = "HELLO\t1\n";
+666          var writer = async
+667              ? await conn.BeginTextImportAsync($"COPY {table} (field_text, field_int4) FROM STDIN")
+668              : conn.BeginTextImport($"COPY {table} (field_text, field_int4) FROM STDIN");
+669          StateAssertions(conn);
+670          writer.Write(line);
+671          writer.Dispose();
+672          Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table} WHERE field_int4=1"), Is.EqualTo(1));
+673          Assert.That(() => writer.Write(line), Throws.Exception.TypeOf<ObjectDisposedException>());
+674          await conn.ExecuteNonQueryAsync($"TRUNCATE {table}");
+675          var iterations = NpgsqlWriteBuffer.MinimumSize/line.Length + 100;
+676          writer = async
+677              ? await conn.BeginTextImportAsync($"COPY {table} (field_text, field_int4) FROM STDIN")
+678              : conn.BeginTextImport($"COPY {table} (field_text, field_int4) FROM STDIN");
+679          for (var i = 0; i < iterations; i++)
+680              writer.Write(line);
+681          writer.Dispose();
+682          Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table} WHERE field_int4=1"), Is.EqualTo(iterations));
+683      }
+684      [Test]
+685      public async Task Cancel_text_import()
+686      {
+687          using var conn = await OpenConnectionAsync();
+688          var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER");
+689          var writer = (NpgsqlCopyTextWriter)conn.BeginTextImport($"COPY {table} (field_text, field_int4) FROM STDIN");
+690          writer.Write("HELLO\t1\n");
+691          writer.Cancel();
+692          Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(0));
+693      }
+694      [Test]
+695      public async Task Text_import_empty()
+696      {
+697          using var conn = await OpenConnectionAsync();
+698          var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER");
+699          using (conn.BeginTextImport($"COPY {table} (field_text, field_int4) FROM STDIN"))
+700          {
+701          }
+702          Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(0));
+703      }
+704      [Test]
+705      public async Task Text_export([Values(false, true)] bool async)
+706      {
+707          using var conn = await OpenConnectionAsync();
+708          var table = await GetTempTableName(conn);
+709          await conn.ExecuteNonQueryAsync($@"
+710  CREATE  TABLE {table} (field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER);
+711  INSERT INTO {table} (field_text, field_int4) VALUES ('HELLO', 1)");
+712          var chars = new char[30];
+713          var reader = async
+714              ? await conn.BeginTextExportAsync($"COPY {table} (field_text, field_int4) TO STDIN")
+715              : conn.BeginTextExport($"COPY {table} (field_text, field_int4) TO STDIN");
+716          StateAssertions(conn);
+717          Assert.That(reader.Read(chars, 0, chars.Length), Is.EqualTo(8));
+718          Assert.That(new string(chars, 0, 8), Is.EqualTo("HELLO\t1\n"));
+719          Assert.That(reader.Read(chars, 0, chars.Length), Is.EqualTo(0));
+720          Assert.That(reader.Read(chars, 0, chars.Length), Is.EqualTo(0));
+721          reader.Dispose();
+722          Assert.That(() => reader.Read(chars, 0, chars.Length), Throws.Exception.TypeOf<ObjectDisposedException>());
+723          await conn.ExecuteNonQueryAsync($"TRUNCATE {table}");
+724      }
+725      [Test]
+726      public async Task Dispose_in_middle_of_text_export()
+727      {
+728          using var conn = await OpenConnectionAsync();
+729          var table = await GetTempTableName(conn);
+730          await conn.ExecuteNonQueryAsync($@"
+731  CREATE TABLE {table} (field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER);
+732  INSERT INTO {table} (field_text, field_int4) VALUES ('HELLO', 1)");
+733          var reader = conn.BeginTextExport($"COPY {table} (field_text, field_int4) TO STDIN");
+734          reader.Dispose();
+735          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+736      }
+737      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2330")]
+738      public async Task Wrong_table_definition_text_import()
+739      {
+740          if (IsMultiplexing)
+741              Assert.Ignore("Multiplexing: fails");
+742          using var conn = await OpenConnectionAsync();
+743          Assert.Throws<PostgresException>(() => conn.BeginTextImport("COPY table_is_not_exist (blob) FROM STDIN"));
+744          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Open));
+745          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+746      }
+747      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2330")]
+748      public async Task Wrong_format_text_import()
+749      {
+750          if (IsMultiplexing)
+751              Assert.Ignore("Multiplexing: fails");
+752          using var conn = await OpenConnectionAsync();
+753          var table = await CreateTempTable(conn, "blob BYTEA");
+754          Assert.Throws<Exception>(() => conn.BeginTextImport($"COPY {table} (blob) FROM STDIN BINARY"));
+755          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Broken));
+756      }
+757      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2330")]
+758      public async Task Wrong_table_definition_text_export()
+759      {
+760          if (IsMultiplexing)
+761              Assert.Ignore("Multiplexing: fails");
+762          using var conn = await OpenConnectionAsync();
+763          Assert.Throws<PostgresException>(() => conn.BeginTextExport("COPY table_is_not_exist (blob) TO STDOUT"));
+764          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Open));
+765          Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+766      }
+767      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/2330")]
+768      public async Task Wrong_format_text_export()
+769      {
+770          if (IsMultiplexing)
+771              Assert.Ignore("Multiplexing: fails");
+772          using var conn = await OpenConnectionAsync();
+773          var table = await CreateTempTable(conn, "blob BYTEA");
+774          Assert.Throws<Exception>(() => conn.BeginTextExport($"COPY {table} (blob) TO STDOUT BINARY"));
+775          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Broken));
+776      }
+777      [Test]
+778      public async Task Cancel_text_export_when_not_consumed_and_then_Dispose()
+779      {
+780          await using var conn = await OpenConnectionAsync();
+781          var reader = (NpgsqlCopyTextReader) conn.BeginTextExport("COPY (select md5(random()::text) as id from generate_series(1, 100000)) TO STDOUT");
+782          var buffer = new char[32];
+783          await reader.ReadAsync(buffer, 0, buffer.Length);
+784          reader.Cancel();
+785          Assert.DoesNotThrow(reader.Dispose);
+786          Assert.That(async () => await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1), "The connection is still OK");
+787      }
+788      #endregion
+789      #region Other
+790      [Test, Description("Starts a transaction before a COPY, testing that prepended messages are handled well")]
+791      public async Task Prepended_messages()
+792      {
+793          using var conn = await OpenConnectionAsync();
+794          conn.BeginTransaction();
+795          await Text_import(async: false);
+796      }
+797      [Test]
+798      public async Task Undefined_table_throws()
+799      {
+800          using var conn = await OpenConnectionAsync();
+801          Assert.That(() => conn.BeginBinaryImport("COPY undefined_table (field_text, field_int2) FROM STDIN BINARY"),
+802              Throws.Exception
+803                  .TypeOf<PostgresException>()
+804                  .With.Property(nameof(PostgresException.SqlState)).EqualTo(PostgresErrorCodes.UndefinedTable)
+805          );
+806      }
+807      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/621")]
+808      public async Task Close_during_copy_throws()
+809      {
+810          using (var conn = await OpenConnectionAsync()) {
+811              var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER");
+812              conn.BeginBinaryImport($"COPY {table} (field_text, field_int4) FROM STDIN BINARY");
+813          }
+814          using (var conn = await OpenConnectionAsync()) {
+815              var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER");
+816              conn.BeginBinaryExport($"COPY {table} (field_text, field_int2) TO STDIN BINARY");
+817          }
+818          using (var conn = await OpenConnectionAsync()) {
+819              var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER");
+820              conn.BeginRawBinaryCopy($"COPY {table} (field_text, field_int4) FROM STDIN BINARY");
+821          }
+822          using (var conn = await OpenConnectionAsync()) {
+823              var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER");
+824              conn.BeginRawBinaryCopy($"COPY {table} (field_text, field_int4) TO STDIN BINARY");
+825          }
+826          using (var conn = await OpenConnectionAsync()) {
+827              var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER");
+828              conn.BeginTextImport($"COPY {table} (field_text, field_int4) FROM STDIN");
+829          }
+830          using (var conn = await OpenConnectionAsync()) {
+831              var table = await CreateTempTable(conn, "field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER");
+832              conn.BeginTextExport($"COPY {table} (field_text, field_int4) TO STDIN");
+833          }
+834      }
+835      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/994")]
+836      public async Task Non_ascii_column_name()
+837      {
+838          using var conn = await OpenConnectionAsync();
+839          var table = await CreateTempTable(conn, "non_ascii_éè TEXT");
+840          using (conn.BeginBinaryImport($"COPY {table} (non_ascii_éè) FROM STDIN BINARY")) { }
+841      }
+842      [Test, IssueLink("https:&bsol;&bsol;stackoverflow.com/questions/37431054/08p01-insufficient-data-left-in-message-for-nullable-datetime/37431464")]
+843      public async Task Write_null_values()
+844      {
+845          using var conn = await OpenConnectionAsync();
+846          var table = await CreateTempTable(conn, "foo1 INT, foo2 UUID, foo3 INT, foo4 UUID");
+847          using (var writer = conn.BeginBinaryImport($"COPY {table} (foo1, foo2, foo3, foo4) FROM STDIN BINARY"))
+848          {
+849              writer.StartRow();
+850              writer.Write(DBNull.Value, NpgsqlDbType.Integer);
+851              writer.Write((string?)null, NpgsqlDbType.Uuid);
+852              writer.Write(DBNull.Value);
+853              writer.Write((string?)null);
+854              var rowsWritten = writer.Complete();
+855              Assert.That(rowsWritten, Is.EqualTo(1));
+856          }
+857          using (var cmd = new NpgsqlCommand($"SELECT foo1,foo2,foo3,foo4 FROM {table}", conn))
+858          using (var reader = await cmd.ExecuteReaderAsync())
+859          {
+860              Assert.That(reader.Read(), Is.True);
+861              for (var i = 0; i < reader.FieldCount; i++)
+862                  Assert.That(reader.IsDBNull(i), Is.True);
+863          }
+864      }
+865      [Test]
+866      public async Task Write_different_types()
+867      {
+868          using var conn = await OpenConnectionAsync();
+869          var table = await CreateTempTable(conn, "foo INT, bar INT[]");
+870          using (var writer = conn.BeginBinaryImport($"COPY {table} (foo, bar) FROM STDIN BINARY"))
+871          {
+872              writer.StartRow();
+873              writer.Write(3.0, NpgsqlDbType.Integer);
+874              writer.Write((object)new[] { 1, 2, 3 });
+875              writer.StartRow();
+876              writer.Write(3, NpgsqlDbType.Integer);
+877              writer.Write((object)new List<int> { 4, 5, 6 });
+878              var rowsWritten = writer.Complete();
+879              Assert.That(rowsWritten, Is.EqualTo(2));
+880          }
+881          Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(2));
+882      }
+883      [Test, Description("Tests nested binding scopes in multiplexing")]
+884      public async Task Within_transaction()
+885      {
+886          using var conn = await OpenConnectionAsync();
+887          var table = await CreateTempTable(conn, "foo INT");
+888          using (var tx = conn.BeginTransaction())
+889          using (var writer = conn.BeginBinaryImport($"COPY {table} (foo) FROM STDIN BINARY"))
+890          {
+891              writer.StartRow();
+892              writer.Write(1);
+893              writer.Dispose();
+894              await tx.CommitAsync();
+895          }
+896          using (var tx = conn.BeginTransaction())
+897          using (var writer = conn.BeginBinaryImport($"COPY {table} (foo) FROM STDIN BINARY"))
+898          {
+899              writer.StartRow();
+900              writer.Write(2);
+901              writer.Complete();
+902          }
+903          using (var tx = conn.BeginTransaction())
+904          {
+905              using (var writer = conn.BeginBinaryImport($"COPY {table} (foo) FROM STDIN BINARY"))
+906              {
+907                  writer.StartRow();
+908                  writer.Write(3);
+909                  writer.Complete();
+910              }
+911              await tx.CommitAsync();
+912          }
+913          Assert.That(async () => await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(1));
+914          Assert.That(async () => await conn.ExecuteScalarAsync($"SELECT foo FROM {table}"), Is.EqualTo(3));
+915      }
+916      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/4199")]
+917      public async Task Copy_from_is_not_supported_in_regular_command_execution()
+918      {
+919          await using var dataSource = CreateDataSource();
+920          await using var conn = await dataSource.OpenConnectionAsync();
+921          var table = await CreateTempTable(conn, "foo INT");
+922          Assert.That(() => conn.ExecuteNonQuery($@"COPY {table} (foo) FROM stdin"), Throws.Exception.TypeOf<NotSupportedException>());
+923      }
+924      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/4974")]
+925      public async Task Copy_to_is_not_supported_in_regular_command_execution()
+926      {
+927          await using var dataSource = CreateDataSource();
+928          await using var conn = await dataSource.OpenConnectionAsync();
+929          var table = await CreateTempTable(conn, "foo INT");
+930          Assert.That(() => conn.ExecuteNonQuery($@"COPY {table} (foo) TO stdin"), Throws.Exception.TypeOf<NotSupportedException>());
+931      }
+932      #endregion
+933      #region Utils
+934      void StateAssertions(NpgsqlConnection conn)
+935      {
+936          Assert.That(conn.Connector!.State, Is.EqualTo(ConnectorState.Copy));
+937          Assert.That(conn.State, Is.EqualTo(ConnectionState.Open));
+938          Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Open | ConnectionState.Fetching));
+939          Assert.That(async () => await conn.ExecuteScalarAsync("SELECT 1"), Throws.Exception.TypeOf<NpgsqlOperationInProgressException>());
+940      }
+941      #endregion
+942      public CopyTests(MultiplexingMode multiplexingMode) : base(multiplexingMode) {}
+943  }
+</code></pre>
+        </div>
+        <div class="column">
+            <h3>npgsql-MDEwOlJlcG9zaXRvcnkyODgzNTc0-flat-ReaderOldSchemaTests.cs</h3>
+            <pre><code>1  using System;
+2  using System.Data;
+3  using System.Linq;
+4  using System.Threading.Tasks;
+5  using NUnit.Framework;
+6  using static Npgsql.Tests.TestUtil;
+7  namespace Npgsql.Tests;
+8  public class ReaderOldSchemaTests : SyncOrAsyncTestBase
+9  {
+10      [Test]
+11      public async Task Primary_key_composite()
+12      {
+13          using var conn = await OpenConnectionAsync();
+14          var table = await GetTempTableName(conn);
+15          await conn.ExecuteNonQueryAsync($@"
+16  CREATE TABLE {table} (
+17      field_pk1 INT2 NOT NULL,
+18      field_pk2 INT2 NOT NULL,
+19      field_serial SERIAL,
+20      CONSTRAINT {table}_pk PRIMARY KEY (field_pk1, field_pk2)
+21  )");
+22          using var command = new NpgsqlCommand($"SELECT * FROM {table}", conn);
+23          using var dr = command.ExecuteReader(CommandBehavior.KeyInfo);
+24          dr.Read();
+25          var dataTable = await GetSchemaTable(dr);
+26          var keyColumns = dataTable!.Rows.Cast<DataRow>().Where(r => (bool)r["IsKey"]).ToArray()!;
+27          Assert.That(keyColumns, Has.Length.EqualTo(2));
+28          Assert.That(keyColumns.Count(c => (string)c["ColumnName"] == "field_pk1"), Is.EqualTo(1));
+29          Assert.That(keyColumns.Count(c => (string)c["ColumnName"] == "field_pk2"), Is.EqualTo(1));
+30      }
+31      [Test]
+32      public async Task Primary_key()
+33      {
+34          using var conn = await OpenConnectionAsync();
+35          var table = await CreateTempTable(conn, "id SERIAL PRIMARY KEY, serial SERIAL");
+36          using var command = new NpgsqlCommand($"SELECT * FROM {table}", conn);
+37          using var dr = command.ExecuteReader(CommandBehavior.KeyInfo);
+38          dr.Read();
+39          var metadata = await GetSchemaTable(dr);
+40          var key = metadata!.Rows.Cast<DataRow>().Single(r => (bool)r["IsKey"])!;
+41          Assert.That(key["ColumnName"], Is.EqualTo("id"));
+42      }
+43      [Test]
+44      public async Task IsAutoIncrement()
+45      {
+46          await using var conn = await OpenConnectionAsync();
+47          IgnoreOnRedshift(conn, "Serial columns not supported on Redshift");
+48          var table = await CreateTempTable(conn, "serial SERIAL, int INT");
+49          var command = new NpgsqlCommand($"SELECT serial, int, 8 FROM {table}", conn);
+50          await using var reader = command.ExecuteReader(CommandBehavior.KeyInfo);
+51          var rows = (await GetSchemaTable(reader))!.Rows;
+52          Assert.That(rows[0]["IsAutoIncrement"], Is.True);
+53          Assert.That(rows[1]["IsAutoIncrement"], Is.False);
+54          Assert.That(rows[2]["IsAutoIncrement"], Is.False);
+55      }
+56      [Test]
+57      public async Task IsAutoIncrement_identity()
+58      {
+59          await using var conn = await OpenConnectionAsync();
+60          IgnoreOnRedshift(conn, "Serial columns not supported on Redshift");
+61          MinimumPgVersion(conn, "10.0", "IDENTITY introduced in PostgreSQL 10");
+62          var table =
+63              await CreateTempTable(conn, "identity1 INT GENERATED BY DEFAULT AS IDENTITY, identity2 INT GENERATED ALWAYS AS IDENTITY");
+64          await using var command = new NpgsqlCommand($"SELECT identity1, identity2 FROM {table}", conn);
+65          await using var reader = command.ExecuteReader(CommandBehavior.KeyInfo);
+66          var rows = (await GetSchemaTable(reader))!.Rows;
+67          Assert.That(rows[0]["IsAutoIncrement"], Is.True);
+68          Assert.That(rows[1]["IsAutoIncrement"], Is.True);
+69      }
+70      [Test]
+71      public async Task IsIdentity()
+72      {
+73          await using var conn = await OpenConnectionAsync();
+74          IgnoreOnRedshift(conn, "Identity columns not support on Redshift");
+75          MinimumPgVersion(conn, "10.0", "IDENTITY introduced in PostgreSQL 10");
+76          var table = await CreateTempTable(
+77              conn,
+78              "identity1 INT GENERATED BY DEFAULT AS IDENTITY, identity2 INT GENERATED ALWAYS AS IDENTITY, serial SERIAL, int INT");
+79          await using var cmd = new NpgsqlCommand($"SELECT identity1, identity2, serial, int, 8 FROM {table}", conn);
+80          await using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SchemaOnly | CommandBehavior.KeyInfo);
+81          var rows = (await GetSchemaTable(reader))!.Rows;
+82          Assert.That(rows[0]["IsIdentity"], Is.True);
+83          Assert.That(rows[1]["IsIdentity"], Is.True);
+84          Assert.That(rows[2]["IsIdentity"], Is.False);
+85          Assert.That(rows[3]["IsIdentity"], Is.False);
+86          Assert.That(rows[4]["IsIdentity"], Is.False);
+87      }
+88      [Test]
+89      public async Task IsReadOnly()
+90      {
+91          using var conn = await OpenConnectionAsync();
+92          var table = await GetTempTableName(conn);
+<span onclick='openModal()' class='match'>93          var view = await GetTempViewName(conn);
+94          await conn.ExecuteNonQueryAsync($@"
+95  CREATE TABLE {table} (id SERIAL PRIMARY KEY, int2 SMALLINT);
+96  CREATE OR REPLACE VIEW {view} (id, int2) AS SELECT id, int2 + int2 AS int2 FROM {table}");
+97          var command = new NpgsqlCommand($"SELECT * FROM {view}", conn);
+</span>98          using var dr = command.ExecuteReader();
+99          var metadata = await GetSchemaTable(dr);
+100          foreach (var r in metadata!.Rows.OfType<DataRow>())
+101          {
+102              switch ((string)r["ColumnName"])
+103              {
+104              case "field_pk":
+105                  if (conn.PostgreSqlVersion < new Version("9.4"))
+106                  {
+107                      Assert.IsTrue((bool)r["IsReadonly"], "field_pk");
+108                  }
+109                  else
+110                  {
+111                      Assert.IsFalse((bool)r["IsReadonly"], "field_pk");
+112                  }
+113                  break;
+114              case "field_int2":
+115                  Assert.IsTrue((bool)r["IsReadonly"]);
+116                  break;
+117              }
+118          }
+119      }
+120      [Test]
+121      public async Task AllowDBNull()
+122      {
+123          using var conn = await OpenConnectionAsync();
+124          var table = await CreateTempTable(conn, "nullable INTEGER, non_nullable INTEGER NOT NULL");
+125          using var cmd = new NpgsqlCommand($"SELECT * FROM {table}", conn);
+126          using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SchemaOnly | CommandBehavior.KeyInfo);
+127          using var metadata = await GetSchemaTable(reader);
+128          foreach (var row in metadata!.Rows.OfType<DataRow>())
+129          {
+130              var isNullable = (bool)row["AllowDBNull"];
+131              switch ((string)row["ColumnName"])
+132              {
+133              case "nullable":
+134                  Assert.IsTrue(isNullable);
+135                  continue;
+136              case "non_nullable":
+137                  Assert.IsFalse(isNullable);
+138                  continue;
+139              }
+140          }
+141      }
+142      [Test, IssueLink("https:&bsol;&bsol;github.com/npgsql/npgsql/issues/1027")]
+143      public async Task Without_result()
+144      {
+145          using var conn = await OpenConnectionAsync();
+146          using var cmd = new NpgsqlCommand("SELECT 1", conn);
+147          using var reader = await cmd.ExecuteReaderAsync();
+148          reader.NextResult();
+149          var table = await GetSchemaTable(reader);
+150          Assert.That(table, Is.Null);
+151      }
+152      [Test]
+153      public async Task Precision_and_scale()
+154      {
+155          using var conn = await OpenConnectionAsync();
+156          using var cmd = new NpgsqlCommand("SELECT 1::NUMERIC AS result", conn);
+157          using var reader = await cmd.ExecuteReaderAsync();
+158          var schemaTable = await GetSchemaTable(reader);
+159          foreach (var myField in schemaTable!.Rows.OfType<DataRow>())
+160          {
+161              Assert.That(myField["NumericScale"], Is.EqualTo(0));
+162              Assert.That(myField["NumericPrecision"], Is.EqualTo(0));
+163          }
+164      }
+165      [Test]
+166      public async Task SchemaOnly([Values(PrepareOrNot.NotPrepared, PrepareOrNot.Prepared)] PrepareOrNot prepare)
+167      {
+168          using var conn = await OpenConnectionAsync();
+169          var table = await CreateTempTable(conn, "name TEXT");
+170          var query = $@"
+171  SELECT 1 AS some_column;
+172  UPDATE {table} SET name='yo' WHERE 1=0;
+173  SELECT 1 AS some_other_column, 2";
+174          using var cmd = new NpgsqlCommand(query, conn);
+175          if (prepare == PrepareOrNot.Prepared)
+176              cmd.Prepare();
+177          using (var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SchemaOnly))
+178          {
+179              Assert.That(reader.Read(), Is.False);
+180              var t = await GetSchemaTable(reader);
+181              Assert.That(t!.Rows[0]["ColumnName"], Is.EqualTo("some_column"));
+182              Assert.That(reader.NextResult(), Is.True);
+183              Assert.That(reader.Read(), Is.False);
+184              t = await GetSchemaTable(reader);
+185              Assert.That(t!.Rows[0]["ColumnName"], Is.EqualTo("some_other_column"));
+186              Assert.That(t.Rows[1]["ColumnName"], Is.EqualTo("?column?"));
+187              Assert.That(reader.NextResult(), Is.False);
+188          }
+189          using (var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SchemaOnly))
+190              reader.Read();
+191      }
+192      [Test]
+193      public async Task BaseColumnName()
+194      {
+195          using var conn = OpenConnection();
+196          conn.ExecuteNonQuery(@"
+197                  CREATE TEMP TABLE data (
+198                      Cod varchar(5) NOT NULL,
+199                      Descr varchar(40),
+200                      Date date,
+201                      CONSTRAINT PK_test_Cod PRIMARY KEY (Cod)
+202                  );
+203              ");
+204          var cmd = new NpgsqlCommand("SELECT Cod as CodAlias, Descr as DescrAlias, Date FROM data", conn);
+205          using var dr = cmd.ExecuteReader(CommandBehavior.SchemaOnly | CommandBehavior.KeyInfo);
+206          var dt = await GetSchemaTable(dr);
+207          Assert.That(dt!.Rows[0]["BaseColumnName"].ToString(), Is.EqualTo("cod"));
+208          Assert.That(dt.Rows[0]["ColumnName"].ToString(), Is.EqualTo("codalias"));
+209          Assert.That(dt.Rows[1]["BaseColumnName"].ToString(), Is.EqualTo("descr"));
+210          Assert.That(dt.Rows[1]["ColumnName"].ToString(), Is.EqualTo("descralias"));
+211          Assert.That(dt.Rows[2]["BaseColumnName"].ToString(), Is.EqualTo("date"));
+212          Assert.That(dt.Rows[2]["ColumnName"].ToString(), Is.EqualTo("date"));
+213      }
+214      public ReaderOldSchemaTests(SyncOrAsync syncOrAsync) : base(syncOrAsync) { }
+215      async Task<DataTable?> GetSchemaTable(NpgsqlDataReader dr) => IsAsync ? await dr.GetSchemaTableAsync() : dr.GetSchemaTable();
+216  }
+</code></pre>
+        </div>
+    
+        <!-- The Modal -->
+        <div id="myModal" class="modal">
+            <div class="modal-content">
+                <span class="row close">&times;</span>
+                <div class='row'>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from npgsql-MDEwOlJlcG9zaXRvcnkyODgzNTc0-flat-CopyTests.cs</div>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from npgsql-MDEwOlJlcG9zaXRvcnkyODgzNTc0-flat-ReaderOldSchemaTests.cs</div>
+                </div>
+                <div class="column column_space"><pre><code>100          var table = await GetTempTableName(conn);
+101          await conn.ExecuteNonQueryAsync($@"
+102  CREATE TABLE {table} (field_text TEXT, field_int2 SMALLINT, field_int4 INTEGER);
+103  INSERT INTO {table} (field_text, field_int4) VALUES ('HELLO', 8)");
+104          var data = new byte[3];
+</pre></code></div>
+                <div class="column column_space"><pre><code>93          var view = await GetTempViewName(conn);
+94          await conn.ExecuteNonQueryAsync($@"
+95  CREATE TABLE {table} (id SERIAL PRIMARY KEY, int2 SMALLINT);
+96  CREATE OR REPLACE VIEW {view} (id, int2) AS SELECT id, int2 + int2 AS int2 FROM {table}");
+97          var command = new NpgsqlCommand($"SELECT * FROM {view}", conn);
+</pre></code></div>
+            </div>
+        </div>
+        <script>
+        // Get the modal
+        var modal = document.getElementById("myModal");
+        
+        // Get the button that opens the modal
+        var btn = document.getElementById("myBtn");
+        
+        // Get the <span> element that closes the modal
+        var span = document.getElementsByClassName("close")[0];
+        
+        // When the user clicks the button, open the modal
+        function openModal(){
+          modal.style.display = "block";
+        }
+        
+        // When the user clicks on <span> (x), close the modal
+        span.onclick = function() {
+        modal.style.display = "none";
+        }
+        
+        // When the user clicks anywhere outside of the modal, close it
+        window.onclick = function(event) {
+        if (event.target == modal) {
+        modal.style.display = "none";
+        } }
+        
+        </script>
+    </body>
+    </html>
+    
