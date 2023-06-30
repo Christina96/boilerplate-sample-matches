@@ -1,0 +1,878 @@
+
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Code Files</title>
+            <style>
+                .column {
+                    width: 47%;
+                    float: left;
+                    padding: 12px;
+                    border: 2px solid #ffd0d0;
+                }
+        
+                .modal {
+                    display: none;
+                    position: fixed;
+                    z-index: 1;
+                    left: 0;
+                    top: 0;
+                    width: 100%;
+                    height: 100%;
+                    overflow: auto;
+                    background-color: rgb(0, 0, 0);
+                    background-color: rgba(0, 0, 0, 0.4);
+                }
+    
+                .modal-content {
+                    height: 250%;
+                    background-color: #fefefe;
+                    margin: 5% auto;
+                    padding: 20px;
+                    border: 1px solid #888;
+                    width: 80%;
+                }
+    
+                .close {
+                    color: #aaa;
+                    float: right;
+                    font-size: 20px;
+                    font-weight: bold;
+                    text-align: right;
+                }
+    
+                .close:hover, .close:focus {
+                    color: black;
+                    text-decoration: none;
+                    cursor: pointer;
+                }
+    
+                .row {
+                    float: right;
+                    width: 100%;
+                }
+    
+                .column_space  {
+                    white - space: pre-wrap;
+                }
+                 
+                pre {
+                    width: 100%;
+                    overflow-y: auto;
+                    background: #f8fef2;
+                }
+                
+                .match {
+                    cursor:pointer; 
+                    background-color:#00ffbb;
+                }
+        </style>
+    </head>
+    <body>
+        <h2>Tokens: 22, <button onclick='openModal()' class='match'></button></h2>
+        <div class="column">
+            <h3>subconverter-MDEwOlJlcG9zaXRvcnkyMTg2ODY3NjM=-flat-webget.cpp</h3>
+            <pre><code>1  #include <iostream>
+2  #include <unistd.h>
+3  #include <sys/stat.h>
+4  #include <thread>
+5  #include <atomic>
+6  #include <curl/curl.h>
+7  #include "../handler/settings.h"
+8  #include "../utils/base64/base64.h"
+9  #include "../utils/defer.h"
+10  #include "../utils/file_extra.h"
+11  #include "../utils/logger.h"
+12  #include "../utils/urlencode.h"
+13  #include "../version.h"
+14  #include "webget.h"
+15  #ifdef _WIN32
+16  #ifndef _stat
+17  #define _stat stat
+18  #endif 
+19  #endif 
+20  class RWLock
+21  {
+22  #define WRITE_LOCK_STATUS -1
+23  #define FREE_STATUS 0
+24  private:
+25      const std::thread::id NULL_THREAD;
+26      const bool WRITE_FIRST;
+27      std::thread::id m_write_thread_id;
+28      std::atomic_int m_lockCount;
+29      std::atomic_uint m_writeWaitCount;
+30  public:
+31      RWLock(const RWLock&) = delete;
+32      RWLock& operator=(const RWLock&) = delete;
+33      RWLock(bool writeFirst = true): WRITE_FIRST(writeFirst), m_write_thread_id(), m_lockCount(0), m_writeWaitCount(0) {}
+34      virtual ~RWLock() = default;
+35      int readLock()
+36      {
+37          if (std::this_thread::get_id() != m_write_thread_id)
+38          {
+39              int count;
+40              if (WRITE_FIRST)
+41                  do {
+42                      while ((count = m_lockCount) == WRITE_LOCK_STATUS || m_writeWaitCount > 0);
+43                  } while (!m_lockCount.compare_exchange_weak(count, count + 1));
+44              else
+45                  do {
+46                      while ((count = m_lockCount) == WRITE_LOCK_STATUS);
+47                  } while (!m_lockCount.compare_exchange_weak(count, count + 1));
+48          }
+49          return m_lockCount;
+50      }
+51      int readUnlock()
+52      {
+53          if (std::this_thread::get_id() != m_write_thread_id)
+54              --m_lockCount;
+55          return m_lockCount;
+56      }
+57      int writeLock()
+58      {
+59          if (std::this_thread::get_id() != m_write_thread_id)
+60          {
+61              ++m_writeWaitCount;
+62              for (int zero = FREE_STATUS; !m_lockCount.compare_exchange_weak(zero, WRITE_LOCK_STATUS); zero = FREE_STATUS);
+63              --m_writeWaitCount;
+64              m_write_thread_id = std::this_thread::get_id();
+65          }
+66          return m_lockCount;
+67      }
+68      int writeUnlock()
+69      {
+70          if (std::this_thread::get_id() != m_write_thread_id)
+71          {
+72              throw std::runtime_error("writeLock/Unlock mismatch");
+73          }
+74          if (WRITE_LOCK_STATUS != m_lockCount)
+75          {
+76              throw std::runtime_error("RWLock internal error");
+77          }
+78          m_write_thread_id = NULL_THREAD;
+79          m_lockCount.store(FREE_STATUS);
+80          return m_lockCount;
+81      }
+82  };
+83  RWLock cache_rw_lock;
+84  static std::string user_agent_str = "subconverter/" VERSION " cURL/" LIBCURL_VERSION;
+85  struct curl_progress_data
+86  {
+87      long size_limit = 0L;
+88  };
+89  static inline void curl_init()
+90  {
+91      static bool init = false;
+92      if(!init)
+93      {
+94          curl_global_init(CURL_GLOBAL_ALL);
+95          init = true;
+96      }
+97  }
+98  static int writer(char *data, size_t size, size_t nmemb, std::string *writerData)
+99  {
+100      if(writerData == NULL)
+101          return 0;
+102      writerData->append(data, size*nmemb);
+103      return size * nmemb;
+104  }
+105  static int dummy_writer(char *data, size_t size, size_t nmemb, void *writerData)
+106  {
+107      (void)data;
+108      (void)writerData;
+109      return size * nmemb;
+110  }
+111  static int size_checker(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow)
+112  {
+113      if(clientp)
+114      {
+115          curl_progress_data *data = reinterpret_cast<curl_progress_data*>(clientp);
+116          if(data->size_limit)
+117          {
+118              if(dlnow > data->size_limit)
+119                  return 1;
+120          }
+121      }
+122      return 0;
+123  }
+124  static inline void curl_set_common_options(CURL *curl_handle, const char *url, curl_progress_data *data)
+125  {
+126      curl_easy_setopt(curl_handle, CURLOPT_URL, url);
+127      curl_easy_setopt(curl_handle, CURLOPT_VERBOSE, global.logLevel == LOG_LEVEL_VERBOSE ? 1L : 0L);
+128      curl_easy_setopt(curl_handle, CURLOPT_NOPROGRESS, 0L);
+129      curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1L);
+130      curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
+131      curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, 20L);
+132      curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
+133      curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 0L);
+134      curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 15L);
+135      curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, user_agent_str.data());
+136      curl_easy_setopt(curl_handle, CURLOPT_COOKIEFILE, "");
+137      if(data)
+138      {
+139          if(data->size_limit)
+140              curl_easy_setopt(curl_handle, CURLOPT_MAXFILESIZE, data->size_limit);
+141          curl_easy_setopt(curl_handle, CURLOPT_XFERINFOFUNCTION, size_checker);
+142          curl_easy_setopt(curl_handle, CURLOPT_XFERINFODATA, data);
+143      }
+144  }
+145  static int curlGet(const FetchArgument &argument, FetchResult &result)
+146  {
+147      CURL *curl_handle;
+148      std::string *data = result.content, new_url = argument.url;
+149      struct curl_slist *list = NULL;
+150      defer(curl_slist_free_all(list);)
+151      long retVal = 0;
+152      curl_init();
+153      curl_handle = curl_easy_init();
+154      if(argument.proxy.size())
+155      {
+156          if(startsWith(argument.proxy, "cors:"))
+157          {
+158              list = curl_slist_append(list, "X-Requested-With: subconverter " VERSION);
+159              new_url = argument.proxy.substr(5) + argument.url;
+160          }
+161          else
+162              curl_easy_setopt(curl_handle, CURLOPT_PROXY, argument.proxy.data());
+163      }
+164      curl_progress_data limit;
+165      limit.size_limit = global.maxAllowedDownloadSize;
+166      curl_set_common_options(curl_handle, new_url.data(), &limit);
+167      list = curl_slist_append(list, "Content-Type: application/json;charset=utf-8");
+168      if(argument.request_headers)
+169      {
+170          for(auto &x : *argument.request_headers)
+171              list = curl_slist_append(list, (x.first + ": " + x.second).data());
+172      }
+173      list = curl_slist_append(list, "SubConverter-Request: 1");
+174      list = curl_slist_append(list, "SubConverter-Version: " VERSION);
+175      if(list)
+176          curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, list);
+177      if(result.content)
+178      {
+179          curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, writer);
+180          curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, result.content);
+181      }
+182      else
+183          curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, dummy_writer);
+184      if(result.response_headers)
+185      {
+186          curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, writer);
+187          curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, result.response_headers);
+188      }
+189      else
+190          curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, dummy_writer);
+191      if(argument.cookies)
+192      {
+193          string_array cookies = split(*argument.cookies, "\r\n");
+194          for(auto &x : cookies)
+195              curl_easy_setopt(curl_handle, CURLOPT_COOKIELIST, x.c_str());
+196      }
+197      switch(argument.method)
+198      {
+199      case HTTP_POST:
+200          curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
+201          if(argument.post_data)
+202          {
+203              curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, argument.post_data->data());
+204              curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, argument.post_data->size());
+205          }
+206          break;
+207      case HTTP_PATCH:
+208          curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "PATCH");
+209          if(argument.post_data)
+210          {
+211              curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, argument.post_data->data());
+212              curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, argument.post_data->size());
+213          }
+214          break;
+215      case HTTP_HEAD:
+216          curl_easy_setopt(curl_handle, CURLOPT_NOBODY, 1L);
+217          break;
+218      case HTTP_GET:
+219          break;
+220      }
+221      unsigned int fail_count = 0, max_fails = 1;
+222      while(true)
+223      {
+224          retVal = curl_easy_perform(curl_handle);
+225          if(retVal == CURLE_OK || max_fails >= fail_count)
+226              break;
+227          else
+228              fail_count++;
+229      }
+230      long code = 0;
+231      curl_easy_getinfo(curl_handle, CURLINFO_HTTP_CODE, &code);
+232      *result.status_code = code;
+233      if(result.cookies)
+234      {
+235          curl_slist *cookies = nullptr;
+236          curl_easy_getinfo(curl_handle, CURLINFO_COOKIELIST, &cookies);
+237          if(cookies)
+238          {
+239              auto each = cookies;
+240              while(each)
+241              {
+242                  result.cookies->append(each->data);
+243                  *result.cookies += "\r\n";
+244                  each = each->next;
+245              }
+246          }
+247          curl_slist_free_all(cookies);
+248      }
+249      curl_easy_cleanup(curl_handle);
+250      if(data && !argument.keep_resp_on_fail)
+251      {
+252          if(retVal != CURLE_OK || *result.status_code != 200)
+253              data->clear();
+254          data->shrink_to_fit();
+255      }
+256      return *result.status_code;
+257  }
+258  static std::string dataGet(const std::string &url)
+259  {
+260      if (!startsWith(url, "data:"))
+261          return std::string();
+262      std::string::size_type comma = url.find(',');
+263      if (comma == std::string::npos || comma == url.size() - 1)
+264          return std::string();
+265      std::string data = urlDecode(url.substr(comma + 1));
+266      if (endsWith(url.substr(0, comma), ";base64")) {
+267          return urlSafeBase64Decode(data);
+268      } else {
+269          return data;
+270      }
+271  }
+272  std::string buildSocks5ProxyString(const std::string &addr, int port, const std::string &username, const std::string &password)
+273  {
+274      std::string authstr = username.size() && password.size() ? username + ":" + password + "@" : "";
+275      std::string proxystr = "socks5:&bsol;&bsol;" + authstr + addr + ":" + std::to_string(port);
+276      return proxystr;
+277  }
+278  std::string webGet(const std::string &url, const std::string &proxy, unsigned int cache_ttl, std::string *response_headers, string_icase_map *request_headers)
+279  {
+280      int return_code = 0;
+281      std::string content;
+282      FetchArgument argument {HTTP_GET, url, proxy, nullptr, request_headers, nullptr, cache_ttl};
+283      FetchResult fetch_res {&return_code, &content, response_headers, nullptr};
+284      if (startsWith(url, "data:"))
+285          return dataGet(url);
+286      if(cache_ttl > 0)
+287      {
+288          md("cache");
+289          const std::string url_md5 = getMD5(url);
+290          const std::string path = "cache/" + url_md5, path_header = path + "_header";
+291          struct stat result;
+292          if(stat(path.data(), &result) == 0) 
+293          {
+294              time_t mtime = result.st_mtime, now = time(NULL); 
+295              if(difftime(now, mtime) <= cache_ttl) 
+296              {
+297                  writeLog(0, "CACHE HIT: '" + url + "', using local cache.");
+298                  cache_rw_lock.readLock();
+299                  defer(cache_rw_lock.readUnlock();)
+300                  if(response_headers)
+301                      *response_headers = fileGet(path_header, true);
+302                  return fileGet(path, true);
+303              }
+304              writeLog(0, "CACHE MISS: '" + url + "', TTL timeout, creating new cache."); 
+305          }
+306          else
+307              writeLog(0, "CACHE NOT EXIST: '" + url + "', creating new cache.");
+308          curlGet(argument, fetch_res);
+309          if(return_code == 200) 
+310          {
+311              cache_rw_lock.writeLock();
+312              defer(cache_rw_lock.writeUnlock();)
+313              fileWrite(path, content, true);
+314              if(response_headers)
+315                  fileWrite(path_header, *response_headers, true);
+316          }
+317          else
+318          {
+319              if(fileExist(path) && global.serveCacheOnFetchFail) 
+320              {
+321                  writeLog(0, "Fetch failed. Serving cached content."); 
+322                  cache_rw_lock.readLock();
+323                  defer(cache_rw_lock.readUnlock();)
+324                  content = fileGet(path, true);
+325                  if(response_headers)
+326                      *response_headers = fileGet(path_header, true);
+327              }
+328              else
+329                  writeLog(0, "Fetch failed. No local cache available."); 
+330          }
+331          return content;
+332      }
+333      curlGet(argument, fetch_res);
+334      return content;
+335  }
+336  void flushCache()
+337  {
+338      cache_rw_lock.writeLock();
+339      defer(cache_rw_lock.writeUnlock();)
+340      operateFiles("cache", [](const std::string &file){ remove(("cache/" + file).data()); return 0; });
+341  }
+342  int webPost(const std::string &url, const std::string &data, const std::string &proxy, const string_icase_map &request_headers, std::string *retData)
+343  {
+344      int return_code = 0;
+345      FetchArgument argument {HTTP_POST, url, proxy, &data, &request_headers, nullptr, 0, true};
+346      FetchResult fetch_res {&return_code, retData, nullptr, nullptr};
+347      return webGet(argument, fetch_res);
+348  }
+349  int webPatch(const std::string &url, const std::string &data, const std::string &proxy, const string_icase_map &request_headers, std::string *retData)
+350  {
+351      int return_code = 0;
+352      FetchArgument argument {HTTP_PATCH, url, proxy, &data, &request_headers, nullptr, 0, true};
+<span onclick='openModal()' class='match'>353      FetchResult fetch_res {&return_code, retData, nullptr, nullptr};
+354      return webGet(argument, fetch_res);
+355  }
+356  int webHead(const std::string &url, const std::string &proxy, const string_icase_map &request_headers, std::string &response_headers)
+</span>357  {
+358      int return_code = 0;
+359      FetchArgument argument {HTTP_HEAD, url, proxy, nullptr, &request_headers, nullptr, 0};
+360      FetchResult fetch_res {&return_code, nullptr, &response_headers, nullptr};
+361      return webGet(argument, fetch_res);
+362  }
+363  string_array headers_map_to_array(const string_map &headers)
+364  {
+365      string_array result;
+366      for(auto &kv : headers)
+367          result.push_back(kv.first + ": " + kv.second);
+368      return result;
+369  }
+370  int webGet(const FetchArgument& argument, FetchResult &result)
+371  {
+372      return curlGet(argument, result);
+373  }
+</code></pre>
+        </div>
+        <div class="column">
+            <h3>subconverter-MDEwOlJlcG9zaXRvcnkyMTg2ODY3NjM=-flat-webget.cpp</h3>
+            <pre><code>1  #include <iostream>
+2  #include <unistd.h>
+3  #include <sys/stat.h>
+4  #include <thread>
+5  #include <atomic>
+6  #include <curl/curl.h>
+7  #include "../handler/settings.h"
+8  #include "../utils/base64/base64.h"
+9  #include "../utils/defer.h"
+10  #include "../utils/file_extra.h"
+11  #include "../utils/logger.h"
+12  #include "../utils/urlencode.h"
+13  #include "../version.h"
+14  #include "webget.h"
+15  #ifdef _WIN32
+16  #ifndef _stat
+17  #define _stat stat
+18  #endif 
+19  #endif 
+20  class RWLock
+21  {
+22  #define WRITE_LOCK_STATUS -1
+23  #define FREE_STATUS 0
+24  private:
+25      const std::thread::id NULL_THREAD;
+26      const bool WRITE_FIRST;
+27      std::thread::id m_write_thread_id;
+28      std::atomic_int m_lockCount;
+29      std::atomic_uint m_writeWaitCount;
+30  public:
+31      RWLock(const RWLock&) = delete;
+32      RWLock& operator=(const RWLock&) = delete;
+33      RWLock(bool writeFirst = true): WRITE_FIRST(writeFirst), m_write_thread_id(), m_lockCount(0), m_writeWaitCount(0) {}
+34      virtual ~RWLock() = default;
+35      int readLock()
+36      {
+37          if (std::this_thread::get_id() != m_write_thread_id)
+38          {
+39              int count;
+40              if (WRITE_FIRST)
+41                  do {
+42                      while ((count = m_lockCount) == WRITE_LOCK_STATUS || m_writeWaitCount > 0);
+43                  } while (!m_lockCount.compare_exchange_weak(count, count + 1));
+44              else
+45                  do {
+46                      while ((count = m_lockCount) == WRITE_LOCK_STATUS);
+47                  } while (!m_lockCount.compare_exchange_weak(count, count + 1));
+48          }
+49          return m_lockCount;
+50      }
+51      int readUnlock()
+52      {
+53          if (std::this_thread::get_id() != m_write_thread_id)
+54              --m_lockCount;
+55          return m_lockCount;
+56      }
+57      int writeLock()
+58      {
+59          if (std::this_thread::get_id() != m_write_thread_id)
+60          {
+61              ++m_writeWaitCount;
+62              for (int zero = FREE_STATUS; !m_lockCount.compare_exchange_weak(zero, WRITE_LOCK_STATUS); zero = FREE_STATUS);
+63              --m_writeWaitCount;
+64              m_write_thread_id = std::this_thread::get_id();
+65          }
+66          return m_lockCount;
+67      }
+68      int writeUnlock()
+69      {
+70          if (std::this_thread::get_id() != m_write_thread_id)
+71          {
+72              throw std::runtime_error("writeLock/Unlock mismatch");
+73          }
+74          if (WRITE_LOCK_STATUS != m_lockCount)
+75          {
+76              throw std::runtime_error("RWLock internal error");
+77          }
+78          m_write_thread_id = NULL_THREAD;
+79          m_lockCount.store(FREE_STATUS);
+80          return m_lockCount;
+81      }
+82  };
+83  RWLock cache_rw_lock;
+84  static std::string user_agent_str = "subconverter/" VERSION " cURL/" LIBCURL_VERSION;
+85  struct curl_progress_data
+86  {
+87      long size_limit = 0L;
+88  };
+89  static inline void curl_init()
+90  {
+91      static bool init = false;
+92      if(!init)
+93      {
+94          curl_global_init(CURL_GLOBAL_ALL);
+95          init = true;
+96      }
+97  }
+98  static int writer(char *data, size_t size, size_t nmemb, std::string *writerData)
+99  {
+100      if(writerData == NULL)
+101          return 0;
+102      writerData->append(data, size*nmemb);
+103      return size * nmemb;
+104  }
+105  static int dummy_writer(char *data, size_t size, size_t nmemb, void *writerData)
+106  {
+107      (void)data;
+108      (void)writerData;
+109      return size * nmemb;
+110  }
+111  static int size_checker(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow)
+112  {
+113      if(clientp)
+114      {
+115          curl_progress_data *data = reinterpret_cast<curl_progress_data*>(clientp);
+116          if(data->size_limit)
+117          {
+118              if(dlnow > data->size_limit)
+119                  return 1;
+120          }
+121      }
+122      return 0;
+123  }
+124  static inline void curl_set_common_options(CURL *curl_handle, const char *url, curl_progress_data *data)
+125  {
+126      curl_easy_setopt(curl_handle, CURLOPT_URL, url);
+127      curl_easy_setopt(curl_handle, CURLOPT_VERBOSE, global.logLevel == LOG_LEVEL_VERBOSE ? 1L : 0L);
+128      curl_easy_setopt(curl_handle, CURLOPT_NOPROGRESS, 0L);
+129      curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1L);
+130      curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
+131      curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, 20L);
+132      curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
+133      curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 0L);
+134      curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 15L);
+135      curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, user_agent_str.data());
+136      curl_easy_setopt(curl_handle, CURLOPT_COOKIEFILE, "");
+137      if(data)
+138      {
+139          if(data->size_limit)
+140              curl_easy_setopt(curl_handle, CURLOPT_MAXFILESIZE, data->size_limit);
+141          curl_easy_setopt(curl_handle, CURLOPT_XFERINFOFUNCTION, size_checker);
+142          curl_easy_setopt(curl_handle, CURLOPT_XFERINFODATA, data);
+143      }
+144  }
+145  static int curlGet(const FetchArgument &argument, FetchResult &result)
+146  {
+147      CURL *curl_handle;
+148      std::string *data = result.content, new_url = argument.url;
+149      struct curl_slist *list = NULL;
+150      defer(curl_slist_free_all(list);)
+151      long retVal = 0;
+152      curl_init();
+153      curl_handle = curl_easy_init();
+154      if(argument.proxy.size())
+155      {
+156          if(startsWith(argument.proxy, "cors:"))
+157          {
+158              list = curl_slist_append(list, "X-Requested-With: subconverter " VERSION);
+159              new_url = argument.proxy.substr(5) + argument.url;
+160          }
+161          else
+162              curl_easy_setopt(curl_handle, CURLOPT_PROXY, argument.proxy.data());
+163      }
+164      curl_progress_data limit;
+165      limit.size_limit = global.maxAllowedDownloadSize;
+166      curl_set_common_options(curl_handle, new_url.data(), &limit);
+167      list = curl_slist_append(list, "Content-Type: application/json;charset=utf-8");
+168      if(argument.request_headers)
+169      {
+170          for(auto &x : *argument.request_headers)
+171              list = curl_slist_append(list, (x.first + ": " + x.second).data());
+172      }
+173      list = curl_slist_append(list, "SubConverter-Request: 1");
+174      list = curl_slist_append(list, "SubConverter-Version: " VERSION);
+175      if(list)
+176          curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, list);
+177      if(result.content)
+178      {
+179          curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, writer);
+180          curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, result.content);
+181      }
+182      else
+183          curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, dummy_writer);
+184      if(result.response_headers)
+185      {
+186          curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, writer);
+187          curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, result.response_headers);
+188      }
+189      else
+190          curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, dummy_writer);
+191      if(argument.cookies)
+192      {
+193          string_array cookies = split(*argument.cookies, "\r\n");
+194          for(auto &x : cookies)
+195              curl_easy_setopt(curl_handle, CURLOPT_COOKIELIST, x.c_str());
+196      }
+197      switch(argument.method)
+198      {
+199      case HTTP_POST:
+200          curl_easy_setopt(curl_handle, CURLOPT_POST, 1L);
+201          if(argument.post_data)
+202          {
+203              curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, argument.post_data->data());
+204              curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, argument.post_data->size());
+205          }
+206          break;
+207      case HTTP_PATCH:
+208          curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "PATCH");
+209          if(argument.post_data)
+210          {
+211              curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, argument.post_data->data());
+212              curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, argument.post_data->size());
+213          }
+214          break;
+215      case HTTP_HEAD:
+216          curl_easy_setopt(curl_handle, CURLOPT_NOBODY, 1L);
+217          break;
+218      case HTTP_GET:
+219          break;
+220      }
+221      unsigned int fail_count = 0, max_fails = 1;
+222      while(true)
+223      {
+224          retVal = curl_easy_perform(curl_handle);
+225          if(retVal == CURLE_OK || max_fails >= fail_count)
+226              break;
+227          else
+228              fail_count++;
+229      }
+230      long code = 0;
+231      curl_easy_getinfo(curl_handle, CURLINFO_HTTP_CODE, &code);
+232      *result.status_code = code;
+233      if(result.cookies)
+234      {
+235          curl_slist *cookies = nullptr;
+236          curl_easy_getinfo(curl_handle, CURLINFO_COOKIELIST, &cookies);
+237          if(cookies)
+238          {
+239              auto each = cookies;
+240              while(each)
+241              {
+242                  result.cookies->append(each->data);
+243                  *result.cookies += "\r\n";
+244                  each = each->next;
+245              }
+246          }
+247          curl_slist_free_all(cookies);
+248      }
+249      curl_easy_cleanup(curl_handle);
+250      if(data && !argument.keep_resp_on_fail)
+251      {
+252          if(retVal != CURLE_OK || *result.status_code != 200)
+253              data->clear();
+254          data->shrink_to_fit();
+255      }
+256      return *result.status_code;
+257  }
+258  static std::string dataGet(const std::string &url)
+259  {
+260      if (!startsWith(url, "data:"))
+261          return std::string();
+262      std::string::size_type comma = url.find(',');
+263      if (comma == std::string::npos || comma == url.size() - 1)
+264          return std::string();
+265      std::string data = urlDecode(url.substr(comma + 1));
+266      if (endsWith(url.substr(0, comma), ";base64")) {
+267          return urlSafeBase64Decode(data);
+268      } else {
+269          return data;
+270      }
+271  }
+272  std::string buildSocks5ProxyString(const std::string &addr, int port, const std::string &username, const std::string &password)
+273  {
+274      std::string authstr = username.size() && password.size() ? username + ":" + password + "@" : "";
+275      std::string proxystr = "socks5:&bsol;&bsol;" + authstr + addr + ":" + std::to_string(port);
+276      return proxystr;
+277  }
+278  std::string webGet(const std::string &url, const std::string &proxy, unsigned int cache_ttl, std::string *response_headers, string_icase_map *request_headers)
+279  {
+280      int return_code = 0;
+281      std::string content;
+282      FetchArgument argument {HTTP_GET, url, proxy, nullptr, request_headers, nullptr, cache_ttl};
+283      FetchResult fetch_res {&return_code, &content, response_headers, nullptr};
+284      if (startsWith(url, "data:"))
+285          return dataGet(url);
+286      if(cache_ttl > 0)
+287      {
+288          md("cache");
+289          const std::string url_md5 = getMD5(url);
+290          const std::string path = "cache/" + url_md5, path_header = path + "_header";
+291          struct stat result;
+292          if(stat(path.data(), &result) == 0) 
+293          {
+294              time_t mtime = result.st_mtime, now = time(NULL); 
+295              if(difftime(now, mtime) <= cache_ttl) 
+296              {
+297                  writeLog(0, "CACHE HIT: '" + url + "', using local cache.");
+298                  cache_rw_lock.readLock();
+299                  defer(cache_rw_lock.readUnlock();)
+300                  if(response_headers)
+301                      *response_headers = fileGet(path_header, true);
+302                  return fileGet(path, true);
+303              }
+304              writeLog(0, "CACHE MISS: '" + url + "', TTL timeout, creating new cache."); 
+305          }
+306          else
+307              writeLog(0, "CACHE NOT EXIST: '" + url + "', creating new cache.");
+308          curlGet(argument, fetch_res);
+309          if(return_code == 200) 
+310          {
+311              cache_rw_lock.writeLock();
+312              defer(cache_rw_lock.writeUnlock();)
+313              fileWrite(path, content, true);
+314              if(response_headers)
+315                  fileWrite(path_header, *response_headers, true);
+316          }
+317          else
+318          {
+319              if(fileExist(path) && global.serveCacheOnFetchFail) 
+320              {
+321                  writeLog(0, "Fetch failed. Serving cached content."); 
+322                  cache_rw_lock.readLock();
+323                  defer(cache_rw_lock.readUnlock();)
+324                  content = fileGet(path, true);
+325                  if(response_headers)
+326                      *response_headers = fileGet(path_header, true);
+327              }
+328              else
+329                  writeLog(0, "Fetch failed. No local cache available."); 
+330          }
+331          return content;
+332      }
+333      curlGet(argument, fetch_res);
+334      return content;
+335  }
+336  void flushCache()
+337  {
+338      cache_rw_lock.writeLock();
+339      defer(cache_rw_lock.writeUnlock();)
+340      operateFiles("cache", [](const std::string &file){ remove(("cache/" + file).data()); return 0; });
+341  }
+342  int webPost(const std::string &url, const std::string &data, const std::string &proxy, const string_icase_map &request_headers, std::string *retData)
+343  {
+344      int return_code = 0;
+345      FetchArgument argument {HTTP_POST, url, proxy, &data, &request_headers, nullptr, 0, true};
+<span onclick='openModal()' class='match'>346      FetchResult fetch_res {&return_code, retData, nullptr, nullptr};
+347      return webGet(argument, fetch_res);
+348  }
+349  int webPatch(const std::string &url, const std::string &data, const std::string &proxy, const string_icase_map &request_headers, std::string *retData)
+</span>350  {
+351      int return_code = 0;
+352      FetchArgument argument {HTTP_PATCH, url, proxy, &data, &request_headers, nullptr, 0, true};
+353      FetchResult fetch_res {&return_code, retData, nullptr, nullptr};
+354      return webGet(argument, fetch_res);
+355  }
+356  int webHead(const std::string &url, const std::string &proxy, const string_icase_map &request_headers, std::string &response_headers)
+357  {
+358      int return_code = 0;
+359      FetchArgument argument {HTTP_HEAD, url, proxy, nullptr, &request_headers, nullptr, 0};
+360      FetchResult fetch_res {&return_code, nullptr, &response_headers, nullptr};
+361      return webGet(argument, fetch_res);
+362  }
+363  string_array headers_map_to_array(const string_map &headers)
+364  {
+365      string_array result;
+366      for(auto &kv : headers)
+367          result.push_back(kv.first + ": " + kv.second);
+368      return result;
+369  }
+370  int webGet(const FetchArgument& argument, FetchResult &result)
+371  {
+372      return curlGet(argument, result);
+373  }
+</code></pre>
+        </div>
+    
+        <!-- The Modal -->
+        <div id="myModal" class="modal">
+            <div class="modal-content">
+                <span class="row close">&times;</span>
+                <div class='row'>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from subconverter-MDEwOlJlcG9zaXRvcnkyMTg2ODY3NjM=-flat-webget.cpp</div>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from subconverter-MDEwOlJlcG9zaXRvcnkyMTg2ODY3NjM=-flat-webget.cpp</div>
+                </div>
+                <div class="column column_space"><pre><code>353      FetchResult fetch_res {&return_code, retData, nullptr, nullptr};
+354      return webGet(argument, fetch_res);
+355  }
+356  int webHead(const std::string &url, const std::string &proxy, const string_icase_map &request_headers, std::string &response_headers)
+</pre></code></div>
+                <div class="column column_space"><pre><code>346      FetchResult fetch_res {&return_code, retData, nullptr, nullptr};
+347      return webGet(argument, fetch_res);
+348  }
+349  int webPatch(const std::string &url, const std::string &data, const std::string &proxy, const string_icase_map &request_headers, std::string *retData)
+</pre></code></div>
+            </div>
+        </div>
+        <script>
+        // Get the modal
+        var modal = document.getElementById("myModal");
+        
+        // Get the button that opens the modal
+        var btn = document.getElementById("myBtn");
+        
+        // Get the <span> element that closes the modal
+        var span = document.getElementsByClassName("close")[0];
+        
+        // When the user clicks the button, open the modal
+        function openModal(){
+          modal.style.display = "block";
+        }
+        
+        // When the user clicks on <span> (x), close the modal
+        span.onclick = function() {
+        modal.style.display = "none";
+        }
+        
+        // When the user clicks anywhere outside of the modal, close it
+        window.onclick = function(event) {
+        if (event.target == modal) {
+        modal.style.display = "none";
+        } }
+        
+        </script>
+    </body>
+    </html>
+    
