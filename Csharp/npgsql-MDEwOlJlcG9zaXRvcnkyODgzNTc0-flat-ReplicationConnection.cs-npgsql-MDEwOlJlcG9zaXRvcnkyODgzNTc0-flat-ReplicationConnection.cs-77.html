@@ -1,0 +1,1398 @@
+
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Code Files</title>
+            <style>
+                .column {
+                    width: 47%;
+                    float: left;
+                    padding: 12px;
+                    border: 2px solid #ffd0d0;
+                }
+        
+                .modal {
+                    display: none;
+                    position: fixed;
+                    z-index: 1;
+                    left: 0;
+                    top: 0;
+                    width: 100%;
+                    height: 100%;
+                    overflow: auto;
+                    background-color: rgb(0, 0, 0);
+                    background-color: rgba(0, 0, 0, 0.4);
+                }
+    
+                .modal-content {
+                    height: 250%;
+                    background-color: #fefefe;
+                    margin: 5% auto;
+                    padding: 20px;
+                    border: 1px solid #888;
+                    width: 80%;
+                }
+    
+                .close {
+                    color: #aaa;
+                    float: right;
+                    font-size: 20px;
+                    font-weight: bold;
+                    text-align: right;
+                }
+    
+                .close:hover, .close:focus {
+                    color: black;
+                    text-decoration: none;
+                    cursor: pointer;
+                }
+    
+                .row {
+                    float: right;
+                    width: 100%;
+                }
+    
+                .column_space  {
+                    white - space: pre-wrap;
+                }
+                 
+                pre {
+                    width: 100%;
+                    overflow-y: auto;
+                    background: #f8fef2;
+                }
+                
+                .match {
+                    cursor:pointer; 
+                    background-color:#00ffbb;
+                }
+        </style>
+    </head>
+    <body>
+        <h2>Tokens: 18, <button onclick='openModal()' class='match'>CODE CLONE</button></h2>
+        <div class="column">
+            <h3>npgsql-MDEwOlJlcG9zaXRvcnkyODgzNTc0-flat-ReplicationConnection.cs</h3>
+            <pre><code>1  using Npgsql.BackendMessages;
+2  using NpgsqlTypes;
+3  using System;
+4  using System.Collections.Generic;
+5  using System.Diagnostics;
+6  using System.Diagnostics.CodeAnalysis;
+7  using System.Globalization;
+8  using System.IO;
+9  using System.Text;
+10  using System.Threading;
+11  using System.Threading.Tasks;
+12  using Microsoft.Extensions.Logging;
+13  using Npgsql.Internal;
+14  using Npgsql.Internal.TypeHandlers.DateTimeHandlers;
+15  using static Npgsql.Util.Statics;
+16  using Npgsql.Util;
+17  namespace Npgsql.Replication;
+18  public abstract class ReplicationConnection : IAsyncDisposable
+19  {
+20      #region Fields
+21      static readonly Version FirstVersionWithTwoPhaseSupport = new(15, 0);
+22      static readonly Version FirstVersionWithoutDropSlotDoubleCommandCompleteMessage = new(13, 0);
+23      static readonly Version FirstVersionWithTemporarySlotsAndSlotSnapshotInitMode = new(10, 0);
+24      readonly NpgsqlConnection _npgsqlConnection;
+25      readonly SemaphoreSlim _feedbackSemaphore = new(1, 1);
+26      string? _userFacingConnectionString;
+27      TimeSpan? _commandTimeout;
+28      TimeSpan _walReceiverTimeout = TimeSpan.FromSeconds(60d);
+29      Timer? _sendFeedbackTimer;
+30      Timer? _requestFeedbackTimer;
+31      TimeSpan _requestFeedbackInterval;
+32      IAsyncEnumerator&lt;XLogDataMessage&gt;? _currentEnumerator;
+33      CancellationTokenSource? _replicationCancellationTokenSource;
+34      bool _pgCancellationSupported;
+35      bool _isDisposed;
+36      long _lastReceivedLsn;
+37      long _lastFlushedLsn;
+38      long _lastAppliedLsn;
+39      readonly XLogDataMessage _cachedXLogDataMessage = new();
+40      internal ILogger ReplicationLogger { get; private set; } = default!; 
+41      #endregion Fields
+42      #region Constructors
+43      private protected ReplicationConnection()
+44      {
+45          _npgsqlConnection = new NpgsqlConnection();
+46          _requestFeedbackInterval = new TimeSpan(_walReceiverTimeout.Ticks / 2);
+47      }
+48      private protected ReplicationConnection(string? connectionString) : this()
+49          =&gt; ConnectionString = connectionString;
+50      #endregion
+51      #region Properties
+52      [AllowNull]
+53      public string ConnectionString {
+54          get =&gt; _userFacingConnectionString ?? string.Empty;
+55          set
+56          {
+57              _userFacingConnectionString = value;
+58              var cs = new NpgsqlConnectionStringBuilder(value)
+59              {
+60                  Pooling = false,
+61                  Enlist = false,
+62                  Multiplexing = false,
+63                  KeepAlive = 0,
+64                  ReplicationMode = ReplicationMode
+65              };
+66              if (ReplicationMode == ReplicationMode.Physical)
+67                  cs.ServerCompatibilityMode = ServerCompatibilityMode.NoTypeLoading;
+68              _npgsqlConnection.ConnectionString = cs.ToString();
+69          }
+70      }
+71      public NpgsqlLogSequenceNumber LastReceivedLsn
+72      {
+73          get =&gt; (NpgsqlLogSequenceNumber)unchecked((ulong)Interlocked.Read(ref _lastReceivedLsn));
+74          private protected set =&gt; Interlocked.Exchange(ref _lastReceivedLsn, unchecked((long)(ulong)value));
+75      }
+76      public NpgsqlLogSequenceNumber LastFlushedLsn
+77      {
+78          get =&gt; (NpgsqlLogSequenceNumber)unchecked((ulong)Interlocked.Read(ref _lastFlushedLsn));
+79          set =&gt; Interlocked.Exchange(ref _lastFlushedLsn, unchecked((long)(ulong)value));
+80      }
+81      public NpgsqlLogSequenceNumber LastAppliedLsn
+82      {
+83          get =&gt; (NpgsqlLogSequenceNumber)unchecked((ulong)Interlocked.Read(ref _lastAppliedLsn));
+84          set =&gt; Interlocked.Exchange(ref _lastAppliedLsn, unchecked((long)(ulong)value));
+85      }
+86      public TimeSpan WalReceiverStatusInterval { get; set; } = TimeSpan.FromSeconds(10d);
+87      public TimeSpan WalReceiverTimeout
+88      {
+89          get =&gt; _walReceiverTimeout;
+90          set
+91          {
+92              _walReceiverTimeout = value;
+93              _requestFeedbackInterval = value == Timeout.InfiniteTimeSpan
+94                  ? value
+95                  : new TimeSpan(value.Ticks / 2);
+96          }
+97      }
+98      private protected abstract ReplicationMode ReplicationMode { get; }
+99      public Version PostgreSqlVersion =&gt; _npgsqlConnection.PostgreSqlVersion;
+100      public string ServerVersion =&gt; _npgsqlConnection.ServerVersion;
+101      internal NpgsqlConnector Connector
+102          =&gt; _npgsqlConnection.Connector ??
+103             throw new InvalidOperationException($&quot;The {nameof(Connector)} property can only be used when there is an active connection&quot;);
+104      public TimeSpan CommandTimeout
+105      {
+106          get =&gt; _commandTimeout ?? (_npgsqlConnection.CommandTimeout &gt; 0
+107              ? TimeSpan.FromSeconds(_npgsqlConnection.CommandTimeout)
+108              : Timeout.InfiniteTimeSpan);
+109          set
+110          {
+111              if (value &lt; TimeSpan.Zero &amp;&amp; value != Timeout.InfiniteTimeSpan)
+112                  throw new ArgumentOutOfRangeException(nameof(value), value,
+113                      $&quot;A finite CommandTimeout can&#x27;t be less than {TimeSpan.Zero}.&quot;);
+114              _commandTimeout = value;
+115              if (Connector.State != ConnectorState.Replication)
+116                  SetTimeouts(value, value);
+117          }
+118      }
+119      public Encoding Encoding =&gt; _npgsqlConnection.Connector?.TextEncoding ?? throw new InvalidOperationException($&quot;The {nameof(Encoding)} property can only be used when there is an active connection&quot;);
+120      public int ProcessID =&gt; _npgsqlConnection.Connector?.BackendProcessId ?? throw new InvalidOperationException($&quot;The {nameof(ProcessID)} property can only be used when there is an active connection&quot;);
+121      #endregion Properties
+122      #region Open / Dispose
+123      public async Task Open(CancellationToken cancellationToken = default)
+124      {
+125          CheckDisposed();
+126          await _npgsqlConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
+127          _pgCancellationSupported = _npgsqlConnection.PostgreSqlVersion.IsGreaterOrEqual(10);
+128          SetTimeouts(CommandTimeout, CommandTimeout);
+129          ReplicationLogger = _npgsqlConnection.Connector!.LoggingConfiguration.ReplicationLogger;
+130      }
+131      public ValueTask DisposeAsync()
+132      {
+133          using (NoSynchronizationContextScope.Enter())
+134              return DisposeAsyncCore();
+135          async ValueTask DisposeAsyncCore()
+136          {
+137              if (_isDisposed)
+138                  return;
+139              if (_npgsqlConnection.Connector?.State == ConnectorState.Replication)
+140              {
+141                  Debug.Assert(_currentEnumerator is not null);
+142                  Debug.Assert(_replicationCancellationTokenSource is not null);
+143                  _replicationCancellationTokenSource.Cancel();
+144                  try
+145                  {
+146                      while (await _currentEnumerator.MoveNextAsync())
+147                      {
+148                      }
+149                  }
+150                  catch
+151                  {
+152                  }
+153              }
+154              Debug.Assert(_sendFeedbackTimer is null, &quot;Send feedback timer isn&#x27;t null at replication shutdown&quot;);
+155              Debug.Assert(_requestFeedbackTimer is null, &quot;Request feedback timer isn&#x27;t null at replication shutdown&quot;);
+156              _feedbackSemaphore.Dispose();
+157              try
+158              {
+159                  await _npgsqlConnection.Close(async: true);
+160              }
+161              catch
+162              {
+163              }
+164              _isDisposed = true;
+165          }
+166      }
+167      #endregion Open / Dispose
+168      #region Replication methods
+169      public Task&lt;ReplicationSystemIdentification&gt; IdentifySystem(CancellationToken cancellationToken = default)
+170      {
+171          using (NoSynchronizationContextScope.Enter())
+172              return IdentifySystemInternal(cancellationToken);
+173          async Task&lt;ReplicationSystemIdentification&gt; IdentifySystemInternal(CancellationToken cancellationToken)
+174          {
+175              var row = await ReadSingleRow(&quot;IDENTIFY_SYSTEM&quot;, cancellationToken);
+176              return new ReplicationSystemIdentification(
+177                  (string)row[0], (uint)row[1], NpgsqlLogSequenceNumber.Parse((string)row[2]), (string)row[3]);
+178          }
+179      }
+180      public Task&lt;string&gt; Show(string parameterName, CancellationToken cancellationToken = default)
+181      {
+182          if (parameterName is null)
+183              throw new ArgumentNullException(nameof(parameterName));
+184          using (NoSynchronizationContextScope.Enter())
+185              return ShowInternal(parameterName, cancellationToken);
+186          async Task&lt;string&gt; ShowInternal(string parameterName, CancellationToken cancellationToken)
+187              =&gt; (string)(await ReadSingleRow(&quot;SHOW &quot; + parameterName, cancellationToken))[0];
+188      }
+189      public Task&lt;TimelineHistoryFile&gt; TimelineHistory(uint tli, CancellationToken cancellationToken = default)
+190      {
+191          using (NoSynchronizationContextScope.Enter())
+192              return TimelineHistoryInternal(tli, cancellationToken);
+193          async Task&lt;TimelineHistoryFile&gt; TimelineHistoryInternal(uint tli, CancellationToken cancellationToken)
+194          {
+195              var result = await ReadSingleRow($&quot;TIMELINE_HISTORY {tli:D}&quot;, cancellationToken);
+196              return new TimelineHistoryFile((string)result[0], (byte[])result[1]);
+197          }
+198      }
+199      internal async Task&lt;ReplicationSlotOptions&gt; CreateReplicationSlot(string command, CancellationToken cancellationToken = default)
+200      {
+201          try
+202          {
+203              var result = await ReadSingleRow(command, cancellationToken);
+204              var slotName = (string)result[0];
+205              var consistentPoint = (string)result[1];
+206              var snapshotName = (string?)result[2];
+207              return new ReplicationSlotOptions(slotName, NpgsqlLogSequenceNumber.Parse(consistentPoint), snapshotName);
+208          }
+209          catch (PostgresException e) when (!Connector.IsBroken &amp;&amp; e.SqlState == PostgresErrorCodes.SyntaxError)
+210          {
+211              if (PostgreSqlVersion &lt; FirstVersionWithTwoPhaseSupport &amp;&amp; command.Contains(&quot; TWO_PHASE&quot;))
+212                  throw new NotSupportedException(&quot;Logical replication support for prepared transactions was introduced in PostgreSQL &quot; +
+213                                                  FirstVersionWithTwoPhaseSupport.ToString(1) +
+214                                                  &quot;. Using PostgreSQL version &quot; +
+215                                                  (PostgreSqlVersion.Build == -1
+216                                                      ? PostgreSqlVersion.ToString(2)
+217                                                      : PostgreSqlVersion.ToString(3)) +
+218                                                  &quot; you have to set the twoPhase argument to false.&quot;, e);
+219              if (PostgreSqlVersion &lt; FirstVersionWithTemporarySlotsAndSlotSnapshotInitMode)
+220              {
+221                  if (command.Contains(&quot; TEMPORARY&quot;))
+222                      throw new NotSupportedException(&quot;Temporary replication slots were introduced in PostgreSQL &quot; +
+223                                                      $&quot;{FirstVersionWithTemporarySlotsAndSlotSnapshotInitMode.ToString(1)}. &quot; +
+224                                                      $&quot;Using PostgreSQL version {PostgreSqlVersion.ToString(3)} you &quot; +
+225                                                      $&quot;have to set the isTemporary argument to false.&quot;, e);
+226                  if (command.Contains(&quot; EXPORT_SNAPSHOT&quot;) || command.Contains(&quot; NOEXPORT_SNAPSHOT&quot;) || command.Contains(&quot; USE_SNAPSHOT&quot;))
+227                      throw new NotSupportedException(
+228                          &quot;The EXPORT_SNAPSHOT, USE_SNAPSHOT and NOEXPORT_SNAPSHOT syntax was introduced in PostgreSQL &quot; +
+229                          $&quot;{FirstVersionWithTemporarySlotsAndSlotSnapshotInitMode.ToString(1)}. Using PostgreSQL version &quot; +
+230                          $&quot;{PostgreSqlVersion.ToString(3)} you have to omit the slotSnapshotInitMode argument.&quot;, e);
+231              }
+232              throw;
+233          }
+234      }
+235      internal async Task&lt;PhysicalReplicationSlot?&gt; ReadReplicationSlotInternal(string slotName, CancellationToken cancellationToken = default)
+236      {
+237          var result = await ReadSingleRow($&quot;READ_REPLICATION_SLOT {slotName}&quot;, cancellationToken);
+238          var slotType = (string?)result[0];
+239          switch (slotType)
+240          {
+241              case &quot;physical&quot;:
+242                  var restartLsn = (string?)result[1];
+243                  var restartTli = (uint?)result[2];
+244                  return new PhysicalReplicationSlot(
+245                      slotName.ToLowerInvariant(),
+246                      restartLsn == null ? null : NpgsqlLogSequenceNumber.Parse(restartLsn),
+247                      restartTli);
+248              case null:
+249                  return null;
+250              default:
+251                  throw new NotSupportedException(
+252                      $&quot;The replication slot type &#x27;{slotType}&#x27; is currently not supported by Npgsql. Please file an issue.&quot;);
+253          }
+254      }
+255      internal IAsyncEnumerator&lt;XLogDataMessage&gt; StartReplicationInternalWrapper(
+256          string command,
+257          bool bypassingStream,
+258          CancellationToken cancellationToken)
+259      {
+260          _currentEnumerator = StartReplicationInternal(command, bypassingStream, cancellationToken);
+261          return _currentEnumerator;
+262      }
+263      internal async IAsyncEnumerator&lt;XLogDataMessage&gt; StartReplicationInternal(
+264          string command,
+265          bool bypassingStream,
+266          CancellationToken cancellationToken)
+267      {
+268          CheckDisposed();
+269          var connector = _npgsqlConnection.Connector!;
+270          _replicationCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+271          using var _ = Connector.StartUserAction(
+272              ConnectorState.Replication, _replicationCancellationTokenSource.Token, attemptPgCancellation: _pgCancellationSupported);
+273          NpgsqlReadBuffer.ColumnStream? columnStream = null;
+274          try
+275          {
+276              await connector.WriteQuery(command, true, cancellationToken);
+277              await connector.Flush(true, cancellationToken);
+278              var msg = await connector.ReadMessage(true);
+279              switch (msg.Code)
+280              {
+281              case BackendMessageCode.CopyBothResponse:
+282                  break;
+283              case BackendMessageCode.CommandComplete:
+284              {
+285                  yield break;
+286              }
+287              default:
+288                  throw connector.UnexpectedMessageReceived(msg.Code);
+289              }
+290              var buf = connector.ReadBuffer;
+291              columnStream = new NpgsqlReadBuffer.ColumnStream(connector, startCancellableOperations: false);
+292              SetTimeouts(_walReceiverTimeout, CommandTimeout);
+<span onclick='openModal()' class='match'>293              _sendFeedbackTimer = new Timer(TimerSendFeedback, state: null, WalReceiverStatusInterval, Timeout.InfiniteTimeSpan);
+294              _requestFeedbackTimer = new Timer(TimerRequestFeedback, state: null, _requestFeedbackInterval, Timeout.InfiniteTimeSpan);
+</span>295              while (true)
+296              {
+297                  msg = await Connector.ReadMessage(async: true);
+298                  Expect&lt;CopyDataMessage&gt;(msg, Connector);
+299                  _requestFeedbackTimer.Change(_requestFeedbackInterval, Timeout.InfiniteTimeSpan);
+300                  var messageLength = ((CopyDataMessage)msg).Length;
+301                  await buf.EnsureAsync(1);
+302                  var code = (char)buf.ReadByte();
+303                  switch (code)
+304                  {
+305                  case &#x27;w&#x27;: 
+306                  {
+307                      await buf.EnsureAsync(24);
+308                      var startLsn = buf.ReadUInt64();
+309                      var endLsn = buf.ReadUInt64();
+310                      var sendTime = DateTimeUtils.DecodeTimestamp(buf.ReadInt64(), DateTimeKind.Utc);
+311                      if (unchecked((ulong)Interlocked.Read(ref _lastReceivedLsn)) &lt; startLsn)
+312                          Interlocked.Exchange(ref _lastReceivedLsn, unchecked((long)startLsn));
+313                      if (unchecked((ulong)Interlocked.Read(ref _lastReceivedLsn)) &lt; endLsn)
+314                          Interlocked.Exchange(ref _lastReceivedLsn, unchecked((long)endLsn));
+315                      var dataLen = messageLength - 25;
+316                      columnStream.Init(dataLen, canSeek: false);
+317                      _cachedXLogDataMessage.Populate(new NpgsqlLogSequenceNumber(startLsn), new NpgsqlLogSequenceNumber(endLsn),
+318                          sendTime, columnStream);
+319                      yield return _cachedXLogDataMessage;
+320                      if (!columnStream.IsDisposed &amp;&amp; columnStream.Position &lt; columnStream.Length &amp;&amp; !bypassingStream)
+321                          await buf.Skip(columnStream.Length - columnStream.Position, true);
+322                      continue;
+323                  }
+324                  case &#x27;k&#x27;: 
+325                  {
+326                      await buf.EnsureAsync(17);
+327                      var end = buf.ReadUInt64();
+328                      if (ReplicationLogger.IsEnabled(LogLevel.Trace))
+329                      {
+330                          var endLsn = new NpgsqlLogSequenceNumber(end);
+331                          var timestamp = DateTimeUtils.DecodeTimestamp(buf.ReadInt64(), DateTimeKind.Utc);
+332                          LogMessages.ReceivedReplicationPrimaryKeepalive(ReplicationLogger, endLsn, timestamp, Connector.Id);
+333                      }
+334                      else
+335                          buf.Skip(8);
+336                      var replyRequested = buf.ReadByte() == 1;
+337                      if (unchecked((ulong)Interlocked.Read(ref _lastReceivedLsn)) &lt; end)
+338                          Interlocked.Exchange(ref _lastReceivedLsn, unchecked((long)end));
+339                      if (replyRequested)
+340                      {
+341                          LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, &quot;the server requested it&quot;, Connector.Id);
+342                          await SendFeedback(waitOnSemaphore: true, cancellationToken: CancellationToken.None);
+343                      }
+344                      continue;
+345                  }
+346                  default:
+347                      throw Connector.Break(new NpgsqlException($&quot;Unknown replication message code &#x27;{code}&#x27;&quot;));
+348                  }
+349              }
+350          }
+351          finally
+352          {
+353              if (columnStream != null &amp;&amp; !bypassingStream &amp;&amp; !_replicationCancellationTokenSource.Token.IsCancellationRequested)
+354                  await columnStream.DisposeAsync();
+355  #if NETSTANDARD2_0
+356              if (_sendFeedbackTimer != null)
+357              {
+358                  var mre = new ManualResetEvent(false);
+359                  var actuallyDisposed = _sendFeedbackTimer.Dispose(mre);
+360                  Debug.Assert(actuallyDisposed, $&quot;{nameof(_sendFeedbackTimer)} had already been disposed when completing replication&quot;);
+361                  if (actuallyDisposed)
+362                      await mre.WaitOneAsync(cancellationToken);
+363              }
+364              if (_requestFeedbackTimer != null)
+365              {
+366                  var mre = new ManualResetEvent(false);
+367                  var actuallyDisposed = _requestFeedbackTimer.Dispose(mre);
+368                  Debug.Assert(actuallyDisposed, $&quot;{nameof(_requestFeedbackTimer)} had already been disposed when completing replication&quot;);
+369                  if (actuallyDisposed)
+370                      await mre.WaitOneAsync(cancellationToken);
+371              }
+372  #else
+373              if (_sendFeedbackTimer != null)
+374                  await _sendFeedbackTimer.DisposeAsync();
+375              if (_requestFeedbackTimer != null)
+376                  await _requestFeedbackTimer.DisposeAsync();
+377  #endif
+378              _sendFeedbackTimer = null;
+379              _requestFeedbackTimer = null;
+380              SetTimeouts(CommandTimeout, CommandTimeout);
+381              _replicationCancellationTokenSource.Dispose();
+382              _replicationCancellationTokenSource = null;
+383              _currentEnumerator = null;
+384          }
+385      }
+386      public void SetReplicationStatus(NpgsqlLogSequenceNumber lastAppliedAndFlushedLsn)
+387      {
+388          Interlocked.Exchange(ref _lastAppliedLsn, unchecked((long)(ulong)lastAppliedAndFlushedLsn));
+389          Interlocked.Exchange(ref _lastFlushedLsn, unchecked((long)(ulong)lastAppliedAndFlushedLsn));
+390      }
+391      public Task SendStatusUpdate(CancellationToken cancellationToken = default)
+392      {
+393          using (NoSynchronizationContextScope.Enter())
+394              return SendStatusUpdateInternal(cancellationToken);
+395          async Task SendStatusUpdateInternal(CancellationToken cancellationToken)
+396          {
+397              CheckDisposed();
+398              cancellationToken.ThrowIfCancellationRequested();
+399              if (Connector.State != ConnectorState.Replication)
+400                  throw new InvalidOperationException(&quot;Status update can only be sent during replication&quot;);
+401              LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, nameof(SendStatusUpdate) + &quot;was called&quot;, Connector.Id);
+402              await SendFeedback(waitOnSemaphore: true, cancellationToken: cancellationToken);
+403          }
+404      }
+405      async Task SendFeedback(bool waitOnSemaphore = false, bool requestReply = false, CancellationToken cancellationToken = default)
+406      {
+407          var taken = waitOnSemaphore
+408              ? await _feedbackSemaphore.WaitAsync(Timeout.Infinite, cancellationToken)
+409              : await _feedbackSemaphore.WaitAsync(TimeSpan.Zero, cancellationToken);
+410          if (!taken)
+411          {
+412              ReplicationLogger.LogTrace($&quot;Aborting feedback due to expired {nameof(WalReceiverStatusInterval)} because of a concurrent feedback request&quot;);
+413              return;
+414          }
+415          try
+416          {
+417              var connector = _npgsqlConnection.Connector!;
+418              var buf = connector.WriteBuffer;
+419              const int len = 39;
+420              if (buf.WriteSpaceLeft &lt; len)
+421                  await connector.Flush(async: true, cancellationToken);
+422              buf.WriteByte(FrontendMessageCode.CopyData);
+423              buf.WriteInt32(len - 1);
+424              buf.WriteByte((byte)&#x27;r&#x27;); 
+425              var lastReceivedLsn = Interlocked.Read(ref _lastReceivedLsn);
+426              var lastFlushedLsn = Interlocked.Read(ref _lastFlushedLsn);
+427              var lastAppliedLsn = Interlocked.Read(ref _lastAppliedLsn);
+428              var timestamp = DateTime.UtcNow;
+429              buf.WriteInt64(lastReceivedLsn);
+430              buf.WriteInt64(lastFlushedLsn);
+431              buf.WriteInt64(lastAppliedLsn);
+432              buf.WriteInt64(DateTimeUtils.EncodeTimestamp(timestamp));
+433              buf.WriteByte(requestReply ? (byte)1 : (byte)0);
+434              await connector.Flush(async: true, cancellationToken);
+435              if (ReplicationLogger.IsEnabled(LogLevel.Trace))
+436              {
+437                  LogMessages.SentReplicationFeedbackMessage(
+438                      ReplicationLogger,
+439                      new NpgsqlLogSequenceNumber(unchecked((ulong)lastReceivedLsn)),
+440                      new NpgsqlLogSequenceNumber(unchecked((ulong)lastFlushedLsn)),
+441                      new NpgsqlLogSequenceNumber(unchecked((ulong)lastAppliedLsn)),
+442                      timestamp,
+443                      Connector.Id);
+444              }
+445          }
+446          catch (Exception e)
+447          {
+448              LogMessages.ReplicationFeedbackMessageSendingFailed(ReplicationLogger, _npgsqlConnection?.Connector?.Id, e);
+449          }
+450          finally
+451          {
+452              _sendFeedbackTimer!.Change(WalReceiverStatusInterval, Timeout.InfiniteTimeSpan);
+453              if (requestReply)
+454                  _requestFeedbackTimer!.Change(_requestFeedbackInterval, Timeout.InfiniteTimeSpan);
+455              _feedbackSemaphore.Release();
+456          }
+457      }
+458      async void TimerRequestFeedback(object? obj)
+459      {
+460          try
+461          {
+462              if (Connector.State != ConnectorState.Replication)
+463                  return;
+464              if (ReplicationLogger.IsEnabled(LogLevel.Trace))
+465                  LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, $&quot;half of the {nameof(WalReceiverTimeout)} of {WalReceiverTimeout} has expired&quot;, Connector.Id);
+466              await SendFeedback(waitOnSemaphore: true, requestReply: true);
+467          }
+468          catch
+469          {
+470          }
+471      }
+472      async void TimerSendFeedback(object? obj)
+473      {
+474          try
+475          {
+476              if (Connector.State != ConnectorState.Replication)
+477                  return;
+478              if (ReplicationLogger.IsEnabled(LogLevel.Trace))
+479                  LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, $&quot;{nameof(WalReceiverStatusInterval)} of {WalReceiverStatusInterval} has expired&quot;, Connector.Id);
+480              await SendFeedback();
+481          }
+482          catch
+483          {
+484          }
+485      }
+486      public Task DropReplicationSlot(string slotName, bool wait = false, CancellationToken cancellationToken = default)
+487      {
+488          if (slotName is null)
+489              throw new ArgumentNullException(nameof(slotName));
+490          using (NoSynchronizationContextScope.Enter())
+491              return DropReplicationSlotInternal(slotName, wait,  cancellationToken);
+492          async Task DropReplicationSlotInternal(string slotName, bool wait, CancellationToken cancellationToken)
+493          {
+494              CheckDisposed();
+495              using var _ = Connector.StartUserAction(cancellationToken, attemptPgCancellation: _pgCancellationSupported);
+496              var command = &quot;DROP_REPLICATION_SLOT &quot; + slotName;
+497              if (wait)
+498                  command += &quot; WAIT&quot;;
+499              LogMessages.DroppingReplicationSlot(ReplicationLogger, slotName, command, Connector.Id);
+500              await Connector.WriteQuery(command, true, CancellationToken.None);
+501              await Connector.Flush(true, CancellationToken.None);
+502              Expect&lt;CommandCompleteMessage&gt;(await Connector.ReadMessage(true), Connector);
+503              if (PostgreSqlVersion &lt; FirstVersionWithoutDropSlotDoubleCommandCompleteMessage)
+504                  Expect&lt;CommandCompleteMessage&gt;(await Connector.ReadMessage(true), Connector);
+505              Expect&lt;ReadyForQueryMessage&gt;(await Connector.ReadMessage(true), Connector);
+506          }
+507      }
+508      #endregion
+509      async Task&lt;object[]&gt; ReadSingleRow(string command, CancellationToken cancellationToken = default)
+510      {
+511          CheckDisposed();
+512          using var _ = Connector.StartUserAction(cancellationToken, attemptPgCancellation: _pgCancellationSupported);
+513          LogMessages.ExecutingReplicationCommand(ReplicationLogger, command, Connector.Id);
+514          await Connector.WriteQuery(command, true, cancellationToken);
+515          await Connector.Flush(true, cancellationToken);
+516          var rowDescription = Expect&lt;RowDescriptionMessage&gt;(await Connector.ReadMessage(true), Connector);
+517          Expect&lt;DataRowMessage&gt;(await Connector.ReadMessage(true), Connector);
+518          var buf = Connector.ReadBuffer;
+519          await buf.EnsureAsync(2);
+520          var results = new object[buf.ReadInt16()];
+521          for (var i = 0; i &lt; results.Length; i++)
+522          {
+523              await buf.EnsureAsync(4);
+524              var len = buf.ReadInt32();
+525              if (len == -1)
+526                  continue;
+527              await buf.EnsureAsync(len);
+528              var field = rowDescription[i];
+529              switch (field.PostgresType.Name)
+530              {
+531              case &quot;text&quot;:
+532                  results[i] = buf.ReadString(len);
+533                  continue;
+534              case &quot;integer&quot;:
+535              case &quot;bigint&quot;:
+536              {
+537                  var str = buf.ReadString(len);
+538                  if (!uint.TryParse(str, NumberStyles.None, null, out var num))
+539                  {
+540                      throw Connector.Break(
+541                          new NpgsqlException(
+542                              $&quot;Could not parse &#x27;{str}&#x27; as unsigned integer in field {field.Name}&quot;));
+543                  }
+544                  results[i] = num;
+545                  continue;
+546              }
+547              case &quot;bytea&quot;:
+548                  try
+549                  {
+550                      var bytes = buf.ReadMemory(len);
+551                      results[i] = ParseBytea(bytes.Span);
+552                  }
+553                  catch (Exception e)
+554                  {
+555                      throw Connector.Break(
+556                          new NpgsqlException($&quot;Could not parse data as bytea in field {field.Name}&quot;, e));
+557                  }
+558                  continue;
+559              default:
+560                  throw Connector.Break(new NpgsqlException(
+561                      $&quot;Field {field.Name} has PostgreSQL type {field.PostgresType.Name} which isn&#x27;t supported yet&quot;));
+562              }
+563          }
+564          Expect&lt;CommandCompleteMessage&gt;(await Connector.ReadMessage(true), Connector);
+565          Expect&lt;ReadyForQueryMessage&gt;(await Connector.ReadMessage(true), Connector);
+566          return results;
+567          static byte[] ParseBytea(ReadOnlySpan&lt;byte&gt; bytes)
+568          {
+569              return bytes.Length &gt;= 2 &amp;&amp; bytes[0] == &#x27;\\&#x27; &amp;&amp; bytes[1] == &#x27;x&#x27;
+570                  ? ParseByteaHex(bytes.Slice(2))
+571                  : ParseByteaEscape(bytes);
+572              static byte[] ParseByteaHex(ReadOnlySpan&lt;byte&gt; inBytes)
+573              {
+574                  var outBytes = new byte[inBytes.Length / 2];
+575                  for (var i = 0; i &lt; inBytes.Length; i++)
+576                  {
+577                      var v1 = inBytes[i++];
+578                      var v2 = inBytes[i];
+579                      outBytes[i / 2] =
+580                          (byte)(((v1 - (v1 &lt; 0x3A ? 0x30 : 87)) &lt;&lt; 4) | (v2 - (v2 &lt; 0x3A ? 0x30 : 87)));
+581                  }
+582                  return outBytes;
+583              }
+584              static byte[] ParseByteaEscape(ReadOnlySpan&lt;byte&gt; inBytes)
+585              {
+586                  var result = new MemoryStream(new byte[inBytes.Length]);
+587                  for (var tp = 0; tp &lt; inBytes.Length;)
+588                  {
+589                      var c1 = inBytes[tp];
+590                      if (c1 != &#x27;\\&#x27;)
+591                      {
+592                          result.WriteByte(c1);
+593                          tp++;
+594                          continue;
+595                      }
+596                      var c2 = inBytes[tp + 1];
+597                      if (c2 == &#x27;\\&#x27;)
+598                      {
+599                          result.WriteByte(c2);
+600                          tp += 2;
+601                          continue;
+602                      }
+603                      var c3 = inBytes[tp + 2];
+604                      var c4 = inBytes[tp + 3];
+605                      if (c2 &gt;= &#x27;0&#x27; &amp;&amp; c2 &lt;= &#x27;3&#x27; &amp;&amp;
+606                          c3 &gt;= &#x27;0&#x27; &amp;&amp; c3 &lt;= &#x27;7&#x27; &amp;&amp;
+607                          c4 &gt;= &#x27;0&#x27; &amp;&amp; c4 &lt;= &#x27;7&#x27;)
+608                      {
+609                          c2 &lt;&lt;= 3;
+610                          c2 += c3;
+611                          c2 &lt;&lt;= 3;
+612                          result.WriteByte((byte)(c2 + c4));
+613                          tp += 4;
+614                          continue;
+615                      }
+616                      throw new FormatException(&quot;Invalid syntax for type bytea&quot;);
+617                  }
+618                  return result.ToArray();
+619              }
+620          }
+621      }
+622      void SetTimeouts(TimeSpan readTimeout, TimeSpan writeTimeout)
+623      {
+624          var connector = Connector;
+625          connector.UserTimeout = readTimeout &gt; TimeSpan.Zero ? (int)readTimeout.TotalMilliseconds : 0;
+626          var writeBuffer = connector.WriteBuffer;
+627          if (writeBuffer != null)
+628              writeBuffer.Timeout = writeTimeout;
+629      }
+630      internal void CheckDisposed()
+631      {
+632          if (_isDisposed)
+633              throw new ObjectDisposedException(GetType().Name);
+634      }
+635  }
+</code></pre>
+        </div>
+        <div class="column">
+            <h3>npgsql-MDEwOlJlcG9zaXRvcnkyODgzNTc0-flat-ReplicationConnection.cs</h3>
+            <pre><code>1  using Npgsql.BackendMessages;
+2  using NpgsqlTypes;
+3  using System;
+4  using System.Collections.Generic;
+5  using System.Diagnostics;
+6  using System.Diagnostics.CodeAnalysis;
+7  using System.Globalization;
+8  using System.IO;
+9  using System.Text;
+10  using System.Threading;
+11  using System.Threading.Tasks;
+12  using Microsoft.Extensions.Logging;
+13  using Npgsql.Internal;
+14  using Npgsql.Internal.TypeHandlers.DateTimeHandlers;
+15  using static Npgsql.Util.Statics;
+16  using Npgsql.Util;
+17  namespace Npgsql.Replication;
+18  public abstract class ReplicationConnection : IAsyncDisposable
+19  {
+20      #region Fields
+21      static readonly Version FirstVersionWithTwoPhaseSupport = new(15, 0);
+22      static readonly Version FirstVersionWithoutDropSlotDoubleCommandCompleteMessage = new(13, 0);
+23      static readonly Version FirstVersionWithTemporarySlotsAndSlotSnapshotInitMode = new(10, 0);
+24      readonly NpgsqlConnection _npgsqlConnection;
+25      readonly SemaphoreSlim _feedbackSemaphore = new(1, 1);
+26      string? _userFacingConnectionString;
+27      TimeSpan? _commandTimeout;
+28      TimeSpan _walReceiverTimeout = TimeSpan.FromSeconds(60d);
+29      Timer? _sendFeedbackTimer;
+30      Timer? _requestFeedbackTimer;
+31      TimeSpan _requestFeedbackInterval;
+32      IAsyncEnumerator&lt;XLogDataMessage&gt;? _currentEnumerator;
+33      CancellationTokenSource? _replicationCancellationTokenSource;
+34      bool _pgCancellationSupported;
+35      bool _isDisposed;
+36      long _lastReceivedLsn;
+37      long _lastFlushedLsn;
+38      long _lastAppliedLsn;
+39      readonly XLogDataMessage _cachedXLogDataMessage = new();
+40      internal ILogger ReplicationLogger { get; private set; } = default!; 
+41      #endregion Fields
+42      #region Constructors
+43      private protected ReplicationConnection()
+44      {
+45          _npgsqlConnection = new NpgsqlConnection();
+46          _requestFeedbackInterval = new TimeSpan(_walReceiverTimeout.Ticks / 2);
+47      }
+48      private protected ReplicationConnection(string? connectionString) : this()
+49          =&gt; ConnectionString = connectionString;
+50      #endregion
+51      #region Properties
+52      [AllowNull]
+53      public string ConnectionString {
+54          get =&gt; _userFacingConnectionString ?? string.Empty;
+55          set
+56          {
+57              _userFacingConnectionString = value;
+58              var cs = new NpgsqlConnectionStringBuilder(value)
+59              {
+60                  Pooling = false,
+61                  Enlist = false,
+62                  Multiplexing = false,
+63                  KeepAlive = 0,
+64                  ReplicationMode = ReplicationMode
+65              };
+66              if (ReplicationMode == ReplicationMode.Physical)
+67                  cs.ServerCompatibilityMode = ServerCompatibilityMode.NoTypeLoading;
+68              _npgsqlConnection.ConnectionString = cs.ToString();
+69          }
+70      }
+71      public NpgsqlLogSequenceNumber LastReceivedLsn
+72      {
+73          get =&gt; (NpgsqlLogSequenceNumber)unchecked((ulong)Interlocked.Read(ref _lastReceivedLsn));
+74          private protected set =&gt; Interlocked.Exchange(ref _lastReceivedLsn, unchecked((long)(ulong)value));
+75      }
+76      public NpgsqlLogSequenceNumber LastFlushedLsn
+77      {
+78          get =&gt; (NpgsqlLogSequenceNumber)unchecked((ulong)Interlocked.Read(ref _lastFlushedLsn));
+79          set =&gt; Interlocked.Exchange(ref _lastFlushedLsn, unchecked((long)(ulong)value));
+80      }
+81      public NpgsqlLogSequenceNumber LastAppliedLsn
+82      {
+83          get =&gt; (NpgsqlLogSequenceNumber)unchecked((ulong)Interlocked.Read(ref _lastAppliedLsn));
+84          set =&gt; Interlocked.Exchange(ref _lastAppliedLsn, unchecked((long)(ulong)value));
+85      }
+86      public TimeSpan WalReceiverStatusInterval { get; set; } = TimeSpan.FromSeconds(10d);
+87      public TimeSpan WalReceiverTimeout
+88      {
+89          get =&gt; _walReceiverTimeout;
+90          set
+91          {
+92              _walReceiverTimeout = value;
+93              _requestFeedbackInterval = value == Timeout.InfiniteTimeSpan
+94                  ? value
+95                  : new TimeSpan(value.Ticks / 2);
+96          }
+97      }
+98      private protected abstract ReplicationMode ReplicationMode { get; }
+99      public Version PostgreSqlVersion =&gt; _npgsqlConnection.PostgreSqlVersion;
+100      public string ServerVersion =&gt; _npgsqlConnection.ServerVersion;
+101      internal NpgsqlConnector Connector
+102          =&gt; _npgsqlConnection.Connector ??
+103             throw new InvalidOperationException($&quot;The {nameof(Connector)} property can only be used when there is an active connection&quot;);
+104      public TimeSpan CommandTimeout
+105      {
+106          get =&gt; _commandTimeout ?? (_npgsqlConnection.CommandTimeout &gt; 0
+107              ? TimeSpan.FromSeconds(_npgsqlConnection.CommandTimeout)
+108              : Timeout.InfiniteTimeSpan);
+109          set
+110          {
+111              if (value &lt; TimeSpan.Zero &amp;&amp; value != Timeout.InfiniteTimeSpan)
+112                  throw new ArgumentOutOfRangeException(nameof(value), value,
+113                      $&quot;A finite CommandTimeout can&#x27;t be less than {TimeSpan.Zero}.&quot;);
+114              _commandTimeout = value;
+115              if (Connector.State != ConnectorState.Replication)
+116                  SetTimeouts(value, value);
+117          }
+118      }
+119      public Encoding Encoding =&gt; _npgsqlConnection.Connector?.TextEncoding ?? throw new InvalidOperationException($&quot;The {nameof(Encoding)} property can only be used when there is an active connection&quot;);
+120      public int ProcessID =&gt; _npgsqlConnection.Connector?.BackendProcessId ?? throw new InvalidOperationException($&quot;The {nameof(ProcessID)} property can only be used when there is an active connection&quot;);
+121      #endregion Properties
+122      #region Open / Dispose
+123      public async Task Open(CancellationToken cancellationToken = default)
+124      {
+125          CheckDisposed();
+126          await _npgsqlConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
+127          _pgCancellationSupported = _npgsqlConnection.PostgreSqlVersion.IsGreaterOrEqual(10);
+128          SetTimeouts(CommandTimeout, CommandTimeout);
+129          ReplicationLogger = _npgsqlConnection.Connector!.LoggingConfiguration.ReplicationLogger;
+130      }
+131      public ValueTask DisposeAsync()
+132      {
+133          using (NoSynchronizationContextScope.Enter())
+134              return DisposeAsyncCore();
+135          async ValueTask DisposeAsyncCore()
+136          {
+137              if (_isDisposed)
+138                  return;
+139              if (_npgsqlConnection.Connector?.State == ConnectorState.Replication)
+140              {
+141                  Debug.Assert(_currentEnumerator is not null);
+142                  Debug.Assert(_replicationCancellationTokenSource is not null);
+143                  _replicationCancellationTokenSource.Cancel();
+144                  try
+145                  {
+146                      while (await _currentEnumerator.MoveNextAsync())
+147                      {
+148                      }
+149                  }
+150                  catch
+151                  {
+152                  }
+153              }
+154              Debug.Assert(_sendFeedbackTimer is null, &quot;Send feedback timer isn&#x27;t null at replication shutdown&quot;);
+155              Debug.Assert(_requestFeedbackTimer is null, &quot;Request feedback timer isn&#x27;t null at replication shutdown&quot;);
+156              _feedbackSemaphore.Dispose();
+157              try
+158              {
+159                  await _npgsqlConnection.Close(async: true);
+160              }
+161              catch
+162              {
+163              }
+164              _isDisposed = true;
+165          }
+166      }
+167      #endregion Open / Dispose
+168      #region Replication methods
+169      public Task&lt;ReplicationSystemIdentification&gt; IdentifySystem(CancellationToken cancellationToken = default)
+170      {
+171          using (NoSynchronizationContextScope.Enter())
+172              return IdentifySystemInternal(cancellationToken);
+173          async Task&lt;ReplicationSystemIdentification&gt; IdentifySystemInternal(CancellationToken cancellationToken)
+174          {
+175              var row = await ReadSingleRow(&quot;IDENTIFY_SYSTEM&quot;, cancellationToken);
+176              return new ReplicationSystemIdentification(
+177                  (string)row[0], (uint)row[1], NpgsqlLogSequenceNumber.Parse((string)row[2]), (string)row[3]);
+178          }
+179      }
+180      public Task&lt;string&gt; Show(string parameterName, CancellationToken cancellationToken = default)
+181      {
+182          if (parameterName is null)
+183              throw new ArgumentNullException(nameof(parameterName));
+184          using (NoSynchronizationContextScope.Enter())
+185              return ShowInternal(parameterName, cancellationToken);
+186          async Task&lt;string&gt; ShowInternal(string parameterName, CancellationToken cancellationToken)
+187              =&gt; (string)(await ReadSingleRow(&quot;SHOW &quot; + parameterName, cancellationToken))[0];
+188      }
+189      public Task&lt;TimelineHistoryFile&gt; TimelineHistory(uint tli, CancellationToken cancellationToken = default)
+190      {
+191          using (NoSynchronizationContextScope.Enter())
+192              return TimelineHistoryInternal(tli, cancellationToken);
+193          async Task&lt;TimelineHistoryFile&gt; TimelineHistoryInternal(uint tli, CancellationToken cancellationToken)
+194          {
+195              var result = await ReadSingleRow($&quot;TIMELINE_HISTORY {tli:D}&quot;, cancellationToken);
+196              return new TimelineHistoryFile((string)result[0], (byte[])result[1]);
+197          }
+198      }
+199      internal async Task&lt;ReplicationSlotOptions&gt; CreateReplicationSlot(string command, CancellationToken cancellationToken = default)
+200      {
+201          try
+202          {
+203              var result = await ReadSingleRow(command, cancellationToken);
+204              var slotName = (string)result[0];
+205              var consistentPoint = (string)result[1];
+206              var snapshotName = (string?)result[2];
+207              return new ReplicationSlotOptions(slotName, NpgsqlLogSequenceNumber.Parse(consistentPoint), snapshotName);
+208          }
+209          catch (PostgresException e) when (!Connector.IsBroken &amp;&amp; e.SqlState == PostgresErrorCodes.SyntaxError)
+210          {
+211              if (PostgreSqlVersion &lt; FirstVersionWithTwoPhaseSupport &amp;&amp; command.Contains(&quot; TWO_PHASE&quot;))
+212                  throw new NotSupportedException(&quot;Logical replication support for prepared transactions was introduced in PostgreSQL &quot; +
+213                                                  FirstVersionWithTwoPhaseSupport.ToString(1) +
+214                                                  &quot;. Using PostgreSQL version &quot; +
+215                                                  (PostgreSqlVersion.Build == -1
+216                                                      ? PostgreSqlVersion.ToString(2)
+217                                                      : PostgreSqlVersion.ToString(3)) +
+218                                                  &quot; you have to set the twoPhase argument to false.&quot;, e);
+219              if (PostgreSqlVersion &lt; FirstVersionWithTemporarySlotsAndSlotSnapshotInitMode)
+220              {
+221                  if (command.Contains(&quot; TEMPORARY&quot;))
+222                      throw new NotSupportedException(&quot;Temporary replication slots were introduced in PostgreSQL &quot; +
+223                                                      $&quot;{FirstVersionWithTemporarySlotsAndSlotSnapshotInitMode.ToString(1)}. &quot; +
+224                                                      $&quot;Using PostgreSQL version {PostgreSqlVersion.ToString(3)} you &quot; +
+225                                                      $&quot;have to set the isTemporary argument to false.&quot;, e);
+226                  if (command.Contains(&quot; EXPORT_SNAPSHOT&quot;) || command.Contains(&quot; NOEXPORT_SNAPSHOT&quot;) || command.Contains(&quot; USE_SNAPSHOT&quot;))
+227                      throw new NotSupportedException(
+228                          &quot;The EXPORT_SNAPSHOT, USE_SNAPSHOT and NOEXPORT_SNAPSHOT syntax was introduced in PostgreSQL &quot; +
+229                          $&quot;{FirstVersionWithTemporarySlotsAndSlotSnapshotInitMode.ToString(1)}. Using PostgreSQL version &quot; +
+230                          $&quot;{PostgreSqlVersion.ToString(3)} you have to omit the slotSnapshotInitMode argument.&quot;, e);
+231              }
+232              throw;
+233          }
+234      }
+235      internal async Task&lt;PhysicalReplicationSlot?&gt; ReadReplicationSlotInternal(string slotName, CancellationToken cancellationToken = default)
+236      {
+237          var result = await ReadSingleRow($&quot;READ_REPLICATION_SLOT {slotName}&quot;, cancellationToken);
+238          var slotType = (string?)result[0];
+239          switch (slotType)
+240          {
+241              case &quot;physical&quot;:
+242                  var restartLsn = (string?)result[1];
+243                  var restartTli = (uint?)result[2];
+244                  return new PhysicalReplicationSlot(
+245                      slotName.ToLowerInvariant(),
+246                      restartLsn == null ? null : NpgsqlLogSequenceNumber.Parse(restartLsn),
+247                      restartTli);
+248              case null:
+249                  return null;
+250              default:
+251                  throw new NotSupportedException(
+252                      $&quot;The replication slot type &#x27;{slotType}&#x27; is currently not supported by Npgsql. Please file an issue.&quot;);
+253          }
+254      }
+255      internal IAsyncEnumerator&lt;XLogDataMessage&gt; StartReplicationInternalWrapper(
+256          string command,
+257          bool bypassingStream,
+258          CancellationToken cancellationToken)
+259      {
+260          _currentEnumerator = StartReplicationInternal(command, bypassingStream, cancellationToken);
+261          return _currentEnumerator;
+262      }
+263      internal async IAsyncEnumerator&lt;XLogDataMessage&gt; StartReplicationInternal(
+264          string command,
+265          bool bypassingStream,
+266          CancellationToken cancellationToken)
+267      {
+268          CheckDisposed();
+269          var connector = _npgsqlConnection.Connector!;
+270          _replicationCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+271          using var _ = Connector.StartUserAction(
+272              ConnectorState.Replication, _replicationCancellationTokenSource.Token, attemptPgCancellation: _pgCancellationSupported);
+273          NpgsqlReadBuffer.ColumnStream? columnStream = null;
+274          try
+275          {
+276              await connector.WriteQuery(command, true, cancellationToken);
+277              await connector.Flush(true, cancellationToken);
+278              var msg = await connector.ReadMessage(true);
+279              switch (msg.Code)
+280              {
+281              case BackendMessageCode.CopyBothResponse:
+282                  break;
+283              case BackendMessageCode.CommandComplete:
+284              {
+285                  yield break;
+286              }
+287              default:
+288                  throw connector.UnexpectedMessageReceived(msg.Code);
+289              }
+290              var buf = connector.ReadBuffer;
+291              columnStream = new NpgsqlReadBuffer.ColumnStream(connector, startCancellableOperations: false);
+292              SetTimeouts(_walReceiverTimeout, CommandTimeout);
+293              _sendFeedbackTimer = new Timer(TimerSendFeedback, state: null, WalReceiverStatusInterval, Timeout.InfiniteTimeSpan);
+<span onclick='openModal()' class='match'>294              _requestFeedbackTimer = new Timer(TimerRequestFeedback, state: null, _requestFeedbackInterval, Timeout.InfiniteTimeSpan);
+295              while (true)
+</span>296              {
+297                  msg = await Connector.ReadMessage(async: true);
+298                  Expect&lt;CopyDataMessage&gt;(msg, Connector);
+299                  _requestFeedbackTimer.Change(_requestFeedbackInterval, Timeout.InfiniteTimeSpan);
+300                  var messageLength = ((CopyDataMessage)msg).Length;
+301                  await buf.EnsureAsync(1);
+302                  var code = (char)buf.ReadByte();
+303                  switch (code)
+304                  {
+305                  case &#x27;w&#x27;: 
+306                  {
+307                      await buf.EnsureAsync(24);
+308                      var startLsn = buf.ReadUInt64();
+309                      var endLsn = buf.ReadUInt64();
+310                      var sendTime = DateTimeUtils.DecodeTimestamp(buf.ReadInt64(), DateTimeKind.Utc);
+311                      if (unchecked((ulong)Interlocked.Read(ref _lastReceivedLsn)) &lt; startLsn)
+312                          Interlocked.Exchange(ref _lastReceivedLsn, unchecked((long)startLsn));
+313                      if (unchecked((ulong)Interlocked.Read(ref _lastReceivedLsn)) &lt; endLsn)
+314                          Interlocked.Exchange(ref _lastReceivedLsn, unchecked((long)endLsn));
+315                      var dataLen = messageLength - 25;
+316                      columnStream.Init(dataLen, canSeek: false);
+317                      _cachedXLogDataMessage.Populate(new NpgsqlLogSequenceNumber(startLsn), new NpgsqlLogSequenceNumber(endLsn),
+318                          sendTime, columnStream);
+319                      yield return _cachedXLogDataMessage;
+320                      if (!columnStream.IsDisposed &amp;&amp; columnStream.Position &lt; columnStream.Length &amp;&amp; !bypassingStream)
+321                          await buf.Skip(columnStream.Length - columnStream.Position, true);
+322                      continue;
+323                  }
+324                  case &#x27;k&#x27;: 
+325                  {
+326                      await buf.EnsureAsync(17);
+327                      var end = buf.ReadUInt64();
+328                      if (ReplicationLogger.IsEnabled(LogLevel.Trace))
+329                      {
+330                          var endLsn = new NpgsqlLogSequenceNumber(end);
+331                          var timestamp = DateTimeUtils.DecodeTimestamp(buf.ReadInt64(), DateTimeKind.Utc);
+332                          LogMessages.ReceivedReplicationPrimaryKeepalive(ReplicationLogger, endLsn, timestamp, Connector.Id);
+333                      }
+334                      else
+335                          buf.Skip(8);
+336                      var replyRequested = buf.ReadByte() == 1;
+337                      if (unchecked((ulong)Interlocked.Read(ref _lastReceivedLsn)) &lt; end)
+338                          Interlocked.Exchange(ref _lastReceivedLsn, unchecked((long)end));
+339                      if (replyRequested)
+340                      {
+341                          LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, &quot;the server requested it&quot;, Connector.Id);
+342                          await SendFeedback(waitOnSemaphore: true, cancellationToken: CancellationToken.None);
+343                      }
+344                      continue;
+345                  }
+346                  default:
+347                      throw Connector.Break(new NpgsqlException($&quot;Unknown replication message code &#x27;{code}&#x27;&quot;));
+348                  }
+349              }
+350          }
+351          finally
+352          {
+353              if (columnStream != null &amp;&amp; !bypassingStream &amp;&amp; !_replicationCancellationTokenSource.Token.IsCancellationRequested)
+354                  await columnStream.DisposeAsync();
+355  #if NETSTANDARD2_0
+356              if (_sendFeedbackTimer != null)
+357              {
+358                  var mre = new ManualResetEvent(false);
+359                  var actuallyDisposed = _sendFeedbackTimer.Dispose(mre);
+360                  Debug.Assert(actuallyDisposed, $&quot;{nameof(_sendFeedbackTimer)} had already been disposed when completing replication&quot;);
+361                  if (actuallyDisposed)
+362                      await mre.WaitOneAsync(cancellationToken);
+363              }
+364              if (_requestFeedbackTimer != null)
+365              {
+366                  var mre = new ManualResetEvent(false);
+367                  var actuallyDisposed = _requestFeedbackTimer.Dispose(mre);
+368                  Debug.Assert(actuallyDisposed, $&quot;{nameof(_requestFeedbackTimer)} had already been disposed when completing replication&quot;);
+369                  if (actuallyDisposed)
+370                      await mre.WaitOneAsync(cancellationToken);
+371              }
+372  #else
+373              if (_sendFeedbackTimer != null)
+374                  await _sendFeedbackTimer.DisposeAsync();
+375              if (_requestFeedbackTimer != null)
+376                  await _requestFeedbackTimer.DisposeAsync();
+377  #endif
+378              _sendFeedbackTimer = null;
+379              _requestFeedbackTimer = null;
+380              SetTimeouts(CommandTimeout, CommandTimeout);
+381              _replicationCancellationTokenSource.Dispose();
+382              _replicationCancellationTokenSource = null;
+383              _currentEnumerator = null;
+384          }
+385      }
+386      public void SetReplicationStatus(NpgsqlLogSequenceNumber lastAppliedAndFlushedLsn)
+387      {
+388          Interlocked.Exchange(ref _lastAppliedLsn, unchecked((long)(ulong)lastAppliedAndFlushedLsn));
+389          Interlocked.Exchange(ref _lastFlushedLsn, unchecked((long)(ulong)lastAppliedAndFlushedLsn));
+390      }
+391      public Task SendStatusUpdate(CancellationToken cancellationToken = default)
+392      {
+393          using (NoSynchronizationContextScope.Enter())
+394              return SendStatusUpdateInternal(cancellationToken);
+395          async Task SendStatusUpdateInternal(CancellationToken cancellationToken)
+396          {
+397              CheckDisposed();
+398              cancellationToken.ThrowIfCancellationRequested();
+399              if (Connector.State != ConnectorState.Replication)
+400                  throw new InvalidOperationException(&quot;Status update can only be sent during replication&quot;);
+401              LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, nameof(SendStatusUpdate) + &quot;was called&quot;, Connector.Id);
+402              await SendFeedback(waitOnSemaphore: true, cancellationToken: cancellationToken);
+403          }
+404      }
+405      async Task SendFeedback(bool waitOnSemaphore = false, bool requestReply = false, CancellationToken cancellationToken = default)
+406      {
+407          var taken = waitOnSemaphore
+408              ? await _feedbackSemaphore.WaitAsync(Timeout.Infinite, cancellationToken)
+409              : await _feedbackSemaphore.WaitAsync(TimeSpan.Zero, cancellationToken);
+410          if (!taken)
+411          {
+412              ReplicationLogger.LogTrace($&quot;Aborting feedback due to expired {nameof(WalReceiverStatusInterval)} because of a concurrent feedback request&quot;);
+413              return;
+414          }
+415          try
+416          {
+417              var connector = _npgsqlConnection.Connector!;
+418              var buf = connector.WriteBuffer;
+419              const int len = 39;
+420              if (buf.WriteSpaceLeft &lt; len)
+421                  await connector.Flush(async: true, cancellationToken);
+422              buf.WriteByte(FrontendMessageCode.CopyData);
+423              buf.WriteInt32(len - 1);
+424              buf.WriteByte((byte)&#x27;r&#x27;); 
+425              var lastReceivedLsn = Interlocked.Read(ref _lastReceivedLsn);
+426              var lastFlushedLsn = Interlocked.Read(ref _lastFlushedLsn);
+427              var lastAppliedLsn = Interlocked.Read(ref _lastAppliedLsn);
+428              var timestamp = DateTime.UtcNow;
+429              buf.WriteInt64(lastReceivedLsn);
+430              buf.WriteInt64(lastFlushedLsn);
+431              buf.WriteInt64(lastAppliedLsn);
+432              buf.WriteInt64(DateTimeUtils.EncodeTimestamp(timestamp));
+433              buf.WriteByte(requestReply ? (byte)1 : (byte)0);
+434              await connector.Flush(async: true, cancellationToken);
+435              if (ReplicationLogger.IsEnabled(LogLevel.Trace))
+436              {
+437                  LogMessages.SentReplicationFeedbackMessage(
+438                      ReplicationLogger,
+439                      new NpgsqlLogSequenceNumber(unchecked((ulong)lastReceivedLsn)),
+440                      new NpgsqlLogSequenceNumber(unchecked((ulong)lastFlushedLsn)),
+441                      new NpgsqlLogSequenceNumber(unchecked((ulong)lastAppliedLsn)),
+442                      timestamp,
+443                      Connector.Id);
+444              }
+445          }
+446          catch (Exception e)
+447          {
+448              LogMessages.ReplicationFeedbackMessageSendingFailed(ReplicationLogger, _npgsqlConnection?.Connector?.Id, e);
+449          }
+450          finally
+451          {
+452              _sendFeedbackTimer!.Change(WalReceiverStatusInterval, Timeout.InfiniteTimeSpan);
+453              if (requestReply)
+454                  _requestFeedbackTimer!.Change(_requestFeedbackInterval, Timeout.InfiniteTimeSpan);
+455              _feedbackSemaphore.Release();
+456          }
+457      }
+458      async void TimerRequestFeedback(object? obj)
+459      {
+460          try
+461          {
+462              if (Connector.State != ConnectorState.Replication)
+463                  return;
+464              if (ReplicationLogger.IsEnabled(LogLevel.Trace))
+465                  LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, $&quot;half of the {nameof(WalReceiverTimeout)} of {WalReceiverTimeout} has expired&quot;, Connector.Id);
+466              await SendFeedback(waitOnSemaphore: true, requestReply: true);
+467          }
+468          catch
+469          {
+470          }
+471      }
+472      async void TimerSendFeedback(object? obj)
+473      {
+474          try
+475          {
+476              if (Connector.State != ConnectorState.Replication)
+477                  return;
+478              if (ReplicationLogger.IsEnabled(LogLevel.Trace))
+479                  LogMessages.SendingReplicationStandbyStatusUpdate(ReplicationLogger, $&quot;{nameof(WalReceiverStatusInterval)} of {WalReceiverStatusInterval} has expired&quot;, Connector.Id);
+480              await SendFeedback();
+481          }
+482          catch
+483          {
+484          }
+485      }
+486      public Task DropReplicationSlot(string slotName, bool wait = false, CancellationToken cancellationToken = default)
+487      {
+488          if (slotName is null)
+489              throw new ArgumentNullException(nameof(slotName));
+490          using (NoSynchronizationContextScope.Enter())
+491              return DropReplicationSlotInternal(slotName, wait,  cancellationToken);
+492          async Task DropReplicationSlotInternal(string slotName, bool wait, CancellationToken cancellationToken)
+493          {
+494              CheckDisposed();
+495              using var _ = Connector.StartUserAction(cancellationToken, attemptPgCancellation: _pgCancellationSupported);
+496              var command = &quot;DROP_REPLICATION_SLOT &quot; + slotName;
+497              if (wait)
+498                  command += &quot; WAIT&quot;;
+499              LogMessages.DroppingReplicationSlot(ReplicationLogger, slotName, command, Connector.Id);
+500              await Connector.WriteQuery(command, true, CancellationToken.None);
+501              await Connector.Flush(true, CancellationToken.None);
+502              Expect&lt;CommandCompleteMessage&gt;(await Connector.ReadMessage(true), Connector);
+503              if (PostgreSqlVersion &lt; FirstVersionWithoutDropSlotDoubleCommandCompleteMessage)
+504                  Expect&lt;CommandCompleteMessage&gt;(await Connector.ReadMessage(true), Connector);
+505              Expect&lt;ReadyForQueryMessage&gt;(await Connector.ReadMessage(true), Connector);
+506          }
+507      }
+508      #endregion
+509      async Task&lt;object[]&gt; ReadSingleRow(string command, CancellationToken cancellationToken = default)
+510      {
+511          CheckDisposed();
+512          using var _ = Connector.StartUserAction(cancellationToken, attemptPgCancellation: _pgCancellationSupported);
+513          LogMessages.ExecutingReplicationCommand(ReplicationLogger, command, Connector.Id);
+514          await Connector.WriteQuery(command, true, cancellationToken);
+515          await Connector.Flush(true, cancellationToken);
+516          var rowDescription = Expect&lt;RowDescriptionMessage&gt;(await Connector.ReadMessage(true), Connector);
+517          Expect&lt;DataRowMessage&gt;(await Connector.ReadMessage(true), Connector);
+518          var buf = Connector.ReadBuffer;
+519          await buf.EnsureAsync(2);
+520          var results = new object[buf.ReadInt16()];
+521          for (var i = 0; i &lt; results.Length; i++)
+522          {
+523              await buf.EnsureAsync(4);
+524              var len = buf.ReadInt32();
+525              if (len == -1)
+526                  continue;
+527              await buf.EnsureAsync(len);
+528              var field = rowDescription[i];
+529              switch (field.PostgresType.Name)
+530              {
+531              case &quot;text&quot;:
+532                  results[i] = buf.ReadString(len);
+533                  continue;
+534              case &quot;integer&quot;:
+535              case &quot;bigint&quot;:
+536              {
+537                  var str = buf.ReadString(len);
+538                  if (!uint.TryParse(str, NumberStyles.None, null, out var num))
+539                  {
+540                      throw Connector.Break(
+541                          new NpgsqlException(
+542                              $&quot;Could not parse &#x27;{str}&#x27; as unsigned integer in field {field.Name}&quot;));
+543                  }
+544                  results[i] = num;
+545                  continue;
+546              }
+547              case &quot;bytea&quot;:
+548                  try
+549                  {
+550                      var bytes = buf.ReadMemory(len);
+551                      results[i] = ParseBytea(bytes.Span);
+552                  }
+553                  catch (Exception e)
+554                  {
+555                      throw Connector.Break(
+556                          new NpgsqlException($&quot;Could not parse data as bytea in field {field.Name}&quot;, e));
+557                  }
+558                  continue;
+559              default:
+560                  throw Connector.Break(new NpgsqlException(
+561                      $&quot;Field {field.Name} has PostgreSQL type {field.PostgresType.Name} which isn&#x27;t supported yet&quot;));
+562              }
+563          }
+564          Expect&lt;CommandCompleteMessage&gt;(await Connector.ReadMessage(true), Connector);
+565          Expect&lt;ReadyForQueryMessage&gt;(await Connector.ReadMessage(true), Connector);
+566          return results;
+567          static byte[] ParseBytea(ReadOnlySpan&lt;byte&gt; bytes)
+568          {
+569              return bytes.Length &gt;= 2 &amp;&amp; bytes[0] == &#x27;\\&#x27; &amp;&amp; bytes[1] == &#x27;x&#x27;
+570                  ? ParseByteaHex(bytes.Slice(2))
+571                  : ParseByteaEscape(bytes);
+572              static byte[] ParseByteaHex(ReadOnlySpan&lt;byte&gt; inBytes)
+573              {
+574                  var outBytes = new byte[inBytes.Length / 2];
+575                  for (var i = 0; i &lt; inBytes.Length; i++)
+576                  {
+577                      var v1 = inBytes[i++];
+578                      var v2 = inBytes[i];
+579                      outBytes[i / 2] =
+580                          (byte)(((v1 - (v1 &lt; 0x3A ? 0x30 : 87)) &lt;&lt; 4) | (v2 - (v2 &lt; 0x3A ? 0x30 : 87)));
+581                  }
+582                  return outBytes;
+583              }
+584              static byte[] ParseByteaEscape(ReadOnlySpan&lt;byte&gt; inBytes)
+585              {
+586                  var result = new MemoryStream(new byte[inBytes.Length]);
+587                  for (var tp = 0; tp &lt; inBytes.Length;)
+588                  {
+589                      var c1 = inBytes[tp];
+590                      if (c1 != &#x27;\\&#x27;)
+591                      {
+592                          result.WriteByte(c1);
+593                          tp++;
+594                          continue;
+595                      }
+596                      var c2 = inBytes[tp + 1];
+597                      if (c2 == &#x27;\\&#x27;)
+598                      {
+599                          result.WriteByte(c2);
+600                          tp += 2;
+601                          continue;
+602                      }
+603                      var c3 = inBytes[tp + 2];
+604                      var c4 = inBytes[tp + 3];
+605                      if (c2 &gt;= &#x27;0&#x27; &amp;&amp; c2 &lt;= &#x27;3&#x27; &amp;&amp;
+606                          c3 &gt;= &#x27;0&#x27; &amp;&amp; c3 &lt;= &#x27;7&#x27; &amp;&amp;
+607                          c4 &gt;= &#x27;0&#x27; &amp;&amp; c4 &lt;= &#x27;7&#x27;)
+608                      {
+609                          c2 &lt;&lt;= 3;
+610                          c2 += c3;
+611                          c2 &lt;&lt;= 3;
+612                          result.WriteByte((byte)(c2 + c4));
+613                          tp += 4;
+614                          continue;
+615                      }
+616                      throw new FormatException(&quot;Invalid syntax for type bytea&quot;);
+617                  }
+618                  return result.ToArray();
+619              }
+620          }
+621      }
+622      void SetTimeouts(TimeSpan readTimeout, TimeSpan writeTimeout)
+623      {
+624          var connector = Connector;
+625          connector.UserTimeout = readTimeout &gt; TimeSpan.Zero ? (int)readTimeout.TotalMilliseconds : 0;
+626          var writeBuffer = connector.WriteBuffer;
+627          if (writeBuffer != null)
+628              writeBuffer.Timeout = writeTimeout;
+629      }
+630      internal void CheckDisposed()
+631      {
+632          if (_isDisposed)
+633              throw new ObjectDisposedException(GetType().Name);
+634      }
+635  }
+</code></pre>
+        </div>
+    
+        <!-- The Modal -->
+        <div id="myModal" class="modal">
+            <div class="modal-content">
+                <span class="row close">&times;</span>
+                <div class='row'>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from npgsql-MDEwOlJlcG9zaXRvcnkyODgzNTc0-flat-ReplicationConnection.cs</div>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from npgsql-MDEwOlJlcG9zaXRvcnkyODgzNTc0-flat-ReplicationConnection.cs</div>
+                </div>
+                <div class="column column_space"><pre><code>293              _sendFeedbackTimer = new Timer(TimerSendFeedback, state: null, WalReceiverStatusInterval, Timeout.InfiniteTimeSpan);
+294              _requestFeedbackTimer = new Timer(TimerRequestFeedback, state: null, _requestFeedbackInterval, Timeout.InfiniteTimeSpan);
+</pre></code></div>
+                <div class="column column_space"><pre><code>294              _requestFeedbackTimer = new Timer(TimerRequestFeedback, state: null, _requestFeedbackInterval, Timeout.InfiniteTimeSpan);
+295              while (true)
+</pre></code></div>
+            </div>
+        </div>
+        <script>
+        // Get the modal
+        var modal = document.getElementById("myModal");
+        
+        // Get the button that opens the modal
+        var btn = document.getElementById("myBtn");
+        
+        // Get the <span> element that closes the modal
+        var span = document.getElementsByClassName("close")[0];
+        
+        // When the user clicks the button, open the modal
+        function openModal(){
+          modal.style.display = "block";
+        }
+        
+        // When the user clicks on <span> (x), close the modal
+        span.onclick = function() {
+        modal.style.display = "none";
+        }
+        
+        // When the user clicks anywhere outside of the modal, close it
+        window.onclick = function(event) {
+        if (event.target == modal) {
+        modal.style.display = "none";
+        } }
+        
+        </script>
+    </body>
+    </html>
+    
