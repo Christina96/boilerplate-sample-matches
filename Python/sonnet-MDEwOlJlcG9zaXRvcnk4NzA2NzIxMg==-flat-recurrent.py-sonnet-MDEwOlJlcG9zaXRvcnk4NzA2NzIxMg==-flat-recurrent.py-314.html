@@ -1,0 +1,1664 @@
+
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Code Files</title>
+            <style>
+                .column {
+                    width: 47%;
+                    float: left;
+                    padding: 12px;
+                    border: 2px solid #ffd0d0;
+                }
+        
+                .modal {
+                    display: none;
+                    position: fixed;
+                    z-index: 1;
+                    left: 0;
+                    top: 0;
+                    width: 100%;
+                    height: 100%;
+                    overflow: auto;
+                    background-color: rgb(0, 0, 0);
+                    background-color: rgba(0, 0, 0, 0.4);
+                }
+    
+                .modal-content {
+                    height: 250%;
+                    background-color: #fefefe;
+                    margin: 5% auto;
+                    padding: 20px;
+                    border: 1px solid #888;
+                    width: 80%;
+                }
+    
+                .close {
+                    color: #aaa;
+                    float: right;
+                    font-size: 20px;
+                    font-weight: bold;
+                    text-align: right;
+                }
+    
+                .close:hover, .close:focus {
+                    color: black;
+                    text-decoration: none;
+                    cursor: pointer;
+                }
+    
+                .row {
+                    float: right;
+                    width: 100%;
+                }
+    
+                .column_space  {
+                    white - space: pre-wrap;
+                }
+                 
+                pre {
+                    width: 100%;
+                    overflow-y: auto;
+                    background: #f8fef2;
+                }
+                
+                .match {
+                    cursor:pointer; 
+                    background-color:#00ffbb;
+                }
+        </style>
+    </head>
+    <body>
+        <h2>Tokens: 54, <button onclick='openModal()' class='match'>CODE CLONE</button></h2>
+        <div class="column">
+            <h3>sonnet-MDEwOlJlcG9zaXRvcnk4NzA2NzIxMg==-flat-recurrent.py</h3>
+            <pre><code>1  import abc
+2  import collections
+3  import functools
+4  from typing import Optional, Sequence, Tuple, Union
+5  import uuid
+6  from sonnet.src import base
+7  from sonnet.src import conv
+8  from sonnet.src import initializers
+9  from sonnet.src import linear
+10  from sonnet.src import once
+11  from sonnet.src import types
+12  from sonnet.src import utils
+13  import tensorflow.compat.v1 as tf1
+14  import tensorflow as tf
+15  import tree
+16  from tensorflow.python import context as context_lib
+17  class RNNCore(base.Module, metaclass=abc.ABCMeta):
+18    @abc.abstractmethod
+19    def __call__(self, inputs: types.TensorNest, prev_state):
+20    @abc.abstractmethod
+21    def initial_state(self, batch_size: types.IntegerLike, **kwargs):
+22  class UnrolledRNN(base.Module, metaclass=abc.ABCMeta):
+23    @abc.abstractmethod
+24    def __call__(self, input_sequence: types.TensorNest,
+25                 initial_state: types.TensorNest):
+26    @abc.abstractmethod
+27    def initial_state(self, batch_size: types.IntegerLike, **kwargs):
+28  class TrainableState(base.Module):
+29    @classmethod
+30    def for_core(cls,
+31                 core: RNNCore,
+32                 mask: Optional[types.TensorNest] = None,
+33                 name: Optional[str] = None):
+34      initial_values = tree.map_structure(lambda s: tf.squeeze(s, axis=0),
+35                                          core.initial_state(batch_size=1))
+36      return cls(initial_values, mask, name)
+37    def __init__(self,
+38                 initial_values: types.TensorNest,
+39                 mask: Optional[types.TensorNest] = None,
+40                 name: Optional[str] = None):
+41      super().__init__(name)
+42      flat_initial_values = tree.flatten_with_path(initial_values)
+43      if mask is None:
+44        flat_mask = [True] * len(flat_initial_values)
+45      else:
+46        tree.assert_same_structure(initial_values, mask)
+47        flat_mask = tree.flatten(mask)
+48      flat_template = []
+49      for (path, initial_value), trainable in zip(flat_initial_values, flat_mask):
+50        name = &quot;/&quot;.join(map(str, path)) or &quot;state&quot;
+51        flat_template.append(
+52            tf.Variable(
+53                tf.expand_dims(initial_value, axis=0),
+54                trainable=trainable,
+55                name=name))
+56      self._template = tree.unflatten_as(initial_values, flat_template)
+57    def __call__(self, batch_size: int) -&gt; types.TensorNest:
+58      return tree.map_structure(
+59          lambda s: tf.tile(s, [batch_size] + [1] * (s.shape.rank - 1)),
+60          self._template)
+61  def static_unroll(
+62      core: RNNCore,
+63      input_sequence: types.TensorNest,  # time-major.
+64      initial_state: types.TensorNest,
+65      sequence_length: Optional[types.IntegerLike] = None
+66  ) -&gt; Tuple[types.TensorNest, types.TensorNest]:
+67    num_steps, input_tas = _unstack_input_sequence(input_sequence)
+68    if not isinstance(num_steps, int):
+69      raise ValueError(
+70          &quot;input_sequence must have a statically known number of time steps&quot;)
+71    outputs = None
+72    state = initial_state
+73    output_accs = None
+74    for t in range(num_steps):
+75      outputs, state = _rnn_step(
+76          core,
+77          input_tas,
+78          sequence_length,
+79          t,
+80          prev_outputs=outputs,
+81          prev_state=state)
+82      if t == 0:
+83        output_accs = tree.map_structure(lambda o: _ListWrapper([o]), outputs)
+84      else:
+85        tree.map_structure(lambda acc, o: acc.data.append(o), output_accs,
+86                           outputs)
+87    output_sequence = tree.map_structure(lambda acc: tf.stack(acc.data),
+88                                         output_accs)
+89    return output_sequence, state
+90  class _ListWrapper:
+91    __slots__ = [&quot;data&quot;]
+92    def __init__(self, data):
+93      self.data = data
+94  @utils.smart_autograph
+95  def dynamic_unroll(
+96      core,
+97      input_sequence,  # time-major.
+98      initial_state,
+99      sequence_length=None,
+100      parallel_iterations=1,
+101      swap_memory=False):
+102    num_steps, input_tas = _unstack_input_sequence(input_sequence)
+103    outputs, state = _rnn_step(
+104        core,
+105        input_tas,
+106        sequence_length,
+107        t=0,
+108        prev_outputs=None,
+109        prev_state=initial_state)
+110    output_tas = tree.map_structure(
+111        lambda o: tf.TensorArray(o.dtype, num_steps).write(0, o), outputs)
+112    for t in tf.range(1, num_steps):
+113      tf.autograph.experimental.set_loop_options(
+114          parallel_iterations=parallel_iterations,
+115          swap_memory=swap_memory,
+116          maximum_iterations=num_steps - 1)
+117      outputs, state = _rnn_step(
+118          core,
+119          input_tas,
+120          sequence_length,
+121          t,
+122          prev_outputs=outputs,
+123          prev_state=state)
+124      output_tas = tree.map_structure(
+125          lambda ta, o, _t=t: ta.write(_t, o), output_tas, outputs)
+126    output_sequence = tree.map_structure(tf.TensorArray.stack, output_tas)
+127    return output_sequence, state
+128  def _unstack_input_sequence(input_sequence):
+129    r
+130    flat_input_sequence = tree.flatten(input_sequence)
+131    all_num_steps = {i.shape[0] for i in flat_input_sequence}
+132    if len(all_num_steps) &gt; 1:
+133      raise ValueError(
+134          &quot;input_sequence tensors must have consistent number of time steps&quot;)
+135    [num_steps] = all_num_steps
+136    if num_steps == 0:
+137      raise ValueError(&quot;input_sequence must have at least a single time step&quot;)
+138    elif num_steps is None:
+139      num_steps = tf.shape(flat_input_sequence[0])[0]
+140    input_tas = tree.map_structure(
+141        lambda i: tf.TensorArray(i.dtype, num_steps).unstack(i), input_sequence)
+142    return num_steps, input_tas
+143  def _safe_where(condition, x, y):  # pylint: disable=g-doc-args
+144    if x.shape.rank == 0:
+145      return y
+146    return tf1.where(condition, x, y)
+147  def _rnn_step(core, input_tas, sequence_length, t, prev_outputs, prev_state):
+148    outputs, state = core(
+149        tree.map_structure(lambda i: i.read(t), input_tas), prev_state)
+150    if prev_outputs is None:
+151      assert t == 0
+152      prev_outputs = tree.map_structure(tf.zeros_like, outputs)
+153    if sequence_length is not None:
+154      maybe_propagate = functools.partial(_safe_where, t &gt;= sequence_length)
+155      outputs = tree.map_structure(maybe_propagate, prev_outputs, outputs)
+156      state = tree.map_structure(maybe_propagate, prev_state, state)
+157    return outputs, state
+158  class VanillaRNN(RNNCore):
+159    def __init__(self,
+160                 hidden_size: int,
+161                 activation: types.ActivationFn = tf.tanh,
+162                 w_i_init: Optional[initializers.Initializer] = None,
+163                 w_h_init: Optional[initializers.Initializer] = None,
+164                 b_init: Optional[initializers.Initializer] = None,
+165                 dtype: tf.DType = tf.float32,
+166                 name: Optional[str] = None):
+167      super().__init__(name)
+168      self._hidden_size = hidden_size
+169      self._activation = activation
+170      self._b_init = b_init or initializers.Zeros()
+171      self._dtype = dtype
+172      self._input_to_hidden = linear.Linear(
+173          hidden_size, with_bias=False, w_init=w_i_init, name=&quot;input_to_hidden&quot;)
+174      self._hidden_to_hidden = linear.Linear(
+175          hidden_size, with_bias=False, w_init=w_h_init, name=&quot;hidden_to_hidden&quot;)
+176    @property
+177    def input_to_hidden(self) -&gt; tf.Variable:
+178      return self._input_to_hidden.w
+179    @property
+180    def hidden_to_hidden(self) -&gt; tf.Variable:
+181      return self._hidden_to_hidden.w
+182    def __call__(self, inputs: types.TensorNest,
+183                 prev_state: types.TensorNest) -&gt; Tuple[tf.Tensor, tf.Tensor]:
+184      self._initialize(inputs)
+185      outputs = self._activation(
+186          self._input_to_hidden(inputs) + self._hidden_to_hidden(prev_state) +
+187          self._b)
+188      return outputs, outputs
+189    def initial_state(self, batch_size: int) -&gt; tf.Tensor:
+190      return tf.zeros(shape=[batch_size, self._hidden_size], dtype=self._dtype)
+191    @once.once
+192    def _initialize(self, inputs: tf.Tensor):
+193      dtype = _check_inputs_dtype(inputs, self._dtype)
+194      self._b = tf.Variable(self._b_init([self._hidden_size], dtype), name=&quot;b&quot;)
+195  class _LegacyDeepRNN(RNNCore):
+196    def __init__(self,
+197                 layers,
+198                 skip_connections,
+199                 concat_final_output_if_skip=True,
+200                 name: Optional[str] = None):
+201      r
+202      super().__init__(name)
+203      self._layers = layers if layers is not None else []
+204      self._skip_connections = skip_connections
+205      self._concat_final_output_if_skip = concat_final_output_if_skip
+206    def __call__(self, inputs, prev_state):
+207      current_inputs = inputs
+208      outputs = []
+209      next_states = []
+210      recurrent_idx = 0
+211      concat = lambda *args: tf.concat(args, axis=-1)
+212      for idx, layer in enumerate(self._layers):
+213        if self._skip_connections and idx &gt; 0:
+214          current_inputs = tree.map_structure(concat, inputs, current_inputs)
+215        if isinstance(layer, RNNCore):
+216          current_inputs, next_state = layer(current_inputs,
+217                                             prev_state[recurrent_idx])
+218          next_states.append(next_state)
+219          recurrent_idx += 1
+220        else:
+221          current_inputs = layer(current_inputs)
+222        if self._skip_connections:
+223          outputs.append(current_inputs)
+224      if self._skip_connections and self._concat_final_output_if_skip:
+225        outputs = tree.map_structure(concat, *outputs)
+226      else:
+227        outputs = current_inputs
+228      return outputs, tuple(next_states)
+229    def initial_state(self, batch_size, **kwargs):
+230      return tuple(
+231          layer.initial_state(batch_size, **kwargs)
+232          for layer in self._layers
+233          if isinstance(layer, RNNCore))
+234  class DeepRNN(_LegacyDeepRNN):
+235    r
+236    def __init__(self, layers, name: Optional[str] = None):
+237      super().__init__(layers, skip_connections=False, name=name)
+238  def deep_rnn_with_skip_connections(
+239      layers: Sequence[RNNCore],
+240      concat_final_output: bool = True,
+241      name: str = &quot;deep_rnn_with_skip_connections&quot;) -&gt; RNNCore:
+242    r
+243    if not all(isinstance(l, RNNCore) for l in layers):
+244      raise ValueError(&quot;deep_rnn_with_skip_connections requires all layers to be &quot;
+245                       &quot;instances of RNNCore&quot;)
+246    return _LegacyDeepRNN(
+247        layers,
+248        skip_connections=True,
+249        concat_final_output_if_skip=concat_final_output,
+250        name=name)
+251  class _ResidualWrapper(RNNCore):
+252    def __init__(self, base_core: RNNCore):
+253      super().__init__(name=base_core.name + &quot;_residual&quot;)
+254      self._base_core = base_core
+255    def __call__(self, inputs: types.TensorNest, prev_state: types.TensorNest):
+256      outputs, next_state = self._base_core(inputs, prev_state)
+257      residual = tree.map_structure(lambda i, o: i + o, inputs, outputs)
+258      return residual, next_state
+259    def initial_state(self, batch_size, **kwargs):
+260      return self._base_core.initial_state(batch_size, **kwargs)
+261  def deep_rnn_with_residual_connections(
+262      layers: Sequence[RNNCore],
+263      name: str = &quot;deep_rnn_with_residual_connections&quot;) -&gt; RNNCore:
+264    r
+265    if not all(isinstance(l, RNNCore) for l in layers):
+266      raise ValueError(
+267          &quot;deep_rnn_with_residual_connections requires all layers to be &quot;
+268          &quot;instances of RNNCore&quot;)
+269    return _LegacyDeepRNN([_ResidualWrapper(l) for l in layers],
+270                          skip_connections=False,
+271                          name=name)
+272  LSTMState = collections.namedtuple(&quot;LSTMState&quot;, [&quot;hidden&quot;, &quot;cell&quot;])
+273  class LSTM(RNNCore):
+274    r
+275    def __init__(self,
+276                 hidden_size: int,
+277                 projection_size: Optional[int] = None,
+278                 projection_init: Optional[initializers.Initializer] = None,
+279                 w_i_init: Optional[initializers.Initializer] = None,
+280                 w_h_init: Optional[initializers.Initializer] = None,
+281                 b_init: Optional[initializers.Initializer] = None,
+282                 forget_bias: types.FloatLike = 1.0,
+283                 dtype: tf.DType = tf.float32,
+284                 name: Optional[str] = None):
+285      super().__init__(name)
+286      self._hidden_size = hidden_size
+287      self._projection_size = projection_size
+288      self._eff_hidden_size = self._projection_size or self._hidden_size
+289      self._projection_init = projection_init
+290      if projection_size is None and projection_init is not None:
+291        raise ValueError(
+292            &quot;projection_init must be None when projection is not used&quot;)
+293      self._w_i_init = w_i_init
+294      self._w_h_init = w_h_init
+295      self._b_init = b_init or initializers.Zeros()
+296      self._forget_bias = forget_bias
+297      self._dtype = dtype
+298    def __call__(self, inputs, prev_state):
+299      self._initialize(inputs)
+300      return _lstm_fn(inputs, prev_state, self._w_i, self._w_h, self.b,
+301                      self.projection)
+302    def initial_state(self, batch_size: int) -&gt; LSTMState:
+303      return LSTMState(
+304          hidden=tf.zeros([batch_size, self._eff_hidden_size], dtype=self._dtype),
+305          cell=tf.zeros([batch_size, self._hidden_size], dtype=self._dtype))
+306    @property
+307    def input_to_hidden(self):
+308      return self._w_i
+309    @property
+310    def hidden_to_hidden(self):
+311      return self._w_h
+312    @once.once
+313    def _initialize(self, inputs):
+314      utils.assert_rank(inputs, 2)
+315      input_size = inputs.shape[1]
+316      dtype = _check_inputs_dtype(inputs, self._dtype)
+317      w_i_init = self._w_i_init or initializers.TruncatedNormal(
+318          stddev=1.0 / tf.sqrt(tf.cast(input_size, dtype)))
+319      w_h_init = self._w_h_init or initializers.TruncatedNormal(
+320          stddev=1.0 / tf.sqrt(tf.constant(self._eff_hidden_size, dtype=dtype)))
+321      self._w_i = tf.Variable(
+322          w_i_init([input_size, 4 * self._hidden_size], dtype), name=&quot;w_i&quot;)
+323      self._w_h = tf.Variable(
+324          w_h_init([self._eff_hidden_size, 4 * self._hidden_size], dtype),
+325          name=&quot;w_h&quot;)
+326      b_i, b_f, b_g, b_o = tf.split(
+327          self._b_init([4 * self._hidden_size], dtype), num_or_size_splits=4)
+328      b_f += self._forget_bias
+329      self.b = tf.Variable(tf.concat([b_i, b_f, b_g, b_o], axis=0), name=&quot;b&quot;)
+330      if self._projection_size is None:
+331        self.projection = None
+332      else:
+333        projection_init = self._projection_init
+334        if projection_init is None:
+335          projection_init = initializers.TruncatedNormal(
+336              stddev=1.0 / tf.sqrt(tf.constant(self._hidden_size, dtype=dtype)))
+337        self.projection = tf.Variable(
+338            projection_init([self._hidden_size, self._projection_size], dtype),
+339            name=&quot;projection&quot;)
+340  def _lstm_fn(inputs, prev_state, w_i, w_h, b, projection=None):
+341    gates_x = tf.matmul(inputs, w_i)
+342    gates_h = tf.matmul(prev_state.hidden, w_h)
+343    gates = gates_x + gates_h + b
+344    i, f, g, o = tf.split(gates, num_or_size_splits=4, axis=1)
+345    next_cell = tf.sigmoid(f) * prev_state.cell
+346    next_cell += tf.sigmoid(i) * tf.tanh(g)
+347    next_hidden = tf.sigmoid(o) * tf.tanh(next_cell)
+348    if projection is not None:
+349      next_hidden = tf.matmul(next_hidden, projection)
+350    return next_hidden, LSTMState(hidden=next_hidden, cell=next_cell)
+351  class UnrolledLSTM(UnrolledRNN):
+352    def __init__(self,
+353                 hidden_size,
+354                 w_i_init: Optional[initializers.Initializer] = None,
+355                 w_h_init: Optional[initializers.Initializer] = None,
+356                 b_init: Optional[initializers.Initializer] = None,
+357                 forget_bias: types.FloatLike = 1.0,
+358                 dtype: tf.DType = tf.float32,
+359                 name: Optional[str] = None):
+360      super().__init__(name)
+361      self._hidden_size = hidden_size
+362      self._w_i_init = w_i_init
+363      self._w_h_init = w_h_init
+364      self._b_init = b_init or initializers.Zeros()
+365      self._forget_bias = forget_bias
+366      self._dtype = dtype
+367    def __call__(self, input_sequence, initial_state):
+368      self._initialize(input_sequence)
+369      return _specialized_unrolled_lstm(input_sequence, initial_state, self._w_i,
+370                                        self._w_h, self.b)
+371    def initial_state(self, batch_size):
+372      return LSTMState(
+373          hidden=tf.zeros([batch_size, self._hidden_size], dtype=self._dtype),
+374          cell=tf.zeros([batch_size, self._hidden_size], dtype=self._dtype))
+375    @property
+376    def input_to_hidden(self):
+377      return self._w_i
+378    @property
+379    def hidden_to_hidden(self):
+380      return self._w_h
+381    @once.once
+382    def _initialize(self, input_sequence):
+383      utils.assert_rank(input_sequence, 3)  # [num_steps, batch_size, input_size].
+384      input_size = input_sequence.shape[2]
+385      dtype = _check_inputs_dtype(input_sequence, self._dtype)
+386      w_i_init = self._w_i_init or initializers.TruncatedNormal(
+387          stddev=1.0 / tf.sqrt(tf.cast(input_size, dtype)))
+388      w_h_init = self._w_h_init or initializers.TruncatedNormal(
+389          stddev=1.0 / tf.sqrt(tf.constant(self._hidden_size, dtype=dtype)))
+390      self._w_i = tf.Variable(
+391          w_i_init([input_size, 4 * self._hidden_size], dtype), name=&quot;w_i&quot;)
+392      self._w_h = tf.Variable(
+393          w_h_init([self._hidden_size, 4 * self._hidden_size], dtype), name=&quot;w_h&quot;)
+394      b_i, b_f, b_g, b_o = tf.split(
+395          self._b_init([4 * self._hidden_size], dtype), num_or_size_splits=4)
+396      b_f += self._forget_bias
+397      self.b = tf.Variable(tf.concat([b_i, b_f, b_g, b_o], axis=0), name=&quot;b&quot;)
+398  def _specialize_per_device(api_name, specializations, default):
+399    list_logical_devices = tf.config.experimental.list_logical_devices
+400    def wrapper(*args, **kwargs):
+401      .format(api_name)
+402      ctx = context_lib.context()
+403      if ctx.executing_eagerly():
+404        device = ctx.device_spec.device_type
+405        if device is None:
+406          device = &quot;GPU&quot; if list_logical_devices(&quot;GPU&quot;) else &quot;CPU&quot;
+407        specialization = specializations.get(device) or specializations[default]
+408        return specialization(*args, **kwargs)
+409      unique_api_name = &quot;{}_{}&quot;.format(api_name, uuid.uuid4())
+410      functions = {}
+411      for device, specialization in specializations.items():
+412        functions[device] = tf.function(
+413            specialization,
+414            experimental_attributes={
+415                &quot;api_implements&quot;: unique_api_name,
+416                &quot;api_preferred_device&quot;: device
+417            })
+418        concrete_func = functions[device].get_concrete_function(*args, **kwargs)
+419        concrete_func.add_to_graph()
+420        concrete_func.add_gradient_functions_to_graph()
+421      return functions[default](*args, **kwargs)
+422    return wrapper
+423  def _fallback_unrolled_lstm(input_sequence, initial_state, w_i, w_h, b):
+424    return dynamic_unroll(
+425        functools.partial(_lstm_fn, w_i=w_i, w_h=w_h, b=b), input_sequence,
+426        initial_state)
+427  def _block_unrolled_lstm(input_sequence, initial_state, w_i, w_h, b):
+428    w_peephole = tf.zeros(
+429        tf.shape(initial_state.hidden)[1:], dtype=initial_state.hidden.dtype)
+430    _, all_cell, _, _, _, _, all_hidden = tf.raw_ops.BlockLSTMV2(
+431        seq_len_max=tf.cast(tf.shape(input_sequence)[0], tf.int64),
+432        x=input_sequence,
+433        cs_prev=initial_state.cell,
+434        h_prev=initial_state.hidden,
+435        w=tf.concat([w_i, w_h], axis=0),
+436        wci=w_peephole,
+437        wcf=w_peephole,
+438        wco=w_peephole,
+439        b=b,
+440        use_peephole=False)
+441    return all_hidden, LSTMState(all_hidden[-1], all_cell[-1])
+442  def _cudnn_unrolled_lstm(input_sequence, initial_state, w_i, w_h, b):
+443    output_sequence, all_hidden, all_cell, _ = tf.raw_ops.CudnnRNN(
+444        input=input_sequence,
+445        input_h=tf.expand_dims(initial_state.hidden, axis=0),
+446        input_c=tf.expand_dims(initial_state.cell, axis=0),
+447        params=tf.concat(
+448            [
+449                tf.reshape(tf.transpose(w_i), [-1]),
+450                tf.reshape(tf.transpose(w_h), [-1]),
+451                b,
+452                tf.zeros_like(b),
+453            ],
+454            axis=0),
+455        rnn_mode=&quot;lstm&quot;)
+456    return output_sequence, LSTMState(all_hidden[-1], all_cell[-1])
+457  _unrolled_lstm_impls = {
+458      &quot;GPU&quot;: _cudnn_unrolled_lstm,
+459      &quot;TPU&quot;: _fallback_unrolled_lstm,
+460  }
+461  if hasattr(tf.raw_ops, &quot;BlockLSTMV2&quot;):
+462    _unrolled_lstm_impls[&quot;CPU&quot;] = _block_unrolled_lstm
+463  _specialized_unrolled_lstm = _specialize_per_device(
+464      &quot;snt_unrolled_lstm&quot;, specializations=_unrolled_lstm_impls, default=&quot;TPU&quot;)
+465  class _RecurrentDropoutWrapper(RNNCore):
+466    def __init__(self, base_core: RNNCore, rates, seed: Optional[int] = None):
+467      super().__init__(name=base_core.name + &quot;_recurrent_dropout&quot;)
+468      self._base_core = base_core
+469      self._rates = rates
+470      self._seed = seed
+471    def __call__(self, inputs, prev_state):
+472      prev_core_state, dropout_masks = prev_state
+473      prev_core_state = tree.map_structure(
+474          lambda s, mask: s  # pylint: disable=g-long-lambda
+475          if mask is None else s * mask,
+476          prev_core_state,
+477          dropout_masks)
+478      output, next_core_state = self._base_core(inputs, prev_core_state)
+479      return output, (next_core_state, dropout_masks)
+480    def initial_state(self, batch_size, **kwargs):
+481      core_initial_state = self._base_core.initial_state(batch_size, **kwargs)
+482      def maybe_dropout(s, rate):
+483        if rate is None:
+484          return None
+485        else:
+486          return tf.nn.dropout(tf.ones_like(s), rate=rate, seed=self._seed)
+487      dropout_masks = tree.map_structure(maybe_dropout, core_initial_state,
+488                                         self._rates)
+489      return core_initial_state, dropout_masks
+490  def lstm_with_recurrent_dropout(hidden_size, dropout=0.5, seed=None, **kwargs):
+491    r
+492    if dropout &lt; 0 or dropout &gt;= 1:
+493      raise ValueError(
+494          &quot;dropout must be in the range [0, 1), got {}&quot;.format(dropout))
+495    lstm = LSTM(hidden_size, **kwargs)
+496    rate = LSTMState(hidden=dropout, cell=None)
+497    return _RecurrentDropoutWrapper(lstm, rate, seed), lstm
+498  class _ConvNDLSTM(RNNCore):
+499    r
+500    def __init__(self,
+501                 num_spatial_dims: int,
+502                 input_shape: types.ShapeLike,
+503                 output_channels: int,
+504                 kernel_shape: Union[int, Sequence[int]],
+505                 data_format: Optional[str] = None,
+506                 w_i_init: Optional[initializers.Initializer] = None,
+507                 w_h_init: Optional[initializers.Initializer] = None,
+508                 b_init: Optional[initializers.Initializer] = None,
+509                 forget_bias: types.FloatLike = 1.0,
+510                 dtype: tf.DType = tf.float32,
+511                 name: Optional[str] = None):
+512      super().__init__(name)
+513      self._num_spatial_dims = num_spatial_dims
+514      self._input_shape = list(input_shape)
+515      self._channel_index = 1 if (data_format is not None and
+516                                  data_format.startswith(&quot;NC&quot;)) else -1
+517      self._output_channels = output_channels
+518      self._b_init = b_init or initializers.Zeros()
+519      self._forget_bias = forget_bias
+520      self._dtype = dtype
+521      self._input_to_hidden = conv.ConvND(
+522          self._num_spatial_dims,
+523          output_channels=4 * output_channels,
+524          kernel_shape=kernel_shape,
+525          padding=&quot;SAME&quot;,
+526          with_bias=False,
+527          w_init=w_i_init,
+528          data_format=data_format,
+529          name=&quot;input_to_hidden&quot;)
+530      self._hidden_to_hidden = conv.ConvND(
+531          self._num_spatial_dims,
+532          output_channels=4 * output_channels,
+533          kernel_shape=kernel_shape,
+534          padding=&quot;SAME&quot;,
+535          with_bias=False,
+536          w_init=w_h_init,
+537          data_format=data_format,
+538          name=&quot;hidden_to_hidden&quot;)
+539    def __call__(self, inputs, prev_state):
+540      self._initialize(inputs)
+541      gates = self._input_to_hidden(inputs)
+542      gates += self._hidden_to_hidden(prev_state.hidden)
+543      gates += self.b
+544      i, f, g, o = tf.split(
+545          gates, num_or_size_splits=4, axis=self._num_spatial_dims + 1)
+546      next_cell = tf.sigmoid(f) * prev_state.cell
+547      next_cell += tf.sigmoid(i) * tf.tanh(g)
+548      next_hidden = tf.sigmoid(o) * tf.tanh(next_cell)
+549      return next_hidden, LSTMState(hidden=next_hidden, cell=next_cell)
+550    @property
+551    def input_to_hidden(self):
+552      return self._input_to_hidden.w
+553    @property
+554    def hidden_to_hidden(self):
+555      return self._hidden_to_hidden.w
+556    def initial_state(self, batch_size):
+557      shape = list(self._input_shape)
+558      shape[self._channel_index] = self._output_channels
+559      shape = [batch_size] + shape
+560      return LSTMState(
+561          hidden=tf.zeros(shape, dtype=self._dtype),
+562          cell=tf.zeros(shape, dtype=self._dtype))
+563    @once.once
+564    def _initialize(self, inputs):
+565      dtype = _check_inputs_dtype(inputs, self._dtype)
+566      b_i, b_f, b_g, b_o = tf.split(
+567          self._b_init([4 * self._output_channels], dtype), num_or_size_splits=4)
+568      b_f += self._forget_bias
+569      self.b = tf.Variable(tf.concat([b_i, b_f, b_g, b_o], axis=0), name=&quot;b&quot;)
+570  class Conv1DLSTM(_ConvNDLSTM):  # pylint: disable=missing-docstring,empty-docstring
+571    __doc__ = _ConvNDLSTM.__doc__.replace(&quot;``num_spatial_dims``&quot;, &quot;1&quot;)
+572    def __init__(self,
+573                 input_shape: types.ShapeLike,
+574                 output_channels: int,
+575                 kernel_shape: Union[int, Sequence[int]],
+576                 data_format=&quot;NWC&quot;,
+577                 w_i_init: Optional[initializers.Initializer] = None,
+578                 w_h_init: Optional[initializers.Initializer] = None,
+579                 b_init: Optional[initializers.Initializer] = None,
+580                 forget_bias: types.FloatLike = 1.0,
+581                 dtype: tf.DType = tf.float32,
+582                 name: Optional[str] = None):
+583      super().__init__(
+584          num_spatial_dims=1,
+585          input_shape=input_shape,
+586          output_channels=output_channels,
+587          kernel_shape=kernel_shape,
+588          data_format=data_format,
+589          w_i_init=w_i_init,
+590          w_h_init=w_h_init,
+591          b_init=b_init,
+592          forget_bias=forget_bias,
+593          dtype=dtype,
+594          name=name)
+595  class Conv2DLSTM(_ConvNDLSTM):  # pylint: disable=missing-docstring,empty-docstring
+596    __doc__ = _ConvNDLSTM.__doc__.replace(&quot;``num_spatial_dims``&quot;, &quot;2&quot;)
+597    def __init__(self,
+598                 input_shape: types.ShapeLike,
+599                 output_channels: int,
+600                 kernel_shape: Union[int, Sequence[int]],
+601                 data_format: str = &quot;NHWC&quot;,
+602                 w_i_init: Optional[initializers.Initializer] = None,
+603                 w_h_init: Optional[initializers.Initializer] = None,
+604                 b_init: Optional[initializers.Initializer] = None,
+605                 forget_bias: types.FloatLike = 1.0,
+606                 dtype: tf.DType = tf.float32,
+607                 name: Optional[str] = None):
+608      super().__init__(
+609          num_spatial_dims=2,
+610          input_shape=input_shape,
+611          output_channels=output_channels,
+612          kernel_shape=kernel_shape,
+613          data_format=data_format,
+614          w_i_init=w_i_init,
+615          w_h_init=w_h_init,
+616          b_init=b_init,
+617          forget_bias=forget_bias,
+618          dtype=dtype,
+619          name=name)
+620  class Conv3DLSTM(_ConvNDLSTM):  # pylint: disable=missing-docstring,empty-docstring
+621    __doc__ = _ConvNDLSTM.__doc__.replace(&quot;``num_spatial_dims``&quot;, &quot;3&quot;)
+622    def __init__(self,
+623                 input_shape: types.ShapeLike,
+624                 output_channels: int,
+625                 kernel_shape: Union[int, Sequence[int]],
+626                 data_format: str = &quot;NDHWC&quot;,
+627                 w_i_init: Optional[initializers.Initializer] = None,
+628                 w_h_init: Optional[initializers.Initializer] = None,
+629                 b_init: Optional[initializers.Initializer] = None,
+630                 forget_bias: types.FloatLike = 1.0,
+631                 dtype: tf.DType = tf.float32,
+632                 name: Optional[str] = None):
+633      super().__init__(
+634          num_spatial_dims=3,
+635          input_shape=input_shape,
+636          output_channels=output_channels,
+637          kernel_shape=kernel_shape,
+638          data_format=data_format,
+639          w_i_init=w_i_init,
+640          w_h_init=w_h_init,
+641          b_init=b_init,
+642          forget_bias=forget_bias,
+643          dtype=dtype,
+644          name=name)
+645  class GRU(RNNCore):
+646    r
+647    def __init__(self,
+648                 hidden_size,
+649                 w_i_init: Optional[initializers.Initializer] = None,
+650                 w_h_init: Optional[initializers.Initializer] = None,
+651                 b_init: Optional[initializers.Initializer] = None,
+652                 dtype: tf.DType = tf.float32,
+653                 name: Optional[str] = None):
+654      super().__init__(name)
+655      self._hidden_size = hidden_size
+656      glorot_uniform = initializers.VarianceScaling(
+<span onclick='openModal()' class='match'>657          mode=&quot;fan_avg&quot;, distribution=&quot;uniform&quot;)
+658      self._w_i_init = w_i_init or glorot_uniform
+659      self._w_h_init = w_h_init or glorot_uniform
+660      self._b_init = b_init or initializers.Zeros()
+661      self._dtype = dtype
+662    def __call__(self, inputs, prev_state):
+663      self._initialize(inputs)
+664      gates_x = tf.matmul(inputs, self._w_i)
+</span>665      zr_idx = slice(2 * self._hidden_size)
+666      zr_x = gates_x[:, zr_idx]
+667      zr_h = tf.matmul(prev_state, self._w_h[:, zr_idx])
+668      zr = zr_x + zr_h + self.b[zr_idx]
+669      z, r = tf.split(tf.sigmoid(zr), num_or_size_splits=2, axis=1)
+670      a_idx = slice(2 * self._hidden_size, 3 * self._hidden_size)
+671      a_x = gates_x[:, a_idx]
+672      a_h = tf.matmul(r * prev_state, self._w_h[:, a_idx])
+673      a = tf.tanh(a_x + a_h + self.b[a_idx])
+674      next_state = (1 - z) * prev_state + z * a
+675      return next_state, next_state
+676    def initial_state(self, batch_size):
+677      return tf.zeros([batch_size, self._hidden_size], dtype=self._dtype)
+678    @property
+679    def input_to_hidden(self):
+680      return self._w_i
+681    @property
+682    def hidden_to_hidden(self):
+683      return self._w_h
+684    @once.once
+685    def _initialize(self, inputs):
+686      utils.assert_rank(inputs, 2)
+687      input_size = inputs.shape[1]
+688      dtype = _check_inputs_dtype(inputs, self._dtype)
+689      self._w_i = tf.Variable(
+690          self._w_i_init([input_size, 3 * self._hidden_size], dtype), name=&quot;w_i&quot;)
+691      self._w_h = tf.Variable(
+692          self._w_h_init([self._hidden_size, 3 * self._hidden_size], dtype),
+693          name=&quot;w_h&quot;)
+694      self.b = tf.Variable(self._b_init([3 * self._hidden_size], dtype), name=&quot;b&quot;)
+695  class CuDNNGRU(RNNCore):
+696    def __init__(self,
+697                 hidden_size,
+698                 w_i_init: Optional[initializers.Initializer] = None,
+699                 w_h_init: Optional[initializers.Initializer] = None,
+700                 b_init: Optional[initializers.Initializer] = None,
+701                 dtype: tf.DType = tf.float32,
+702                 name: Optional[str] = None):
+703      super().__init__(name)
+704      self._hidden_size = hidden_size
+705      glorot_uniform = initializers.VarianceScaling(
+706          mode=&quot;fan_avg&quot;, distribution=&quot;uniform&quot;)
+707      self._w_i_init = w_i_init or glorot_uniform
+708      self._w_h_init = w_h_init or glorot_uniform
+709      self._b_init = b_init or initializers.Zeros()
+710      self._dtype = dtype
+711    def __call__(self, inputs, prev_state):
+712      self._initialize(inputs)
+713      w_iz, w_ir, w_ia = tf.split(self._w_i, num_or_size_splits=3, axis=1)
+714      w_hz, w_hr, w_ha = tf.split(self._w_h, num_or_size_splits=3, axis=1)
+715      b_z, b_r, b_a = tf.split(self.b, num_or_size_splits=3)
+716      b_h_zero = tf.zeros([self._hidden_size])
+717      outputs, next_hidden, _, _ = tf.raw_ops.CudnnRNN(
+718          input=inputs,
+719          input_h=tf.expand_dims(prev_state, axis=0),
+720          input_c=0,
+721          params=tf.concat(
+722              [
+723                  tf.reshape(tf.transpose(w_ir), [-1]),
+724                  tf.reshape(tf.transpose(w_iz), [-1]),
+725                  tf.reshape(tf.transpose(w_ia), [-1]),
+726                  tf.reshape(tf.transpose(w_hr), [-1]),
+727                  tf.reshape(tf.transpose(w_hz), [-1]),
+728                  tf.reshape(tf.transpose(w_ha), [-1]),
+729                  b_r,
+730                  b_z,
+731                  b_a,
+732                  b_h_zero,
+733                  b_h_zero,
+734                  b_h_zero,
+735              ],
+736              axis=0),
+737          rnn_mode=&quot;gru&quot;)
+738      return outputs, next_hidden
+739    @property
+740    def input_to_hidden(self):
+741      return self._w_i
+742    @property
+743    def hidden_to_hidden(self):
+744      return self._w_h
+745    def initial_state(self, batch_size):
+746      return tf.zeros([batch_size, self._hidden_size], dtype=self._dtype)
+747    @once.once
+748    def _initialize(self, inputs):
+749      utils.assert_rank(inputs, 3)  # [num_steps, batch_size, input_size].
+750      input_size = inputs.shape[2]
+751      dtype = _check_inputs_dtype(inputs, self._dtype)
+752      self._w_i = tf.Variable(
+753          self._w_i_init([input_size, 3 * self._hidden_size], dtype), name=&quot;w_i&quot;)
+754      self._w_h = tf.Variable(
+755          self._w_h_init([self._hidden_size, 3 * self._hidden_size], dtype),
+756          name=&quot;w_h&quot;)
+757      self.b = tf.Variable(self._b_init([3 * self._hidden_size], dtype), name=&quot;b&quot;)
+758  def _check_inputs_dtype(inputs, expected_dtype):
+759    if inputs.dtype is not expected_dtype:
+760      raise TypeError(&quot;inputs must have dtype {!r}, got {!r}&quot;.format(
+761          expected_dtype, inputs.dtype))
+762    return expected_dtype
+</code></pre>
+        </div>
+        <div class="column">
+            <h3>sonnet-MDEwOlJlcG9zaXRvcnk4NzA2NzIxMg==-flat-recurrent.py</h3>
+            <pre><code>1  import abc
+2  import collections
+3  import functools
+4  from typing import Optional, Sequence, Tuple, Union
+5  import uuid
+6  from sonnet.src import base
+7  from sonnet.src import conv
+8  from sonnet.src import initializers
+9  from sonnet.src import linear
+10  from sonnet.src import once
+11  from sonnet.src import types
+12  from sonnet.src import utils
+13  import tensorflow.compat.v1 as tf1
+14  import tensorflow as tf
+15  import tree
+16  from tensorflow.python import context as context_lib
+17  class RNNCore(base.Module, metaclass=abc.ABCMeta):
+18    @abc.abstractmethod
+19    def __call__(self, inputs: types.TensorNest, prev_state):
+20    @abc.abstractmethod
+21    def initial_state(self, batch_size: types.IntegerLike, **kwargs):
+22  class UnrolledRNN(base.Module, metaclass=abc.ABCMeta):
+23    @abc.abstractmethod
+24    def __call__(self, input_sequence: types.TensorNest,
+25                 initial_state: types.TensorNest):
+26    @abc.abstractmethod
+27    def initial_state(self, batch_size: types.IntegerLike, **kwargs):
+28  class TrainableState(base.Module):
+29    @classmethod
+30    def for_core(cls,
+31                 core: RNNCore,
+32                 mask: Optional[types.TensorNest] = None,
+33                 name: Optional[str] = None):
+34      initial_values = tree.map_structure(lambda s: tf.squeeze(s, axis=0),
+35                                          core.initial_state(batch_size=1))
+36      return cls(initial_values, mask, name)
+37    def __init__(self,
+38                 initial_values: types.TensorNest,
+39                 mask: Optional[types.TensorNest] = None,
+40                 name: Optional[str] = None):
+41      super().__init__(name)
+42      flat_initial_values = tree.flatten_with_path(initial_values)
+43      if mask is None:
+44        flat_mask = [True] * len(flat_initial_values)
+45      else:
+46        tree.assert_same_structure(initial_values, mask)
+47        flat_mask = tree.flatten(mask)
+48      flat_template = []
+49      for (path, initial_value), trainable in zip(flat_initial_values, flat_mask):
+50        name = &quot;/&quot;.join(map(str, path)) or &quot;state&quot;
+51        flat_template.append(
+52            tf.Variable(
+53                tf.expand_dims(initial_value, axis=0),
+54                trainable=trainable,
+55                name=name))
+56      self._template = tree.unflatten_as(initial_values, flat_template)
+57    def __call__(self, batch_size: int) -&gt; types.TensorNest:
+58      return tree.map_structure(
+59          lambda s: tf.tile(s, [batch_size] + [1] * (s.shape.rank - 1)),
+60          self._template)
+61  def static_unroll(
+62      core: RNNCore,
+63      input_sequence: types.TensorNest,  # time-major.
+64      initial_state: types.TensorNest,
+65      sequence_length: Optional[types.IntegerLike] = None
+66  ) -&gt; Tuple[types.TensorNest, types.TensorNest]:
+67    num_steps, input_tas = _unstack_input_sequence(input_sequence)
+68    if not isinstance(num_steps, int):
+69      raise ValueError(
+70          &quot;input_sequence must have a statically known number of time steps&quot;)
+71    outputs = None
+72    state = initial_state
+73    output_accs = None
+74    for t in range(num_steps):
+75      outputs, state = _rnn_step(
+76          core,
+77          input_tas,
+78          sequence_length,
+79          t,
+80          prev_outputs=outputs,
+81          prev_state=state)
+82      if t == 0:
+83        output_accs = tree.map_structure(lambda o: _ListWrapper([o]), outputs)
+84      else:
+85        tree.map_structure(lambda acc, o: acc.data.append(o), output_accs,
+86                           outputs)
+87    output_sequence = tree.map_structure(lambda acc: tf.stack(acc.data),
+88                                         output_accs)
+89    return output_sequence, state
+90  class _ListWrapper:
+91    __slots__ = [&quot;data&quot;]
+92    def __init__(self, data):
+93      self.data = data
+94  @utils.smart_autograph
+95  def dynamic_unroll(
+96      core,
+97      input_sequence,  # time-major.
+98      initial_state,
+99      sequence_length=None,
+100      parallel_iterations=1,
+101      swap_memory=False):
+102    num_steps, input_tas = _unstack_input_sequence(input_sequence)
+103    outputs, state = _rnn_step(
+104        core,
+105        input_tas,
+106        sequence_length,
+107        t=0,
+108        prev_outputs=None,
+109        prev_state=initial_state)
+110    output_tas = tree.map_structure(
+111        lambda o: tf.TensorArray(o.dtype, num_steps).write(0, o), outputs)
+112    for t in tf.range(1, num_steps):
+113      tf.autograph.experimental.set_loop_options(
+114          parallel_iterations=parallel_iterations,
+115          swap_memory=swap_memory,
+116          maximum_iterations=num_steps - 1)
+117      outputs, state = _rnn_step(
+118          core,
+119          input_tas,
+120          sequence_length,
+121          t,
+122          prev_outputs=outputs,
+123          prev_state=state)
+124      output_tas = tree.map_structure(
+125          lambda ta, o, _t=t: ta.write(_t, o), output_tas, outputs)
+126    output_sequence = tree.map_structure(tf.TensorArray.stack, output_tas)
+127    return output_sequence, state
+128  def _unstack_input_sequence(input_sequence):
+129    r
+130    flat_input_sequence = tree.flatten(input_sequence)
+131    all_num_steps = {i.shape[0] for i in flat_input_sequence}
+132    if len(all_num_steps) &gt; 1:
+133      raise ValueError(
+134          &quot;input_sequence tensors must have consistent number of time steps&quot;)
+135    [num_steps] = all_num_steps
+136    if num_steps == 0:
+137      raise ValueError(&quot;input_sequence must have at least a single time step&quot;)
+138    elif num_steps is None:
+139      num_steps = tf.shape(flat_input_sequence[0])[0]
+140    input_tas = tree.map_structure(
+141        lambda i: tf.TensorArray(i.dtype, num_steps).unstack(i), input_sequence)
+142    return num_steps, input_tas
+143  def _safe_where(condition, x, y):  # pylint: disable=g-doc-args
+144    if x.shape.rank == 0:
+145      return y
+146    return tf1.where(condition, x, y)
+147  def _rnn_step(core, input_tas, sequence_length, t, prev_outputs, prev_state):
+148    outputs, state = core(
+149        tree.map_structure(lambda i: i.read(t), input_tas), prev_state)
+150    if prev_outputs is None:
+151      assert t == 0
+152      prev_outputs = tree.map_structure(tf.zeros_like, outputs)
+153    if sequence_length is not None:
+154      maybe_propagate = functools.partial(_safe_where, t &gt;= sequence_length)
+155      outputs = tree.map_structure(maybe_propagate, prev_outputs, outputs)
+156      state = tree.map_structure(maybe_propagate, prev_state, state)
+157    return outputs, state
+158  class VanillaRNN(RNNCore):
+159    def __init__(self,
+160                 hidden_size: int,
+161                 activation: types.ActivationFn = tf.tanh,
+162                 w_i_init: Optional[initializers.Initializer] = None,
+163                 w_h_init: Optional[initializers.Initializer] = None,
+164                 b_init: Optional[initializers.Initializer] = None,
+165                 dtype: tf.DType = tf.float32,
+166                 name: Optional[str] = None):
+167      super().__init__(name)
+168      self._hidden_size = hidden_size
+169      self._activation = activation
+170      self._b_init = b_init or initializers.Zeros()
+171      self._dtype = dtype
+172      self._input_to_hidden = linear.Linear(
+173          hidden_size, with_bias=False, w_init=w_i_init, name=&quot;input_to_hidden&quot;)
+174      self._hidden_to_hidden = linear.Linear(
+175          hidden_size, with_bias=False, w_init=w_h_init, name=&quot;hidden_to_hidden&quot;)
+176    @property
+177    def input_to_hidden(self) -&gt; tf.Variable:
+178      return self._input_to_hidden.w
+179    @property
+180    def hidden_to_hidden(self) -&gt; tf.Variable:
+181      return self._hidden_to_hidden.w
+182    def __call__(self, inputs: types.TensorNest,
+183                 prev_state: types.TensorNest) -&gt; Tuple[tf.Tensor, tf.Tensor]:
+184      self._initialize(inputs)
+185      outputs = self._activation(
+186          self._input_to_hidden(inputs) + self._hidden_to_hidden(prev_state) +
+187          self._b)
+188      return outputs, outputs
+189    def initial_state(self, batch_size: int) -&gt; tf.Tensor:
+190      return tf.zeros(shape=[batch_size, self._hidden_size], dtype=self._dtype)
+191    @once.once
+192    def _initialize(self, inputs: tf.Tensor):
+193      dtype = _check_inputs_dtype(inputs, self._dtype)
+194      self._b = tf.Variable(self._b_init([self._hidden_size], dtype), name=&quot;b&quot;)
+195  class _LegacyDeepRNN(RNNCore):
+196    def __init__(self,
+197                 layers,
+198                 skip_connections,
+199                 concat_final_output_if_skip=True,
+200                 name: Optional[str] = None):
+201      r
+202      super().__init__(name)
+203      self._layers = layers if layers is not None else []
+204      self._skip_connections = skip_connections
+205      self._concat_final_output_if_skip = concat_final_output_if_skip
+206    def __call__(self, inputs, prev_state):
+207      current_inputs = inputs
+208      outputs = []
+209      next_states = []
+210      recurrent_idx = 0
+211      concat = lambda *args: tf.concat(args, axis=-1)
+212      for idx, layer in enumerate(self._layers):
+213        if self._skip_connections and idx &gt; 0:
+214          current_inputs = tree.map_structure(concat, inputs, current_inputs)
+215        if isinstance(layer, RNNCore):
+216          current_inputs, next_state = layer(current_inputs,
+217                                             prev_state[recurrent_idx])
+218          next_states.append(next_state)
+219          recurrent_idx += 1
+220        else:
+221          current_inputs = layer(current_inputs)
+222        if self._skip_connections:
+223          outputs.append(current_inputs)
+224      if self._skip_connections and self._concat_final_output_if_skip:
+225        outputs = tree.map_structure(concat, *outputs)
+226      else:
+227        outputs = current_inputs
+228      return outputs, tuple(next_states)
+229    def initial_state(self, batch_size, **kwargs):
+230      return tuple(
+231          layer.initial_state(batch_size, **kwargs)
+232          for layer in self._layers
+233          if isinstance(layer, RNNCore))
+234  class DeepRNN(_LegacyDeepRNN):
+235    r
+236    def __init__(self, layers, name: Optional[str] = None):
+237      super().__init__(layers, skip_connections=False, name=name)
+238  def deep_rnn_with_skip_connections(
+239      layers: Sequence[RNNCore],
+240      concat_final_output: bool = True,
+241      name: str = &quot;deep_rnn_with_skip_connections&quot;) -&gt; RNNCore:
+242    r
+243    if not all(isinstance(l, RNNCore) for l in layers):
+244      raise ValueError(&quot;deep_rnn_with_skip_connections requires all layers to be &quot;
+245                       &quot;instances of RNNCore&quot;)
+246    return _LegacyDeepRNN(
+247        layers,
+248        skip_connections=True,
+249        concat_final_output_if_skip=concat_final_output,
+250        name=name)
+251  class _ResidualWrapper(RNNCore):
+252    def __init__(self, base_core: RNNCore):
+253      super().__init__(name=base_core.name + &quot;_residual&quot;)
+254      self._base_core = base_core
+255    def __call__(self, inputs: types.TensorNest, prev_state: types.TensorNest):
+256      outputs, next_state = self._base_core(inputs, prev_state)
+257      residual = tree.map_structure(lambda i, o: i + o, inputs, outputs)
+258      return residual, next_state
+259    def initial_state(self, batch_size, **kwargs):
+260      return self._base_core.initial_state(batch_size, **kwargs)
+261  def deep_rnn_with_residual_connections(
+262      layers: Sequence[RNNCore],
+263      name: str = &quot;deep_rnn_with_residual_connections&quot;) -&gt; RNNCore:
+264    r
+265    if not all(isinstance(l, RNNCore) for l in layers):
+266      raise ValueError(
+267          &quot;deep_rnn_with_residual_connections requires all layers to be &quot;
+268          &quot;instances of RNNCore&quot;)
+269    return _LegacyDeepRNN([_ResidualWrapper(l) for l in layers],
+270                          skip_connections=False,
+271                          name=name)
+272  LSTMState = collections.namedtuple(&quot;LSTMState&quot;, [&quot;hidden&quot;, &quot;cell&quot;])
+273  class LSTM(RNNCore):
+274    r
+275    def __init__(self,
+276                 hidden_size: int,
+277                 projection_size: Optional[int] = None,
+278                 projection_init: Optional[initializers.Initializer] = None,
+279                 w_i_init: Optional[initializers.Initializer] = None,
+280                 w_h_init: Optional[initializers.Initializer] = None,
+281                 b_init: Optional[initializers.Initializer] = None,
+282                 forget_bias: types.FloatLike = 1.0,
+283                 dtype: tf.DType = tf.float32,
+284                 name: Optional[str] = None):
+285      super().__init__(name)
+286      self._hidden_size = hidden_size
+287      self._projection_size = projection_size
+288      self._eff_hidden_size = self._projection_size or self._hidden_size
+289      self._projection_init = projection_init
+290      if projection_size is None and projection_init is not None:
+291        raise ValueError(
+292            &quot;projection_init must be None when projection is not used&quot;)
+293      self._w_i_init = w_i_init
+294      self._w_h_init = w_h_init
+295      self._b_init = b_init or initializers.Zeros()
+296      self._forget_bias = forget_bias
+297      self._dtype = dtype
+298    def __call__(self, inputs, prev_state):
+299      self._initialize(inputs)
+300      return _lstm_fn(inputs, prev_state, self._w_i, self._w_h, self.b,
+301                      self.projection)
+302    def initial_state(self, batch_size: int) -&gt; LSTMState:
+303      return LSTMState(
+304          hidden=tf.zeros([batch_size, self._eff_hidden_size], dtype=self._dtype),
+305          cell=tf.zeros([batch_size, self._hidden_size], dtype=self._dtype))
+306    @property
+307    def input_to_hidden(self):
+308      return self._w_i
+309    @property
+310    def hidden_to_hidden(self):
+311      return self._w_h
+312    @once.once
+313    def _initialize(self, inputs):
+314      utils.assert_rank(inputs, 2)
+315      input_size = inputs.shape[1]
+316      dtype = _check_inputs_dtype(inputs, self._dtype)
+317      w_i_init = self._w_i_init or initializers.TruncatedNormal(
+318          stddev=1.0 / tf.sqrt(tf.cast(input_size, dtype)))
+319      w_h_init = self._w_h_init or initializers.TruncatedNormal(
+320          stddev=1.0 / tf.sqrt(tf.constant(self._eff_hidden_size, dtype=dtype)))
+321      self._w_i = tf.Variable(
+322          w_i_init([input_size, 4 * self._hidden_size], dtype), name=&quot;w_i&quot;)
+323      self._w_h = tf.Variable(
+324          w_h_init([self._eff_hidden_size, 4 * self._hidden_size], dtype),
+325          name=&quot;w_h&quot;)
+326      b_i, b_f, b_g, b_o = tf.split(
+327          self._b_init([4 * self._hidden_size], dtype), num_or_size_splits=4)
+328      b_f += self._forget_bias
+329      self.b = tf.Variable(tf.concat([b_i, b_f, b_g, b_o], axis=0), name=&quot;b&quot;)
+330      if self._projection_size is None:
+331        self.projection = None
+332      else:
+333        projection_init = self._projection_init
+334        if projection_init is None:
+335          projection_init = initializers.TruncatedNormal(
+336              stddev=1.0 / tf.sqrt(tf.constant(self._hidden_size, dtype=dtype)))
+337        self.projection = tf.Variable(
+338            projection_init([self._hidden_size, self._projection_size], dtype),
+339            name=&quot;projection&quot;)
+340  def _lstm_fn(inputs, prev_state, w_i, w_h, b, projection=None):
+341    gates_x = tf.matmul(inputs, w_i)
+342    gates_h = tf.matmul(prev_state.hidden, w_h)
+343    gates = gates_x + gates_h + b
+344    i, f, g, o = tf.split(gates, num_or_size_splits=4, axis=1)
+345    next_cell = tf.sigmoid(f) * prev_state.cell
+346    next_cell += tf.sigmoid(i) * tf.tanh(g)
+347    next_hidden = tf.sigmoid(o) * tf.tanh(next_cell)
+348    if projection is not None:
+349      next_hidden = tf.matmul(next_hidden, projection)
+350    return next_hidden, LSTMState(hidden=next_hidden, cell=next_cell)
+351  class UnrolledLSTM(UnrolledRNN):
+352    def __init__(self,
+353                 hidden_size,
+354                 w_i_init: Optional[initializers.Initializer] = None,
+355                 w_h_init: Optional[initializers.Initializer] = None,
+356                 b_init: Optional[initializers.Initializer] = None,
+357                 forget_bias: types.FloatLike = 1.0,
+358                 dtype: tf.DType = tf.float32,
+359                 name: Optional[str] = None):
+360      super().__init__(name)
+361      self._hidden_size = hidden_size
+362      self._w_i_init = w_i_init
+363      self._w_h_init = w_h_init
+364      self._b_init = b_init or initializers.Zeros()
+365      self._forget_bias = forget_bias
+366      self._dtype = dtype
+367    def __call__(self, input_sequence, initial_state):
+368      self._initialize(input_sequence)
+369      return _specialized_unrolled_lstm(input_sequence, initial_state, self._w_i,
+370                                        self._w_h, self.b)
+371    def initial_state(self, batch_size):
+372      return LSTMState(
+373          hidden=tf.zeros([batch_size, self._hidden_size], dtype=self._dtype),
+374          cell=tf.zeros([batch_size, self._hidden_size], dtype=self._dtype))
+375    @property
+376    def input_to_hidden(self):
+377      return self._w_i
+378    @property
+379    def hidden_to_hidden(self):
+380      return self._w_h
+381    @once.once
+382    def _initialize(self, input_sequence):
+383      utils.assert_rank(input_sequence, 3)  # [num_steps, batch_size, input_size].
+384      input_size = input_sequence.shape[2]
+385      dtype = _check_inputs_dtype(input_sequence, self._dtype)
+386      w_i_init = self._w_i_init or initializers.TruncatedNormal(
+387          stddev=1.0 / tf.sqrt(tf.cast(input_size, dtype)))
+388      w_h_init = self._w_h_init or initializers.TruncatedNormal(
+389          stddev=1.0 / tf.sqrt(tf.constant(self._hidden_size, dtype=dtype)))
+390      self._w_i = tf.Variable(
+391          w_i_init([input_size, 4 * self._hidden_size], dtype), name=&quot;w_i&quot;)
+392      self._w_h = tf.Variable(
+393          w_h_init([self._hidden_size, 4 * self._hidden_size], dtype), name=&quot;w_h&quot;)
+394      b_i, b_f, b_g, b_o = tf.split(
+395          self._b_init([4 * self._hidden_size], dtype), num_or_size_splits=4)
+396      b_f += self._forget_bias
+397      self.b = tf.Variable(tf.concat([b_i, b_f, b_g, b_o], axis=0), name=&quot;b&quot;)
+398  def _specialize_per_device(api_name, specializations, default):
+399    list_logical_devices = tf.config.experimental.list_logical_devices
+400    def wrapper(*args, **kwargs):
+401      .format(api_name)
+402      ctx = context_lib.context()
+403      if ctx.executing_eagerly():
+404        device = ctx.device_spec.device_type
+405        if device is None:
+406          device = &quot;GPU&quot; if list_logical_devices(&quot;GPU&quot;) else &quot;CPU&quot;
+407        specialization = specializations.get(device) or specializations[default]
+408        return specialization(*args, **kwargs)
+409      unique_api_name = &quot;{}_{}&quot;.format(api_name, uuid.uuid4())
+410      functions = {}
+411      for device, specialization in specializations.items():
+412        functions[device] = tf.function(
+413            specialization,
+414            experimental_attributes={
+415                &quot;api_implements&quot;: unique_api_name,
+416                &quot;api_preferred_device&quot;: device
+417            })
+418        concrete_func = functions[device].get_concrete_function(*args, **kwargs)
+419        concrete_func.add_to_graph()
+420        concrete_func.add_gradient_functions_to_graph()
+421      return functions[default](*args, **kwargs)
+422    return wrapper
+423  def _fallback_unrolled_lstm(input_sequence, initial_state, w_i, w_h, b):
+424    return dynamic_unroll(
+425        functools.partial(_lstm_fn, w_i=w_i, w_h=w_h, b=b), input_sequence,
+426        initial_state)
+427  def _block_unrolled_lstm(input_sequence, initial_state, w_i, w_h, b):
+428    w_peephole = tf.zeros(
+429        tf.shape(initial_state.hidden)[1:], dtype=initial_state.hidden.dtype)
+430    _, all_cell, _, _, _, _, all_hidden = tf.raw_ops.BlockLSTMV2(
+431        seq_len_max=tf.cast(tf.shape(input_sequence)[0], tf.int64),
+432        x=input_sequence,
+433        cs_prev=initial_state.cell,
+434        h_prev=initial_state.hidden,
+435        w=tf.concat([w_i, w_h], axis=0),
+436        wci=w_peephole,
+437        wcf=w_peephole,
+438        wco=w_peephole,
+439        b=b,
+440        use_peephole=False)
+441    return all_hidden, LSTMState(all_hidden[-1], all_cell[-1])
+442  def _cudnn_unrolled_lstm(input_sequence, initial_state, w_i, w_h, b):
+443    output_sequence, all_hidden, all_cell, _ = tf.raw_ops.CudnnRNN(
+444        input=input_sequence,
+445        input_h=tf.expand_dims(initial_state.hidden, axis=0),
+446        input_c=tf.expand_dims(initial_state.cell, axis=0),
+447        params=tf.concat(
+448            [
+449                tf.reshape(tf.transpose(w_i), [-1]),
+450                tf.reshape(tf.transpose(w_h), [-1]),
+451                b,
+452                tf.zeros_like(b),
+453            ],
+454            axis=0),
+455        rnn_mode=&quot;lstm&quot;)
+456    return output_sequence, LSTMState(all_hidden[-1], all_cell[-1])
+457  _unrolled_lstm_impls = {
+458      &quot;GPU&quot;: _cudnn_unrolled_lstm,
+459      &quot;TPU&quot;: _fallback_unrolled_lstm,
+460  }
+461  if hasattr(tf.raw_ops, &quot;BlockLSTMV2&quot;):
+462    _unrolled_lstm_impls[&quot;CPU&quot;] = _block_unrolled_lstm
+463  _specialized_unrolled_lstm = _specialize_per_device(
+464      &quot;snt_unrolled_lstm&quot;, specializations=_unrolled_lstm_impls, default=&quot;TPU&quot;)
+465  class _RecurrentDropoutWrapper(RNNCore):
+466    def __init__(self, base_core: RNNCore, rates, seed: Optional[int] = None):
+467      super().__init__(name=base_core.name + &quot;_recurrent_dropout&quot;)
+468      self._base_core = base_core
+469      self._rates = rates
+470      self._seed = seed
+471    def __call__(self, inputs, prev_state):
+472      prev_core_state, dropout_masks = prev_state
+473      prev_core_state = tree.map_structure(
+474          lambda s, mask: s  # pylint: disable=g-long-lambda
+475          if mask is None else s * mask,
+476          prev_core_state,
+477          dropout_masks)
+478      output, next_core_state = self._base_core(inputs, prev_core_state)
+479      return output, (next_core_state, dropout_masks)
+480    def initial_state(self, batch_size, **kwargs):
+481      core_initial_state = self._base_core.initial_state(batch_size, **kwargs)
+482      def maybe_dropout(s, rate):
+483        if rate is None:
+484          return None
+485        else:
+486          return tf.nn.dropout(tf.ones_like(s), rate=rate, seed=self._seed)
+487      dropout_masks = tree.map_structure(maybe_dropout, core_initial_state,
+488                                         self._rates)
+489      return core_initial_state, dropout_masks
+490  def lstm_with_recurrent_dropout(hidden_size, dropout=0.5, seed=None, **kwargs):
+491    r
+492    if dropout &lt; 0 or dropout &gt;= 1:
+493      raise ValueError(
+494          &quot;dropout must be in the range [0, 1), got {}&quot;.format(dropout))
+495    lstm = LSTM(hidden_size, **kwargs)
+496    rate = LSTMState(hidden=dropout, cell=None)
+497    return _RecurrentDropoutWrapper(lstm, rate, seed), lstm
+498  class _ConvNDLSTM(RNNCore):
+499    r
+500    def __init__(self,
+501                 num_spatial_dims: int,
+502                 input_shape: types.ShapeLike,
+503                 output_channels: int,
+504                 kernel_shape: Union[int, Sequence[int]],
+505                 data_format: Optional[str] = None,
+506                 w_i_init: Optional[initializers.Initializer] = None,
+507                 w_h_init: Optional[initializers.Initializer] = None,
+508                 b_init: Optional[initializers.Initializer] = None,
+509                 forget_bias: types.FloatLike = 1.0,
+510                 dtype: tf.DType = tf.float32,
+511                 name: Optional[str] = None):
+512      super().__init__(name)
+513      self._num_spatial_dims = num_spatial_dims
+514      self._input_shape = list(input_shape)
+515      self._channel_index = 1 if (data_format is not None and
+516                                  data_format.startswith(&quot;NC&quot;)) else -1
+517      self._output_channels = output_channels
+518      self._b_init = b_init or initializers.Zeros()
+519      self._forget_bias = forget_bias
+520      self._dtype = dtype
+521      self._input_to_hidden = conv.ConvND(
+522          self._num_spatial_dims,
+523          output_channels=4 * output_channels,
+524          kernel_shape=kernel_shape,
+525          padding=&quot;SAME&quot;,
+526          with_bias=False,
+527          w_init=w_i_init,
+528          data_format=data_format,
+529          name=&quot;input_to_hidden&quot;)
+530      self._hidden_to_hidden = conv.ConvND(
+531          self._num_spatial_dims,
+532          output_channels=4 * output_channels,
+533          kernel_shape=kernel_shape,
+534          padding=&quot;SAME&quot;,
+535          with_bias=False,
+536          w_init=w_h_init,
+537          data_format=data_format,
+538          name=&quot;hidden_to_hidden&quot;)
+539    def __call__(self, inputs, prev_state):
+540      self._initialize(inputs)
+541      gates = self._input_to_hidden(inputs)
+542      gates += self._hidden_to_hidden(prev_state.hidden)
+543      gates += self.b
+544      i, f, g, o = tf.split(
+545          gates, num_or_size_splits=4, axis=self._num_spatial_dims + 1)
+546      next_cell = tf.sigmoid(f) * prev_state.cell
+547      next_cell += tf.sigmoid(i) * tf.tanh(g)
+548      next_hidden = tf.sigmoid(o) * tf.tanh(next_cell)
+549      return next_hidden, LSTMState(hidden=next_hidden, cell=next_cell)
+550    @property
+551    def input_to_hidden(self):
+552      return self._input_to_hidden.w
+553    @property
+554    def hidden_to_hidden(self):
+555      return self._hidden_to_hidden.w
+556    def initial_state(self, batch_size):
+557      shape = list(self._input_shape)
+558      shape[self._channel_index] = self._output_channels
+559      shape = [batch_size] + shape
+560      return LSTMState(
+561          hidden=tf.zeros(shape, dtype=self._dtype),
+562          cell=tf.zeros(shape, dtype=self._dtype))
+563    @once.once
+564    def _initialize(self, inputs):
+565      dtype = _check_inputs_dtype(inputs, self._dtype)
+566      b_i, b_f, b_g, b_o = tf.split(
+567          self._b_init([4 * self._output_channels], dtype), num_or_size_splits=4)
+568      b_f += self._forget_bias
+569      self.b = tf.Variable(tf.concat([b_i, b_f, b_g, b_o], axis=0), name=&quot;b&quot;)
+570  class Conv1DLSTM(_ConvNDLSTM):  # pylint: disable=missing-docstring,empty-docstring
+571    __doc__ = _ConvNDLSTM.__doc__.replace(&quot;``num_spatial_dims``&quot;, &quot;1&quot;)
+572    def __init__(self,
+573                 input_shape: types.ShapeLike,
+574                 output_channels: int,
+575                 kernel_shape: Union[int, Sequence[int]],
+576                 data_format=&quot;NWC&quot;,
+577                 w_i_init: Optional[initializers.Initializer] = None,
+578                 w_h_init: Optional[initializers.Initializer] = None,
+579                 b_init: Optional[initializers.Initializer] = None,
+580                 forget_bias: types.FloatLike = 1.0,
+581                 dtype: tf.DType = tf.float32,
+582                 name: Optional[str] = None):
+583      super().__init__(
+584          num_spatial_dims=1,
+585          input_shape=input_shape,
+586          output_channels=output_channels,
+587          kernel_shape=kernel_shape,
+588          data_format=data_format,
+589          w_i_init=w_i_init,
+590          w_h_init=w_h_init,
+591          b_init=b_init,
+592          forget_bias=forget_bias,
+593          dtype=dtype,
+594          name=name)
+595  class Conv2DLSTM(_ConvNDLSTM):  # pylint: disable=missing-docstring,empty-docstring
+596    __doc__ = _ConvNDLSTM.__doc__.replace(&quot;``num_spatial_dims``&quot;, &quot;2&quot;)
+597    def __init__(self,
+598                 input_shape: types.ShapeLike,
+599                 output_channels: int,
+600                 kernel_shape: Union[int, Sequence[int]],
+601                 data_format: str = &quot;NHWC&quot;,
+602                 w_i_init: Optional[initializers.Initializer] = None,
+603                 w_h_init: Optional[initializers.Initializer] = None,
+604                 b_init: Optional[initializers.Initializer] = None,
+605                 forget_bias: types.FloatLike = 1.0,
+606                 dtype: tf.DType = tf.float32,
+607                 name: Optional[str] = None):
+608      super().__init__(
+609          num_spatial_dims=2,
+610          input_shape=input_shape,
+611          output_channels=output_channels,
+612          kernel_shape=kernel_shape,
+613          data_format=data_format,
+614          w_i_init=w_i_init,
+615          w_h_init=w_h_init,
+616          b_init=b_init,
+617          forget_bias=forget_bias,
+618          dtype=dtype,
+619          name=name)
+620  class Conv3DLSTM(_ConvNDLSTM):  # pylint: disable=missing-docstring,empty-docstring
+621    __doc__ = _ConvNDLSTM.__doc__.replace(&quot;``num_spatial_dims``&quot;, &quot;3&quot;)
+622    def __init__(self,
+623                 input_shape: types.ShapeLike,
+624                 output_channels: int,
+625                 kernel_shape: Union[int, Sequence[int]],
+626                 data_format: str = &quot;NDHWC&quot;,
+627                 w_i_init: Optional[initializers.Initializer] = None,
+628                 w_h_init: Optional[initializers.Initializer] = None,
+629                 b_init: Optional[initializers.Initializer] = None,
+630                 forget_bias: types.FloatLike = 1.0,
+631                 dtype: tf.DType = tf.float32,
+632                 name: Optional[str] = None):
+633      super().__init__(
+634          num_spatial_dims=3,
+635          input_shape=input_shape,
+636          output_channels=output_channels,
+637          kernel_shape=kernel_shape,
+638          data_format=data_format,
+639          w_i_init=w_i_init,
+640          w_h_init=w_h_init,
+641          b_init=b_init,
+642          forget_bias=forget_bias,
+643          dtype=dtype,
+644          name=name)
+645  class GRU(RNNCore):
+646    r
+647    def __init__(self,
+648                 hidden_size,
+649                 w_i_init: Optional[initializers.Initializer] = None,
+650                 w_h_init: Optional[initializers.Initializer] = None,
+651                 b_init: Optional[initializers.Initializer] = None,
+652                 dtype: tf.DType = tf.float32,
+653                 name: Optional[str] = None):
+654      super().__init__(name)
+655      self._hidden_size = hidden_size
+656      glorot_uniform = initializers.VarianceScaling(
+657          mode=&quot;fan_avg&quot;, distribution=&quot;uniform&quot;)
+658      self._w_i_init = w_i_init or glorot_uniform
+659      self._w_h_init = w_h_init or glorot_uniform
+660      self._b_init = b_init or initializers.Zeros()
+661      self._dtype = dtype
+662    def __call__(self, inputs, prev_state):
+663      self._initialize(inputs)
+664      gates_x = tf.matmul(inputs, self._w_i)
+665      zr_idx = slice(2 * self._hidden_size)
+666      zr_x = gates_x[:, zr_idx]
+667      zr_h = tf.matmul(prev_state, self._w_h[:, zr_idx])
+668      zr = zr_x + zr_h + self.b[zr_idx]
+669      z, r = tf.split(tf.sigmoid(zr), num_or_size_splits=2, axis=1)
+670      a_idx = slice(2 * self._hidden_size, 3 * self._hidden_size)
+671      a_x = gates_x[:, a_idx]
+672      a_h = tf.matmul(r * prev_state, self._w_h[:, a_idx])
+673      a = tf.tanh(a_x + a_h + self.b[a_idx])
+674      next_state = (1 - z) * prev_state + z * a
+675      return next_state, next_state
+676    def initial_state(self, batch_size):
+677      return tf.zeros([batch_size, self._hidden_size], dtype=self._dtype)
+678    @property
+679    def input_to_hidden(self):
+680      return self._w_i
+681    @property
+682    def hidden_to_hidden(self):
+683      return self._w_h
+684    @once.once
+685    def _initialize(self, inputs):
+686      utils.assert_rank(inputs, 2)
+687      input_size = inputs.shape[1]
+688      dtype = _check_inputs_dtype(inputs, self._dtype)
+689      self._w_i = tf.Variable(
+690          self._w_i_init([input_size, 3 * self._hidden_size], dtype), name=&quot;w_i&quot;)
+691      self._w_h = tf.Variable(
+692          self._w_h_init([self._hidden_size, 3 * self._hidden_size], dtype),
+693          name=&quot;w_h&quot;)
+694      self.b = tf.Variable(self._b_init([3 * self._hidden_size], dtype), name=&quot;b&quot;)
+695  class CuDNNGRU(RNNCore):
+696    def __init__(self,
+697                 hidden_size,
+698                 w_i_init: Optional[initializers.Initializer] = None,
+699                 w_h_init: Optional[initializers.Initializer] = None,
+700                 b_init: Optional[initializers.Initializer] = None,
+701                 dtype: tf.DType = tf.float32,
+702                 name: Optional[str] = None):
+703      super().__init__(name)
+704      self._hidden_size = hidden_size
+705      glorot_uniform = initializers.VarianceScaling(
+<span onclick='openModal()' class='match'>706          mode=&quot;fan_avg&quot;, distribution=&quot;uniform&quot;)
+707      self._w_i_init = w_i_init or glorot_uniform
+708      self._w_h_init = w_h_init or glorot_uniform
+709      self._b_init = b_init or initializers.Zeros()
+710      self._dtype = dtype
+711    def __call__(self, inputs, prev_state):
+712      self._initialize(inputs)
+713      w_iz, w_ir, w_ia = tf.split(self._w_i, num_or_size_splits=3, axis=1)
+</span>714      w_hz, w_hr, w_ha = tf.split(self._w_h, num_or_size_splits=3, axis=1)
+715      b_z, b_r, b_a = tf.split(self.b, num_or_size_splits=3)
+716      b_h_zero = tf.zeros([self._hidden_size])
+717      outputs, next_hidden, _, _ = tf.raw_ops.CudnnRNN(
+718          input=inputs,
+719          input_h=tf.expand_dims(prev_state, axis=0),
+720          input_c=0,
+721          params=tf.concat(
+722              [
+723                  tf.reshape(tf.transpose(w_ir), [-1]),
+724                  tf.reshape(tf.transpose(w_iz), [-1]),
+725                  tf.reshape(tf.transpose(w_ia), [-1]),
+726                  tf.reshape(tf.transpose(w_hr), [-1]),
+727                  tf.reshape(tf.transpose(w_hz), [-1]),
+728                  tf.reshape(tf.transpose(w_ha), [-1]),
+729                  b_r,
+730                  b_z,
+731                  b_a,
+732                  b_h_zero,
+733                  b_h_zero,
+734                  b_h_zero,
+735              ],
+736              axis=0),
+737          rnn_mode=&quot;gru&quot;)
+738      return outputs, next_hidden
+739    @property
+740    def input_to_hidden(self):
+741      return self._w_i
+742    @property
+743    def hidden_to_hidden(self):
+744      return self._w_h
+745    def initial_state(self, batch_size):
+746      return tf.zeros([batch_size, self._hidden_size], dtype=self._dtype)
+747    @once.once
+748    def _initialize(self, inputs):
+749      utils.assert_rank(inputs, 3)  # [num_steps, batch_size, input_size].
+750      input_size = inputs.shape[2]
+751      dtype = _check_inputs_dtype(inputs, self._dtype)
+752      self._w_i = tf.Variable(
+753          self._w_i_init([input_size, 3 * self._hidden_size], dtype), name=&quot;w_i&quot;)
+754      self._w_h = tf.Variable(
+755          self._w_h_init([self._hidden_size, 3 * self._hidden_size], dtype),
+756          name=&quot;w_h&quot;)
+757      self.b = tf.Variable(self._b_init([3 * self._hidden_size], dtype), name=&quot;b&quot;)
+758  def _check_inputs_dtype(inputs, expected_dtype):
+759    if inputs.dtype is not expected_dtype:
+760      raise TypeError(&quot;inputs must have dtype {!r}, got {!r}&quot;.format(
+761          expected_dtype, inputs.dtype))
+762    return expected_dtype
+</code></pre>
+        </div>
+    
+        <!-- The Modal -->
+        <div id="myModal" class="modal">
+            <div class="modal-content">
+                <span class="row close">&times;</span>
+                <div class='row'>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from sonnet-MDEwOlJlcG9zaXRvcnk4NzA2NzIxMg==-flat-recurrent.py</div>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from sonnet-MDEwOlJlcG9zaXRvcnk4NzA2NzIxMg==-flat-recurrent.py</div>
+                </div>
+                <div class="column column_space"><pre><code>657          mode=&quot;fan_avg&quot;, distribution=&quot;uniform&quot;)
+658      self._w_i_init = w_i_init or glorot_uniform
+659      self._w_h_init = w_h_init or glorot_uniform
+660      self._b_init = b_init or initializers.Zeros()
+661      self._dtype = dtype
+662    def __call__(self, inputs, prev_state):
+663      self._initialize(inputs)
+664      gates_x = tf.matmul(inputs, self._w_i)
+</pre></code></div>
+                <div class="column column_space"><pre><code>706          mode=&quot;fan_avg&quot;, distribution=&quot;uniform&quot;)
+707      self._w_i_init = w_i_init or glorot_uniform
+708      self._w_h_init = w_h_init or glorot_uniform
+709      self._b_init = b_init or initializers.Zeros()
+710      self._dtype = dtype
+711    def __call__(self, inputs, prev_state):
+712      self._initialize(inputs)
+713      w_iz, w_ir, w_ia = tf.split(self._w_i, num_or_size_splits=3, axis=1)
+</pre></code></div>
+            </div>
+        </div>
+        <script>
+        // Get the modal
+        var modal = document.getElementById("myModal");
+        
+        // Get the button that opens the modal
+        var btn = document.getElementById("myBtn");
+        
+        // Get the <span> element that closes the modal
+        var span = document.getElementsByClassName("close")[0];
+        
+        // When the user clicks the button, open the modal
+        function openModal(){
+          modal.style.display = "block";
+        }
+        
+        // When the user clicks on <span> (x), close the modal
+        span.onclick = function() {
+        modal.style.display = "none";
+        }
+        
+        // When the user clicks anywhere outside of the modal, close it
+        window.onclick = function(event) {
+        if (event.target == modal) {
+        modal.style.display = "none";
+        } }
+        
+        </script>
+    </body>
+    </html>
+    

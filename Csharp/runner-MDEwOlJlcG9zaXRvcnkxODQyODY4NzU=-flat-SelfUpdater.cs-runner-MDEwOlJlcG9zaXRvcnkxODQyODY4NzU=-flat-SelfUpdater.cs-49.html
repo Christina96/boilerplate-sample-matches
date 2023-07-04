@@ -1,0 +1,2030 @@
+
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Code Files</title>
+            <style>
+                .column {
+                    width: 47%;
+                    float: left;
+                    padding: 12px;
+                    border: 2px solid #ffd0d0;
+                }
+        
+                .modal {
+                    display: none;
+                    position: fixed;
+                    z-index: 1;
+                    left: 0;
+                    top: 0;
+                    width: 100%;
+                    height: 100%;
+                    overflow: auto;
+                    background-color: rgb(0, 0, 0);
+                    background-color: rgba(0, 0, 0, 0.4);
+                }
+    
+                .modal-content {
+                    height: 250%;
+                    background-color: #fefefe;
+                    margin: 5% auto;
+                    padding: 20px;
+                    border: 1px solid #888;
+                    width: 80%;
+                }
+    
+                .close {
+                    color: #aaa;
+                    float: right;
+                    font-size: 20px;
+                    font-weight: bold;
+                    text-align: right;
+                }
+    
+                .close:hover, .close:focus {
+                    color: black;
+                    text-decoration: none;
+                    cursor: pointer;
+                }
+    
+                .row {
+                    float: right;
+                    width: 100%;
+                }
+    
+                .column_space  {
+                    white - space: pre-wrap;
+                }
+                 
+                pre {
+                    width: 100%;
+                    overflow-y: auto;
+                    background: #f8fef2;
+                }
+                
+                .match {
+                    cursor:pointer; 
+                    background-color:#00ffbb;
+                }
+        </style>
+    </head>
+    <body>
+        <h2>Tokens: 63, <button onclick='openModal()' class='match'>CODE CLONE</button></h2>
+        <div class="column">
+            <h3>runner-MDEwOlJlcG9zaXRvcnkxODQyODY4NzU=-flat-SelfUpdater.cs</h3>
+            <pre><code>1  using System;
+2  using System.Collections.Concurrent;
+3  using System.Collections.Generic;
+4  using System.Diagnostics;
+5  using System.IO;
+6  using System.IO.Compression;
+7  using System.Linq;
+8  using System.Net.Http;
+9  using System.Reflection;
+10  using System.Security.Cryptography;
+11  using System.Threading;
+12  using System.Threading.Tasks;
+13  using GitHub.DistributedTask.WebApi;
+14  using GitHub.Runner.Common;
+15  using GitHub.Runner.Common.Util;
+16  using GitHub.Runner.Sdk;
+17  using GitHub.Services.Common;
+18  using GitHub.Services.WebApi;
+19  namespace GitHub.Runner.Listener
+20  {
+21      [ServiceLocator(Default = typeof(SelfUpdater))]
+22      public interface ISelfUpdater : IRunnerService
+23      {
+24          bool Busy { get; }
+25          Task&lt;bool&gt; SelfUpdate(AgentRefreshMessage updateMessage, IJobDispatcher jobDispatcher, bool restartInteractiveRunner, CancellationToken token);
+26      }
+27      public class SelfUpdater : RunnerService, ISelfUpdater
+28      {
+29          private static string _packageType = &quot;agent&quot;;
+30          private static string _platform = BuildConstants.RunnerPackage.PackageName;
+31          private static string _dotnetRuntime = &quot;dotnetRuntime&quot;;
+32          private static string _externals = &quot;externals&quot;;
+33          private readonly Dictionary&lt;string, string&gt; _contentHashes = new();
+34          private PackageMetadata _targetPackage;
+35          private ITerminal _terminal;
+36          private IRunnerServer _runnerServer;
+37          private int _poolId;
+38          private int _agentId;
+39          private readonly ConcurrentQueue&lt;string&gt; _updateTrace = new();
+40          private Task _cloneAndCalculateContentHashTask;
+41          private string _dotnetRuntimeCloneDirectory;
+42          private string _externalsCloneDirectory;
+43          public bool Busy { get; private set; }
+44          public override void Initialize(IHostContext hostContext)
+45          {
+46              base.Initialize(hostContext);
+47              _terminal = hostContext.GetService&lt;ITerminal&gt;();
+48              _runnerServer = HostContext.GetService&lt;IRunnerServer&gt;();
+49              var configStore = HostContext.GetService&lt;IConfigurationStore&gt;();
+50              var settings = configStore.GetSettings();
+51              _poolId = settings.PoolId;
+52              _agentId = settings.AgentId;
+53              _dotnetRuntimeCloneDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), &quot;__dotnet_runtime__&quot;);
+54              _externalsCloneDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), &quot;__externals__&quot;);
+55          }
+56          public async Task&lt;bool&gt; SelfUpdate(AgentRefreshMessage updateMessage, IJobDispatcher jobDispatcher, bool restartInteractiveRunner, CancellationToken token)
+57          {
+58              Busy = true;
+59              try
+60              {
+61                  var totalUpdateTime = Stopwatch.StartNew();
+62                  var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(token);
+63                  _cloneAndCalculateContentHashTask = CloneAndCalculateAssetsHash(_dotnetRuntimeCloneDirectory, _externalsCloneDirectory, linkedTokenSource.Token);
+64                  if (!await UpdateNeeded(updateMessage.TargetVersion, token))
+65                  {
+66                      Trace.Info($&quot;Can&#x27;t find available update package.&quot;);
+67                      return false;
+68                  }
+69                  Trace.Info($&quot;An update is available.&quot;);
+70                  _updateTrace.Enqueue($&quot;RunnerPlatform: {_targetPackage.Platform}&quot;);
+71                  await UpdateRunnerUpdateStateAsync(&quot;Runner update in progress, do not shutdown runner.&quot;);
+72                  await UpdateRunnerUpdateStateAsync($&quot;Downloading {_targetPackage.Version} runner&quot;);
+73                  if (_targetPackage.TrimmedPackages?.Count &gt; 0)
+74                  {
+75                      await _cloneAndCalculateContentHashTask;
+76                  }
+77                  else
+78                  {
+79                      linkedTokenSource.Cancel();
+80                      try
+81                      {
+82                          await _cloneAndCalculateContentHashTask;
+83                      }
+84                      catch (Exception ex)
+85                      {
+86                          Trace.Info($&quot;Ingore errors after cancelling cloning assets task: {ex}&quot;);
+87                      }
+88                  }
+89                  await DownloadLatestRunner(token, updateMessage.TargetVersion);
+90                  Trace.Info($&quot;Download latest runner and unzip into runner root.&quot;);
+91                  await UpdateRunnerUpdateStateAsync(&quot;Waiting for current job finish running.&quot;);
+92                  await jobDispatcher.WaitAsync(token);
+93                  Trace.Info($&quot;All running job has exited.&quot;);
+94                  var stopWatch = Stopwatch.StartNew();
+95                  DeletePreviousVersionRunnerBackup(token);
+96                  Trace.Info($&quot;Delete old version runner backup.&quot;);
+97                  stopWatch.Stop();
+98                  _updateTrace.Enqueue($&quot;DeleteRunnerBackupTime: {stopWatch.ElapsedMilliseconds}ms&quot;);
+99                  await UpdateRunnerUpdateStateAsync(&quot;Generate and execute update script.&quot;);
+100                  string updateScript = GenerateUpdateScript(restartInteractiveRunner);
+101                  Trace.Info($&quot;Generate update script into: {updateScript}&quot;);
+102                  if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(&quot;_GITHUB_ACTION_EXECUTE_UPDATE_SCRIPT&quot;)))
+103                  {
+104                      string flagFile = &quot;update.finished&quot;;
+105                      IOUtil.DeleteFile(flagFile);
+106                      Process invokeScript = new();
+107  #if OS_WINDOWS
+108                      invokeScript.StartInfo.FileName = WhichUtil.Which(&quot;cmd.exe&quot;, trace: Trace);
+109                      invokeScript.StartInfo.Arguments = $&quot;/c \&quot;{updateScript}\&quot;&quot;;
+110  #elif (OS_OSX || OS_LINUX)
+111                      invokeScript.StartInfo.FileName = WhichUtil.Which(&quot;bash&quot;, trace: Trace);
+112                      invokeScript.StartInfo.Arguments = $&quot;\&quot;{updateScript}\&quot;&quot;;
+113  #endif
+114                      invokeScript.Start();
+115                      Trace.Info($&quot;Update script start running&quot;);
+116                  }
+117                  totalUpdateTime.Stop();
+118                  _updateTrace.Enqueue($&quot;TotalUpdateTime: {totalUpdateTime.ElapsedMilliseconds}ms&quot;);
+119                  await UpdateRunnerUpdateStateAsync(&quot;Runner will exit shortly for update, should be back online within 10 seconds.&quot;);
+120                  return true;
+121              }
+122              catch (Exception ex)
+123              {
+124                  _updateTrace.Enqueue(ex.ToString());
+125                  throw;
+126              }
+127              finally
+128              {
+129                  await UpdateRunnerUpdateStateAsync(&quot;Runner update process finished.&quot;);
+130                  Busy = false;
+131              }
+132          }
+133          private async Task&lt;bool&gt; UpdateNeeded(string targetVersion, CancellationToken token)
+134          {
+135              if (string.IsNullOrEmpty(targetVersion))
+136              {
+137                  var packages = await _runnerServer.GetPackagesAsync(_packageType, _platform, 1, true, token);
+138                  if (packages == null || packages.Count == 0)
+139                  {
+140                      Trace.Info($&quot;There is no package for {_packageType} and {_platform}.&quot;);
+141                      return false;
+142                  }
+143                  _targetPackage = packages.FirstOrDefault();
+144              }
+145              else
+146              {
+147                  _targetPackage = await _runnerServer.GetPackageAsync(_packageType, _platform, targetVersion, true, token);
+148                  if (_targetPackage == null)
+149                  {
+150                      Trace.Info($&quot;There is no package for {_packageType} and {_platform} with version {targetVersion}.&quot;);
+151                      return false;
+152                  }
+153              }
+154              Trace.Info($&quot;Version &#x27;{_targetPackage.Version}&#x27; of &#x27;{_targetPackage.Type}&#x27; package available in server.&quot;);
+155              PackageVersion serverVersion = new(_targetPackage.Version);
+156              Trace.Info($&quot;Current running runner version is {BuildConstants.RunnerPackage.Version}&quot;);
+157              PackageVersion runnerVersion = new(BuildConstants.RunnerPackage.Version);
+158              return serverVersion.CompareTo(runnerVersion) &gt; 0;
+159          }
+160          private async Task DownloadLatestRunner(CancellationToken token, string targetVersion)
+161          {
+162              string latestRunnerDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), Constants.Path.UpdateDirectory);
+163              IOUtil.DeleteDirectory(latestRunnerDirectory, token);
+164              Directory.CreateDirectory(latestRunnerDirectory);
+165              string archiveFile = null;
+166              var packageDownloadUrl = _targetPackage.DownloadUrl;
+167              var packageHashValue = _targetPackage.HashValue;
+168              var runtimeTrimmed = false;
+169              var externalsTrimmed = false;
+170              var fallbackToFullPackage = false;
+171              if (_contentHashes.Count == 2 &amp;&amp;
+172                  _contentHashes.ContainsKey(_dotnetRuntime) &amp;&amp;
+173                  _contentHashes.ContainsKey(_externals) &amp;&amp;
+174                  _targetPackage.TrimmedPackages?.Count &gt; 0)
+175              {
+176                  Trace.Info($&quot;Current runner content hash: {StringUtil.ConvertToJson(_contentHashes)}&quot;);
+177                  Trace.Info($&quot;Trimmed packages info from service: {StringUtil.ConvertToJson(_targetPackage.TrimmedPackages)}&quot;);
+178                  foreach (var trimmedPackage in _targetPackage.TrimmedPackages)
+179                  {
+180                      if (trimmedPackage.TrimmedContents.Count == 2 &amp;&amp;
+181                          trimmedPackage.TrimmedContents.TryGetValue(_dotnetRuntime, out var trimmedRuntimeHash) &amp;&amp;
+182                          trimmedRuntimeHash == _contentHashes[_dotnetRuntime] &amp;&amp;
+183                          trimmedPackage.TrimmedContents.TryGetValue(_externals, out var trimmedExternalsHash) &amp;&amp;
+184                          trimmedExternalsHash == _contentHashes[_externals])
+185                      {
+186                          Trace.Info($&quot;Use trimmed (runtime+externals) package &#x27;{trimmedPackage.DownloadUrl}&#x27; to update runner.&quot;);
+187                          packageDownloadUrl = trimmedPackage.DownloadUrl;
+188                          packageHashValue = trimmedPackage.HashValue;
+189                          runtimeTrimmed = true;
+190                          externalsTrimmed = true;
+191                          break;
+192                      }
+193                      else if (trimmedPackage.TrimmedContents.Count == 1 &amp;&amp;
+194                               trimmedPackage.TrimmedContents.TryGetValue(_externals, out trimmedExternalsHash) &amp;&amp;
+195                               trimmedExternalsHash == _contentHashes[_externals])
+196                      {
+197                          Trace.Info($&quot;Use trimmed (externals) package &#x27;{trimmedPackage.DownloadUrl}&#x27; to update runner.&quot;);
+198                          packageDownloadUrl = trimmedPackage.DownloadUrl;
+199                          packageHashValue = trimmedPackage.HashValue;
+200                          externalsTrimmed = true;
+201                          break;
+202                      }
+203                      else
+204                      {
+205                          Trace.Info($&quot;Can&#x27;t use trimmed package from &#x27;{trimmedPackage.DownloadUrl}&#x27; since the current runner does not carry those trimmed content (Hash mismatch).&quot;);
+206                      }
+207                  }
+208              }
+209              _updateTrace.Enqueue($&quot;DownloadUrl: {packageDownloadUrl}&quot;);
+210              _updateTrace.Enqueue($&quot;RuntimeTrimmed: {runtimeTrimmed}&quot;);
+211              _updateTrace.Enqueue($&quot;ExternalsTrimmed: {externalsTrimmed}&quot;);
+212              try
+213              {
+214  #if DEBUG
+215                  if (StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable(&quot;GITHUB_ACTIONS_RUNNER_IS_MOCK_UPDATE&quot;)))
+216                  {
+217                      var waitForDebugger = StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable(&quot;GITHUB_ACTIONS_RUNNER_IS_MOCK_UPDATE_WAIT_FOR_DEBUGGER&quot;));
+218                      if (waitForDebugger)
+219                      {
+220                          int waitInSeconds = 20;
+221                          while (!Debugger.IsAttached &amp;&amp; waitInSeconds-- &gt; 0)
+222                          {
+223                              await Task.Delay(1000);
+224                          }
+225                          Debugger.Break();
+226                      }
+227                      if (_targetPackage.Platform.StartsWith(&quot;win&quot;))
+228                      {
+229                          archiveFile = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;runner{targetVersion}.zip&quot;);
+230                      }
+231                      else
+232                      {
+233                          archiveFile = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;runner{targetVersion}.tar.gz&quot;);
+234                      }
+235                      if (File.Exists(archiveFile))
+236                      {
+237                          _updateTrace.Enqueue($&quot;Mocking update with file: &#x27;{archiveFile}&#x27; and targetVersion: &#x27;{targetVersion}&#x27;, nothing is downloaded&quot;);
+238                          _terminal.WriteLine($&quot;Mocking update with file: &#x27;{archiveFile}&#x27; and targetVersion: &#x27;{targetVersion}&#x27;, nothing is downloaded&quot;);
+239                      }
+240                      else
+241                      {
+242                          archiveFile = null;
+243                          _terminal.WriteLine($&quot;Mock runner archive not found at {archiveFile} for target version {targetVersion}, proceeding with download instead&quot;);
+244                          _updateTrace.Enqueue($&quot;Mock runner archive not found at {archiveFile} for target version {targetVersion}, proceeding with download instead&quot;);
+245                      }
+246                  }
+247  #endif
+248                  if (string.IsNullOrEmpty(archiveFile))
+249                  {
+250                      archiveFile = await DownLoadRunner(latestRunnerDirectory, packageDownloadUrl, packageHashValue, token);
+251                      if (string.IsNullOrEmpty(archiveFile))
+252                      {
+253                          throw new TaskCanceledException($&quot;Runner package &#x27;{packageDownloadUrl}&#x27; failed after {Constants.RunnerDownloadRetryMaxAttempts} download attempts&quot;);
+254                      }
+255                      await ValidateRunnerHash(archiveFile, packageHashValue);
+256                  }
+257                  await ExtractRunnerPackage(archiveFile, latestRunnerDirectory, token);
+258              }
+259              catch (Exception ex) when (runtimeTrimmed || externalsTrimmed)
+260              {
+261                  Trace.Error($&quot;Fail to download latest runner using trimmed package: {ex}&quot;);
+262                  fallbackToFullPackage = true;
+263              }
+264              finally
+265              {
+266                  try
+267                  {
+268                      if (!string.IsNullOrEmpty(archiveFile) &amp;&amp; File.Exists(archiveFile))
+269                      {
+270                          Trace.Verbose(&quot;Deleting latest runner package zip: {0}&quot;, archiveFile);
+271                          IOUtil.DeleteFile(archiveFile);
+272                      }
+273                  }
+274                  catch (Exception ex)
+275                  {
+276                      Trace.Warning(&quot;Failed to delete runner package zip &#x27;{0}&#x27;. Exception: {1}&quot;, archiveFile, ex);
+277                  }
+278              }
+279              var trimmedPackageRestoreTasks = new List&lt;Task&lt;bool&gt;&gt;();
+280              if (!fallbackToFullPackage)
+281              {
+282                  if (externalsTrimmed)
+283                  {
+284                      trimmedPackageRestoreTasks.Add(RestoreTrimmedExternals(latestRunnerDirectory, token));
+285                  }
+286                  if (runtimeTrimmed)
+287                  {
+288                      trimmedPackageRestoreTasks.Add(RestoreTrimmedDotnetRuntime(latestRunnerDirectory, token));
+289                  }
+290              }
+291              if (trimmedPackageRestoreTasks.Count &gt; 0)
+292              {
+293                  var restoreResults = await Task.WhenAll(trimmedPackageRestoreTasks);
+294                  if (restoreResults.Any(x =&gt; x == false))
+295                  {
+296                      fallbackToFullPackage = true;
+297                  }
+298              }
+299              if (fallbackToFullPackage)
+300              {
+301                  Trace.Error(&quot;Something wrong with the trimmed runner package, failback to use the full package for runner updates.&quot;);
+302                  _updateTrace.Enqueue($&quot;FallbackToFullPackage: {fallbackToFullPackage}&quot;);
+303                  IOUtil.DeleteDirectory(latestRunnerDirectory, token);
+304                  Directory.CreateDirectory(latestRunnerDirectory);
+305                  packageDownloadUrl = _targetPackage.DownloadUrl;
+306                  packageHashValue = _targetPackage.HashValue;
+307                  _updateTrace.Enqueue($&quot;DownloadUrl: {packageDownloadUrl}&quot;);
+308                  try
+309                  {
+310                      archiveFile = await DownLoadRunner(latestRunnerDirectory, packageDownloadUrl, packageHashValue, token);
+311                      if (string.IsNullOrEmpty(archiveFile))
+312                      {
+313                          throw new TaskCanceledException($&quot;Runner package &#x27;{packageDownloadUrl}&#x27; failed after {Constants.RunnerDownloadRetryMaxAttempts} download attempts&quot;);
+314                      }
+315                      await ValidateRunnerHash(archiveFile, packageHashValue);
+316                      await ExtractRunnerPackage(archiveFile, latestRunnerDirectory, token);
+317                  }
+318                  finally
+319                  {
+320                      try
+321                      {
+322                          if (!string.IsNullOrEmpty(archiveFile) &amp;&amp; File.Exists(archiveFile))
+323                          {
+324                              Trace.Verbose(&quot;Deleting latest runner package zip: {0}&quot;, archiveFile);
+325                              IOUtil.DeleteFile(archiveFile);
+326                          }
+327                      }
+328                      catch (Exception ex)
+329                      {
+330                          Trace.Warning(&quot;Failed to delete runner package zip &#x27;{0}&#x27;. Exception: {1}&quot;, archiveFile, ex);
+331                      }
+332                  }
+333              }
+334              await CopyLatestRunnerToRoot(latestRunnerDirectory, token);
+335          }
+336          private async Task&lt;string&gt; DownLoadRunner(string downloadDirectory, string packageDownloadUrl, string packageHashValue, CancellationToken token)
+337          {
+338              var stopWatch = Stopwatch.StartNew();
+339              int runnerSuffix = 1;
+340              string archiveFile = null;
+341              bool downloadSucceeded = false;
+342              for (int attempt = 1; attempt &lt;= Constants.RunnerDownloadRetryMaxAttempts; attempt++)
+343              {
+344                  while (true)
+345                  {
+346                      if (_targetPackage.Platform.StartsWith(&quot;win&quot;))
+347                      {
+348                          archiveFile = Path.Combine(downloadDirectory, $&quot;runner{runnerSuffix}.zip&quot;);
+349                      }
+350                      else
+351                      {
+352                          archiveFile = Path.Combine(downloadDirectory, $&quot;runner{runnerSuffix}.tar.gz&quot;);
+353                      }
+354                      try
+355                      {
+356                          if (!string.IsNullOrEmpty(archiveFile) &amp;&amp; File.Exists(archiveFile))
+357                          {
+358                              Trace.Verbose(&quot;Deleting latest runner package zip &#x27;{0}&#x27;&quot;, archiveFile);
+359                              IOUtil.DeleteFile(archiveFile);
+360                          }
+361                          break;
+362                      }
+363                      catch (Exception ex)
+364                      {
+365                          Trace.Warning(&quot;Failed to delete runner package zip &#x27;{0}&#x27;. Exception: {1}&quot;, archiveFile, ex);
+366                          runnerSuffix++;
+367                      }
+368                  }
+369                  if (!int.TryParse(Environment.GetEnvironmentVariable(&quot;GITHUB_ACTIONS_RUNNER_DOWNLOAD_TIMEOUT&quot;) ?? string.Empty, out int timeoutSeconds))
+370                  {
+371                      timeoutSeconds = 15 * 60;
+372                  }
+373                  Trace.Info($&quot;Attempt {attempt}: save latest runner into {archiveFile}.&quot;);
+374                  using (var downloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
+375                  using (var downloadCts = CancellationTokenSource.CreateLinkedTokenSource(downloadTimeout.Token, token))
+376                  {
+377                      try
+378                      {
+379                          Trace.Info($&quot;Download runner: begin download&quot;);
+380                          long downloadSize = 0;
+381                          using (HttpClient httpClient = new(HostContext.CreateHttpClientHandler()))
+382                          {
+383                              if (!string.IsNullOrEmpty(_targetPackage.Token))
+384                              {
+385                                  Trace.Info($&quot;Adding authorization token ({_targetPackage.Token.Length} chars)&quot;);
+386                                  httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(&quot;Bearer&quot;, _targetPackage.Token);
+387                              }
+388                              Trace.Info($&quot;Downloading {packageDownloadUrl}&quot;);
+389                              using (FileStream fs = new(archiveFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true))
+390                              using (Stream result = await httpClient.GetStreamAsync(packageDownloadUrl))
+391                              {
+392                                  await result.CopyToAsync(fs, 81920, downloadCts.Token);
+393                                  await fs.FlushAsync(downloadCts.Token);
+394                                  downloadSize = fs.Length;
+395                              }
+396                          }
+397                          Trace.Info($&quot;Download runner: finished download&quot;);
+398                          downloadSucceeded = true;
+399                          stopWatch.Stop();
+400                          _updateTrace.Enqueue($&quot;PackageDownloadTime: {stopWatch.ElapsedMilliseconds}ms&quot;);
+401                          _updateTrace.Enqueue($&quot;Attempts: {attempt}&quot;);
+402                          _updateTrace.Enqueue($&quot;PackageSize: {downloadSize / 1024 / 1024}MB&quot;);
+403                          break;
+404                      }
+405                      catch (OperationCanceledException) when (token.IsCancellationRequested)
+406                      {
+407                          Trace.Info($&quot;Runner download has been cancelled.&quot;);
+408                          throw;
+409                      }
+410                      catch (Exception ex)
+411                      {
+412                          if (downloadCts.Token.IsCancellationRequested)
+413                          {
+414                              Trace.Warning($&quot;Runner download has timed out after {timeoutSeconds} seconds&quot;);
+415                          }
+416                          Trace.Warning($&quot;Failed to get package &#x27;{archiveFile}&#x27; from &#x27;{packageDownloadUrl}&#x27;. Exception {ex}&quot;);
+417                      }
+418                  }
+419              }
+420              if (downloadSucceeded)
+421              {
+422                  return archiveFile;
+423              }
+424              else
+425              {
+426                  return null;
+427              }
+428          }
+429          private async Task ValidateRunnerHash(string archiveFile, string packageHashValue)
+430          {
+431              var stopWatch = Stopwatch.StartNew();
+432              using (FileStream stream = File.OpenRead(archiveFile))
+433              {
+434                  if (!string.IsNullOrEmpty(packageHashValue))
+435                  {
+436                      using (SHA256 sha256 = SHA256.Create())
+437                      {
+438                          byte[] srcHashBytes = await sha256.ComputeHashAsync(stream);
+439                          var hash = PrimitiveExtensions.ConvertToHexString(srcHashBytes);
+440                          if (hash != packageHashValue)
+441                          {
+442                              throw new Exception($&quot;Computed runner hash {hash} did not match expected Runner Hash {packageHashValue} for {archiveFile}&quot;);
+443                          }
+444                          stopWatch.Stop();
+445                          Trace.Info($&quot;Validated Runner Hash matches {archiveFile} : {packageHashValue}&quot;);
+446                          _updateTrace.Enqueue($&quot;ValidateHashTime: {stopWatch.ElapsedMilliseconds}ms&quot;);
+447                      }
+448                  }
+449              }
+450          }
+451          private async Task ExtractRunnerPackage(string archiveFile, string extractDirectory, CancellationToken token)
+452          {
+453              var stopWatch = Stopwatch.StartNew();
+454              if (archiveFile.EndsWith(&quot;.zip&quot;, StringComparison.OrdinalIgnoreCase))
+455              {
+456                  ZipFile.ExtractToDirectory(archiveFile, extractDirectory);
+457              }
+458              else if (archiveFile.EndsWith(&quot;.tar.gz&quot;, StringComparison.OrdinalIgnoreCase))
+459              {
+460                  string tar = WhichUtil.Which(&quot;tar&quot;, trace: Trace);
+461                  if (string.IsNullOrEmpty(tar))
+462                  {
+463                      throw new NotSupportedException($&quot;tar -xzf&quot;);
+464                  }
+465                  using (var processInvoker = HostContext.CreateService&lt;IProcessInvoker&gt;())
+466                  {
+467                      processInvoker.OutputDataReceived += new EventHandler&lt;ProcessDataReceivedEventArgs&gt;((sender, args) =&gt;
+468                      {
+469                          if (!string.IsNullOrEmpty(args.Data))
+470                          {
+471                              Trace.Info(args.Data);
+472                          }
+473                      });
+474                      processInvoker.ErrorDataReceived += new EventHandler&lt;ProcessDataReceivedEventArgs&gt;((sender, args) =&gt;
+475                      {
+476                          if (!string.IsNullOrEmpty(args.Data))
+477                          {
+478                              Trace.Error(args.Data);
+479                          }
+480                      });
+481                      int exitCode = await processInvoker.ExecuteAsync(extractDirectory, tar, $&quot;-xzf \&quot;{archiveFile}\&quot;&quot;, null, token);
+482                      if (exitCode != 0)
+483                      {
+484                          throw new NotSupportedException($&quot;Can&#x27;t use &#x27;tar -xzf&#x27; to extract archive file: {archiveFile}. return code: {exitCode}.&quot;);
+485                      }
+486                  }
+487              }
+488              else
+489              {
+490                  throw new NotSupportedException($&quot;{archiveFile}&quot;);
+491              }
+492              stopWatch.Stop();
+493              Trace.Info($&quot;Finished getting latest runner package at: {extractDirectory}.&quot;);
+494              _updateTrace.Enqueue($&quot;PackageExtractTime: {stopWatch.ElapsedMilliseconds}ms&quot;);
+495          }
+496          private Task CopyLatestRunnerToRoot(string latestRunnerDirectory, CancellationToken token)
+497          {
+498              var stopWatch = Stopwatch.StartNew();
+499              string binVersionDir = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;{Constants.Path.BinDirectory}.{_targetPackage.Version}&quot;);
+500              Directory.CreateDirectory(binVersionDir);
+501              Trace.Info($&quot;Copy {Path.Combine(latestRunnerDirectory, Constants.Path.BinDirectory)} to {binVersionDir}.&quot;);
+502              IOUtil.CopyDirectory(Path.Combine(latestRunnerDirectory, Constants.Path.BinDirectory), binVersionDir, token);
+503              string externalsVersionDir = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;{Constants.Path.ExternalsDirectory}.{_targetPackage.Version}&quot;);
+504              Directory.CreateDirectory(externalsVersionDir);
+505              Trace.Info($&quot;Copy {Path.Combine(latestRunnerDirectory, Constants.Path.ExternalsDirectory)} to {externalsVersionDir}.&quot;);
+506              IOUtil.CopyDirectory(Path.Combine(latestRunnerDirectory, Constants.Path.ExternalsDirectory), externalsVersionDir, token);
+507              Trace.Info($&quot;Copy any remaining .sh/.cmd files into runner root.&quot;);
+508              foreach (FileInfo file in new DirectoryInfo(latestRunnerDirectory).GetFiles() ?? new FileInfo[0])
+509              {
+510                  string destination = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), file.Name);
+511                  Trace.Info($&quot;Copy {file.FullName} to {destination}&quot;);
+512                  IOUtil.DeleteFile(destination);
+513                  file.CopyTo(destination, true);
+514              }
+515              stopWatch.Stop();
+516              _updateTrace.Enqueue($&quot;CopyRunnerToRootTime: {stopWatch.ElapsedMilliseconds}ms&quot;);
+517              return Task.CompletedTask;
+518          }
+519          private void DeletePreviousVersionRunnerBackup(CancellationToken token)
+520          {
+521              foreach (string existBackUp in Directory.GetDirectories(HostContext.GetDirectory(WellKnownDirectory.Root), &quot;*.bak.*&quot;))
+522              {
+523                  Trace.Info($&quot;Delete existing runner backup at {existBackUp}.&quot;);
+524                  try
+525                  {
+526                      IOUtil.DeleteDirectory(existBackUp, token);
+527                  }
+528                  catch (Exception ex) when (!(ex is OperationCanceledException))
+529                  {
+530                      Trace.Error(ex);
+531                      Trace.Info($&quot;Catch exception during delete backup folder {existBackUp}, ignore this error try delete the backup folder on next auto-update.&quot;);
+532                  }
+533              }
+534              var allBinDirs = Directory.GetDirectories(HostContext.GetDirectory(WellKnownDirectory.Root), &quot;bin.*&quot;);
+535              if (allBinDirs.Length &gt; 2)
+536              {
+537                  foreach (var oldBinDir in allBinDirs)
+538                  {
+539                      if (string.Equals(oldBinDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;bin&quot;), StringComparison.OrdinalIgnoreCase) ||
+540                          string.Equals(oldBinDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;bin.{BuildConstants.RunnerPackage.Version}&quot;), StringComparison.OrdinalIgnoreCase) ||
+541                          string.Equals(oldBinDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;bin.{_targetPackage.Version}&quot;), StringComparison.OrdinalIgnoreCase))
+542                      {
+543                          continue;
+544                      }
+545                      Trace.Info($&quot;Delete runner bin folder&#x27;s backup at {oldBinDir}.&quot;);
+546                      try
+547                      {
+548                          IOUtil.DeleteDirectory(oldBinDir, token);
+549                      }
+550                      catch (Exception ex) when (!(ex is OperationCanceledException))
+551                      {
+552                          Trace.Error(ex);
+553                          Trace.Info($&quot;Catch exception during delete backup folder {oldBinDir}, ignore this error try delete the backup folder on next auto-update.&quot;);
+554                      }
+555                  }
+556              }
+557              var allExternalsDirs = Directory.GetDirectories(HostContext.GetDirectory(WellKnownDirectory.Root), &quot;externals.*&quot;);
+558              if (allExternalsDirs.Length &gt; 2)
+559              {
+560                  foreach (var oldExternalDir in allExternalsDirs)
+561                  {
+562                      if (string.Equals(oldExternalDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;externals&quot;), StringComparison.OrdinalIgnoreCase) ||
+563                          string.Equals(oldExternalDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;externals.{BuildConstants.RunnerPackage.Version}&quot;), StringComparison.OrdinalIgnoreCase) ||
+564                          string.Equals(oldExternalDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;externals.{_targetPackage.Version}&quot;), StringComparison.OrdinalIgnoreCase))
+565                      {
+566                          continue;
+567                      }
+568                      Trace.Info($&quot;Delete runner externals folder&#x27;s backup at {oldExternalDir}.&quot;);
+569                      try
+570                      {
+571                          IOUtil.DeleteDirectory(oldExternalDir, token);
+572                      }
+573                      catch (Exception ex) when (!(ex is OperationCanceledException))
+574                      {
+575                          Trace.Error(ex);
+576                          Trace.Info($&quot;Catch exception during delete backup folder {oldExternalDir}, ignore this error try delete the backup folder on next auto-update.&quot;);
+577                      }
+578                  }
+579              }
+580          }
+581          private string GenerateUpdateScript(bool restartInteractiveRunner)
+582          {
+583              int processId = Process.GetCurrentProcess().Id;
+584              string updateLog = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Diag), $&quot;SelfUpdate-{DateTime.UtcNow.ToString(&quot;yyyyMMdd-HHmmss&quot;)}.log&quot;);
+585              string runnerRoot = HostContext.GetDirectory(WellKnownDirectory.Root);
+586  #if OS_WINDOWS
+587              string templateName = &quot;update.cmd.template&quot;;
+588  #else
+589              string templateName = &quot;update.sh.template&quot;;
+590  #endif
+591              string templatePath = Path.Combine(runnerRoot, $&quot;bin.{_targetPackage.Version}&quot;, templateName);
+592              string template = File.ReadAllText(templatePath);
+593              template = template.Replace(&quot;_PROCESS_ID_&quot;, processId.ToString());
+594              template = template.Replace(&quot;_RUNNER_PROCESS_NAME_&quot;, $&quot;Runner.Listener{IOUtil.ExeExtension}&quot;);
+595              template = template.Replace(&quot;_ROOT_FOLDER_&quot;, runnerRoot);
+596              template = template.Replace(&quot;_EXIST_RUNNER_VERSION_&quot;, BuildConstants.RunnerPackage.Version);
+597              template = template.Replace(&quot;_DOWNLOAD_RUNNER_VERSION_&quot;, _targetPackage.Version);
+598              template = template.Replace(&quot;_UPDATE_LOG_&quot;, updateLog);
+599              template = template.Replace(&quot;_RESTART_INTERACTIVE_RUNNER_&quot;, restartInteractiveRunner ? &quot;1&quot; : &quot;0&quot;);
+600  #if OS_WINDOWS
+601              string scriptName = &quot;_update.cmd&quot;;
+602  #else
+603              string scriptName = &quot;_update.sh&quot;;
+604  #endif
+605              string updateScript = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), scriptName);
+606              if (File.Exists(updateScript))
+607              {
+608                  IOUtil.DeleteFile(updateScript);
+609              }
+610              File.WriteAllText(updateScript, template);
+611              return updateScript;
+612          }
+613          private async Task UpdateRunnerUpdateStateAsync(string currentState)
+614          {
+615              _terminal.WriteLine(currentState);
+616              var traces = new List&lt;string&gt;();
+617              while (_updateTrace.TryDequeue(out var trace))
+618              {
+619                  traces.Add(trace);
+620              }
+621              if (traces.Count &gt; 0)
+622              {
+623                  foreach (var trace in traces)
+624                  {
+625                      Trace.Info(trace);
+626                  }
+627              }
+628              try
+629              {
+630                  await _runnerServer.UpdateAgentUpdateStateAsync(_poolId, _agentId, currentState, string.Join(Environment.NewLine, traces));
+631                  _updateTrace.Clear();
+632              }
+633              catch (VssResourceNotFoundException)
+634              {
+635                  Trace.Info($&quot;Catch VssResourceNotFoundException during report update state, ignore this error for backcompat.&quot;);
+636              }
+637              catch (Exception ex)
+638              {
+639                  Trace.Error(ex);
+640                  Trace.Info($&quot;Catch exception during report update state, ignore this error and continue auto-update.&quot;);
+641              }
+642          }
+643          private async Task&lt;bool&gt; RestoreTrimmedExternals(string downloadDirectory, CancellationToken token)
+644          {
+645              var stopWatch = Stopwatch.StartNew();
+646              try
+647              {
+648                  Trace.Info($&quot;Copy {_externalsCloneDirectory} to {Path.Combine(downloadDirectory, Constants.Path.ExternalsDirectory)}.&quot;);
+649                  IOUtil.CopyDirectory(_externalsCloneDirectory, Path.Combine(downloadDirectory, Constants.Path.ExternalsDirectory), token);
+650                  var nodeVersions = NodeUtil.BuiltInNodeVersions;
+651                  foreach (var nodeVersion in nodeVersions)
+652                  {
+653                      var newNodeBinary = Path.Combine(downloadDirectory, Constants.Path.ExternalsDirectory, nodeVersion, &quot;bin&quot;, $&quot;node{IOUtil.ExeExtension}&quot;);
+654                      if (File.Exists(newNodeBinary))
+655                      {
+656                          using (var p = HostContext.CreateService&lt;IProcessInvoker&gt;())
+657                          {
+658                              var outputs = &quot;&quot;;
+659                              p.ErrorDataReceived += (_, data) =&gt;
+660                              {
+661                                  if (!string.IsNullOrEmpty(data.Data))
+662                                  {
+663                                      Trace.Error(data.Data);
+664                                  }
+665                              };
+666                              p.OutputDataReceived += (_, data) =&gt;
+667                              {
+668                                  if (!string.IsNullOrEmpty(data.Data))
+669                                  {
+670                                      Trace.Info(data.Data);
+671                                      outputs = data.Data;
+672                                  }
+673                              };
+674                              var exitCode = await p.ExecuteAsync(HostContext.GetDirectory(WellKnownDirectory.Root), newNodeBinary, $&quot;-e \&quot;console.log(&#x27;{nameof(RestoreTrimmedExternals)}&#x27;)\&quot;&quot;, null, token);
+675                              if (exitCode != 0)
+676                              {
+677                                  Trace.Error($&quot;{newNodeBinary} -e \&quot;console.log()\&quot; failed with exit code {exitCode}&quot;);
+678                                  return false;
+679                              }
+680                              if (!string.Equals(outputs, nameof(RestoreTrimmedExternals), StringComparison.OrdinalIgnoreCase))
+681                              {
+682                                  Trace.Error($&quot;{newNodeBinary} -e \&quot;console.log()\&quot; did not output expected content.&quot;);
+683                                  return false;
+684                              }
+685                          }
+686                      }
+687                  }
+688                  return true;
+689              }
+690              catch (Exception ex)
+691              {
+692                  Trace.Error($&quot;Fail to restore externals for trimmed package: {ex}&quot;);
+693                  return false;
+694              }
+695              finally
+696              {
+697                  stopWatch.Stop();
+698                  _updateTrace.Enqueue($&quot;{nameof(RestoreTrimmedExternals)}Time: {stopWatch.ElapsedMilliseconds}ms&quot;);
+699              }
+700          }
+701          private async Task&lt;bool&gt; RestoreTrimmedDotnetRuntime(string downloadDirectory, CancellationToken token)
+702          {
+703              var stopWatch = Stopwatch.StartNew();
+704              try
+705              {
+706                  Trace.Info($&quot;Copy {_dotnetRuntimeCloneDirectory} to {Path.Combine(downloadDirectory, Constants.Path.BinDirectory)}.&quot;);
+707                  IOUtil.CopyDirectory(_dotnetRuntimeCloneDirectory, Path.Combine(downloadDirectory, Constants.Path.BinDirectory), token);
+708                  var newRunnerBinary = Path.Combine(downloadDirectory, Constants.Path.BinDirectory, &quot;Runner.Listener&quot;);
+709                  using (var p = HostContext.CreateService&lt;IProcessInvoker&gt;())
+710                  {
+711                      p.ErrorDataReceived += (_, data) =&gt;
+712                      {
+713                          if (!string.IsNullOrEmpty(data.Data))
+714                          {
+715                              Trace.Error(data.Data);
+716                          }
+717                      };
+718                      p.OutputDataReceived += (_, data) =&gt;
+719                      {
+720                          if (!string.IsNullOrEmpty(data.Data))
+721                          {
+722                              Trace.Info(data.Data);
+723                          }
+724                      };
+725                      var exitCode = await p.ExecuteAsync(HostContext.GetDirectory(WellKnownDirectory.Root), newRunnerBinary, &quot;--version&quot;, null, token);
+726                      if (exitCode != 0)
+727                      {
+728                          Trace.Error($&quot;{newRunnerBinary} --version failed with exit code {exitCode}&quot;);
+729                          return false;
+730                      }
+731                      else
+732                      {
+733                          return true;
+734                      }
+735                  }
+736              }
+737              catch (Exception ex)
+738              {
+739                  Trace.Error($&quot;Fail to restore dotnet runtime for trimmed package: {ex}&quot;);
+740                  return false;
+741              }
+742              finally
+743              {
+744                  stopWatch.Stop();
+745                  _updateTrace.Enqueue($&quot;{nameof(RestoreTrimmedDotnetRuntime)}Time: {stopWatch.ElapsedMilliseconds}ms&quot;);
+746              }
+747          }
+748          private async Task CloneAndCalculateAssetsHash(string dotnetRuntimeCloneDirectory, string externalsCloneDirectory, CancellationToken token)
+749          {
+750              var runtimeCloneTask = CloneDotnetRuntime(dotnetRuntimeCloneDirectory, token);
+751              var externalsCloneTask = CloneExternals(externalsCloneDirectory, token);
+752              var waitingTasks = new Dictionary&lt;string, Task&gt;()
+753              {
+754                  {nameof(CloneDotnetRuntime), runtimeCloneTask},
+755                  {nameof(CloneExternals),externalsCloneTask}
+756              };
+757              while (waitingTasks.Count &gt; 0)
+758              {
+759                  Trace.Info($&quot;Waiting for {waitingTasks.Count} tasks to complete.&quot;);
+760                  var complatedTask = await Task.WhenAny(waitingTasks.Values);
+761                  if (waitingTasks.ContainsKey(nameof(CloneExternals)) &amp;&amp;
+762                      complatedTask == waitingTasks[nameof(CloneExternals)])
+763                  {
+764                      Trace.Info($&quot;Externals clone finished.&quot;);
+765                      waitingTasks.Remove(nameof(CloneExternals));
+766                      try
+767                      {
+768                          if (await externalsCloneTask &amp;&amp; !token.IsCancellationRequested)
+769                          {
+<span onclick='openModal()' class='match'>770                              var externalsHash = await HashFiles(externalsCloneDirectory, token);
+771                              Trace.Info($&quot;Externals content hash: {externalsHash}&quot;);
+772                              _contentHashes[_externals] = externalsHash;
+773                              _updateTrace.Enqueue($&quot;ExternalsHash: {_contentHashes[_externals]}&quot;);
+774                          }
+775                          else
+776                          {
+777                              Trace.Error($&quot;Skip compute hash since clone externals failed/cancelled.&quot;);
+778                          }
+779                      }
+780                      catch (Exception ex)
+781                      {
+782                          Trace.Error($&quot;Fail to hash externals content: {ex}&quot;);
+783                      }
+784                  }
+785                  else if (waitingTasks.ContainsKey(nameof(CloneDotnetRuntime)) &amp;&amp;
+</span>786                           complatedTask == waitingTasks[nameof(CloneDotnetRuntime)])
+787                  {
+788                      Trace.Info($&quot;Dotnet runtime clone finished.&quot;);
+789                      waitingTasks.Remove(nameof(CloneDotnetRuntime));
+790                      try
+791                      {
+792                          if (await runtimeCloneTask &amp;&amp; !token.IsCancellationRequested)
+793                          {
+794                              var runtimeHash = await HashFiles(dotnetRuntimeCloneDirectory, token);
+795                              Trace.Info($&quot;Runtime content hash: {runtimeHash}&quot;);
+796                              _contentHashes[_dotnetRuntime] = runtimeHash;
+797                              _updateTrace.Enqueue($&quot;DotnetRuntimeHash: {_contentHashes[_dotnetRuntime]}&quot;);
+798                          }
+799                          else
+800                          {
+801                              Trace.Error($&quot;Skip compute hash since clone dotnet runtime failed/cancelled.&quot;);
+802                          }
+803                      }
+804                      catch (Exception ex)
+805                      {
+806                          Trace.Error($&quot;Fail to hash runtime content: {ex}&quot;);
+807                      }
+808                  }
+809                  Trace.Info($&quot;Still waiting for {waitingTasks.Count} tasks to complete.&quot;);
+810              }
+811          }
+812          private async Task&lt;bool&gt; CloneDotnetRuntime(string runtimeDir, CancellationToken token)
+813          {
+814              var stopWatch = Stopwatch.StartNew();
+815              try
+816              {
+817                  Trace.Info($&quot;Cloning dotnet runtime to {runtimeDir}&quot;);
+818                  IOUtil.DeleteDirectory(runtimeDir, CancellationToken.None);
+819                  Directory.CreateDirectory(runtimeDir);
+820                  var assembly = Assembly.GetExecutingAssembly();
+821                  var assetsContent = default(string);
+822                  using (var stream = assembly.GetManifestResourceStream(&quot;GitHub.Runner.Listener.runnercoreassets&quot;))
+823                  using (var streamReader = new StreamReader(stream))
+824                  {
+825                      assetsContent = await streamReader.ReadToEndAsync();
+826                  }
+827                  if (!string.IsNullOrEmpty(assetsContent))
+828                  {
+829                      var runnerCoreAssets = assetsContent.Split(new[] { &quot;\n&quot;, &quot;\r\n&quot; }, StringSplitOptions.RemoveEmptyEntries);
+830                      if (runnerCoreAssets.Length &gt; 0)
+831                      {
+832                          var binDir = HostContext.GetDirectory(WellKnownDirectory.Bin);
+833                          IOUtil.CopyDirectory(binDir, runtimeDir, token);
+834                          var clonedFile = 0;
+835                          foreach (var file in Directory.EnumerateFiles(runtimeDir, &quot;*&quot;, SearchOption.AllDirectories))
+836                          {
+837                              token.ThrowIfCancellationRequested();
+838                              if (runnerCoreAssets.Any(x =&gt; file.Replace(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).EndsWith(x.Trim())))
+839                              {
+840                                  Trace.Verbose($&quot;{file} is part of the runner core, delete from cloned runtime directory.&quot;);
+841                                  IOUtil.DeleteFile(file);
+842                              }
+843                              else
+844                              {
+845                                  clonedFile++;
+846                              }
+847                          }
+848                          Trace.Info($&quot;Successfully cloned dotnet runtime to {runtimeDir}. Total files: {clonedFile}&quot;);
+849                          return true;
+850                      }
+851                  }
+852              }
+853              catch (Exception ex)
+854              {
+855                  Trace.Error($&quot;Fail to clone dotnet runtime to {runtimeDir}&quot;);
+856                  Trace.Error(ex);
+857              }
+858              finally
+859              {
+860                  stopWatch.Stop();
+861                  _updateTrace.Enqueue($&quot;{nameof(CloneDotnetRuntime)}Time: {stopWatch.ElapsedMilliseconds}ms&quot;);
+862              }
+863              return false;
+864          }
+865          private Task&lt;bool&gt; CloneExternals(string externalsDir, CancellationToken token)
+866          {
+867              var stopWatch = Stopwatch.StartNew();
+868              try
+869              {
+870                  Trace.Info($&quot;Cloning externals to {externalsDir}&quot;);
+871                  IOUtil.DeleteDirectory(externalsDir, CancellationToken.None);
+872                  Directory.CreateDirectory(externalsDir);
+873                  IOUtil.CopyDirectory(HostContext.GetDirectory(WellKnownDirectory.Externals), externalsDir, token);
+874                  Trace.Info($&quot;Successfully cloned externals to {externalsDir}.&quot;);
+875                  return Task.FromResult(true);
+876              }
+877              catch (Exception ex)
+878              {
+879                  Trace.Error($&quot;Fail to clone externals to {externalsDir}&quot;);
+880                  Trace.Error(ex);
+881              }
+882              finally
+883              {
+884                  stopWatch.Stop();
+885                  _updateTrace.Enqueue($&quot;{nameof(CloneExternals)}Time: {stopWatch.ElapsedMilliseconds}ms&quot;);
+886              }
+887              return Task.FromResult(false);
+888          }
+889          private async Task&lt;string&gt; HashFiles(string fileFolder, CancellationToken token)
+890          {
+891              Trace.Info($&quot;Calculating hash for {fileFolder}&quot;);
+892              var stopWatch = Stopwatch.StartNew();
+893              string binDir = HostContext.GetDirectory(WellKnownDirectory.Bin);
+894              string node = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), NodeUtil.GetInternalNodeVersion(), &quot;bin&quot;, $&quot;node{IOUtil.ExeExtension}&quot;);
+895              string hashFilesScript = Path.Combine(binDir, &quot;hashFiles&quot;);
+896              var hashResult = string.Empty;
+897              using (var processInvoker = HostContext.CreateService&lt;IProcessInvoker&gt;())
+898              {
+899                  processInvoker.ErrorDataReceived += (_, data) =&gt;
+900                  {
+901                      if (!string.IsNullOrEmpty(data.Data) &amp;&amp; data.Data.StartsWith(&quot;__OUTPUT__&quot;) &amp;&amp; data.Data.EndsWith(&quot;__OUTPUT__&quot;))
+902                      {
+903                          hashResult = data.Data.Substring(10, data.Data.Length - 20);
+904                          Trace.Info($&quot;Hash result: &#x27;{hashResult}&#x27;&quot;);
+905                      }
+906                      else
+907                      {
+908                          Trace.Info(data.Data);
+909                      }
+910                  };
+911                  processInvoker.OutputDataReceived += (_, data) =&gt;
+912                  {
+913                      Trace.Verbose(data.Data);
+914                  };
+915                  var env = new Dictionary&lt;string, string&gt;
+916                  {
+917                      [&quot;patterns&quot;] = &quot;**&quot;
+918                  };
+919                  int exitCode = await processInvoker.ExecuteAsync(workingDirectory: fileFolder,
+920                                                fileName: node,
+921                                                arguments: $&quot;\&quot;{hashFilesScript.Replace(&quot;\&quot;&quot;, &quot;\\\&quot;&quot;)}\&quot;&quot;,
+922                                                environment: env,
+923                                                requireExitCodeZero: false,
+924                                                outputEncoding: null,
+925                                                killProcessOnCancel: true,
+926                                                cancellationToken: token);
+927                  if (exitCode != 0)
+928                  {
+929                      Trace.Error($&quot;hashFiles returns &#x27;{exitCode}&#x27; failed. Fail to hash files under directory &#x27;{fileFolder}&#x27;&quot;);
+930                  }
+931                  stopWatch.Stop();
+932                  _updateTrace.Enqueue($&quot;{nameof(HashFiles)}{Path.GetFileName(fileFolder)}Time: {stopWatch.ElapsedMilliseconds}ms&quot;);
+933                  return hashResult;
+934              }
+935          }
+936      }
+937  }
+</code></pre>
+        </div>
+        <div class="column">
+            <h3>runner-MDEwOlJlcG9zaXRvcnkxODQyODY4NzU=-flat-SelfUpdater.cs</h3>
+            <pre><code>1  using System;
+2  using System.Collections.Concurrent;
+3  using System.Collections.Generic;
+4  using System.Diagnostics;
+5  using System.IO;
+6  using System.IO.Compression;
+7  using System.Linq;
+8  using System.Net.Http;
+9  using System.Reflection;
+10  using System.Security.Cryptography;
+11  using System.Threading;
+12  using System.Threading.Tasks;
+13  using GitHub.DistributedTask.WebApi;
+14  using GitHub.Runner.Common;
+15  using GitHub.Runner.Common.Util;
+16  using GitHub.Runner.Sdk;
+17  using GitHub.Services.Common;
+18  using GitHub.Services.WebApi;
+19  namespace GitHub.Runner.Listener
+20  {
+21      [ServiceLocator(Default = typeof(SelfUpdater))]
+22      public interface ISelfUpdater : IRunnerService
+23      {
+24          bool Busy { get; }
+25          Task&lt;bool&gt; SelfUpdate(AgentRefreshMessage updateMessage, IJobDispatcher jobDispatcher, bool restartInteractiveRunner, CancellationToken token);
+26      }
+27      public class SelfUpdater : RunnerService, ISelfUpdater
+28      {
+29          private static string _packageType = &quot;agent&quot;;
+30          private static string _platform = BuildConstants.RunnerPackage.PackageName;
+31          private static string _dotnetRuntime = &quot;dotnetRuntime&quot;;
+32          private static string _externals = &quot;externals&quot;;
+33          private readonly Dictionary&lt;string, string&gt; _contentHashes = new();
+34          private PackageMetadata _targetPackage;
+35          private ITerminal _terminal;
+36          private IRunnerServer _runnerServer;
+37          private int _poolId;
+38          private int _agentId;
+39          private readonly ConcurrentQueue&lt;string&gt; _updateTrace = new();
+40          private Task _cloneAndCalculateContentHashTask;
+41          private string _dotnetRuntimeCloneDirectory;
+42          private string _externalsCloneDirectory;
+43          public bool Busy { get; private set; }
+44          public override void Initialize(IHostContext hostContext)
+45          {
+46              base.Initialize(hostContext);
+47              _terminal = hostContext.GetService&lt;ITerminal&gt;();
+48              _runnerServer = HostContext.GetService&lt;IRunnerServer&gt;();
+49              var configStore = HostContext.GetService&lt;IConfigurationStore&gt;();
+50              var settings = configStore.GetSettings();
+51              _poolId = settings.PoolId;
+52              _agentId = settings.AgentId;
+53              _dotnetRuntimeCloneDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), &quot;__dotnet_runtime__&quot;);
+54              _externalsCloneDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), &quot;__externals__&quot;);
+55          }
+56          public async Task&lt;bool&gt; SelfUpdate(AgentRefreshMessage updateMessage, IJobDispatcher jobDispatcher, bool restartInteractiveRunner, CancellationToken token)
+57          {
+58              Busy = true;
+59              try
+60              {
+61                  var totalUpdateTime = Stopwatch.StartNew();
+62                  var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(token);
+63                  _cloneAndCalculateContentHashTask = CloneAndCalculateAssetsHash(_dotnetRuntimeCloneDirectory, _externalsCloneDirectory, linkedTokenSource.Token);
+64                  if (!await UpdateNeeded(updateMessage.TargetVersion, token))
+65                  {
+66                      Trace.Info($&quot;Can&#x27;t find available update package.&quot;);
+67                      return false;
+68                  }
+69                  Trace.Info($&quot;An update is available.&quot;);
+70                  _updateTrace.Enqueue($&quot;RunnerPlatform: {_targetPackage.Platform}&quot;);
+71                  await UpdateRunnerUpdateStateAsync(&quot;Runner update in progress, do not shutdown runner.&quot;);
+72                  await UpdateRunnerUpdateStateAsync($&quot;Downloading {_targetPackage.Version} runner&quot;);
+73                  if (_targetPackage.TrimmedPackages?.Count &gt; 0)
+74                  {
+75                      await _cloneAndCalculateContentHashTask;
+76                  }
+77                  else
+78                  {
+79                      linkedTokenSource.Cancel();
+80                      try
+81                      {
+82                          await _cloneAndCalculateContentHashTask;
+83                      }
+84                      catch (Exception ex)
+85                      {
+86                          Trace.Info($&quot;Ingore errors after cancelling cloning assets task: {ex}&quot;);
+87                      }
+88                  }
+89                  await DownloadLatestRunner(token, updateMessage.TargetVersion);
+90                  Trace.Info($&quot;Download latest runner and unzip into runner root.&quot;);
+91                  await UpdateRunnerUpdateStateAsync(&quot;Waiting for current job finish running.&quot;);
+92                  await jobDispatcher.WaitAsync(token);
+93                  Trace.Info($&quot;All running job has exited.&quot;);
+94                  var stopWatch = Stopwatch.StartNew();
+95                  DeletePreviousVersionRunnerBackup(token);
+96                  Trace.Info($&quot;Delete old version runner backup.&quot;);
+97                  stopWatch.Stop();
+98                  _updateTrace.Enqueue($&quot;DeleteRunnerBackupTime: {stopWatch.ElapsedMilliseconds}ms&quot;);
+99                  await UpdateRunnerUpdateStateAsync(&quot;Generate and execute update script.&quot;);
+100                  string updateScript = GenerateUpdateScript(restartInteractiveRunner);
+101                  Trace.Info($&quot;Generate update script into: {updateScript}&quot;);
+102                  if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(&quot;_GITHUB_ACTION_EXECUTE_UPDATE_SCRIPT&quot;)))
+103                  {
+104                      string flagFile = &quot;update.finished&quot;;
+105                      IOUtil.DeleteFile(flagFile);
+106                      Process invokeScript = new();
+107  #if OS_WINDOWS
+108                      invokeScript.StartInfo.FileName = WhichUtil.Which(&quot;cmd.exe&quot;, trace: Trace);
+109                      invokeScript.StartInfo.Arguments = $&quot;/c \&quot;{updateScript}\&quot;&quot;;
+110  #elif (OS_OSX || OS_LINUX)
+111                      invokeScript.StartInfo.FileName = WhichUtil.Which(&quot;bash&quot;, trace: Trace);
+112                      invokeScript.StartInfo.Arguments = $&quot;\&quot;{updateScript}\&quot;&quot;;
+113  #endif
+114                      invokeScript.Start();
+115                      Trace.Info($&quot;Update script start running&quot;);
+116                  }
+117                  totalUpdateTime.Stop();
+118                  _updateTrace.Enqueue($&quot;TotalUpdateTime: {totalUpdateTime.ElapsedMilliseconds}ms&quot;);
+119                  await UpdateRunnerUpdateStateAsync(&quot;Runner will exit shortly for update, should be back online within 10 seconds.&quot;);
+120                  return true;
+121              }
+122              catch (Exception ex)
+123              {
+124                  _updateTrace.Enqueue(ex.ToString());
+125                  throw;
+126              }
+127              finally
+128              {
+129                  await UpdateRunnerUpdateStateAsync(&quot;Runner update process finished.&quot;);
+130                  Busy = false;
+131              }
+132          }
+133          private async Task&lt;bool&gt; UpdateNeeded(string targetVersion, CancellationToken token)
+134          {
+135              if (string.IsNullOrEmpty(targetVersion))
+136              {
+137                  var packages = await _runnerServer.GetPackagesAsync(_packageType, _platform, 1, true, token);
+138                  if (packages == null || packages.Count == 0)
+139                  {
+140                      Trace.Info($&quot;There is no package for {_packageType} and {_platform}.&quot;);
+141                      return false;
+142                  }
+143                  _targetPackage = packages.FirstOrDefault();
+144              }
+145              else
+146              {
+147                  _targetPackage = await _runnerServer.GetPackageAsync(_packageType, _platform, targetVersion, true, token);
+148                  if (_targetPackage == null)
+149                  {
+150                      Trace.Info($&quot;There is no package for {_packageType} and {_platform} with version {targetVersion}.&quot;);
+151                      return false;
+152                  }
+153              }
+154              Trace.Info($&quot;Version &#x27;{_targetPackage.Version}&#x27; of &#x27;{_targetPackage.Type}&#x27; package available in server.&quot;);
+155              PackageVersion serverVersion = new(_targetPackage.Version);
+156              Trace.Info($&quot;Current running runner version is {BuildConstants.RunnerPackage.Version}&quot;);
+157              PackageVersion runnerVersion = new(BuildConstants.RunnerPackage.Version);
+158              return serverVersion.CompareTo(runnerVersion) &gt; 0;
+159          }
+160          private async Task DownloadLatestRunner(CancellationToken token, string targetVersion)
+161          {
+162              string latestRunnerDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), Constants.Path.UpdateDirectory);
+163              IOUtil.DeleteDirectory(latestRunnerDirectory, token);
+164              Directory.CreateDirectory(latestRunnerDirectory);
+165              string archiveFile = null;
+166              var packageDownloadUrl = _targetPackage.DownloadUrl;
+167              var packageHashValue = _targetPackage.HashValue;
+168              var runtimeTrimmed = false;
+169              var externalsTrimmed = false;
+170              var fallbackToFullPackage = false;
+171              if (_contentHashes.Count == 2 &amp;&amp;
+172                  _contentHashes.ContainsKey(_dotnetRuntime) &amp;&amp;
+173                  _contentHashes.ContainsKey(_externals) &amp;&amp;
+174                  _targetPackage.TrimmedPackages?.Count &gt; 0)
+175              {
+176                  Trace.Info($&quot;Current runner content hash: {StringUtil.ConvertToJson(_contentHashes)}&quot;);
+177                  Trace.Info($&quot;Trimmed packages info from service: {StringUtil.ConvertToJson(_targetPackage.TrimmedPackages)}&quot;);
+178                  foreach (var trimmedPackage in _targetPackage.TrimmedPackages)
+179                  {
+180                      if (trimmedPackage.TrimmedContents.Count == 2 &amp;&amp;
+181                          trimmedPackage.TrimmedContents.TryGetValue(_dotnetRuntime, out var trimmedRuntimeHash) &amp;&amp;
+182                          trimmedRuntimeHash == _contentHashes[_dotnetRuntime] &amp;&amp;
+183                          trimmedPackage.TrimmedContents.TryGetValue(_externals, out var trimmedExternalsHash) &amp;&amp;
+184                          trimmedExternalsHash == _contentHashes[_externals])
+185                      {
+186                          Trace.Info($&quot;Use trimmed (runtime+externals) package &#x27;{trimmedPackage.DownloadUrl}&#x27; to update runner.&quot;);
+187                          packageDownloadUrl = trimmedPackage.DownloadUrl;
+188                          packageHashValue = trimmedPackage.HashValue;
+189                          runtimeTrimmed = true;
+190                          externalsTrimmed = true;
+191                          break;
+192                      }
+193                      else if (trimmedPackage.TrimmedContents.Count == 1 &amp;&amp;
+194                               trimmedPackage.TrimmedContents.TryGetValue(_externals, out trimmedExternalsHash) &amp;&amp;
+195                               trimmedExternalsHash == _contentHashes[_externals])
+196                      {
+197                          Trace.Info($&quot;Use trimmed (externals) package &#x27;{trimmedPackage.DownloadUrl}&#x27; to update runner.&quot;);
+198                          packageDownloadUrl = trimmedPackage.DownloadUrl;
+199                          packageHashValue = trimmedPackage.HashValue;
+200                          externalsTrimmed = true;
+201                          break;
+202                      }
+203                      else
+204                      {
+205                          Trace.Info($&quot;Can&#x27;t use trimmed package from &#x27;{trimmedPackage.DownloadUrl}&#x27; since the current runner does not carry those trimmed content (Hash mismatch).&quot;);
+206                      }
+207                  }
+208              }
+209              _updateTrace.Enqueue($&quot;DownloadUrl: {packageDownloadUrl}&quot;);
+210              _updateTrace.Enqueue($&quot;RuntimeTrimmed: {runtimeTrimmed}&quot;);
+211              _updateTrace.Enqueue($&quot;ExternalsTrimmed: {externalsTrimmed}&quot;);
+212              try
+213              {
+214  #if DEBUG
+215                  if (StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable(&quot;GITHUB_ACTIONS_RUNNER_IS_MOCK_UPDATE&quot;)))
+216                  {
+217                      var waitForDebugger = StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable(&quot;GITHUB_ACTIONS_RUNNER_IS_MOCK_UPDATE_WAIT_FOR_DEBUGGER&quot;));
+218                      if (waitForDebugger)
+219                      {
+220                          int waitInSeconds = 20;
+221                          while (!Debugger.IsAttached &amp;&amp; waitInSeconds-- &gt; 0)
+222                          {
+223                              await Task.Delay(1000);
+224                          }
+225                          Debugger.Break();
+226                      }
+227                      if (_targetPackage.Platform.StartsWith(&quot;win&quot;))
+228                      {
+229                          archiveFile = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;runner{targetVersion}.zip&quot;);
+230                      }
+231                      else
+232                      {
+233                          archiveFile = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;runner{targetVersion}.tar.gz&quot;);
+234                      }
+235                      if (File.Exists(archiveFile))
+236                      {
+237                          _updateTrace.Enqueue($&quot;Mocking update with file: &#x27;{archiveFile}&#x27; and targetVersion: &#x27;{targetVersion}&#x27;, nothing is downloaded&quot;);
+238                          _terminal.WriteLine($&quot;Mocking update with file: &#x27;{archiveFile}&#x27; and targetVersion: &#x27;{targetVersion}&#x27;, nothing is downloaded&quot;);
+239                      }
+240                      else
+241                      {
+242                          archiveFile = null;
+243                          _terminal.WriteLine($&quot;Mock runner archive not found at {archiveFile} for target version {targetVersion}, proceeding with download instead&quot;);
+244                          _updateTrace.Enqueue($&quot;Mock runner archive not found at {archiveFile} for target version {targetVersion}, proceeding with download instead&quot;);
+245                      }
+246                  }
+247  #endif
+248                  if (string.IsNullOrEmpty(archiveFile))
+249                  {
+250                      archiveFile = await DownLoadRunner(latestRunnerDirectory, packageDownloadUrl, packageHashValue, token);
+251                      if (string.IsNullOrEmpty(archiveFile))
+252                      {
+253                          throw new TaskCanceledException($&quot;Runner package &#x27;{packageDownloadUrl}&#x27; failed after {Constants.RunnerDownloadRetryMaxAttempts} download attempts&quot;);
+254                      }
+255                      await ValidateRunnerHash(archiveFile, packageHashValue);
+256                  }
+257                  await ExtractRunnerPackage(archiveFile, latestRunnerDirectory, token);
+258              }
+259              catch (Exception ex) when (runtimeTrimmed || externalsTrimmed)
+260              {
+261                  Trace.Error($&quot;Fail to download latest runner using trimmed package: {ex}&quot;);
+262                  fallbackToFullPackage = true;
+263              }
+264              finally
+265              {
+266                  try
+267                  {
+268                      if (!string.IsNullOrEmpty(archiveFile) &amp;&amp; File.Exists(archiveFile))
+269                      {
+270                          Trace.Verbose(&quot;Deleting latest runner package zip: {0}&quot;, archiveFile);
+271                          IOUtil.DeleteFile(archiveFile);
+272                      }
+273                  }
+274                  catch (Exception ex)
+275                  {
+276                      Trace.Warning(&quot;Failed to delete runner package zip &#x27;{0}&#x27;. Exception: {1}&quot;, archiveFile, ex);
+277                  }
+278              }
+279              var trimmedPackageRestoreTasks = new List&lt;Task&lt;bool&gt;&gt;();
+280              if (!fallbackToFullPackage)
+281              {
+282                  if (externalsTrimmed)
+283                  {
+284                      trimmedPackageRestoreTasks.Add(RestoreTrimmedExternals(latestRunnerDirectory, token));
+285                  }
+286                  if (runtimeTrimmed)
+287                  {
+288                      trimmedPackageRestoreTasks.Add(RestoreTrimmedDotnetRuntime(latestRunnerDirectory, token));
+289                  }
+290              }
+291              if (trimmedPackageRestoreTasks.Count &gt; 0)
+292              {
+293                  var restoreResults = await Task.WhenAll(trimmedPackageRestoreTasks);
+294                  if (restoreResults.Any(x =&gt; x == false))
+295                  {
+296                      fallbackToFullPackage = true;
+297                  }
+298              }
+299              if (fallbackToFullPackage)
+300              {
+301                  Trace.Error(&quot;Something wrong with the trimmed runner package, failback to use the full package for runner updates.&quot;);
+302                  _updateTrace.Enqueue($&quot;FallbackToFullPackage: {fallbackToFullPackage}&quot;);
+303                  IOUtil.DeleteDirectory(latestRunnerDirectory, token);
+304                  Directory.CreateDirectory(latestRunnerDirectory);
+305                  packageDownloadUrl = _targetPackage.DownloadUrl;
+306                  packageHashValue = _targetPackage.HashValue;
+307                  _updateTrace.Enqueue($&quot;DownloadUrl: {packageDownloadUrl}&quot;);
+308                  try
+309                  {
+310                      archiveFile = await DownLoadRunner(latestRunnerDirectory, packageDownloadUrl, packageHashValue, token);
+311                      if (string.IsNullOrEmpty(archiveFile))
+312                      {
+313                          throw new TaskCanceledException($&quot;Runner package &#x27;{packageDownloadUrl}&#x27; failed after {Constants.RunnerDownloadRetryMaxAttempts} download attempts&quot;);
+314                      }
+315                      await ValidateRunnerHash(archiveFile, packageHashValue);
+316                      await ExtractRunnerPackage(archiveFile, latestRunnerDirectory, token);
+317                  }
+318                  finally
+319                  {
+320                      try
+321                      {
+322                          if (!string.IsNullOrEmpty(archiveFile) &amp;&amp; File.Exists(archiveFile))
+323                          {
+324                              Trace.Verbose(&quot;Deleting latest runner package zip: {0}&quot;, archiveFile);
+325                              IOUtil.DeleteFile(archiveFile);
+326                          }
+327                      }
+328                      catch (Exception ex)
+329                      {
+330                          Trace.Warning(&quot;Failed to delete runner package zip &#x27;{0}&#x27;. Exception: {1}&quot;, archiveFile, ex);
+331                      }
+332                  }
+333              }
+334              await CopyLatestRunnerToRoot(latestRunnerDirectory, token);
+335          }
+336          private async Task&lt;string&gt; DownLoadRunner(string downloadDirectory, string packageDownloadUrl, string packageHashValue, CancellationToken token)
+337          {
+338              var stopWatch = Stopwatch.StartNew();
+339              int runnerSuffix = 1;
+340              string archiveFile = null;
+341              bool downloadSucceeded = false;
+342              for (int attempt = 1; attempt &lt;= Constants.RunnerDownloadRetryMaxAttempts; attempt++)
+343              {
+344                  while (true)
+345                  {
+346                      if (_targetPackage.Platform.StartsWith(&quot;win&quot;))
+347                      {
+348                          archiveFile = Path.Combine(downloadDirectory, $&quot;runner{runnerSuffix}.zip&quot;);
+349                      }
+350                      else
+351                      {
+352                          archiveFile = Path.Combine(downloadDirectory, $&quot;runner{runnerSuffix}.tar.gz&quot;);
+353                      }
+354                      try
+355                      {
+356                          if (!string.IsNullOrEmpty(archiveFile) &amp;&amp; File.Exists(archiveFile))
+357                          {
+358                              Trace.Verbose(&quot;Deleting latest runner package zip &#x27;{0}&#x27;&quot;, archiveFile);
+359                              IOUtil.DeleteFile(archiveFile);
+360                          }
+361                          break;
+362                      }
+363                      catch (Exception ex)
+364                      {
+365                          Trace.Warning(&quot;Failed to delete runner package zip &#x27;{0}&#x27;. Exception: {1}&quot;, archiveFile, ex);
+366                          runnerSuffix++;
+367                      }
+368                  }
+369                  if (!int.TryParse(Environment.GetEnvironmentVariable(&quot;GITHUB_ACTIONS_RUNNER_DOWNLOAD_TIMEOUT&quot;) ?? string.Empty, out int timeoutSeconds))
+370                  {
+371                      timeoutSeconds = 15 * 60;
+372                  }
+373                  Trace.Info($&quot;Attempt {attempt}: save latest runner into {archiveFile}.&quot;);
+374                  using (var downloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
+375                  using (var downloadCts = CancellationTokenSource.CreateLinkedTokenSource(downloadTimeout.Token, token))
+376                  {
+377                      try
+378                      {
+379                          Trace.Info($&quot;Download runner: begin download&quot;);
+380                          long downloadSize = 0;
+381                          using (HttpClient httpClient = new(HostContext.CreateHttpClientHandler()))
+382                          {
+383                              if (!string.IsNullOrEmpty(_targetPackage.Token))
+384                              {
+385                                  Trace.Info($&quot;Adding authorization token ({_targetPackage.Token.Length} chars)&quot;);
+386                                  httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(&quot;Bearer&quot;, _targetPackage.Token);
+387                              }
+388                              Trace.Info($&quot;Downloading {packageDownloadUrl}&quot;);
+389                              using (FileStream fs = new(archiveFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true))
+390                              using (Stream result = await httpClient.GetStreamAsync(packageDownloadUrl))
+391                              {
+392                                  await result.CopyToAsync(fs, 81920, downloadCts.Token);
+393                                  await fs.FlushAsync(downloadCts.Token);
+394                                  downloadSize = fs.Length;
+395                              }
+396                          }
+397                          Trace.Info($&quot;Download runner: finished download&quot;);
+398                          downloadSucceeded = true;
+399                          stopWatch.Stop();
+400                          _updateTrace.Enqueue($&quot;PackageDownloadTime: {stopWatch.ElapsedMilliseconds}ms&quot;);
+401                          _updateTrace.Enqueue($&quot;Attempts: {attempt}&quot;);
+402                          _updateTrace.Enqueue($&quot;PackageSize: {downloadSize / 1024 / 1024}MB&quot;);
+403                          break;
+404                      }
+405                      catch (OperationCanceledException) when (token.IsCancellationRequested)
+406                      {
+407                          Trace.Info($&quot;Runner download has been cancelled.&quot;);
+408                          throw;
+409                      }
+410                      catch (Exception ex)
+411                      {
+412                          if (downloadCts.Token.IsCancellationRequested)
+413                          {
+414                              Trace.Warning($&quot;Runner download has timed out after {timeoutSeconds} seconds&quot;);
+415                          }
+416                          Trace.Warning($&quot;Failed to get package &#x27;{archiveFile}&#x27; from &#x27;{packageDownloadUrl}&#x27;. Exception {ex}&quot;);
+417                      }
+418                  }
+419              }
+420              if (downloadSucceeded)
+421              {
+422                  return archiveFile;
+423              }
+424              else
+425              {
+426                  return null;
+427              }
+428          }
+429          private async Task ValidateRunnerHash(string archiveFile, string packageHashValue)
+430          {
+431              var stopWatch = Stopwatch.StartNew();
+432              using (FileStream stream = File.OpenRead(archiveFile))
+433              {
+434                  if (!string.IsNullOrEmpty(packageHashValue))
+435                  {
+436                      using (SHA256 sha256 = SHA256.Create())
+437                      {
+438                          byte[] srcHashBytes = await sha256.ComputeHashAsync(stream);
+439                          var hash = PrimitiveExtensions.ConvertToHexString(srcHashBytes);
+440                          if (hash != packageHashValue)
+441                          {
+442                              throw new Exception($&quot;Computed runner hash {hash} did not match expected Runner Hash {packageHashValue} for {archiveFile}&quot;);
+443                          }
+444                          stopWatch.Stop();
+445                          Trace.Info($&quot;Validated Runner Hash matches {archiveFile} : {packageHashValue}&quot;);
+446                          _updateTrace.Enqueue($&quot;ValidateHashTime: {stopWatch.ElapsedMilliseconds}ms&quot;);
+447                      }
+448                  }
+449              }
+450          }
+451          private async Task ExtractRunnerPackage(string archiveFile, string extractDirectory, CancellationToken token)
+452          {
+453              var stopWatch = Stopwatch.StartNew();
+454              if (archiveFile.EndsWith(&quot;.zip&quot;, StringComparison.OrdinalIgnoreCase))
+455              {
+456                  ZipFile.ExtractToDirectory(archiveFile, extractDirectory);
+457              }
+458              else if (archiveFile.EndsWith(&quot;.tar.gz&quot;, StringComparison.OrdinalIgnoreCase))
+459              {
+460                  string tar = WhichUtil.Which(&quot;tar&quot;, trace: Trace);
+461                  if (string.IsNullOrEmpty(tar))
+462                  {
+463                      throw new NotSupportedException($&quot;tar -xzf&quot;);
+464                  }
+465                  using (var processInvoker = HostContext.CreateService&lt;IProcessInvoker&gt;())
+466                  {
+467                      processInvoker.OutputDataReceived += new EventHandler&lt;ProcessDataReceivedEventArgs&gt;((sender, args) =&gt;
+468                      {
+469                          if (!string.IsNullOrEmpty(args.Data))
+470                          {
+471                              Trace.Info(args.Data);
+472                          }
+473                      });
+474                      processInvoker.ErrorDataReceived += new EventHandler&lt;ProcessDataReceivedEventArgs&gt;((sender, args) =&gt;
+475                      {
+476                          if (!string.IsNullOrEmpty(args.Data))
+477                          {
+478                              Trace.Error(args.Data);
+479                          }
+480                      });
+481                      int exitCode = await processInvoker.ExecuteAsync(extractDirectory, tar, $&quot;-xzf \&quot;{archiveFile}\&quot;&quot;, null, token);
+482                      if (exitCode != 0)
+483                      {
+484                          throw new NotSupportedException($&quot;Can&#x27;t use &#x27;tar -xzf&#x27; to extract archive file: {archiveFile}. return code: {exitCode}.&quot;);
+485                      }
+486                  }
+487              }
+488              else
+489              {
+490                  throw new NotSupportedException($&quot;{archiveFile}&quot;);
+491              }
+492              stopWatch.Stop();
+493              Trace.Info($&quot;Finished getting latest runner package at: {extractDirectory}.&quot;);
+494              _updateTrace.Enqueue($&quot;PackageExtractTime: {stopWatch.ElapsedMilliseconds}ms&quot;);
+495          }
+496          private Task CopyLatestRunnerToRoot(string latestRunnerDirectory, CancellationToken token)
+497          {
+498              var stopWatch = Stopwatch.StartNew();
+499              string binVersionDir = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;{Constants.Path.BinDirectory}.{_targetPackage.Version}&quot;);
+500              Directory.CreateDirectory(binVersionDir);
+501              Trace.Info($&quot;Copy {Path.Combine(latestRunnerDirectory, Constants.Path.BinDirectory)} to {binVersionDir}.&quot;);
+502              IOUtil.CopyDirectory(Path.Combine(latestRunnerDirectory, Constants.Path.BinDirectory), binVersionDir, token);
+503              string externalsVersionDir = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;{Constants.Path.ExternalsDirectory}.{_targetPackage.Version}&quot;);
+504              Directory.CreateDirectory(externalsVersionDir);
+505              Trace.Info($&quot;Copy {Path.Combine(latestRunnerDirectory, Constants.Path.ExternalsDirectory)} to {externalsVersionDir}.&quot;);
+506              IOUtil.CopyDirectory(Path.Combine(latestRunnerDirectory, Constants.Path.ExternalsDirectory), externalsVersionDir, token);
+507              Trace.Info($&quot;Copy any remaining .sh/.cmd files into runner root.&quot;);
+508              foreach (FileInfo file in new DirectoryInfo(latestRunnerDirectory).GetFiles() ?? new FileInfo[0])
+509              {
+510                  string destination = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), file.Name);
+511                  Trace.Info($&quot;Copy {file.FullName} to {destination}&quot;);
+512                  IOUtil.DeleteFile(destination);
+513                  file.CopyTo(destination, true);
+514              }
+515              stopWatch.Stop();
+516              _updateTrace.Enqueue($&quot;CopyRunnerToRootTime: {stopWatch.ElapsedMilliseconds}ms&quot;);
+517              return Task.CompletedTask;
+518          }
+519          private void DeletePreviousVersionRunnerBackup(CancellationToken token)
+520          {
+521              foreach (string existBackUp in Directory.GetDirectories(HostContext.GetDirectory(WellKnownDirectory.Root), &quot;*.bak.*&quot;))
+522              {
+523                  Trace.Info($&quot;Delete existing runner backup at {existBackUp}.&quot;);
+524                  try
+525                  {
+526                      IOUtil.DeleteDirectory(existBackUp, token);
+527                  }
+528                  catch (Exception ex) when (!(ex is OperationCanceledException))
+529                  {
+530                      Trace.Error(ex);
+531                      Trace.Info($&quot;Catch exception during delete backup folder {existBackUp}, ignore this error try delete the backup folder on next auto-update.&quot;);
+532                  }
+533              }
+534              var allBinDirs = Directory.GetDirectories(HostContext.GetDirectory(WellKnownDirectory.Root), &quot;bin.*&quot;);
+535              if (allBinDirs.Length &gt; 2)
+536              {
+537                  foreach (var oldBinDir in allBinDirs)
+538                  {
+539                      if (string.Equals(oldBinDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;bin&quot;), StringComparison.OrdinalIgnoreCase) ||
+540                          string.Equals(oldBinDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;bin.{BuildConstants.RunnerPackage.Version}&quot;), StringComparison.OrdinalIgnoreCase) ||
+541                          string.Equals(oldBinDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;bin.{_targetPackage.Version}&quot;), StringComparison.OrdinalIgnoreCase))
+542                      {
+543                          continue;
+544                      }
+545                      Trace.Info($&quot;Delete runner bin folder&#x27;s backup at {oldBinDir}.&quot;);
+546                      try
+547                      {
+548                          IOUtil.DeleteDirectory(oldBinDir, token);
+549                      }
+550                      catch (Exception ex) when (!(ex is OperationCanceledException))
+551                      {
+552                          Trace.Error(ex);
+553                          Trace.Info($&quot;Catch exception during delete backup folder {oldBinDir}, ignore this error try delete the backup folder on next auto-update.&quot;);
+554                      }
+555                  }
+556              }
+557              var allExternalsDirs = Directory.GetDirectories(HostContext.GetDirectory(WellKnownDirectory.Root), &quot;externals.*&quot;);
+558              if (allExternalsDirs.Length &gt; 2)
+559              {
+560                  foreach (var oldExternalDir in allExternalsDirs)
+561                  {
+562                      if (string.Equals(oldExternalDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;externals&quot;), StringComparison.OrdinalIgnoreCase) ||
+563                          string.Equals(oldExternalDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;externals.{BuildConstants.RunnerPackage.Version}&quot;), StringComparison.OrdinalIgnoreCase) ||
+564                          string.Equals(oldExternalDir, Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), $&quot;externals.{_targetPackage.Version}&quot;), StringComparison.OrdinalIgnoreCase))
+565                      {
+566                          continue;
+567                      }
+568                      Trace.Info($&quot;Delete runner externals folder&#x27;s backup at {oldExternalDir}.&quot;);
+569                      try
+570                      {
+571                          IOUtil.DeleteDirectory(oldExternalDir, token);
+572                      }
+573                      catch (Exception ex) when (!(ex is OperationCanceledException))
+574                      {
+575                          Trace.Error(ex);
+576                          Trace.Info($&quot;Catch exception during delete backup folder {oldExternalDir}, ignore this error try delete the backup folder on next auto-update.&quot;);
+577                      }
+578                  }
+579              }
+580          }
+581          private string GenerateUpdateScript(bool restartInteractiveRunner)
+582          {
+583              int processId = Process.GetCurrentProcess().Id;
+584              string updateLog = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Diag), $&quot;SelfUpdate-{DateTime.UtcNow.ToString(&quot;yyyyMMdd-HHmmss&quot;)}.log&quot;);
+585              string runnerRoot = HostContext.GetDirectory(WellKnownDirectory.Root);
+586  #if OS_WINDOWS
+587              string templateName = &quot;update.cmd.template&quot;;
+588  #else
+589              string templateName = &quot;update.sh.template&quot;;
+590  #endif
+591              string templatePath = Path.Combine(runnerRoot, $&quot;bin.{_targetPackage.Version}&quot;, templateName);
+592              string template = File.ReadAllText(templatePath);
+593              template = template.Replace(&quot;_PROCESS_ID_&quot;, processId.ToString());
+594              template = template.Replace(&quot;_RUNNER_PROCESS_NAME_&quot;, $&quot;Runner.Listener{IOUtil.ExeExtension}&quot;);
+595              template = template.Replace(&quot;_ROOT_FOLDER_&quot;, runnerRoot);
+596              template = template.Replace(&quot;_EXIST_RUNNER_VERSION_&quot;, BuildConstants.RunnerPackage.Version);
+597              template = template.Replace(&quot;_DOWNLOAD_RUNNER_VERSION_&quot;, _targetPackage.Version);
+598              template = template.Replace(&quot;_UPDATE_LOG_&quot;, updateLog);
+599              template = template.Replace(&quot;_RESTART_INTERACTIVE_RUNNER_&quot;, restartInteractiveRunner ? &quot;1&quot; : &quot;0&quot;);
+600  #if OS_WINDOWS
+601              string scriptName = &quot;_update.cmd&quot;;
+602  #else
+603              string scriptName = &quot;_update.sh&quot;;
+604  #endif
+605              string updateScript = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Work), scriptName);
+606              if (File.Exists(updateScript))
+607              {
+608                  IOUtil.DeleteFile(updateScript);
+609              }
+610              File.WriteAllText(updateScript, template);
+611              return updateScript;
+612          }
+613          private async Task UpdateRunnerUpdateStateAsync(string currentState)
+614          {
+615              _terminal.WriteLine(currentState);
+616              var traces = new List&lt;string&gt;();
+617              while (_updateTrace.TryDequeue(out var trace))
+618              {
+619                  traces.Add(trace);
+620              }
+621              if (traces.Count &gt; 0)
+622              {
+623                  foreach (var trace in traces)
+624                  {
+625                      Trace.Info(trace);
+626                  }
+627              }
+628              try
+629              {
+630                  await _runnerServer.UpdateAgentUpdateStateAsync(_poolId, _agentId, currentState, string.Join(Environment.NewLine, traces));
+631                  _updateTrace.Clear();
+632              }
+633              catch (VssResourceNotFoundException)
+634              {
+635                  Trace.Info($&quot;Catch VssResourceNotFoundException during report update state, ignore this error for backcompat.&quot;);
+636              }
+637              catch (Exception ex)
+638              {
+639                  Trace.Error(ex);
+640                  Trace.Info($&quot;Catch exception during report update state, ignore this error and continue auto-update.&quot;);
+641              }
+642          }
+643          private async Task&lt;bool&gt; RestoreTrimmedExternals(string downloadDirectory, CancellationToken token)
+644          {
+645              var stopWatch = Stopwatch.StartNew();
+646              try
+647              {
+648                  Trace.Info($&quot;Copy {_externalsCloneDirectory} to {Path.Combine(downloadDirectory, Constants.Path.ExternalsDirectory)}.&quot;);
+649                  IOUtil.CopyDirectory(_externalsCloneDirectory, Path.Combine(downloadDirectory, Constants.Path.ExternalsDirectory), token);
+650                  var nodeVersions = NodeUtil.BuiltInNodeVersions;
+651                  foreach (var nodeVersion in nodeVersions)
+652                  {
+653                      var newNodeBinary = Path.Combine(downloadDirectory, Constants.Path.ExternalsDirectory, nodeVersion, &quot;bin&quot;, $&quot;node{IOUtil.ExeExtension}&quot;);
+654                      if (File.Exists(newNodeBinary))
+655                      {
+656                          using (var p = HostContext.CreateService&lt;IProcessInvoker&gt;())
+657                          {
+658                              var outputs = &quot;&quot;;
+659                              p.ErrorDataReceived += (_, data) =&gt;
+660                              {
+661                                  if (!string.IsNullOrEmpty(data.Data))
+662                                  {
+663                                      Trace.Error(data.Data);
+664                                  }
+665                              };
+666                              p.OutputDataReceived += (_, data) =&gt;
+667                              {
+668                                  if (!string.IsNullOrEmpty(data.Data))
+669                                  {
+670                                      Trace.Info(data.Data);
+671                                      outputs = data.Data;
+672                                  }
+673                              };
+674                              var exitCode = await p.ExecuteAsync(HostContext.GetDirectory(WellKnownDirectory.Root), newNodeBinary, $&quot;-e \&quot;console.log(&#x27;{nameof(RestoreTrimmedExternals)}&#x27;)\&quot;&quot;, null, token);
+675                              if (exitCode != 0)
+676                              {
+677                                  Trace.Error($&quot;{newNodeBinary} -e \&quot;console.log()\&quot; failed with exit code {exitCode}&quot;);
+678                                  return false;
+679                              }
+680                              if (!string.Equals(outputs, nameof(RestoreTrimmedExternals), StringComparison.OrdinalIgnoreCase))
+681                              {
+682                                  Trace.Error($&quot;{newNodeBinary} -e \&quot;console.log()\&quot; did not output expected content.&quot;);
+683                                  return false;
+684                              }
+685                          }
+686                      }
+687                  }
+688                  return true;
+689              }
+690              catch (Exception ex)
+691              {
+692                  Trace.Error($&quot;Fail to restore externals for trimmed package: {ex}&quot;);
+693                  return false;
+694              }
+695              finally
+696              {
+697                  stopWatch.Stop();
+698                  _updateTrace.Enqueue($&quot;{nameof(RestoreTrimmedExternals)}Time: {stopWatch.ElapsedMilliseconds}ms&quot;);
+699              }
+700          }
+701          private async Task&lt;bool&gt; RestoreTrimmedDotnetRuntime(string downloadDirectory, CancellationToken token)
+702          {
+703              var stopWatch = Stopwatch.StartNew();
+704              try
+705              {
+706                  Trace.Info($&quot;Copy {_dotnetRuntimeCloneDirectory} to {Path.Combine(downloadDirectory, Constants.Path.BinDirectory)}.&quot;);
+707                  IOUtil.CopyDirectory(_dotnetRuntimeCloneDirectory, Path.Combine(downloadDirectory, Constants.Path.BinDirectory), token);
+708                  var newRunnerBinary = Path.Combine(downloadDirectory, Constants.Path.BinDirectory, &quot;Runner.Listener&quot;);
+709                  using (var p = HostContext.CreateService&lt;IProcessInvoker&gt;())
+710                  {
+711                      p.ErrorDataReceived += (_, data) =&gt;
+712                      {
+713                          if (!string.IsNullOrEmpty(data.Data))
+714                          {
+715                              Trace.Error(data.Data);
+716                          }
+717                      };
+718                      p.OutputDataReceived += (_, data) =&gt;
+719                      {
+720                          if (!string.IsNullOrEmpty(data.Data))
+721                          {
+722                              Trace.Info(data.Data);
+723                          }
+724                      };
+725                      var exitCode = await p.ExecuteAsync(HostContext.GetDirectory(WellKnownDirectory.Root), newRunnerBinary, &quot;--version&quot;, null, token);
+726                      if (exitCode != 0)
+727                      {
+728                          Trace.Error($&quot;{newRunnerBinary} --version failed with exit code {exitCode}&quot;);
+729                          return false;
+730                      }
+731                      else
+732                      {
+733                          return true;
+734                      }
+735                  }
+736              }
+737              catch (Exception ex)
+738              {
+739                  Trace.Error($&quot;Fail to restore dotnet runtime for trimmed package: {ex}&quot;);
+740                  return false;
+741              }
+742              finally
+743              {
+744                  stopWatch.Stop();
+745                  _updateTrace.Enqueue($&quot;{nameof(RestoreTrimmedDotnetRuntime)}Time: {stopWatch.ElapsedMilliseconds}ms&quot;);
+746              }
+747          }
+748          private async Task CloneAndCalculateAssetsHash(string dotnetRuntimeCloneDirectory, string externalsCloneDirectory, CancellationToken token)
+749          {
+750              var runtimeCloneTask = CloneDotnetRuntime(dotnetRuntimeCloneDirectory, token);
+751              var externalsCloneTask = CloneExternals(externalsCloneDirectory, token);
+752              var waitingTasks = new Dictionary&lt;string, Task&gt;()
+753              {
+754                  {nameof(CloneDotnetRuntime), runtimeCloneTask},
+755                  {nameof(CloneExternals),externalsCloneTask}
+756              };
+757              while (waitingTasks.Count &gt; 0)
+758              {
+759                  Trace.Info($&quot;Waiting for {waitingTasks.Count} tasks to complete.&quot;);
+760                  var complatedTask = await Task.WhenAny(waitingTasks.Values);
+761                  if (waitingTasks.ContainsKey(nameof(CloneExternals)) &amp;&amp;
+762                      complatedTask == waitingTasks[nameof(CloneExternals)])
+763                  {
+764                      Trace.Info($&quot;Externals clone finished.&quot;);
+765                      waitingTasks.Remove(nameof(CloneExternals));
+766                      try
+767                      {
+768                          if (await externalsCloneTask &amp;&amp; !token.IsCancellationRequested)
+769                          {
+770                              var externalsHash = await HashFiles(externalsCloneDirectory, token);
+771                              Trace.Info($&quot;Externals content hash: {externalsHash}&quot;);
+772                              _contentHashes[_externals] = externalsHash;
+773                              _updateTrace.Enqueue($&quot;ExternalsHash: {_contentHashes[_externals]}&quot;);
+774                          }
+775                          else
+776                          {
+777                              Trace.Error($&quot;Skip compute hash since clone externals failed/cancelled.&quot;);
+778                          }
+779                      }
+780                      catch (Exception ex)
+781                      {
+782                          Trace.Error($&quot;Fail to hash externals content: {ex}&quot;);
+783                      }
+784                  }
+785                  else if (waitingTasks.ContainsKey(nameof(CloneDotnetRuntime)) &amp;&amp;
+786                           complatedTask == waitingTasks[nameof(CloneDotnetRuntime)])
+787                  {
+788                      Trace.Info($&quot;Dotnet runtime clone finished.&quot;);
+789                      waitingTasks.Remove(nameof(CloneDotnetRuntime));
+790                      try
+791                      {
+792                          if (await runtimeCloneTask &amp;&amp; !token.IsCancellationRequested)
+793                          {
+<span onclick='openModal()' class='match'>794                              var runtimeHash = await HashFiles(dotnetRuntimeCloneDirectory, token);
+795                              Trace.Info($&quot;Runtime content hash: {runtimeHash}&quot;);
+796                              _contentHashes[_dotnetRuntime] = runtimeHash;
+797                              _updateTrace.Enqueue($&quot;DotnetRuntimeHash: {_contentHashes[_dotnetRuntime]}&quot;);
+798                          }
+799                          else
+800                          {
+801                              Trace.Error($&quot;Skip compute hash since clone dotnet runtime failed/cancelled.&quot;);
+802                          }
+803                      }
+804                      catch (Exception ex)
+805                      {
+806                          Trace.Error($&quot;Fail to hash runtime content: {ex}&quot;);
+807                      }
+808                  }
+809                  Trace.Info($&quot;Still waiting for {waitingTasks.Count} tasks to complete.&quot;);
+</span>810              }
+811          }
+812          private async Task&lt;bool&gt; CloneDotnetRuntime(string runtimeDir, CancellationToken token)
+813          {
+814              var stopWatch = Stopwatch.StartNew();
+815              try
+816              {
+817                  Trace.Info($&quot;Cloning dotnet runtime to {runtimeDir}&quot;);
+818                  IOUtil.DeleteDirectory(runtimeDir, CancellationToken.None);
+819                  Directory.CreateDirectory(runtimeDir);
+820                  var assembly = Assembly.GetExecutingAssembly();
+821                  var assetsContent = default(string);
+822                  using (var stream = assembly.GetManifestResourceStream(&quot;GitHub.Runner.Listener.runnercoreassets&quot;))
+823                  using (var streamReader = new StreamReader(stream))
+824                  {
+825                      assetsContent = await streamReader.ReadToEndAsync();
+826                  }
+827                  if (!string.IsNullOrEmpty(assetsContent))
+828                  {
+829                      var runnerCoreAssets = assetsContent.Split(new[] { &quot;\n&quot;, &quot;\r\n&quot; }, StringSplitOptions.RemoveEmptyEntries);
+830                      if (runnerCoreAssets.Length &gt; 0)
+831                      {
+832                          var binDir = HostContext.GetDirectory(WellKnownDirectory.Bin);
+833                          IOUtil.CopyDirectory(binDir, runtimeDir, token);
+834                          var clonedFile = 0;
+835                          foreach (var file in Directory.EnumerateFiles(runtimeDir, &quot;*&quot;, SearchOption.AllDirectories))
+836                          {
+837                              token.ThrowIfCancellationRequested();
+838                              if (runnerCoreAssets.Any(x =&gt; file.Replace(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).EndsWith(x.Trim())))
+839                              {
+840                                  Trace.Verbose($&quot;{file} is part of the runner core, delete from cloned runtime directory.&quot;);
+841                                  IOUtil.DeleteFile(file);
+842                              }
+843                              else
+844                              {
+845                                  clonedFile++;
+846                              }
+847                          }
+848                          Trace.Info($&quot;Successfully cloned dotnet runtime to {runtimeDir}. Total files: {clonedFile}&quot;);
+849                          return true;
+850                      }
+851                  }
+852              }
+853              catch (Exception ex)
+854              {
+855                  Trace.Error($&quot;Fail to clone dotnet runtime to {runtimeDir}&quot;);
+856                  Trace.Error(ex);
+857              }
+858              finally
+859              {
+860                  stopWatch.Stop();
+861                  _updateTrace.Enqueue($&quot;{nameof(CloneDotnetRuntime)}Time: {stopWatch.ElapsedMilliseconds}ms&quot;);
+862              }
+863              return false;
+864          }
+865          private Task&lt;bool&gt; CloneExternals(string externalsDir, CancellationToken token)
+866          {
+867              var stopWatch = Stopwatch.StartNew();
+868              try
+869              {
+870                  Trace.Info($&quot;Cloning externals to {externalsDir}&quot;);
+871                  IOUtil.DeleteDirectory(externalsDir, CancellationToken.None);
+872                  Directory.CreateDirectory(externalsDir);
+873                  IOUtil.CopyDirectory(HostContext.GetDirectory(WellKnownDirectory.Externals), externalsDir, token);
+874                  Trace.Info($&quot;Successfully cloned externals to {externalsDir}.&quot;);
+875                  return Task.FromResult(true);
+876              }
+877              catch (Exception ex)
+878              {
+879                  Trace.Error($&quot;Fail to clone externals to {externalsDir}&quot;);
+880                  Trace.Error(ex);
+881              }
+882              finally
+883              {
+884                  stopWatch.Stop();
+885                  _updateTrace.Enqueue($&quot;{nameof(CloneExternals)}Time: {stopWatch.ElapsedMilliseconds}ms&quot;);
+886              }
+887              return Task.FromResult(false);
+888          }
+889          private async Task&lt;string&gt; HashFiles(string fileFolder, CancellationToken token)
+890          {
+891              Trace.Info($&quot;Calculating hash for {fileFolder}&quot;);
+892              var stopWatch = Stopwatch.StartNew();
+893              string binDir = HostContext.GetDirectory(WellKnownDirectory.Bin);
+894              string node = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Externals), NodeUtil.GetInternalNodeVersion(), &quot;bin&quot;, $&quot;node{IOUtil.ExeExtension}&quot;);
+895              string hashFilesScript = Path.Combine(binDir, &quot;hashFiles&quot;);
+896              var hashResult = string.Empty;
+897              using (var processInvoker = HostContext.CreateService&lt;IProcessInvoker&gt;())
+898              {
+899                  processInvoker.ErrorDataReceived += (_, data) =&gt;
+900                  {
+901                      if (!string.IsNullOrEmpty(data.Data) &amp;&amp; data.Data.StartsWith(&quot;__OUTPUT__&quot;) &amp;&amp; data.Data.EndsWith(&quot;__OUTPUT__&quot;))
+902                      {
+903                          hashResult = data.Data.Substring(10, data.Data.Length - 20);
+904                          Trace.Info($&quot;Hash result: &#x27;{hashResult}&#x27;&quot;);
+905                      }
+906                      else
+907                      {
+908                          Trace.Info(data.Data);
+909                      }
+910                  };
+911                  processInvoker.OutputDataReceived += (_, data) =&gt;
+912                  {
+913                      Trace.Verbose(data.Data);
+914                  };
+915                  var env = new Dictionary&lt;string, string&gt;
+916                  {
+917                      [&quot;patterns&quot;] = &quot;**&quot;
+918                  };
+919                  int exitCode = await processInvoker.ExecuteAsync(workingDirectory: fileFolder,
+920                                                fileName: node,
+921                                                arguments: $&quot;\&quot;{hashFilesScript.Replace(&quot;\&quot;&quot;, &quot;\\\&quot;&quot;)}\&quot;&quot;,
+922                                                environment: env,
+923                                                requireExitCodeZero: false,
+924                                                outputEncoding: null,
+925                                                killProcessOnCancel: true,
+926                                                cancellationToken: token);
+927                  if (exitCode != 0)
+928                  {
+929                      Trace.Error($&quot;hashFiles returns &#x27;{exitCode}&#x27; failed. Fail to hash files under directory &#x27;{fileFolder}&#x27;&quot;);
+930                  }
+931                  stopWatch.Stop();
+932                  _updateTrace.Enqueue($&quot;{nameof(HashFiles)}{Path.GetFileName(fileFolder)}Time: {stopWatch.ElapsedMilliseconds}ms&quot;);
+933                  return hashResult;
+934              }
+935          }
+936      }
+937  }
+</code></pre>
+        </div>
+    
+        <!-- The Modal -->
+        <div id="myModal" class="modal">
+            <div class="modal-content">
+                <span class="row close">&times;</span>
+                <div class='row'>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from runner-MDEwOlJlcG9zaXRvcnkxODQyODY4NzU=-flat-SelfUpdater.cs</div>
+                    <div class="column" style="font-weight: bold;text-decoration: underline">Fragment from runner-MDEwOlJlcG9zaXRvcnkxODQyODY4NzU=-flat-SelfUpdater.cs</div>
+                </div>
+                <div class="column column_space"><pre><code>770                              var externalsHash = await HashFiles(externalsCloneDirectory, token);
+771                              Trace.Info($&quot;Externals content hash: {externalsHash}&quot;);
+772                              _contentHashes[_externals] = externalsHash;
+773                              _updateTrace.Enqueue($&quot;ExternalsHash: {_contentHashes[_externals]}&quot;);
+774                          }
+775                          else
+776                          {
+777                              Trace.Error($&quot;Skip compute hash since clone externals failed/cancelled.&quot;);
+778                          }
+779                      }
+780                      catch (Exception ex)
+781                      {
+782                          Trace.Error($&quot;Fail to hash externals content: {ex}&quot;);
+783                      }
+784                  }
+785                  else if (waitingTasks.ContainsKey(nameof(CloneDotnetRuntime)) &amp;&amp;
+</pre></code></div>
+                <div class="column column_space"><pre><code>794                              var runtimeHash = await HashFiles(dotnetRuntimeCloneDirectory, token);
+795                              Trace.Info($&quot;Runtime content hash: {runtimeHash}&quot;);
+796                              _contentHashes[_dotnetRuntime] = runtimeHash;
+797                              _updateTrace.Enqueue($&quot;DotnetRuntimeHash: {_contentHashes[_dotnetRuntime]}&quot;);
+798                          }
+799                          else
+800                          {
+801                              Trace.Error($&quot;Skip compute hash since clone dotnet runtime failed/cancelled.&quot;);
+802                          }
+803                      }
+804                      catch (Exception ex)
+805                      {
+806                          Trace.Error($&quot;Fail to hash runtime content: {ex}&quot;);
+807                      }
+808                  }
+809                  Trace.Info($&quot;Still waiting for {waitingTasks.Count} tasks to complete.&quot;);
+</pre></code></div>
+            </div>
+        </div>
+        <script>
+        // Get the modal
+        var modal = document.getElementById("myModal");
+        
+        // Get the button that opens the modal
+        var btn = document.getElementById("myBtn");
+        
+        // Get the <span> element that closes the modal
+        var span = document.getElementsByClassName("close")[0];
+        
+        // When the user clicks the button, open the modal
+        function openModal(){
+          modal.style.display = "block";
+        }
+        
+        // When the user clicks on <span> (x), close the modal
+        span.onclick = function() {
+        modal.style.display = "none";
+        }
+        
+        // When the user clicks anywhere outside of the modal, close it
+        window.onclick = function(event) {
+        if (event.target == modal) {
+        modal.style.display = "none";
+        } }
+        
+        </script>
+    </body>
+    </html>
+    
